@@ -16,7 +16,7 @@
 //!   5. SCC 縮約 + 逆位相1パス
 //!   6. 到達経路
 
-use crate::ast::{Expr, ExprKind, Item, Program};
+use crate::ast::{Expr, ExprKind, Head, Item, Program};
 use std::collections::{BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -50,8 +50,22 @@ impl Slots {
 ///
 /// ヒント: `program.items` を回して `Item::Effect { slot, trait_name, .. }` に
 /// マッチしたものを入れるだけ。再帰も木歩きも要らない。
-pub fn collect_slots(_program: &Program) -> Slots {
-    todo!("手順1: Item::Effect を集めて Slots を返す")
+pub fn collect_slots(program: &Program) -> Slots {
+    let mut map = HashMap::new();
+    for x in program.items.iter() {
+        match x {
+            Item::Effect {
+                slot,
+                trait_name,
+                span: _,
+            } => {
+                // TODO: インサートでダブったらエラーにする
+                map.insert(slot.clone(), trait_name.clone());
+            }
+            _ => (),
+        }
+    }
+    Slots { map: map }
 }
 
 // ---------------------------------------------------------------------------
@@ -72,8 +86,54 @@ pub fn collect_slots(_program: &Program) -> Slots {
 ///
 /// ヒント: 下の `walk` で全部の部分式を訪問し、`ExprKind::Field(recv, _)` を見つけて
 /// `recv` が `ExprKind::Ident(name)` かつ `slots.is_slot(name)` なら集める。
-pub fn direct_uses(_body: &[Expr], _slots: &Slots) -> BTreeSet<String> {
-    todo!("手順2: 本体を歩いて、直接使っているスロット名を集める")
+pub fn direct_uses(body: &[Expr], slots: &Slots) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    for expr in body {
+        walk(expr, &mut |e| {
+            if let ExprKind::Field(recv, _) = &e.kind {
+                if let ExprKind::Ident(name) = &recv.kind {
+                    if slots.is_slot(name) {
+                        result.insert(name.clone());
+                    }
+                }
+            }
+        });
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// 手順3: 呼び出し辺
+// ---------------------------------------------------------------------------
+
+/// 1つの関数の本体を歩いて、**この関数が呼んでいる関数の名前**を集める。
+/// これが呼び出しグラフの辺になる。
+///
+/// 集めるのはこの形だけ:
+///
+/// ```text
+/// stamp(u)              →  Call( Ident("stamp"), [u] )        集める
+/// db.save(u)            →  Call( Field(..), [u] )             集めない(スロット使用)
+/// Postgres::new(url)    →  Call( Path([..]), [url] )          集めない(パス呼び出し)
+/// ```
+///
+/// 定義されている関数かどうかの絞り込みはここではしない(グラフを組むときの仕事)。
+pub fn calls(body: &[Expr], slots: &Slots) -> BTreeSet<String> {
+    let mut result = BTreeSet::new();
+    for x in body {
+        walk(x, &mut |x| {
+            if let ExprKind::Call(callee, _) = &x.kind
+                && let ExprKind::Ident(name) = &callee.kind
+            {
+                if slots.is_slot(name) {
+                    return;
+                }
+                result.insert(name.clone());
+            }
+        })
+    }
+    result
+    // todo!("手順3: Call(Ident(name), _) の name を集める")
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +271,10 @@ mod tests {
              }\n",
         );
         let slots = collect_slots(&p);
-        assert_eq!(direct_uses(body_of(&p, "stamp"), &slots), set(&["clock", "db"]));
+        assert_eq!(
+            direct_uses(body_of(&p, "stamp"), &slots),
+            set(&["clock", "db"])
+        );
     }
 
     #[test]
@@ -224,6 +287,58 @@ mod tests {
         );
         let slots = collect_slots(&p);
         assert!(direct_uses(body_of(&p, "f"), &slots).is_empty());
+    }
+
+    // ---- 手順3 ----
+
+    #[test]
+    fn 手順3_呼んでいる関数の名前を集める() {
+        let p = program(
+            "fn stamp(u: User) {\n\
+             \x20 1\n\
+             }\n\
+             fn promote(id: UserId -> bool) {\n\
+             \x20 stamp(u)\n\
+             \x20 audit(u)\n\
+             \x20 true\n\
+             }\n",
+        );
+        let slots = collect_slots(&p);
+        assert_eq!(
+            calls(body_of(&p, "promote"), &slots),
+            set(&["audit", "stamp"])
+        );
+    }
+
+    #[test]
+    fn 手順3_スロット使用とパス呼び出しは辺ではない() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(id: UserId) {\n\
+             \x20 db.save(id)\n\
+             \x20 let x = Postgres::new(id)\n\
+             \x20 stamp(x)\n\
+             }\n",
+        );
+        // db.save は Field 越し、Postgres::new は Path。辺になるのは stamp だけ
+        let slots = collect_slots(&p);
+        assert_eq!(calls(body_of(&p, "f"), &slots), set(&["stamp"]));
+    }
+
+    #[test]
+    fn 手順3_提供は呼び出しではない() {
+        // `db(pg): { ... }` の `db(pg)` は Call(Ident("db"), _) と同じ形をしているが、
+        // これは提供であって呼び出しではない。辺にしてはいけない
+        let p = program(
+            "effect db: Database\n\
+             fn main() {\n\
+             \x20 db(pg): {\n\
+             \x20   handle(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        let slots = collect_slots(&p);
+        assert_eq!(calls(body_of(&p, "main"), &slots), set(&["handle"]));
     }
 
     #[test]
