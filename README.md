@@ -5,19 +5,22 @@
 変数の束縛は関数を跨ぐと切れる。切れない束縛を言語に入れると、DIコンテナが不要になる。
 
 ```rhodolite
+effect db: Database                       // スロット宣言
+effect clock: Clock
+
 fn stamp(u: User) {                       // 使用
-    u.promoted_at = Clock::now()
-    Database::save(u)
+    u.promoted_at = clock.now()
+    db.save(u)
 }
 
 fn promote(id: UserId -> bool) {          // 経由するだけ = 無記述
-    let u = Database::find(id) ?? return false
+    let u = db.find(id) ?? return false
     stamp(u)
     true
 }
 
 fn main() {
-    Database(Postgres::new(url)), Clock(system_clock): {   // 提供
+    db(Postgres::new(url)), clock(system_clock): {   // 提供
         promote(user_id)
     }
 }

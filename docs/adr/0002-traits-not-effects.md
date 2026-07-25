@@ -5,16 +5,40 @@
 使用側(推移するか・推論されるか)にしかないため、宣言構文を2つ持つ理由がない。
 よって **`effect` キーワードを廃止し、「ambient に置かれた trait」をエフェクトと定義する**。
 
-その上で、ambient に関わる記述をソース上の3箇所に限定する:
+その上で、ambient に関わる記述をソース上の4箇所に限定する:
 
 | 位置 | 書くもの |
 |---|---|
-| 宣言 | `trait Database { fn save(u: User -> unit) }` |
-| 提供 | `Database(db): { handle() }` |
-| 使用 | `Database::save(u)` |
+| 契約 | `trait Database { fn save(u: User -> unit) }` |
+| スロット宣言 | `effect db: Database` |
+| 提供 | `db(Postgres::new(url)): { handle() }` |
+| 使用 | `db.save(u)` |
 
-**この3箇所以外には1文字も現れない。**経由するだけの関数は無記述で、関数が何を要求
-するかは推論する(書かない)。IDE がゴーストテキストで `@env Database, Clock` として見せる。
+**この4箇所以外には1文字も現れない。**経由するだけの関数は無記述で、関数が何を要求
+するかは推論する(書かない)。IDE がゴーストテキストで `@env db, clock` として見せる。
+
+## 追記(同日): `effect` はスロット宣言として復活した
+
+`effect` キーワードは廃止しない。ただし**関数を1つも宣言しない**形で入れる:
+
+```rhodolite
+trait  Database { fn find(...)  fn save(...) }   // 関数の集まり = 契約
+effect db: Database                              // Database 型のスロットが1つ、名は db
+```
+
+このADRが禁じたのは「関数の集まりを宣言する構文が2つある」ことであり、
+`effect db: Database` はそれに当たらない。**契約(trait)と役割(スロット)を分けて書く**形。
+
+差し引きで**規則は減っている**:
+
+- **得**: ambient になれる trait が宣言で決まる(`Display` を ambient 位置に置けない)/
+  スロットが常に名前を持つので同じ trait の複数実装で曖昧性が構造的に発生しない /
+  役割名(`db`, `clock`, `primary`, `replica`)がインターフェース名より呼び出しで読みやすい
+- **消えたもの**: `@Replica` のシジル、「ambient が1つなら省略・2つ以上なら名指し必須」
+  という特例規則
+- **代償**: 宣言形が1つ増える。`db.save(u)` はローカル変数と見た目が同じになる
+  (ただしレシーバが見えており、`effect db: Database` がモジュール先頭にあるため追跡可能。
+  裸呼び出し `save()` とは別物)
 
 ## Considered Options
 
