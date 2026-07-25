@@ -41,9 +41,26 @@ fn main() -> ExitCode {
         println!("  {}", summary(item));
     }
 
-    // 手順1 が緑になったらここが動く
-    let slots = requirement::collect_slots(&program);
-    println!("スロット: {:?}", slots.names());
+    let analysis = requirement::analyze(&program);
+
+    println!("\nスロット:");
+    for slot in analysis.slots.names() {
+        let trait_name = analysis.slots.trait_of(slot).unwrap_or("?");
+        println!("  effect {slot}: {trait_name}");
+    }
+
+    // 「書かせない、だが見える」— 誰も書いていない要求を推論して見せる
+    println!("\n推論された要求:");
+    print!("{}", analysis.render());
+
+    let errors = analysis.unsatisfied();
+    if !errors.is_empty() {
+        eprintln!();
+        for e in &errors {
+            eprintln!("{e}");
+        }
+        return ExitCode::FAILURE;
+    }
 
     ExitCode::SUCCESS
 }
