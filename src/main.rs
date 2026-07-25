@@ -3,6 +3,7 @@
 mod ast;
 mod lex;
 mod parse;
+mod requirement;
 
 use std::process::ExitCode;
 
@@ -39,6 +40,11 @@ fn main() -> ExitCode {
     for item in &program.items {
         println!("  {}", summary(item));
     }
+
+    // 手順1 が緑になったらここが動く
+    let slots = requirement::collect_slots(&program);
+    println!("スロット: {:?}", slots.names());
+
     ExitCode::SUCCESS
 }
 

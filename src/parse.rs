@@ -11,6 +11,7 @@
 use crate::ast::*;
 use crate::lex::{Span, Tok, Token};
 
+#[derive(Debug)]
 pub struct ParseError {
     pub msg: String,
     pub line: u32,
