@@ -63,7 +63,7 @@ pub fn collect_slots(program: &Program) -> Slots {
             span: _,
         } = x
         {
-            // TODO: インサートでダブったらエラーにする
+            // 重複は analyze の診断で止めるため、ここでどちらが残るかは観測されない。
             map.insert(slot.clone(), trait_name.clone());
         }
     }
@@ -83,6 +83,17 @@ pub fn collect_slots(program: &Program) -> Slots {
 pub struct CallSite {
     pub callee: String,
     pub provided: BTreeMap<String, SlotLevel>,
+    pub kind: CallKind,
+}
+
+/// 名前解決で検査する必要があるのは、`stamp()` のような直接呼び出しだけ。
+///
+/// メソッド呼び出しは型検査が入るまで候補を確定できないため、要求伝播の辺としては
+/// 記録するが、ここでは未定義エラーにしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Direct,
+    Method,
 }
 
 /// スロットの型だけが要るか、実体まで要るか。
@@ -213,6 +224,7 @@ fn scan(
                     out.calls.push(CallSite {
                         callee: name.clone(),
                         provided: provided.clone(),
+                        kind: CallKind::Direct,
                     });
                 }
                 ExprKind::Field(recv, method) => {
@@ -223,6 +235,7 @@ fn scan(
                         out.calls.push(CallSite {
                             callee: trait_method_key(trait_name, method),
                             provided: provided.clone(),
+                            kind: CallKind::Method,
                         });
                     }
                 }
@@ -239,6 +252,7 @@ fn scan(
                         out.calls.push(CallSite {
                             callee,
                             provided: provided.clone(),
+                            kind: CallKind::Method,
                         });
                     }
                 }
@@ -357,6 +371,7 @@ pub struct Analysis {
     pub reqs: BTreeMap<String, Reqs>,
     /// 出力の並び順(宣言順)。BTreeMap の辞書順だと読みにくいため
     pub order: Vec<String>,
+    diagnostics: Vec<String>,
 }
 
 /// テストの本体も関数と同じ扱いにする。名前がぶつからないよう印を付ける。
@@ -366,6 +381,7 @@ fn test_key(name: &str) -> String {
 
 pub fn analyze(program: &Program) -> Analysis {
     let slots = collect_slots(program);
+    let mut diagnostics = duplicate_slot_diagnostics(program);
 
     // 各関数・テスト・implメソッドの本体を1回だけ歩く。ここから先は AST を見ない
     let mut facts: BTreeMap<String, BodyFacts> = BTreeMap::new();
@@ -417,6 +433,22 @@ pub fn analyze(program: &Program) -> Analysis {
             _ => {}
         }
     }
+
+    // v1 には extern / FFI の宣言構文がない。したがって、ここに定義がない直接
+    // 呼び出しは外部関数とはみなさず typo として報告する。メソッドの存在確認は
+    // レシーバの型が必要なので、型検査の段まで保留する。
+    for (caller, body) in &facts {
+        for site in &body.calls {
+            if site.kind == CallKind::Direct && !facts.contains_key(&site.callee) {
+                diagnostics.push(format!(
+                    "{caller}: 関数 `{}` が定義されていません",
+                    site.callee
+                ));
+            }
+        }
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
 
     // 空から始めて、変化がなくなるまで回す。
     // 要求は増える一方(単調)なので必ず止まる。
@@ -477,7 +509,32 @@ pub fn analyze(program: &Program) -> Analysis {
         }
     }
 
-    Analysis { slots, reqs, order }
+    Analysis {
+        slots,
+        reqs,
+        order,
+        diagnostics,
+    }
+}
+
+fn duplicate_slot_diagnostics(program: &Program) -> Vec<String> {
+    let mut declared: HashMap<&str, &str> = HashMap::new();
+    let mut diagnostics = Vec::new();
+
+    for item in &program.items {
+        if let Item::Effect {
+            slot, trait_name, ..
+        } = item
+        {
+            if let Some(previous_trait) = declared.insert(slot, trait_name) {
+                diagnostics.push(format!(
+                    "effect `{slot}` が重複しています (`{previous_trait}` と `{trait_name}`)"
+                ));
+            }
+        }
+    }
+
+    diagnostics
 }
 
 fn merge_requirement(reqs: &mut Reqs, slot: &str, level: SlotLevel, path: Vec<String>) -> bool {
@@ -496,6 +553,13 @@ fn merge_requirement(reqs: &mut Reqs, slot: &str, level: SlotLevel, path: Vec<St
 }
 
 impl Analysis {
+    /// 要求解析より前に見つかる宣言・名前解決エラーと、提供忘れをまとめて返す。
+    pub fn errors(&self) -> Vec<String> {
+        let mut errors = self.diagnostics.clone();
+        errors.extend(self.unsatisfied());
+        errors
+    }
+
     /// 推論結果の一覧。IDE がゴーストテキストで見せるものの、テキスト版。
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -610,6 +674,41 @@ mod tests {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let slots = collect_slots(&program(&src));
         assert_eq!(slots.names(), ["clock", "db"].into_iter().collect());
+    }
+
+    #[test]
+    fn 重複したスロットを報告する() {
+        let p = program("effect service: Clock\neffect service: Database\n");
+        let errors = analyze(&p).errors();
+
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("effect `service` が重複しています (`Clock` と `Database`)"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn 未定義の直接関数呼び出しを報告する() {
+        let p = program("fn main() { stanp() }\n");
+        let errors = analyze(&p).errors();
+
+        assert_eq!(
+            errors,
+            vec!["main: 関数 `stanp` が定義されていません".to_string()]
+        );
+    }
+
+    #[test]
+    fn 後で定義された関数は呼び出せる() {
+        let p = program("fn main() { stamp() }\nfn stamp() { 1 }\n");
+        assert!(analyze(&p).errors().is_empty());
+    }
+
+    #[test]
+    fn メソッドの存在確認は未定義関数検査に含めない() {
+        let p = program("fn helper() { Missing::new() }\n");
+        assert!(analyze(&p).errors().is_empty());
     }
 
     // ---- 手順2 ----

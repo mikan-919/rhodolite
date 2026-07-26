@@ -59,9 +59,9 @@ flowchart LR
     P["Program (AST)"]
     S["Slots<br/>slot -> trait 名"]
     BF["BodyFacts<br/>escaping: slot -> SlotLevel<br/>calls: Vec&lt;CallSite&gt;"]
-    CS["CallSite<br/>callee: String<br/>provided: slot -> SlotLevel"]
+    CS["CallSite<br/>callee: String<br/>provided: slot -> SlotLevel<br/>kind: Direct | Method"]
     R["Reqs<br/>slot -> Requirement<br/>(SlotLevel + 到達経路)"]
-    A["Analysis<br/>slots / reqs / order"]
+    A["Analysis<br/>slots / reqs / order / diagnostics"]
     OUT["文字列出力"]
 
     P -->|collect_slots| S
@@ -96,3 +96,7 @@ flowchart LR
 実体提供は両方を満たすが、型提供は`Value`要求を満たさない。
 スロット経由のメソッド呼び出しはtrait単位、`Type::method()`は型単位の
 `impl`呼び出し辺にもなり、メソッド本体で生じた要求を呼び出し元へ伝える。
+
+`CallKind`は要求伝播と最低限の名前解決を分ける。`Direct`な呼び出し先が
+トップレベル関数に無ければエラーにする。`Method`の存在確認にはレシーバの型が
+必要なので、型検査が入るまで要求伝播の辺としてだけ扱う。

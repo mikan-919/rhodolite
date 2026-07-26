@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     println!("\n推論された要求:");
     print!("{}", analysis.render());
 
-    let errors = analysis.unsatisfied();
+    let errors = analysis.errors();
     if !errors.is_empty() {
         eprintln!();
         for e in &errors {
