@@ -183,6 +183,36 @@ impl<'a> Parser<'a> {
                 })
             }
 
+            // `impl Database for Postgres { ... }` / `impl Postgres { ... }`
+            // ハンドラに専用構文は無い(CONTEXT.md「ハンドラ」)。ただの impl。
+            Tok::Impl => {
+                self.bump();
+                let first = self.expect_ident("trait 名または型名")?;
+                let (trait_name, type_name) = if self.eat(&Tok::For) {
+                    (Some(first), self.expect_ident("型名")?)
+                } else {
+                    (None, first)
+                };
+                self.expect(&Tok::LBrace, "`{`")?;
+                let mut methods = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.eat(&Tok::RBrace) {
+                        break;
+                    }
+                    self.expect(&Tok::Fn, "`fn`")?;
+                    let sig = self.sig()?;
+                    let body = self.block()?;
+                    methods.push((sig, body));
+                }
+                Ok(Item::Impl {
+                    trait_name,
+                    type_name,
+                    methods,
+                    span: self.to(start),
+                })
+            }
+
             // `effect db: Database` — 関数を1つも宣言しない。契約と役割を分けて書く
             Tok::Effect => {
                 self.bump();
@@ -227,7 +257,7 @@ impl<'a> Parser<'a> {
             }
 
             other => Err(self.err(&format!(
-                "trait / struct / effect / fn / test のいずれかが必要です (実際は {:?})",
+                "trait / struct / impl / effect / fn / test のいずれかが必要です (実際は {:?})",
                 other
             ))),
         }

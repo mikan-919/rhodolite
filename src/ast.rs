@@ -24,6 +24,14 @@ pub enum Item {
         fields: Vec<(String, Type)>,
         span: Span,
     },
+    /// `impl Database for Postgres { ... }` — ハンドラの正体。専用構文は持たない。
+    /// `impl Postgres { ... }`(trait 無し)も書ける。`Postgres::new` はそこに置く
+    Impl {
+        trait_name: Option<String>,
+        type_name: String,
+        methods: Vec<(Sig, Vec<Expr>)>,
+        span: Span,
+    },
     /// `effect db: Database` — スロット宣言。関数を1つも宣言しない
     Effect {
         slot: String,

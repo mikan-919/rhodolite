@@ -77,6 +77,15 @@ fn summary(item: &ast::Item) -> String {
         Struct { name, fields, .. } => {
             format!("struct {name} ({} フィールド)", fields.len())
         }
+        Impl {
+            trait_name,
+            type_name,
+            methods,
+            ..
+        } => match trait_name {
+            Some(t) => format!("impl   {t} for {type_name} ({} メソッド)", methods.len()),
+            None => format!("impl   {type_name} ({} メソッド)", methods.len()),
+        },
         Effect {
             slot, trait_name, ..
         } => format!("effect {slot}: {trait_name}"),

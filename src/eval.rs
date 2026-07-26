@@ -33,6 +33,9 @@ pub enum Value {
     /// `User?` の無い方
     Nil,
     Struct(Rc<RefCell<Obj>>),
+    /// `[alice]`。struct と同じく**参照**。`let a = b` は別物にならない。
+    /// 「複合値は参照」の規則1本で済ませるため(型によって代入の意味が変わらない)
+    Array(Rc<RefCell<Vec<Value>>>),
 }
 
 /// struct の実体。
@@ -88,6 +91,21 @@ impl Value {
                 }
                 true
             }
+            (Array(a), Array(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return Ok(true);
+                }
+                let (a, b) = (a.borrow(), b.borrow());
+                if a.len() != b.len() {
+                    return Ok(false);
+                }
+                for (x, y) in a.iter().zip(b.iter()) {
+                    if !x.eq_at(y, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
             _ => false,
         })
     }
@@ -100,6 +118,7 @@ impl Value {
             Value::Unit => "unit".to_string(),
             Value::Nil => "nil".to_string(),
             Value::Struct(o) => o.borrow().type_name.clone(),
+            Value::Array(xs) => format!("[{} 要素]", xs.borrow().len()),
         }
     }
 }
@@ -130,8 +149,25 @@ type Env = HashMap<String, Value>;
 // インタプリタ
 // ---------------------------------------------------------------------------
 
+/// `impl` の中の1メソッド。
+///
+/// `trait_name` を**鍵にせず候補側に持つ**のは、呼び出し地点で trait が
+/// 分かるとは限らないため。`db.save(u)` はスロットなので `effect db: Database`
+/// から引けるが、`store.get(id)` はただの変数で、実行時にあるのは型名だけ。
+///
+/// 候補が複数あるとき、スロット経由なら trait で絞れて必ず一意に決まる
+/// (CONTEXT.md「スロットは常に名前を持つので曖昧性が発生しない」)。
+/// ただの変数で複数あるなら曖昧としてエラーにする。
+struct Method<'a> {
+    trait_name: Option<&'a str>,
+    sig: &'a Sig,
+    body: &'a [Expr],
+}
+
 pub struct Interp<'a> {
     fns: HashMap<&'a str, (&'a Sig, &'a [Expr])>,
+    /// 型名 → その型の全メソッド(trait 実装も inherent も混ぜて入れる)
+    methods: HashMap<&'a str, Vec<Method<'a>>>,
     /// 型名の集合。`Gold` のようなフィールド0個の struct を名前だけで値にするのに使う。
     ///
     /// ponytail: 宣言されたフィールドは検査しない。struct 生成で与えたものが
@@ -142,6 +178,7 @@ pub struct Interp<'a> {
 impl<'a> Interp<'a> {
     pub fn new(program: &'a Program) -> Self {
         let mut fns = HashMap::new();
+        let mut methods: HashMap<_, Vec<_>> = HashMap::new();
         let mut structs = HashSet::new();
         for item in &program.items {
             match item {
@@ -151,10 +188,68 @@ impl<'a> Interp<'a> {
                 Item::Struct { name, .. } => {
                     structs.insert(name.as_str());
                 }
+                Item::Impl {
+                    trait_name,
+                    type_name,
+                    methods: ms,
+                    ..
+                } => {
+                    let entry: &mut Vec<_> = methods.entry(type_name.as_str()).or_default();
+                    for (sig, body) in ms {
+                        entry.push(Method {
+                            trait_name: trait_name.as_deref(),
+                            sig,
+                            body: body.as_slice(),
+                        });
+                    }
+                }
                 _ => {}
             }
         }
-        Interp { fns, structs }
+        Interp {
+            fns,
+            methods,
+            structs,
+        }
+    }
+
+    /// 型名とメソッド名から本体を引く。
+    ///
+    /// `want_trait` は「この trait のものが欲しい」— スロット経由の呼び出しで
+    /// だけ分かる。段3で使う。ponytail: いまの呼び出し元は常に `None`
+    fn find_method(
+        &self,
+        type_name: &str,
+        method: &str,
+        want_trait: Option<&str>,
+    ) -> Result<&Method<'a>, Flow> {
+        let all = self.methods.get(type_name).map(Vec::as_slice).unwrap_or(&[]);
+        let mut named = all.iter().filter(|m| m.sig.name == method);
+
+        let Some(first) = named.next() else {
+            return fail(format!("`{type_name}` に `{method}` がありません"));
+        };
+
+        if let Some(want) = want_trait {
+            return match all
+                .iter()
+                .find(|m| m.sig.name == method && m.trait_name == Some(want))
+            {
+                Some(m) => Ok(m),
+                None => fail(format!(
+                    "`{type_name}` は `{want}` の `{method}` を実装していません"
+                )),
+            };
+        }
+
+        // 候補が2つ以上あるのに trait が分からない。スロット経由なら
+        // trait で絞れるので、ここに来るのはただの変数のときだけ
+        if named.next().is_some() {
+            return fail(format!(
+                "`{type_name}` の `{method}` がどの trait のものか決まりません"
+            ));
+        }
+        Ok(first)
     }
 
     /// 名前で関数を呼ぶ。
@@ -165,9 +260,20 @@ impl<'a> Interp<'a> {
         let Some((sig, body)) = self.fns.get(name) else {
             return fail(format!("関数 `{name}` がありません"));
         };
+        self.invoke(name, sig, body, args)
+    }
+
+    /// `Postgres::new(url)` — レシーバを取らない、型に属する関数。
+    fn call_path(&self, type_name: &str, method: &str, args: Vec<Value>) -> Eval {
+        let m = self.find_method(type_name, method, None)?;
+        self.invoke(&format!("{type_name}::{method}"), m.sig, m.body, args)
+    }
+
+    /// 本体を新しい `Env` で走らせる。`call` と `call_path` の共通部分。
+    fn invoke(&self, what: &str, sig: &Sig, body: &[Expr], args: Vec<Value>) -> Eval {
         if sig.params.len() != args.len() {
             return fail(format!(
-                "`{name}` は引数 {} 個ですが {} 個渡されました",
+                "`{what}` は引数 {} 個ですが {} 個渡されました",
                 sig.params.len(),
                 args.len()
             ));
@@ -276,22 +382,35 @@ impl<'a> Interp<'a> {
             ExprKind::Block(body) => self.block(body, env),
 
             ExprKind::Call(callee, args) => {
-                let ExprKind::Ident(name) = &callee.kind else {
-                    return fail("段2で実装: メソッド呼び出しとパス呼び出し");
-                };
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, env)?);
                 }
-                self.call(name, vals)
+                match &callee.kind {
+                    ExprKind::Ident(name) => self.call(name, vals),
+                    ExprKind::Path(parts) => match parts.as_slice() {
+                        [type_name, method] => self.call_path(type_name, method, vals),
+                        _ => fail(format!("`{}` は呼べません", parts.join("::"))),
+                    },
+                    // レシーバをメソッド本体でどう参照するかが未決(sig に self が無い)
+                    ExprKind::Field(_, m) => fail(format!("未実装: `.{m}` のメソッド呼び出し")),
+                    _ => fail("呼べない式です"),
+                }
             }
 
             ExprKind::Head { head, body, orelse } => {
                 self.head(head, body, orelse.as_deref(), env)
             }
 
-            ExprKind::Array(_) => fail("段2で実装: 配列"),
-            ExprKind::Path(_) => fail("段2で実装: パス"),
+            ExprKind::Array(items) => {
+                let mut xs = Vec::with_capacity(items.len());
+                for i in items {
+                    xs.push(self.eval(i, env)?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(xs))))
+            }
+
+            ExprKind::Path(parts) => fail(format!("`{}` は値ではありません", parts.join("::"))),
         }
     }
 
@@ -349,7 +468,19 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
-            Head::For { .. } => fail("段2で実装: for(配列が要る)"),
+            Head::For { var, iter } => {
+                let Value::Array(xs) = self.eval(iter, env)? else {
+                    return fail("for で回せるのは配列だけです");
+                };
+                // ponytail: 開始時点のスナップショットを回す。本体が同じ配列を
+                // 触っても RefCell が二重借用で落ちない。回している最中の追加は見えない
+                let snapshot: Vec<Value> = xs.borrow().clone();
+                for v in snapshot {
+                    env.insert(var.clone(), v);
+                    self.eval(body, env)?;
+                }
+                Ok(Value::Unit)
+            }
             Head::Ambient(_) => fail("段3で実装: ambient の提供"),
         }
     }
@@ -515,6 +646,77 @@ mod tests {
                    \x20 1 ?? return 999\n\
                    }\n";
         assert_eq!(int(src), 1);
+    }
+
+    // ---- 段2: impl と配列 ----
+
+    #[test]
+    fn パス呼び出しでimplの関数を呼ぶ() {
+        let src = "struct Frozen { t: Time }\n\
+                   impl Frozen {\n\
+                   \x20 fn at(t: Time -> Frozen) {\n\
+                   \x20   Frozen { t = t }\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 Frozen::at(1000).t\n\
+                   }\n";
+        assert_eq!(int(src), 1000);
+    }
+
+    #[test]
+    fn 配列は参照() {
+        // `let b = a` でコピーされない。for が両方から同じものを見る
+        let src = "fn main() {\n\
+                   \x20 let a = [1, 2]\n\
+                   \x20 let b = a\n\
+                   \x20 a == b\n\
+                   }\n";
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(true))));
+    }
+
+    #[test]
+    fn forで配列を回す() {
+        let src = "fn main() {\n\
+                   \x20 let total = 0\n\
+                   \x20 for x in [1, 2, 3]: total = total + x\n\
+                   \x20 total\n\
+                   }\n";
+        assert_eq!(int(src), 6);
+    }
+
+    #[test]
+    fn 配列の等値は中身で決まる() {
+        let src = "fn main() {\n\
+                   \x20 [1, 2] == [1, 2]\n\
+                   }\n";
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(true))));
+    }
+
+    /// trait を候補側に持つ効果。ただの変数では絞れないので曖昧エラーになる
+    #[test]
+    fn 同名メソッドが二つのtraitにあると曖昧() {
+        let src = "struct X {}\n\
+                   impl A for X {\n\
+                   \x20 fn get(-> Int) {\n\
+                   \x20   1\n\
+                   \x20 }\n\
+                   }\n\
+                   impl B for X {\n\
+                   \x20 fn get(-> Int) {\n\
+                   \x20   2\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 X::get()\n\
+                   }\n";
+        let e = run(src, "main").expect_err("曖昧なのでエラー");
+        assert!(e.contains("どの trait"), "{e}");
+    }
+
+    #[test]
+    fn 無い型のメソッドはエラー() {
+        assert!(run("fn main() {\n Nope::go()\n}\n", "main").is_err());
     }
 
     #[test]
