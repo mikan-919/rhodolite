@@ -1,8 +1,6 @@
 // 構文木のフィールドは次の段(要求推論)で読む。それまでは未使用になる。
 #[allow(dead_code)]
 mod ast;
-// 段1。CLI に繋ぐのは段4(`test` の実行)。それまではテストからだけ呼ぶ
-#[allow(dead_code)]
 mod eval;
 mod lex;
 mod parse;
@@ -65,7 +63,56 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    ExitCode::SUCCESS
+    // 検査を通ったので走らせる
+    run(&program)
+}
+
+/// `test` があれば全部走らせる。無ければ `main` を走らせる。
+fn run(program: &ast::Program) -> ExitCode {
+    let interp = eval::Interp::new(program);
+
+    let tests: Vec<(&str, &[ast::Expr])> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            ast::Item::Test { name, body, .. } => Some((name.as_str(), body.as_slice())),
+            _ => None,
+        })
+        .collect();
+
+    if tests.is_empty() {
+        println!("\n実行:");
+        return match interp.run("main") {
+            Ok(v) => {
+                println!("  main -> {}", v.show());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("  main で失敗: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    println!("\nテスト:");
+    let mut failed = 0;
+    for (name, body) in &tests {
+        match interp.run_body(body) {
+            Ok(_) => println!("  ok   {name}"),
+            Err(e) => {
+                failed += 1;
+                println!("  FAIL {name}");
+                println!("       {e}");
+            }
+        }
+    }
+
+    println!("\n{} 件中 {} 件成功", tests.len(), tests.len() - failed);
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn summary(item: &ast::Item) -> String {

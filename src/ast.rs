@@ -87,6 +87,8 @@ pub enum ExprKind {
     Int(i64),
     Str(String),
     Bool(bool),
+    /// `User?` の空の側。`db.find(id) ?? return false` の左辺が取りうる値
+    Nil,
     /// 変数、あるいはスロット名
     Ident(String),
     /// `Postgres::new` — 2要素以上のパス

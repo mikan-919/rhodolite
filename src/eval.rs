@@ -111,7 +111,7 @@ impl Value {
         })
     }
 
-    fn show(&self) -> String {
+    pub fn show(&self) -> String {
         match self {
             Value::Int(n) => n.to_string(),
             Value::Str(s) => format!("{s:?}"),
@@ -135,6 +135,15 @@ pub enum Flow {
     Return(Value),
     /// 実行時エラー。ponytail: 文字列。span を付けるのは miette を入れるときに
     Error(String),
+}
+
+impl std::fmt::Display for Flow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Flow::Error(m) => write!(f, "{m}"),
+            Flow::Return(_) => write!(f, "`return` が関数の外に出ました"),
+        }
+    }
 }
 
 pub type Eval = Result<Value, Flow>;
@@ -282,11 +291,20 @@ impl<'a> Interp<'a> {
             .is_some_and(|ms| ms.iter().any(|m| m.trait_name == Some(trait_name)))
     }
 
-    /// エントリ(`main` やテスト)を呼ぶ。
+    /// エントリ(`main`)を呼ぶ。
     ///
     /// **ambient は空から始まる。**提供されていないものは何も届かない、が出発点。
     pub fn run(&self, name: &str) -> Eval {
         self.call(name, Vec::new(), &Ambient::new())
+    }
+
+    /// `test` の本体を走らせる。関数と同じ扱いで、`Env` も `Ambient` も空から。
+    pub fn run_body(&self, body: &[Expr]) -> Eval {
+        let mut env = Env::new();
+        match self.block(body, &mut env, &Ambient::new()) {
+            Err(Flow::Return(v)) => Ok(v),
+            other => other,
+        }
     }
 
     /// 名前で関数を呼ぶ。
@@ -396,6 +414,7 @@ impl<'a> Interp<'a> {
             ExprKind::Int(n) => Ok(Value::Int(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+            ExprKind::Nil => Ok(Value::Nil),
 
             ExprKind::Ident(name) => match env.get(name) {
                 Some(v) => Ok(v.clone()),
@@ -974,6 +993,48 @@ mod tests {
                    \x20 s.get()\n\
                    }\n";
         assert!(run(src, "main").is_err());
+    }
+
+    // ---- 段4: 正典の完走 ----
+
+    /// **v1 の到達目標。**`examples/canonical.rd` の test が緑になること。
+    ///
+    /// 中で起きていること: `handle` → `promote` → `stamp` と3段潜って
+    /// `clock.now()` と `db.save(u)` に届く。間の2つは1文字も書いていない。
+    /// 提供を `Frozen`/`InMemoryDb` に差し替えても呼ばれる側は無変更。
+    #[test]
+    fn 正典のテストが通る() {
+        let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
+        let program = parse::parse(&join(lex(&src).unwrap())).expect("パースできるはず");
+        let interp = Interp::new(&program);
+
+        for item in &program.items {
+            if let crate::ast::Item::Test { name, body, .. } = item {
+                if let Err(e) = interp.run_body(body) {
+                    panic!("test {name:?} が失敗: {e}");
+                }
+            }
+        }
+    }
+
+    /// 本番側の経路も走ること。Postgres は空の DB なので false が返る
+    #[test]
+    fn 正典のmainが走る() {
+        let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
+        let program = parse::parse(&join(lex(&src).unwrap())).expect("パースできるはず");
+        assert!(matches!(
+            Interp::new(&program).run("main"),
+            Ok(Value::Bool(false))
+        ));
+    }
+
+    #[test]
+    fn nilは合体演算子の左辺で短絡する() {
+        let src = "fn main(-> bool) {\n\
+                   \x20 let u = nil ?? return false\n\
+                   \x20 true\n\
+                   }\n";
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(false))));
     }
 
     // ---- 段3: ambient ----

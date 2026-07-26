@@ -675,6 +675,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 ExprKind::Bool(false)
             }
+            Tok::Nil => {
+                self.bump();
+                ExprKind::Nil
+            }
 
             // `self` は式としてはただの名前。新しい産出も値も足さない。
             // 束縛されるのはメソッドを呼んだときだけ(eval)
@@ -813,7 +817,25 @@ mod tests {
     fn 正典プログラムが通る() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let p = ok(&src);
-        assert_eq!(p.items.len(), 9);
+
+        // 個数ではなく、宣言の種類が全部読めていることを見る
+        let mut kinds = std::collections::BTreeSet::new();
+        for i in &p.items {
+            kinds.insert(match i {
+                Item::Trait { .. } => "trait",
+                Item::Struct { .. } => "struct",
+                Item::Impl { .. } => "impl",
+                Item::Effect { .. } => "effect",
+                Item::Fn { .. } => "fn",
+                Item::Test { .. } => "test",
+            });
+        }
+        assert_eq!(
+            kinds,
+            ["effect", "fn", "impl", "struct", "test", "trait"]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

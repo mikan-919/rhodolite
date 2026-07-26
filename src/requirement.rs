@@ -191,7 +191,7 @@ fn scan(e: &Expr, slots: &Slots, provided: &BTreeSet<String>, out: &mut BodyFact
         }
 
         // --- 以下は素通り。子に同じ provided を渡すだけ ---
-        ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Bool(_) => {}
+        ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
         ExprKind::Ident(_) | ExprKind::Path(_) => {}
         ExprKind::Array(items) => {
             for i in items {

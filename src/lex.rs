@@ -40,6 +40,7 @@ pub enum Tok {
     Assert,
     True,
     False,
+    Nil,
 
     // 記号
     LBrace,
@@ -236,6 +237,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "assert" => Tok::Assert,
         "true" => Tok::True,
         "false" => Tok::False,
+        "nil" => Tok::Nil,
         _ => Tok::Ident(w.to_string()),
     }
 }
@@ -305,6 +307,7 @@ fn can_end_expr(t: &Tok) -> bool {
             | Tok::Str(_)
             | Tok::True
             | Tok::False
+            | Tok::Nil
             | Tok::RParen
             | Tok::RBrace
             | Tok::RBracket
@@ -327,6 +330,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::Str(_)
             | Tok::True
             | Tok::False
+            | Tok::Nil
             | Tok::LParen
             | Tok::LBrace
             | Tok::LBracket
