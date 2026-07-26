@@ -404,9 +404,10 @@ impl<'a> Interp<'a> {
         type_name: &str,
         method: &str,
         args: Vec<Value>,
+        want_trait: Option<&str>,
         ambient: &Ambient,
     ) -> Eval {
-        let m = self.find_method(type_name, method, None)?;
+        let m = self.find_method(type_name, method, want_trait)?;
         let what = format!("{type_name}::{method}");
         if m.sig.has_self {
             return fail(format!("`{what}` はレシーバが必要です"));
@@ -621,9 +622,17 @@ impl<'a> Interp<'a> {
                                     ));
                                 }
                             };
-                            self.call_path(&type_name, method, vals, ambient)
+                            self.call_path(
+                                &type_name,
+                                method,
+                                vals,
+                                self.slots.trait_of(name),
+                                ambient,
+                            )
                         }
-                        [type_name, method] => self.call_path(type_name, method, vals, ambient),
+                        [type_name, method] => {
+                            self.call_path(type_name, method, vals, None, ambient)
+                        }
                         _ => fail(format!("`{}` は呼べません", parts.join("::"))),
                     },
                     (ExprKind::Field(_, m), Some((recv, want_trait))) => {
@@ -1342,6 +1351,24 @@ mod tests {
                    }\n";
         let error = run(src, "main").unwrap_err();
         assert!(error.contains("型だけ"), "{error}");
+    }
+
+    #[test]
+    fn 型射影もスロットのtraitで関連関数を絞る() {
+        let src = "trait Database { fn new(-> Both) }\n\
+                   trait Other { fn new(-> Both) }\n\
+                   effect db: Database\n\
+                   struct Both { n: Int }\n\
+                   impl Database for Both {\n\
+                   \x20 fn new(-> Both) { Both { n = 1 } }\n\
+                   }\n\
+                   impl Other for Both {\n\
+                   \x20 fn new(-> Both) { Both { n = 2 } }\n\
+                   }\n\
+                   fn main(-> Int) {\n\
+                   \x20 with db<Both> { db::new().n }\n\
+                   }\n";
+        assert_eq!(run(src, "main").unwrap().show(), "1");
     }
 
     /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと
