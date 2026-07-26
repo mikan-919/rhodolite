@@ -56,6 +56,11 @@ pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<String>> {
             "エントリーファイルの親ディレクトリがありません".to_string(),
         ]);
     };
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let Some(stem) = entry_file.file_stem().and_then(|s| s.to_str()) else {
         return Err(vec![
             "エントリーファイル名を UTF-8 として読めません".to_string(),

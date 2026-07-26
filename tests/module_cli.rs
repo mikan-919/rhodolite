@@ -33,6 +33,14 @@ impl Project {
             .output()
             .unwrap()
     }
+
+    fn run_relative(&self, entry: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_rhodolite"))
+            .current_dir(&self.root)
+            .arg(entry)
+            .output()
+            .unwrap()
+    }
 }
 
 impl Drop for Project {
@@ -403,4 +411,15 @@ fn 依存モジュールのtestは今回の実行対象にしない() {
     assert!(output.status.success(), "{text}");
     assert!(text.contains("main -> 5"), "{text}");
     assert!(!text.contains("dependency test"), "{text}");
+}
+
+#[test]
+fn 裸の相対エントリ名を読み込める() {
+    let project = Project::new();
+    project.write("main.rd", "fn main() { 6 }\n");
+
+    let output = project.run_relative("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 6"), "{text}");
 }
