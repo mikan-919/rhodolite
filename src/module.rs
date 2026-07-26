@@ -360,7 +360,25 @@ fn resolve(
         );
     }
 
+    for module in modules.values() {
+        let (local, imported_declarations, imported_modules) = &scopes[&module.path];
+        for reference in declaration_references(&module.items) {
+            let Some(first) = reference.first() else {
+                continue;
+            };
+            if reference.len() >= 2
+                && !local.contains_key(first)
+                && !imported_declarations.contains_key(first)
+                && !imported_modules.contains_key(first)
+            {
+                diagnostics.push(format!("モジュール名 `{first}` は `use` されていません"));
+            }
+        }
+    }
+
     if !diagnostics.is_empty() {
+        diagnostics.sort();
+        diagnostics.dedup();
         return Err(diagnostics);
     }
 
@@ -368,6 +386,11 @@ fn resolve(
     for (path, mut module) in modules {
         let (local, imported_declarations, imported_modules) = &scopes[&path];
         for mut item in module.items.drain(..) {
+            // ADR-0006 は複数モジュールの test 実行を決めない。エントリーの既存 test
+            // だけを従来どおり実行し、依存モジュールの test は今回の Program に入れない。
+            if path != *entry_path && matches!(item, Item::Test { .. }) {
+                continue;
+            }
             resolve_item(
                 &mut item,
                 local,
@@ -617,6 +640,9 @@ fn resolve_expr(
             );
         }
         ExprKind::Path(parts) => {
+            if parts.first().is_some_and(|first| locals.contains(first)) {
+                return;
+            }
             let original = parts.clone();
             let resolved = resolve_parts(
                 parts,
@@ -682,13 +708,19 @@ fn resolve_expr(
             diagnostics,
         ),
         ExprKind::StructLit { name, fields } => {
-            *name = resolve_name(
-                name,
-                local,
-                imported_declarations,
-                imported_modules,
-                declarations,
-            );
+            if !name
+                .split("::")
+                .next()
+                .is_some_and(|first| locals.contains(first))
+            {
+                *name = resolve_name(
+                    name,
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                );
+            }
             for (_, value) in fields {
                 resolve_expr(
                     value,
@@ -777,13 +809,19 @@ fn resolve_expr(
                         let original_slot = provision.slot().to_string();
                         match provision {
                             Provision::Type { slot, type_name } => {
-                                *type_name = resolve_name(
-                                    type_name,
-                                    local,
-                                    imported_declarations,
-                                    imported_modules,
-                                    declarations,
-                                );
+                                if !type_name
+                                    .split("::")
+                                    .next()
+                                    .is_some_and(|first| locals.contains(first))
+                                {
+                                    *type_name = resolve_name(
+                                        type_name,
+                                        local,
+                                        imported_declarations,
+                                        imported_modules,
+                                        declarations,
+                                    );
+                                }
                                 *slot = resolve_name(
                                     slot,
                                     local,
@@ -959,6 +997,33 @@ fn valid_ident(name: &str) -> bool {
 }
 
 fn module_references(items: &[Item]) -> Vec<Vec<String>> {
+    let mut paths = declaration_references(items);
+    for item in items {
+        match item {
+            Item::Impl { methods, .. } => {
+                for (sig, body) in methods {
+                    let mut locals: BTreeSet<String> =
+                        sig.params.iter().map(|param| param.name.clone()).collect();
+                    if sig.has_self {
+                        locals.insert("self".to_string());
+                    }
+                    collect_expr_paths(body, &mut locals, &mut paths);
+                }
+            }
+            Item::Fn { sig, body, .. } => {
+                let mut locals = sig.params.iter().map(|param| param.name.clone()).collect();
+                collect_expr_paths(body, &mut locals, &mut paths);
+            }
+            Item::Test { body, .. } => {
+                collect_expr_paths(body, &mut BTreeSet::new(), &mut paths);
+            }
+            Item::Trait { .. } | Item::Struct { .. } | Item::Effect { .. } => {}
+        }
+    }
+    paths
+}
+
+fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
     let mut paths = Vec::new();
     for item in items {
         match item {
@@ -982,19 +1047,13 @@ fn module_references(items: &[Item]) -> Vec<Vec<String>> {
                     collect_name_path(trait_name, &mut paths);
                 }
                 collect_name_path(type_name, &mut paths);
-                for (sig, body) in methods {
+                for (sig, _) in methods {
                     collect_sig_paths(sig, &mut paths);
-                    collect_expr_paths(body, &mut paths);
                 }
             }
             Item::Effect { trait_name, .. } => collect_name_path(trait_name, &mut paths),
-            Item::Fn { sig, body, .. } => {
-                collect_sig_paths(sig, &mut paths);
-                collect_expr_paths(body, &mut paths);
-            }
-            Item::Test { body, .. } => {
-                collect_expr_paths(body, &mut paths);
-            }
+            Item::Fn { sig, .. } => collect_sig_paths(sig, &mut paths),
+            Item::Test { .. } => {}
         }
     }
     paths
@@ -1016,26 +1075,37 @@ fn collect_name_path(name: &str, paths: &mut Vec<Vec<String>>) {
     }
 }
 
-fn collect_expr_paths(body: &[Expr], paths: &mut Vec<Vec<String>>) {
+fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut Vec<Vec<String>>) {
     for expr in body {
         match &expr.kind {
-            ExprKind::Path(parts) => paths.push(parts.clone()),
+            ExprKind::Path(parts) if !parts.first().is_some_and(|first| locals.contains(first)) => {
+                paths.push(parts.clone());
+            }
             ExprKind::Field(recv, _) | ExprKind::Unary(_, recv) | ExprKind::Assert(recv) => {
-                collect_expr_paths(std::slice::from_ref(recv), paths);
+                collect_expr_paths(std::slice::from_ref(recv), locals, paths);
             }
             ExprKind::Call(callee, args) => {
-                collect_expr_paths(std::slice::from_ref(callee), paths);
-                collect_expr_paths(args, paths);
+                collect_expr_paths(std::slice::from_ref(callee), locals, paths);
+                collect_expr_paths(args, locals, paths);
             }
-            ExprKind::Array(items) | ExprKind::Block(items) => collect_expr_paths(items, paths),
+            ExprKind::Array(items) | ExprKind::Block(items) => {
+                collect_expr_paths(items, locals, paths);
+            }
             ExprKind::StructLit { name, fields } => {
-                collect_name_path(name, paths);
+                if !name
+                    .split("::")
+                    .next()
+                    .is_some_and(|first| locals.contains(first))
+                {
+                    collect_name_path(name, paths);
+                }
                 for (_, value) in fields {
-                    collect_expr_paths(std::slice::from_ref(value), paths);
+                    collect_expr_paths(std::slice::from_ref(value), locals, paths);
                 }
             }
-            ExprKind::Let { value, .. } => {
-                collect_expr_paths(std::slice::from_ref(value), paths);
+            ExprKind::Let { name, value } => {
+                collect_expr_paths(std::slice::from_ref(value), locals, paths);
+                locals.insert(name.clone());
             }
             ExprKind::Assign { target, value }
             | ExprKind::Binary {
@@ -1043,40 +1113,55 @@ fn collect_expr_paths(body: &[Expr], paths: &mut Vec<Vec<String>>) {
                 rhs: value,
                 ..
             } => {
-                collect_expr_paths(std::slice::from_ref(target), paths);
-                collect_expr_paths(std::slice::from_ref(value), paths);
+                collect_expr_paths(std::slice::from_ref(target), locals, paths);
+                collect_expr_paths(std::slice::from_ref(value), locals, paths);
             }
             ExprKind::Return(Some(value)) => {
-                collect_expr_paths(std::slice::from_ref(value), paths);
+                collect_expr_paths(std::slice::from_ref(value), locals, paths);
             }
             ExprKind::Head { head, body, orelse } => {
                 match head {
                     Head::If(condition) | Head::Elif(condition) | Head::While(condition) => {
-                        collect_expr_paths(std::slice::from_ref(condition), paths);
+                        collect_expr_paths(std::slice::from_ref(condition), locals, paths);
+                        collect_expr_paths(std::slice::from_ref(body), &mut locals.clone(), paths);
                     }
-                    Head::For { iter, .. } => {
-                        collect_expr_paths(std::slice::from_ref(iter), paths);
+                    Head::For { var, iter } => {
+                        collect_expr_paths(std::slice::from_ref(iter), locals, paths);
+                        let mut inner_locals = locals.clone();
+                        inner_locals.insert(var.clone());
+                        collect_expr_paths(std::slice::from_ref(body), &mut inner_locals, paths);
                     }
                     Head::Ambient(provisions) => {
                         for provision in provisions {
                             match provision {
                                 Provision::Type { slot, type_name } => {
-                                    for name in [slot, type_name] {
-                                        collect_name_path(name, paths);
+                                    collect_name_path(slot, paths);
+                                    if !type_name
+                                        .split("::")
+                                        .next()
+                                        .is_some_and(|first| locals.contains(first))
+                                    {
+                                        collect_name_path(type_name, paths);
                                     }
                                 }
                                 Provision::Value { slot, value } => {
                                     collect_name_path(slot, paths);
-                                    collect_expr_paths(std::slice::from_ref(value), paths);
+                                    collect_expr_paths(std::slice::from_ref(value), locals, paths);
                                 }
                             }
                         }
+                        let mut inner_locals = locals.clone();
+                        for provision in provisions {
+                            inner_locals.remove(provision.slot());
+                        }
+                        collect_expr_paths(std::slice::from_ref(body), &mut inner_locals, paths);
                     }
-                    Head::Else => {}
+                    Head::Else => {
+                        collect_expr_paths(std::slice::from_ref(body), &mut locals.clone(), paths)
+                    }
                 }
-                collect_expr_paths(std::slice::from_ref(body), paths);
                 if let Some(orelse) = orelse {
-                    collect_expr_paths(std::slice::from_ref(orelse), paths);
+                    collect_expr_paths(std::slice::from_ref(orelse), &mut locals.clone(), paths);
                 }
             }
             ExprKind::Int(_)
@@ -1084,6 +1169,7 @@ fn collect_expr_paths(body: &[Expr], paths: &mut Vec<Vec<String>>) {
             | ExprKind::Bool(_)
             | ExprKind::Nil
             | ExprKind::Ident(_)
+            | ExprKind::Path(_)
             | ExprKind::Return(None) => {}
         }
     }

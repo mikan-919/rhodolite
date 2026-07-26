@@ -342,3 +342,65 @@ fn 宣言位置の修飾参照から子モジュールを読み込む() {
     );
     assert!(!text.contains("use` されていません"), "{text}");
 }
+
+#[test]
+fn useしていない宣言位置のモジュール参照を報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "effect db: services::users::StoreApi\n\
+         fn main() { 0 }\n",
+    );
+    project.write(
+        "services/users.rd",
+        "trait StoreApi {\n\
+         \x20 fn read(self -> Int)\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("モジュール名 `services` は `use` されていません"),
+        "{text}"
+    );
+}
+
+#[test]
+fn ローカル束縛は修飾参照でもモジュールimportを隠す() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use services\n\
+         fn helper(services: Int) { services::users::run() }\n\
+         fn main() { 0 }\n",
+    );
+    project.write("services/users.rd", "this must not be read\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 0"), "{text}");
+}
+
+#[test]
+fn 依存モジュールのtestは今回の実行対象にしない() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep\n\
+         fn main() { dep::value() }\n",
+    );
+    project.write(
+        "dep.rd",
+        "fn value() { 5 }\n\
+         test \"dependency test\" { assert false }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 5"), "{text}");
+    assert!(!text.contains("dependency test"), "{text}");
+}

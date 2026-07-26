@@ -158,7 +158,11 @@ impl<'a> Parser<'a> {
     fn use_decl(&mut self) -> PResult<UseDecl> {
         let start = self.span();
         self.expect(&Tok::Use, "`use`")?;
-        let mut path = vec![self.expect_ident("モジュール名")?];
+        let first = self.expect_ident("モジュール名")?;
+        if first == "super" || first == "crate" {
+            return Err(self.err("`use` にはソースルート基準の絶対モジュールパスが必要です"));
+        }
+        let mut path = vec![first];
 
         while self.eat(&Tok::ColonColon) {
             if self.eat(&Tok::LBrace) {
@@ -1153,5 +1157,11 @@ mod tests {
     #[test]
     fn asはuse以外では既存どおり識別子として使える() {
         ok("fn as() { 1 }\nfn main() { as() }\n");
+    }
+
+    #[test]
+    fn useに相対モジュールパスは書けない() {
+        let error = parse_src("use super::services\nfn main() { 0 }\n").unwrap_err();
+        assert!(error.msg.contains("絶対"), "{}", error.msg);
     }
 }
