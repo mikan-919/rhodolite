@@ -31,6 +31,7 @@ pub enum Tok {
     In,
     While,
     Trait,
+    Struct,
     Effect,
     Test,
     Return,
@@ -224,6 +225,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "in" => Tok::In,
         "while" => Tok::While,
         "trait" => Tok::Trait,
+        "struct" => Tok::Struct,
         "effect" => Tok::Effect,
         "test" => Tok::Test,
         "return" => Tok::Return,
@@ -329,6 +331,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::For
             | Tok::While
             | Tok::Trait
+            | Tok::Struct
             | Tok::Effect
             | Tok::Test
             | Tok::Return

@@ -1,6 +1,9 @@
 // 構文木のフィールドは次の段(要求推論)で読む。それまでは未使用になる。
 #[allow(dead_code)]
 mod ast;
+// 段1。CLI に繋ぐのは段4(`test` の実行)。それまではテストからだけ呼ぶ
+#[allow(dead_code)]
+mod eval;
 mod lex;
 mod parse;
 mod requirement;
@@ -70,6 +73,9 @@ fn summary(item: &ast::Item) -> String {
     match item {
         Trait { name, methods, .. } => {
             format!("trait  {name} ({} メソッド)", methods.len())
+        }
+        Struct { name, fields, .. } => {
+            format!("struct {name} ({} フィールド)", fields.len())
         }
         Effect {
             slot, trait_name, ..

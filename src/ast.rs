@@ -18,6 +18,12 @@ pub enum Item {
         methods: Vec<Sig>,
         span: Span,
     },
+    /// `struct User { rank: Rank }` — フィールドの宣言
+    Struct {
+        name: String,
+        fields: Vec<(String, Type)>,
+        span: Span,
+    },
     /// `effect db: Database` — スロット宣言。関数を1つも宣言しない
     Effect {
         slot: String,

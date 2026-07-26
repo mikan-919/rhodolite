@@ -160,6 +160,29 @@ impl<'a> Parser<'a> {
                 })
             }
 
+            // `struct User { rank: Rank }`。`struct Gold {}` のようにフィールド0個も書ける
+            Tok::Struct => {
+                self.bump();
+                let name = self.expect_ident("struct 名")?;
+                self.expect(&Tok::LBrace, "`{`")?;
+                let mut fields = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.eat(&Tok::RBrace) {
+                        break;
+                    }
+                    let fname = self.expect_ident("フィールド名")?;
+                    self.expect(&Tok::Colon, "`:`")?;
+                    fields.push((fname, self.ty()?));
+                    self.eat(&Tok::Comma);
+                }
+                Ok(Item::Struct {
+                    name,
+                    fields,
+                    span: self.to(start),
+                })
+            }
+
             // `effect db: Database` — 関数を1つも宣言しない。契約と役割を分けて書く
             Tok::Effect => {
                 self.bump();
@@ -204,7 +227,7 @@ impl<'a> Parser<'a> {
             }
 
             other => Err(self.err(&format!(
-                "trait / effect / fn / test のいずれかが必要です (実際は {:?})",
+                "trait / struct / effect / fn / test のいずれかが必要です (実際は {:?})",
                 other
             ))),
         }
