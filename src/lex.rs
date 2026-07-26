@@ -30,6 +30,7 @@ pub enum Tok {
     For,
     In,
     While,
+    With,
     Trait,
     Struct,
     Impl,
@@ -227,6 +228,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "for" => Tok::For,
         "in" => Tok::In,
         "while" => Tok::While,
+        "with" => Tok::With,
         "trait" => Tok::Trait,
         "struct" => Tok::Struct,
         "impl" => Tok::Impl,
@@ -312,7 +314,7 @@ fn can_end_expr(t: &Tok) -> bool {
             | Tok::RBrace
             | Tok::RBracket
             | Tok::Question // `User?` の後置
-            | Tok::Return   // 値なし return
+            | Tok::Return // 値なし return
     )
 }
 
@@ -340,6 +342,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::If
             | Tok::For
             | Tok::While
+            | Tok::With
             | Tok::Trait
             | Tok::Struct
             | Tok::Impl
@@ -394,11 +397,21 @@ mod tests {
     fn コロンは一義でパスと区別される() {
         assert_eq!(
             toks("db: x"),
-            vec![Tok::Ident("db".into()), Tok::Colon, Tok::Ident("x".into()), Tok::Eof]
+            vec![
+                Tok::Ident("db".into()),
+                Tok::Colon,
+                Tok::Ident("x".into()),
+                Tok::Eof
+            ]
         );
         assert_eq!(
             toks("Db::x"),
-            vec![Tok::Ident("Db".into()), Tok::ColonColon, Tok::Ident("x".into()), Tok::Eof]
+            vec![
+                Tok::Ident("Db".into()),
+                Tok::ColonColon,
+                Tok::Ident("x".into()),
+                Tok::Eof
+            ]
         );
     }
 }

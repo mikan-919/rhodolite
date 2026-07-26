@@ -245,7 +245,9 @@ impl<'a> Parser<'a> {
                         s
                     }
                     other => {
-                        return Err(self.err(&format!("テスト名の文字列が必要です (実際は {:?})", other)));
+                        return Err(
+                            self.err(&format!("テスト名の文字列が必要です (実際は {:?})", other))
+                        );
                     }
                 };
                 let body = self.block()?;
@@ -358,6 +360,24 @@ impl<'a> Parser<'a> {
             return Err(self.err("対応する `if` がありません"));
         }
 
+        // `with db(value), clock(value) { ... }` — ambient の提供。
+        if self.at(&Tok::With) {
+            self.bump();
+            let mut binders = vec![self.expr()?];
+            while self.eat(&Tok::Comma) {
+                binders.push(self.expr()?);
+            }
+            let body = self.head_body()?;
+            return Ok(Expr {
+                kind: ExprKind::Head {
+                    head: Head::Ambient(binders),
+                    body: Box::new(body),
+                    orelse: None,
+                },
+                span: self.to(start),
+            });
+        }
+
         // キーワードで始まる Head
         let head = match self.peek() {
             Tok::While => {
@@ -418,7 +438,9 @@ impl<'a> Parser<'a> {
             let elif_start = self.span();
             self.bump();
             let cond = self.cond()?;
-            Some(Box::new(self.if_tail(Head::Elif(Box::new(cond)), elif_start)?))
+            Some(Box::new(
+                self.if_tail(Head::Elif(Box::new(cond)), elif_start)?,
+            ))
         } else if self.at(&Tok::Else) {
             let else_start = self.span();
             self.bump();
@@ -455,13 +477,11 @@ impl<'a> Parser<'a> {
         e
     }
 
-    /// `':' 単純式` または `':' '{' ... '}'`。
+    /// `'{' ... '}'`、または `':' 単純式`。
     ///
     /// 非ブレースの本体は Head と同一物理行に限る。これが dangling else と
     /// goto-fail を構文レベルで殺している規則なので、ここで検査する。
     fn head_body(&mut self) -> PResult<Expr> {
-        let colon = self.expect(&Tok::Colon, "`:`")?;
-
         if self.at(&Tok::LBrace) {
             let start = self.span();
             let body = self.block()?;
@@ -470,6 +490,8 @@ impl<'a> Parser<'a> {
                 span: self.to(start),
             });
         }
+
+        let colon = self.expect(&Tok::Colon, "`:` または `{`")?;
 
         if self.line() != colon.line {
             return Err(self.err(
@@ -842,10 +864,8 @@ mod tests {
     fn 契約とスロット宣言() {
         let p = ok("trait Database {\n  fn find(id: UserId -> User?)\n}\neffect db: Database\n");
         assert!(matches!(&p.items[0], Item::Trait { methods, .. } if methods.len() == 1));
-        assert!(
-            matches!(&p.items[1], Item::Effect { slot, trait_name, .. }
-                     if slot == "db" && trait_name == "Database")
-        );
+        assert!(matches!(&p.items[1], Item::Effect { slot, trait_name, .. }
+                     if slot == "db" && trait_name == "Database"));
     }
 
     /// 値ベースなので Head も値を産む。`let` の右辺に来られること
@@ -922,6 +942,40 @@ mod tests {
     }
 
     #[test]
+    fn ブロック形headにコロンはいらない() {
+        ok("fn f() {\n\
+            \x20 if ready { one() }\n\
+            \x20 for x in xs { use(x) }\n\
+            \x20 while running { tick() }\n\
+            }\n");
+    }
+
+    #[test]
+    fn withはambient提供になる() {
+        let p = ok("fn main() {\n\
+                    \x20 with db(pg), clock(sys) {\n\
+                    \x20   handle(id)\n\
+                    \x20 }\n\
+                    }\n");
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!()
+        };
+        let ExprKind::Head {
+            head: Head::Ambient(binders),
+            ..
+        } = &body[0].kind
+        else {
+            panic!("with が ambient head になっていない: {:?}", body[0].kind)
+        };
+        assert_eq!(binders.len(), 2);
+    }
+
+    #[test]
+    fn head条件のstruct生成は括弧で囲める() {
+        ok("fn f() {\n  if user == (User { id = 1 }) { yes() }\n}\n");
+    }
+
+    #[test]
     fn 一行フォームと結合() {
         ok("fn f() {\n  if a: x()\n  elif b: y()\n  else: z()\n}\n");
     }
@@ -945,9 +999,8 @@ mod tests {
     }
 
     #[test]
-    fn 条件位置ではstruct生成と読まない() {
-        // `while c { }` の `c { }` を struct リテラルにしてしまうと `:` が来ずに壊れる
-        let e = parse_src("fn f() {\n  while c { x() }\n}\n").unwrap_err();
-        assert!(e.msg.contains('`'), "{}", e.msg);
+    fn 条件直後のbraceはhead本体になる() {
+        // `while c { }` の `{ }` を `c` の struct リテラルにはしない
+        ok("fn f() {\n  while c { x() }\n}\n");
     }
 }
