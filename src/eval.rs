@@ -40,8 +40,9 @@ pub enum Value {
 /// `Rc<RefCell<_>>` にしてあるのは `stamp(u)` の中の `u.promoted_at = ...` が
 /// **呼び出し元から見えないといけない**ため。値のコピーだと差し替えのデモが成立しない。
 ///
-/// ponytail: 参照カウント。循環参照は漏れる。canonical.rd に循環はない。
-/// 必要になったら GC か arena + 世代 index に替える。
+/// ponytail: 参照カウント。`u.x = u` で循環が作れるので**漏れる**。
+/// 短命なプロセスなので放置している。常駐させるなら GC か arena + 世代 index に替える。
+/// (漏れは放置できるが、循環を辿る比較は落ちるので `eq_at` で深さを見ている)
 #[derive(Debug)]
 pub struct Obj {
     pub type_name: String,
@@ -49,27 +50,46 @@ pub struct Obj {
 }
 
 impl Value {
-    /// `u.rank == Gold` のための等値。struct は**中身**で比べる(`Rc` の同一性ではない)。
+    /// `u.rank == Gold` のための等値。struct は**中身**で比べる。
+    fn eq(&self, other: &Value) -> Result<bool, Flow> {
+        self.eq_at(other, 0)
+    }
+
+    /// 循環は `u.x = u` で作れてしまう。深さを見ていないと**プロセスが落ちる**
+    /// (スタックオーバーフローは catch できない)ので、上限でエラーに変える。
     ///
-    /// ponytail: 循環していると止まらない。作れないので今は起きない。
-    fn eq(&self, other: &Value) -> bool {
+    /// ponytail: 深さ上限。到達可能な実体を覚えて回る方が正確だが、上限に
+    /// 当たるのは循環しているときだけなので足りている
+    fn eq_at(&self, other: &Value, depth: u32) -> Result<bool, Flow> {
+        const MAX_DEPTH: u32 = 100;
+        if depth > MAX_DEPTH {
+            return fail("値の比較が深すぎます(循環している可能性)");
+        }
+
         use Value::*;
-        match (self, other) {
+        Ok(match (self, other) {
             (Int(a), Int(b)) => a == b,
             (Str(a), Str(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Unit, Unit) | (Nil, Nil) => true,
             (Struct(a), Struct(b)) => {
+                // 同じ実体なら中身を見ない。循環していても答えが出る
+                if Rc::ptr_eq(a, b) {
+                    return Ok(true);
+                }
                 let (a, b) = (a.borrow(), b.borrow());
-                a.type_name == b.type_name
-                    && a.fields.len() == b.fields.len()
-                    && a.fields
-                        .iter()
-                        .zip(b.fields.iter())
-                        .all(|((ka, va), (kb, vb))| ka == kb && va.eq(vb))
+                if a.type_name != b.type_name || a.fields.len() != b.fields.len() {
+                    return Ok(false);
+                }
+                for ((ka, va), (kb, vb)) in a.fields.iter().zip(b.fields.iter()) {
+                    if ka != kb || !va.eq_at(vb, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                true
             }
             _ => false,
-        }
+        })
     }
 
     fn show(&self) -> String {
@@ -291,7 +311,7 @@ impl<'a> Interp<'a> {
         let r = self.eval(rhs, env)?;
 
         if let BinOp::Eq = op {
-            return Ok(Value::Bool(l.eq(&r)));
+            return Ok(Value::Bool(l.eq(&r)?));
         }
 
         match (l, r) {
@@ -504,6 +524,33 @@ mod tests {
                    \x20 db(pg): {\n\
                    \x20   1\n\
                    \x20 }\n\
+                   }\n";
+        assert!(run(src, "main").is_err());
+    }
+
+    /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと
+    #[test]
+    fn 自己参照structを比較しても落ちない() {
+        let src = "struct Node { x: Node }\n\
+                   fn main() {\n\
+                   \x20 let u = Node { x = 1 }\n\
+                   \x20 u.x = u\n\
+                   \x20 u == u\n\
+                   }\n";
+        // 同じ実体なので中身を見ずに真
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(true))));
+    }
+
+    /// 相互に参照し合う2つを比べる。上限に当たってエラーになる(落ちない)
+    #[test]
+    fn 相互循環の比較はエラーになる() {
+        let src = "struct Node { x: Node }\n\
+                   fn main() {\n\
+                   \x20 let a = Node { x = 1 }\n\
+                   \x20 let b = Node { x = 1 }\n\
+                   \x20 a.x = b\n\
+                   \x20 b.x = a\n\
+                   \x20 a == b\n\
                    }\n";
         assert!(run(src, "main").is_err());
     }
