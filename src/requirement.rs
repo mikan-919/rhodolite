@@ -57,19 +57,17 @@ impl Slots {
 pub fn collect_slots(program: &Program) -> Slots {
     let mut map = HashMap::new();
     for x in program.items.iter() {
-        match x {
-            Item::Effect {
-                slot,
-                trait_name,
-                span: _,
-            } => {
-                // TODO: インサートでダブったらエラーにする
-                map.insert(slot.clone(), trait_name.clone());
-            }
-            _ => (),
+        if let Item::Effect {
+            slot,
+            trait_name,
+            span: _,
+        } = x
+        {
+            // TODO: インサートでダブったらエラーにする
+            map.insert(slot.clone(), trait_name.clone());
         }
     }
-    Slots { map: map }
+    Slots { map }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,12 +104,12 @@ pub enum SlotLevel {
 /// stamp(u)            →  Call( Ident("stamp"), [u] )     calls の辺になる
 /// with db(pg) { ... } →  Head( Ambient([Provision::Value { .. }]), .. )
 ///                        辺ではない。提供。ブロックの中だけ打ち消す
-/// Postgres::new(url)  →  Call( Path([..]), [url] )       どちらでもない
+/// Postgres::new(url)  →  Call( Path([..]), [url] )       implへの辺
 /// ```
 ///
 /// 呼び出し先には潜らない。定義されている関数かどうかの絞り込みもしない
 /// (それは `analyze` の仕事)。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct BodyFacts {
     /// 提供されないまま漏れた直接使用
     pub escaping: BTreeMap<String, SlotLevel>,
@@ -182,19 +180,23 @@ fn scan(
                 }
                 Head::If(c) | Head::Elif(c) | Head::While(c) => {
                     scan(c, slots, provided, locals, out);
-                    scan(body, slots, provided, locals, out);
+                    let mut inner_locals = locals.clone();
+                    scan(body, slots, provided, &mut inner_locals, out);
                 }
                 Head::For { var, iter } => {
                     scan(iter, slots, provided, locals, out);
-                    locals.insert(var.clone());
-                    scan(body, slots, provided, locals, out);
+                    let mut inner_locals = locals.clone();
+                    inner_locals.insert(var.clone());
+                    scan(body, slots, provided, &mut inner_locals, out);
                 }
                 Head::Else => {
-                    scan(body, slots, provided, locals, out);
+                    let mut inner_locals = locals.clone();
+                    scan(body, slots, provided, &mut inner_locals, out);
                 }
             }
             if let Some(o) = orelse {
-                scan(o, slots, provided, locals, out);
+                let mut inner_locals = locals.clone();
+                scan(o, slots, provided, &mut inner_locals, out);
             }
         }
 
@@ -206,13 +208,41 @@ fn scan(
         }
 
         ExprKind::Call(callee, args) => {
-            if let ExprKind::Ident(name) = &callee.kind {
-                if !slots.is_slot(name) && !locals.contains(name) {
+            match &callee.kind {
+                ExprKind::Ident(name) if !slots.is_slot(name) && !locals.contains(name) => {
                     out.calls.push(CallSite {
                         callee: name.clone(),
                         provided: provided.clone(),
                     });
                 }
+                ExprKind::Field(recv, method) => {
+                    if let ExprKind::Ident(name) = &recv.kind
+                        && !locals.contains(name)
+                        && let Some(trait_name) = slots.trait_of(name)
+                    {
+                        out.calls.push(CallSite {
+                            callee: trait_method_key(trait_name, method),
+                            provided: provided.clone(),
+                        });
+                    }
+                }
+                ExprKind::Path(parts) => {
+                    if let [owner, method] = parts.as_slice() {
+                        let callee = if !locals.contains(owner) {
+                            slots
+                                .trait_of(owner)
+                                .map(|trait_name| trait_method_key(trait_name, method))
+                                .unwrap_or_else(|| type_method_key(owner, method))
+                        } else {
+                            type_method_key(owner, method)
+                        };
+                        out.calls.push(CallSite {
+                            callee,
+                            provided: provided.clone(),
+                        });
+                    }
+                }
+                _ => {}
             }
             scan(callee, slots, provided, locals, out);
             for a in args {
@@ -281,6 +311,27 @@ fn record_access(
     }
 }
 
+fn trait_method_key(trait_name: &str, method: &str) -> String {
+    format!("impl {trait_name}::{method}")
+}
+
+fn type_method_key(type_name: &str, method: &str) -> String {
+    format!("impl {type_name}::{method}")
+}
+
+fn merge_facts(into: &mut BodyFacts, from: BodyFacts) {
+    for (slot, level) in from.escaping {
+        match into.escaping.get_mut(&slot) {
+            Some(existing) if *existing < level => *existing = level,
+            Some(_) => {}
+            None => {
+                into.escaping.insert(slot, level);
+            }
+        }
+    }
+    into.calls.extend(from.calls);
+}
+
 // ---------------------------------------------------------------------------
 // 手順5+6: 要求の伝播と到達経路
 // ---------------------------------------------------------------------------
@@ -316,7 +367,7 @@ fn test_key(name: &str) -> String {
 pub fn analyze(program: &Program) -> Analysis {
     let slots = collect_slots(program);
 
-    // 各関数の本体を1回だけ歩く。ここから先は AST を見ない
+    // 各関数・テスト・implメソッドの本体を1回だけ歩く。ここから先は AST を見ない
     let mut facts: BTreeMap<String, BodyFacts> = BTreeMap::new();
     let mut order: Vec<String> = Vec::new();
 
@@ -334,6 +385,34 @@ pub fn analyze(program: &Program) -> Analysis {
                 let key = test_key(name);
                 facts.insert(key.clone(), scan_body(body, &slots));
                 order.push(key);
+            }
+            Item::Impl {
+                trait_name,
+                type_name,
+                methods,
+                ..
+            } => {
+                for (sig, body) in methods {
+                    let key = match trait_name {
+                        Some(trait_name) => trait_method_key(trait_name, &sig.name),
+                        None => type_method_key(type_name, &sig.name),
+                    };
+                    let mut locals: BTreeSet<String> =
+                        sig.params.iter().map(|p| p.name.clone()).collect();
+                    if sig.has_self {
+                        locals.insert("self".to_string());
+                    }
+                    let method_facts = scan_body_with_locals(body, &slots, locals);
+                    merge_facts(facts.entry(key).or_default(), method_facts.clone());
+                    if trait_name.is_some() {
+                        merge_facts(
+                            facts
+                                .entry(type_method_key(type_name, &sig.name))
+                                .or_default(),
+                            method_facts,
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -577,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn 手順3_スロット使用とパス呼び出しは辺ではない() {
+    fn 手順3_メソッド呼び出しもimplへの辺になる() {
         let p = program(
             "effect db: Database\n\
              fn f(id: UserId) {\n\
@@ -586,8 +665,10 @@ mod tests {
              \x20 stamp(x)\n\
              }\n",
         );
-        // db.save は Field 越し、Postgres::new は Path。辺になるのは stamp だけ
-        assert_eq!(callees(&p, "f"), set(&["stamp"]));
+        assert_eq!(
+            callees(&p, "f"),
+            set(&["impl Database::save", "impl Postgres::new", "stamp"])
+        );
     }
 
     #[test]
@@ -851,5 +932,56 @@ mod tests {
              }\n",
         );
         assert!(analyze(&p).reqs["f"].is_empty());
+    }
+
+    #[test]
+    fn 実行されないhead本体のletは後続のスロットを隠さない() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(local: LocalDb) {\n\
+             \x20 if false { let db = local }\n\
+             \x20 db.save(user)\n\
+             }\n",
+        );
+        assert_eq!(analysis_level(&p, "f", "db"), Some(SlotLevel::Value));
+    }
+
+    #[test]
+    fn impl本体の要求はスロット呼び出し元へ伝わる() {
+        let p = program(
+            "trait Database { fn save(self) }\n\
+             trait Clock { fn now(self -> Int) }\n\
+             effect db: Database\n\
+             effect clock: Clock\n\
+             struct Store {}\n\
+             impl Database for Store {\n\
+             \x20 fn save(self) { clock.now() }\n\
+             }\n\
+             fn main() {\n\
+             \x20 with db(Store) { db.save() }\n\
+             }\n",
+        );
+        assert_eq!(analyze(&p).reqs["main"]["clock"].level, SlotLevel::Value);
+    }
+
+    #[test]
+    fn impl本体の要求は型パス呼び出し元へ伝わる() {
+        let p = program(
+            "trait Clock { fn now(self -> Int) }\n\
+             effect clock: Clock\n\
+             struct Store {}\n\
+             impl Store {\n\
+             \x20 fn new(-> Store) {\n\
+             \x20   clock.now()\n\
+             \x20   Store\n\
+             \x20 }\n\
+             }\n\
+             fn main() { Store::new() }\n",
+        );
+        assert_eq!(analyze(&p).reqs["main"]["clock"].level, SlotLevel::Value);
+    }
+
+    fn analysis_level(program: &Program, function: &str, slot: &str) -> Option<SlotLevel> {
+        analyze(program).reqs[function].get(slot).map(|r| r.level)
     }
 }

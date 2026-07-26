@@ -535,6 +535,9 @@ impl<'a> Interp<'a> {
                 let v = self.eval(value, env, ambient)?;
                 match &target.kind {
                     ExprKind::Ident(n) => {
+                        if self.name_is_slot(n, env) {
+                            return fail(format!("スロット `{n}` には代入できません"));
+                        }
                         if env.assign(n, v).is_err() {
                             return fail(format!("スロット `{n}` には代入できません"));
                         }
@@ -1130,10 +1133,10 @@ mod tests {
         let interp = Interp::new(&program);
 
         for item in &program.items {
-            if let crate::ast::Item::Test { name, body, .. } = item {
-                if let Err(e) = interp.run_body(body) {
-                    panic!("test {name:?} が失敗: {e}");
-                }
+            if let crate::ast::Item::Test { name, body, .. } = item
+                && let Err(e) = interp.run_body(body)
+            {
+                panic!("test {name:?} が失敗: {e}");
             }
         }
     }
@@ -1369,6 +1372,20 @@ mod tests {
                    \x20 with db<Both> { db::new().n }\n\
                    }\n";
         assert_eq!(run(src, "main").unwrap().show(), "1");
+    }
+
+    #[test]
+    fn letなしの代入ではスロットを隠せない() {
+        let src = "trait Database { fn save(self) }\n\
+                   effect db: Database\n\
+                   struct Store {}\n\
+                   impl Database for Store { fn save(self) { 1 } }\n\
+                   fn main() { db = Store }\n";
+        let error = run(src, "main").unwrap_err();
+        assert!(
+            error.contains("スロット `db` には代入できません"),
+            "{error}"
+        );
     }
 
     /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと

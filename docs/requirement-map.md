@@ -65,7 +65,7 @@ flowchart LR
     OUT["文字列出力"]
 
     P -->|collect_slots| S
-    P -->|scan_body 各関数1回| BF
+    P -->|scan_body 各関数・implメソッド1回| BF
     BF -.含む.-> CS
     S -->|参照| BF
     BF -->|analyze の不動点反復| R
@@ -83,7 +83,7 @@ flowchart LR
 | 2 | `scan` の `Path` 腕 | 代筆（型射影の要求） |
 | 3 | `scan` の `Call` 腕 | 代筆（元は手書きの `calls`） |
 | 4 | `scan` の `Head::Ambient` 腕 | 代筆 |
-| 5 | `analyze` の `loop` | 代筆 |
+| 5 | `analyze` の `impl` 収集と `loop` | 代筆 |
 | 6 | `Analysis::unsatisfied` | 代筆 |
 
 手順2・3は最初 `direct_uses` / `calls` として別々に手書きしたが、
@@ -94,3 +94,5 @@ flowchart LR
 
 `SlotLevel`は`Type < Value`。`db::new()`は`Type`、`db.save()`は`Value`を要求する。
 実体提供は両方を満たすが、型提供は`Value`要求を満たさない。
+スロット経由のメソッド呼び出しはtrait単位、`Type::method()`は型単位の
+`impl`呼び出し辺にもなり、メソッド本体で生じた要求を呼び出し元へ伝える。
