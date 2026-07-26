@@ -260,17 +260,56 @@ impl<'a> Interp<'a> {
         let Some((sig, body)) = self.fns.get(name) else {
             return fail(format!("関数 `{name}` がありません"));
         };
-        self.invoke(name, sig, body, args)
+        self.invoke(name, sig, body, args, None)
     }
 
     /// `Postgres::new(url)` — レシーバを取らない、型に属する関数。
     fn call_path(&self, type_name: &str, method: &str, args: Vec<Value>) -> Eval {
         let m = self.find_method(type_name, method, None)?;
-        self.invoke(&format!("{type_name}::{method}"), m.sig, m.body, args)
+        let what = format!("{type_name}::{method}");
+        if m.sig.has_self {
+            return fail(format!("`{what}` はレシーバが必要です"));
+        }
+        self.invoke(&what, m.sig, m.body, args, None)
     }
 
-    /// 本体を新しい `Env` で走らせる。`call` と `call_path` の共通部分。
-    fn invoke(&self, what: &str, sig: &Sig, body: &[Expr], args: Vec<Value>) -> Eval {
+    /// `store.get(id)` — レシーバを取るメソッド。
+    ///
+    /// `want_trait` はスロット経由のときだけ渡せる(段3)。
+    fn call_method(
+        &self,
+        recv: Value,
+        method: &str,
+        args: Vec<Value>,
+        want_trait: Option<&str>,
+    ) -> Eval {
+        let Value::Struct(o) = &recv else {
+            return fail(format!(
+                "`.{method}` を呼べません。struct ではありません ({})",
+                recv.show()
+            ));
+        };
+        let type_name = o.borrow().type_name.clone();
+
+        let m = self.find_method(&type_name, method, want_trait)?;
+        let what = format!("{type_name}.{method}");
+        if !m.sig.has_self {
+            return fail(format!(
+                "`{what}` は self を取りません。`{type_name}::{method}` で呼びます"
+            ));
+        }
+        self.invoke(&what, m.sig, m.body, args, Some(recv))
+    }
+
+    /// 本体を新しい `Env` で走らせる。呼び出し3種の共通部分。
+    fn invoke(
+        &self,
+        what: &str,
+        sig: &Sig,
+        body: &[Expr],
+        args: Vec<Value>,
+        recv: Option<Value>,
+    ) -> Eval {
         if sig.params.len() != args.len() {
             return fail(format!(
                 "`{what}` は引数 {} 個ですが {} 個渡されました",
@@ -280,6 +319,10 @@ impl<'a> Interp<'a> {
         }
 
         let mut env = Env::new();
+        // `self` は普通の束縛。ambient と違って**関数呼び出しで切れる**
+        if let Some(r) = recv {
+            env.insert("self".to_string(), r);
+        }
         for (p, a) in sig.params.iter().zip(args) {
             env.insert(p.name.clone(), a);
         }
@@ -381,19 +424,27 @@ impl<'a> Interp<'a> {
 
             ExprKind::Block(body) => self.block(body, env),
 
+            // レシーバ → 引数 の順に評価する(左から右)
             ExprKind::Call(callee, args) => {
+                // ここでレシーバがスロットなら trait が分かるので候補を絞れる。
+                // それは段3(ambient)の仕事。いまは常に None
+                let recv = match &callee.kind {
+                    ExprKind::Field(r, _) => Some(self.eval(r, env)?),
+                    _ => None,
+                };
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
                     vals.push(self.eval(a, env)?);
                 }
-                match &callee.kind {
-                    ExprKind::Ident(name) => self.call(name, vals),
-                    ExprKind::Path(parts) => match parts.as_slice() {
+                match (&callee.kind, recv) {
+                    (ExprKind::Ident(name), _) => self.call(name, vals),
+                    (ExprKind::Path(parts), _) => match parts.as_slice() {
                         [type_name, method] => self.call_path(type_name, method, vals),
                         _ => fail(format!("`{}` は呼べません", parts.join("::"))),
                     },
-                    // レシーバをメソッド本体でどう参照するかが未決(sig に self が無い)
-                    ExprKind::Field(_, m) => fail(format!("未実装: `.{m}` のメソッド呼び出し")),
+                    (ExprKind::Field(_, m), Some(recv)) => {
+                        self.call_method(recv, m, vals, None)
+                    }
                     _ => fail("呼べない式です"),
                 }
             }
@@ -717,6 +768,101 @@ mod tests {
     #[test]
     fn 無い型のメソッドはエラー() {
         assert!(run("fn main() {\n Nope::go()\n}\n", "main").is_err());
+    }
+
+    // ---- 段2b: self を取るメソッド ----
+
+    /// ハンドラの本体が自分の保存先に手が届くこと。これが無いと差し替えが書けない
+    #[test]
+    fn メソッドはselfでレシーバに触れる() {
+        let src = "struct Frozen { t: Time }\n\
+                   impl Clock for Frozen {\n\
+                   \x20 fn now(self -> Time) {\n\
+                   \x20   self.t\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 let c = Frozen { t = 1000 }\n\
+                   \x20 c.now()\n\
+                   }\n";
+        assert_eq!(int(src), 1000);
+    }
+
+    /// `InMemoryDb` の骨。配列を持って足せること
+    #[test]
+    fn メソッドがselfの配列を変更できる() {
+        let src = "struct Store { xs: Ints }\n\
+                   impl Store {\n\
+                   \x20 fn new(-> Store) {\n\
+                   \x20   Store { xs = [] }\n\
+                   \x20 }\n\
+                   }\n\
+                   impl Db for Store {\n\
+                   \x20 fn save(self, x: Int -> unit) {\n\
+                   \x20   self.xs = [x]\n\
+                   \x20 }\n\
+                   \x20 fn count(self -> Int) {\n\
+                   \x20   let n = 0\n\
+                   \x20   for y in self.xs: n = n + 1\n\
+                   \x20   n\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 let s = Store::new()\n\
+                   \x20 s.save(7)\n\
+                   \x20 s.count()\n\
+                   }\n";
+        assert_eq!(int(src), 1);
+    }
+
+    #[test]
+    fn selfを取らないメソッドはドットで呼べない() {
+        let src = "struct S {}\n\
+                   impl S {\n\
+                   \x20 fn go(-> Int) {\n\
+                   \x20   1\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 let s = S {}\n\
+                   \x20 s.go()\n\
+                   }\n";
+        let e = run(src, "main").expect_err("self が無いのでエラー");
+        assert!(e.contains("self を取りません"), "{e}");
+    }
+
+    #[test]
+    fn selfを取るメソッドはパスで呼べない() {
+        let src = "struct S { n: Int }\n\
+                   impl S {\n\
+                   \x20 fn get(self -> Int) {\n\
+                   \x20   self.n\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 S::get()\n\
+                   }\n";
+        let e = run(src, "main").expect_err("レシーバが無いのでエラー");
+        assert!(e.contains("レシーバ"), "{e}");
+    }
+
+    /// `self` は ambient と違って普通の束縛。呼び出しで切れる
+    #[test]
+    fn selfは呼び出し先に届かない() {
+        let src = "struct S { n: Int }\n\
+                   fn helper(-> Int) {\n\
+                   \x20 self.n\n\
+                   }\n\
+                   impl S {\n\
+                   \x20 fn get(self -> Int) {\n\
+                   \x20   helper()\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 let s = S { n = 1 }\n\
+                   \x20 s.get()\n\
+                   }\n";
+        assert!(run(src, "main").is_err());
     }
 
     #[test]

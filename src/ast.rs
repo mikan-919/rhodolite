@@ -54,6 +54,10 @@ pub enum Item {
 #[derive(Debug)]
 pub struct Sig {
     pub name: String,
+    /// 第一引数が `self` か。トレイトのメソッドと関連関数の区別はこれ一つ。
+    /// 暗黙にしないのは、`Postgres::new` のようにレシーバを取らないものと
+    /// 見た目で区別できなくなるため
+    pub has_self: bool,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub span: Span,

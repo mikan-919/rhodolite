@@ -33,6 +33,7 @@ pub enum Tok {
     Trait,
     Struct,
     Impl,
+    SelfKw,
     Effect,
     Test,
     Return,
@@ -228,6 +229,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "trait" => Tok::Trait,
         "struct" => Tok::Struct,
         "impl" => Tok::Impl,
+        "self" => Tok::SelfKw,
         "effect" => Tok::Effect,
         "test" => Tok::Test,
         "return" => Tok::Return,
@@ -298,6 +300,7 @@ fn can_end_expr(t: &Tok) -> bool {
     matches!(
         t,
         Tok::Ident(_)
+            | Tok::SelfKw
             | Tok::Int(_)
             | Tok::Str(_)
             | Tok::True
@@ -319,6 +322,7 @@ fn can_start_expr(t: &Tok) -> bool {
     matches!(
         t,
         Tok::Ident(_)
+            | Tok::SelfKw
             | Tok::Int(_)
             | Tok::Str(_)
             | Tok::True

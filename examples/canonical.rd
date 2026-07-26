@@ -9,12 +9,12 @@
 // ---- 契約 ----
 
 trait Database {
-    fn find(id: UserId -> User?)
-    fn save(u: User -> unit)
+    fn find(self, id: UserId -> User?)
+    fn save(self, u: User -> unit)
 }
 
 trait Clock {
-    fn now(-> Time)
+    fn now(self -> Time)
 }
 
 // ---- スロット宣言: 役割に名前を与える ----

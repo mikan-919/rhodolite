@@ -273,6 +273,13 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         let mut ret = None;
 
+        // `fn save(self, u: User -> unit)` — self は型を書かない。
+        // これがある/ないだけがメソッドと関連関数の区別
+        let has_self = self.eat(&Tok::SelfKw);
+        if has_self {
+            self.eat(&Tok::Comma);
+        }
+
         if !self.at(&Tok::RParen) {
             if !self.at(&Tok::Arrow) {
                 loop {
@@ -293,6 +300,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::RParen, "`)`")?;
         Ok(Sig {
             name,
+            has_self,
             params,
             ret,
             span: self.to(start),
@@ -668,6 +676,13 @@ impl<'a> Parser<'a> {
                 ExprKind::Bool(false)
             }
 
+            // `self` は式としてはただの名前。新しい産出も値も足さない。
+            // 束縛されるのはメソッドを呼んだときだけ(eval)
+            Tok::SelfKw => {
+                self.bump();
+                ExprKind::Ident("self".to_string())
+            }
+
             Tok::Ident(name) => {
                 self.bump();
                 // `Circle { r = 1.0 }` — struct 生成。`=` は「束縛」で let と一貫。
@@ -805,6 +820,35 @@ mod tests {
             matches!(&p.items[1], Item::Effect { slot, trait_name, .. }
                      if slot == "db" && trait_name == "Database")
         );
+    }
+
+    /// `self` の有無だけがメソッドと関連関数の区別
+    #[test]
+    fn selfは第一引数として書く() {
+        let p = ok("impl Database for Postgres {\n\
+                    \x20 fn save(self, u: User -> unit) {\n\
+                    \x20   1\n\
+                    \x20 }\n\
+                    \x20 fn new(url: Str -> Postgres) {\n\
+                    \x20   2\n\
+                    \x20 }\n\
+                    }\n");
+        let Item::Impl {
+            trait_name,
+            type_name,
+            methods,
+            ..
+        } = &p.items[0]
+        else {
+            panic!()
+        };
+        assert_eq!(trait_name.as_deref(), Some("Database"));
+        assert_eq!(type_name, "Postgres");
+        // self は params には入らない。has_self に出る
+        assert!(methods[0].0.has_self);
+        assert_eq!(methods[0].0.params.len(), 1);
+        assert!(!methods[1].0.has_self);
+        assert_eq!(methods[1].0.params.len(), 1);
     }
 
     #[test]

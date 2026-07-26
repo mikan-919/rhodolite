@@ -81,13 +81,28 @@ Rust にある「`if x { ... }` の `x { ... }` が struct リテラルかブロ
 ## ambient は4箇所にしか現れない
 
 ```rhodolite
-trait Database { fn save(u: User -> unit) }   // 契約
+trait Database { fn save(self, u: User -> unit) }  // 契約
 effect db: Database                            // スロット宣言
 db(Postgres::new(url)): { handle(id) }         // 提供(Head 産出の一実例)
 db.save(u)                                     // 使用
 ```
 
 経由するだけの関数は**無記述**。要求は推論する(→ ADR-0002)。
+
+## メソッドと関連関数
+
+シグネチャの第一引数が `self` かどうかだけが両者の区別。暗黙にしない。
+
+```rhodolite
+impl Database for Postgres {
+    fn save(self, u: User -> unit) { ... }   // メソッド。`pg.save(u)` で呼ぶ
+    fn new(url: Str -> Postgres) { ... }     // 関連関数。`Postgres::new(url)` で呼ぶ
+}
+```
+
+`self` を暗黙にすると `new` にもレシーバがあることになり、トップレベルの `fn` と
+trait の中の `fn` が同じ見た目で違う意味になる。宣言に出す方を採った。
+`self` は ambient と違って**関数呼び出しで切れる**普通の束縛。
 
 ## まだ決めていない
 
