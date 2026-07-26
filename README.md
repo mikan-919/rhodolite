@@ -20,7 +20,7 @@ fn promote(id: UserId -> bool) {          // 経由するだけ = 無記述
 }
 
 fn main() {
-    db(Postgres::new(url)), clock(system_clock): {   // 提供
+    with db(Postgres::new(url)), clock(system_clock) {   // 提供
         promote(user_id)
     }
 }
@@ -69,8 +69,9 @@ v1 の到達目標は [examples/canonical.rd](./examples/canonical.rd)。
 
 ## 現状
 
-設計フェーズ。実装は未着手。
+v1 の到達目標は達成済み。lexer、parser、要求推論、インタプリタ、CLIがつながり、
+`cargo run`で正典プログラムのテストが完走する。現在の地図と次の作業は
+[docs/overview.md](./docs/overview.md)。
 
-構想の全文は Obsidian vault の `2_Products/rhodolite/` にある
-(`syntax_design` / `memory_design` / `effect_design` ほか)。
-所有権・借用・`'a` 推論の柱は v1 スコープ外として棚上げ中 — [ADR-0001](./docs/adr/0001-v1-scope-effects-only.md)。
+所有権・借用・`'a` 推論の柱はv1スコープ外として棚上げ中
+（[ADR-0001](./docs/adr/0001-v1-scope-effects-only.md)）。

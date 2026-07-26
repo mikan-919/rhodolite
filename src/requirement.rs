@@ -78,7 +78,7 @@ pub fn collect_slots(program: &Program) -> Slots {
 
 /// 呼び出し1つ分の記録。
 ///
-/// 「どの関数を呼んだか」だけでは足りない。`db(pg): { handle(id) }` のように
+/// 「どの関数を呼んだか」だけでは足りない。`with db(pg) { handle(id) }` のように
 /// 提供の中で呼ばれていると、`handle` から来る db 要求はここで消えるため、
 /// **その地点で何が提供されていたか**を一緒に覚えておく必要がある。
 #[derive(Debug, Clone)]
@@ -104,7 +104,7 @@ pub enum SlotLevel {
 /// db.save(u)          →  Call( Field( Ident("db"), "save" ), [u] )
 ///                              ~~~~~~~~~~~~~~~~~~~ "db" が Slots にあれば escaping
 /// stamp(u)            →  Call( Ident("stamp"), [u] )     calls の辺になる
-/// db(pg): { ... }     →  Head( Ambient([Call(Ident("db"), [pg])]), .. )
+/// with db(pg) { ... } →  Head( Ambient([Provision::Value { .. }]), .. )
 ///                        辺ではない。提供。ブロックの中だけ打ち消す
 /// Postgres::new(url)  →  Call( Path([..]), [url] )       どちらでもない
 /// ```
@@ -425,7 +425,13 @@ impl Analysis {
             if reqs.is_empty() {
                 out.push_str(&format!("  {name} / (要求なし)\n"));
             } else {
-                let names: Vec<&str> = reqs.keys().map(|s| s.as_str()).collect();
+                let names: Vec<String> = reqs
+                    .iter()
+                    .map(|(slot, requirement)| match requirement.level {
+                        SlotLevel::Type => format!("{slot} (型)"),
+                        SlotLevel::Value => slot.clone(),
+                    })
+                    .collect();
                 out.push_str(&format!("  {name} / {}\n", names.join(", ")));
             }
         }
@@ -586,12 +592,11 @@ mod tests {
 
     #[test]
     fn 手順3_提供は呼び出しではない() {
-        // `db(pg): { ... }` の `db(pg)` は Call(Ident("db"), _) と同じ形をしているが、
-        // これは提供であって呼び出しではない。辺にしてはいけない
+        // `with db(pg) { ... }` は提供であって呼び出しではない。辺にしてはいけない
         let p = program(
             "effect db: Database\n\
              fn main() {\n\
-             \x20 db(pg): {\n\
+             \x20 with db(pg) {\n\
              \x20   handle(id)\n\
              \x20 }\n\
              }\n",
@@ -606,7 +611,7 @@ mod tests {
         let p = program(
             "effect db: Database\n\
              fn f() {\n\
-             \x20 db(pg): {\n\
+             \x20 with db(pg) {\n\
              \x20   db.save(u)\n\
              \x20 }\n\
              }\n",
@@ -620,7 +625,7 @@ mod tests {
             "effect db: Database\n\
              effect clock: Clock\n\
              fn f() {\n\
-             \x20 db(pg): {\n\
+             \x20 with db(pg) {\n\
              \x20   db.save(u)\n\
              \x20   clock.now()\n\
              \x20 }\n\
@@ -634,7 +639,7 @@ mod tests {
         let p = program(
             "effect db: Database\n\
              fn f() {\n\
-             \x20 db(pg): {\n\
+             \x20 with db(pg) {\n\
              \x20   db.save(u)\n\
              \x20 }\n\
              \x20 db.find(id)\n\
@@ -651,7 +656,7 @@ mod tests {
             "effect db: Database\n\
              effect clock: Clock\n\
              fn f() {\n\
-             \x20 db(make(clock.now())): {\n\
+             \x20 with db(make(clock.now())) {\n\
              \x20   db.save(u)\n\
              \x20 }\n\
              }\n",
@@ -665,7 +670,7 @@ mod tests {
             "effect db: Database\n\
              fn f() {\n\
              \x20 handle(a)\n\
-             \x20 db(pg): {\n\
+             \x20 with db(pg) {\n\
              \x20   handle(b)\n\
              \x20 }\n\
              }\n",
@@ -815,6 +820,7 @@ mod tests {
         let analysis = analyze(&p);
         assert_eq!(analysis.reqs["make"]["db"].level, SlotLevel::Type);
         assert_eq!(analysis.reqs["use"]["db"].level, SlotLevel::Value);
+        assert!(analysis.render().contains("make / db (型)"));
     }
 
     #[test]

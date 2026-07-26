@@ -121,7 +121,7 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     /// `{ ... }` — 第二級。値は最後の式
     Block(Vec<Expr>),
-    /// `Head ':' expr` — 文法の4産出のうち2つがこれ
+    /// `Head block` または `Head ':' 単純式`
     Head {
         head: Head,
         body: Box<Expr>,

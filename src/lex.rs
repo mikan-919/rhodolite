@@ -380,7 +380,7 @@ mod tests {
     fn 行頭が式を始められないなら継続する() {
         assert_eq!(newlines("let a = 1\n+ 2\n"), 1);
         assert_eq!(newlines("users.filter(f)\n.map(g)\n"), 1);
-        assert_eq!(newlines("if c: { a() }\nelse: b()\n"), 1);
+        assert_eq!(newlines("if c { a() }\nelse: b()\n"), 1);
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! 評価。構文木を走らせる。
 //!
-//! 段は4つに割ってあり、いま段3まで済んでいる。
+//! 段は4つに割って実装した。
 //!
 //!   1. struct・フィールド・演算・`if`・`return`・関数呼び出し
 //!   2. `impl` とメソッド呼び出し・配列
-//!   3. **ambient** — `db(store): { ... }` が `db.save(u)` に届く
-//!   4. `test` の実行。`examples/canonical.rd` 完走  ← 次
+//!   3. **ambient** — `with db(store) { ... }` が `db.save(u)` に届く
+//!   4. `test` の実行。`examples/canonical.rd` 完走
 //!
 //! `Env` は `invoke` で作り直し、`Ambient` はそのまま渡す。
 //! **この差1行が言語の全部**(CONTEXT.md「ambient」)。
@@ -723,7 +723,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Unit)
             }
-            // `db(store), clock(Frozen::at(1000)): { ... }` — 提供。
+            // `with db(store), clock(Frozen::at(1000)) { ... }` — 提供。
             //
             // requirement.rs の `scan` と同じ形。**スコープの終わりを書かない** —
             // `self.eval(body, env, &inner)` から戻れば `inner` は消えていて、
@@ -1170,7 +1170,7 @@ mod tests {
         let src = format!(
             "{CLOCK}\
              fn main() {{\n\
-             \x20 clock(Frozen::at(1000)): {{\n\
+             \x20 with clock(Frozen::at(1000)) {{\n\
              \x20   clock.now()\n\
              \x20 }}\n\
              }}\n"
@@ -1194,7 +1194,7 @@ mod tests {
              \x20 promote()\n\
              }}\n\
              fn main() {{\n\
-             \x20 clock(Frozen::at(1000)): {{\n\
+             \x20 with clock(Frozen::at(1000)) {{\n\
              \x20   handle()\n\
              \x20 }}\n\
              }}\n"
@@ -1224,8 +1224,8 @@ mod tests {
              \x20 clock.now()\n\
              }}\n\
              fn main(-> Int) {{\n\
-             \x20 let a = clock(Frozen::at(1)): {{ stamp() }}\n\
-             \x20 let b = clock(Frozen::at(2)): {{ stamp() }}\n\
+             \x20 let a = with clock(Frozen::at(1)) {{ stamp() }}\n\
+             \x20 let b = with clock(Frozen::at(2)) {{ stamp() }}\n\
              \x20 b - a\n\
              }}\n"
         );
@@ -1237,7 +1237,7 @@ mod tests {
         let src = format!(
             "{CLOCK}\
              fn main() {{\n\
-             \x20 clock(Frozen::at(1000)): {{ clock.now() }}\n\
+             \x20 with clock(Frozen::at(1000)) {{ clock.now() }}\n\
              \x20 clock.now()\n\
              }}\n"
         );
@@ -1250,8 +1250,8 @@ mod tests {
         let src = format!(
             "{CLOCK}\
              fn main() {{\n\
-             \x20 clock(Frozen::at(1)): {{\n\
-             \x20   clock(Frozen::at(2)): {{\n\
+             \x20 with clock(Frozen::at(1)) {{\n\
+             \x20   with clock(Frozen::at(2)) {{\n\
              \x20     clock.now()\n\
              \x20   }}\n\
              \x20 }}\n\
@@ -1266,7 +1266,7 @@ mod tests {
         let src = format!(
             "{CLOCK}\
              fn main() {{\n\
-             \x20 clock(Frozen::at(clock.now())): {{ 1 }}\n\
+             \x20 with clock(Frozen::at(clock.now())) {{ 1 }}\n\
              }}\n"
         );
         let e = run(&src, "main").expect_err("clock はまだ立っていない");
@@ -1279,7 +1279,7 @@ mod tests {
         let src = "effect clock: Clock\n\
                    struct Nope {}\n\
                    fn main() {\n\
-                   \x20 clock(Nope {}): { 1 }\n\
+                   \x20 with clock(Nope {}) { 1 }\n\
                    }\n";
         let e = run(src, "main").expect_err("Clock を実装していない");
         assert!(e.contains("実装していない"), "{e}");
@@ -1301,7 +1301,7 @@ mod tests {
                    \x20 }\n\
                    }\n\
                    fn main() {\n\
-                   \x20 clock(Both {}): { clock.now() }\n\
+                   \x20 with clock(Both {}) { clock.now() }\n\
                    }\n";
         // ただの変数なら「どの trait か決まらない」になる場面。
         // スロットには trait 名が付いているので Clock 側が選ばれる

@@ -17,8 +17,10 @@ flowchart TD
     subgraph body["本体の走査"]
         collect["collect_slots(&Program) -> Slots"]
         scan_body["scan_body(&[Expr], &Slots) -> BodyFacts"]
-        scan["scan(&Expr, &Slots, &BTreeSet&lt;String&gt;, &mut BodyFacts)"]
-        psn["provided_slot_name(&Expr) -> Option&lt;String&gt;"]
+        scan_exprs["scan_exprs(&[Expr], &Slots, provided, locals, out)"]
+        scan["scan(&Expr, &Slots, provided, locals, out)"]
+        access["record_access(slot, SlotLevel, provided, locals, out)"]
+        merge["merge_requirement(&mut Reqs, slot, SlotLevel, path)"]
         test_key["test_key(&str) -> String"]
     end
 
@@ -38,14 +40,17 @@ flowchart TD
     analyze --> scan_body
     analyze --> test_key
 
-    scan_body --> scan
+    scan_body --> scan_exprs
+    scan_exprs --> scan
     scan --> scan
-    scan --> psn
+    scan --> access
     scan --> is_slot
+    analyze --> merge
 ```
 
-`scan` の自己ループが全部。手順2（スロット使用）・手順3（呼び出し辺）・
-手順4（提供による打ち消し）を、本体1回の再帰で同時に集めている。
+`scan` の自己ループが中心。手順2（型射影・値射影のスロット使用）・手順3
+（呼び出し辺）・手順4（提供による打ち消し）を、本体1回の再帰で同時に集める。
+`locals`は順番に更新し、同名ローカルが見えている場所ではスロット使用に数えない。
 
 ## データの流れ
 
@@ -53,9 +58,9 @@ flowchart TD
 flowchart LR
     P["Program (AST)"]
     S["Slots<br/>slot -> trait 名"]
-    BF["BodyFacts<br/>escaping: BTreeSet&lt;String&gt;<br/>calls: Vec&lt;CallSite&gt;"]
-    CS["CallSite<br/>callee: String<br/>provided: BTreeSet&lt;String&gt;"]
-    R["Reqs<br/>= BTreeMap&lt;String, Vec&lt;String&gt;&gt;<br/>slot -> 到達経路"]
+    BF["BodyFacts<br/>escaping: slot -> SlotLevel<br/>calls: Vec&lt;CallSite&gt;"]
+    CS["CallSite<br/>callee: String<br/>provided: slot -> SlotLevel"]
+    R["Reqs<br/>slot -> Requirement<br/>(SlotLevel + 到達経路)"]
     A["Analysis<br/>slots / reqs / order"]
     OUT["文字列出力"]
 
@@ -75,6 +80,7 @@ flowchart LR
 |---|---|---|
 | 1 | `collect_slots` | 手書き |
 | 2 | `scan` の `Field` 腕 | 代筆（元は手書きの `direct_uses`） |
+| 2 | `scan` の `Path` 腕 | 代筆（型射影の要求） |
 | 3 | `scan` の `Call` 腕 | 代筆（元は手書きの `calls`） |
 | 4 | `scan` の `Head::Ambient` 腕 | 代筆 |
 | 5 | `analyze` の `loop` | 代筆 |
@@ -85,3 +91,6 @@ flowchart LR
 実装が2本あると片方だけ直して食い違うので、実装は1本にしてある。
 検査は残っていて、`手順2_*` / `手順3_*` のテストは `scan_body` の
 `escaping` と `calls` を見ている。
+
+`SlotLevel`は`Type < Value`。`db::new()`は`Type`、`db.save()`は`Value`を要求する。
+実体提供は両方を満たすが、型提供は`Value`要求を満たさない。

@@ -9,7 +9,7 @@
 expr ::= 単純式
        | '{' expr* '}'
        | Head ':' 単純式          # Head と同一物理行に限る
-       | Head ':' '{' expr* '}'
+       | Head '{' expr* '}'
 ```
 
 **値ベース。**文と式の区別を持たない。すべての形が値を産む。
@@ -21,14 +21,16 @@ expr ::= 単純式
 | `if c` / `elif c` / `else` | 分岐(実行回数 0か1) |
 | `if let Ok(x) = e` | 束縛 + 分岐 |
 | `for x in xs` / `while c` | 束縛 + 反復 |
-| `db(pg)` / `db(pg), clock(sys)` | **ambient 束縛**(関数呼び出しで切れない) |
+| `with db(pg)` / `with db(pg), clock(sys)` | **ambient 束縛**(関数呼び出しで切れない) |
+| `with db<Postgres>` | ambient な実装型 |
 | `ar` (将来) | ambient なアロケータ |
 
-`:` の意味はただひとつ — 「**Head が構築した環境で、続く1つを実行する**」。
+ブロック自身が本体の境界を示すため、ブロック形では `:` を書かない。
+一行形だけは `:` でHeadと本体を分ける。
 
 - `elif` はキーワード(else-if 特例を持たないため)
 - `;` は言語に存在しない。1行1文
-- Head の被演算子は単純式かブロックのみ、ワンライナーは同一行限定。
+- Head の本体は単純式かブロックのみ、ワンライナーは同一行限定。
   これで dangling else と goto-fail が両方**構文レベルで**死ぬ
 
 ## 行継続
@@ -45,7 +47,7 @@ let total = price +        // 行末 `+` が終えられない → 継続
 let total = price
           + tax            // 行頭 `+` が始められない → 継続
 
-let x = if c: {
+let x = if c {
     foo()
 }
 else: bar()                // 行頭 `else` が始められない → 継続
@@ -74,20 +76,31 @@ Circle { r = 1.0 }
 
 `=` は「束縛」で `let x = 1` と同じ意味。`:` は Head 専用に保つ。
 
-Rust にある「`if x { ... }` の `x { ... }` が struct リテラルかブロックか決まらない」
-という曖昧性は**構造的に発生しない** — Head は `:` 必須なので `if x { ... }` は
-そもそも Head 形ではないため。`:` を1義に絞った設計の副産物。
+Head の条件では裸のstructリテラルを読まない。条件に置く場合だけ括弧で囲む。
+
+```rhodolite
+if value == (Circle { r = 1.0 }) {
+    same()
+}
+```
+
+頻度の低い条件内structリテラルへ括弧を課す代わりに、すべてのブロック形Headから
+コロンを外した（→ ADR-0005）。
 
 ## ambient は4箇所にしか現れない
 
 ```rhodolite
 trait Database { fn save(self, u: User -> unit) }  // 契約
 effect db: Database                            // スロット宣言
-db(Postgres::new(url)): { handle(id) }         // 提供(Head 産出の一実例)
+with db(Postgres::new(url)) { handle(id) }     // 実体の提供
+with db<Postgres> { db::new(url) }              // 実装型の提供
 db.save(u)                                     // 使用
 ```
 
 経由するだけの関数は**無記述**。要求は推論する(→ ADR-0002)。
+
+`with db(value)` の値は提供前の外側で評価する。したがって `with db(db)` の右側は
+外側のローカル、ブロック内の `db` は提供されたスロットになる。
 
 ## メソッドと関連関数
 

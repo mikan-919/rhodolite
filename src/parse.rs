@@ -4,9 +4,8 @@
 //!
 //!   assign → coalesce → equality → additive → multiplicative → unary → postfix → primary
 //!
-//! `Head` に専用の構文カテゴリはない。CONTEXT.md の定義どおり
-//! 「`:` の左にあるもの」なので、式を読んでから次が `:` かどうかで判明する。
-//! キーワードで始まる `if`/`for`/`while` だけ先に分岐する。
+//! Head は `if` / `for` / `while` / `with` のキーワードから始まる。
+//! ブロック形はそのまま `{}`、一行形だけ `:` で本体を区切る。
 
 use crate::ast::*;
 use crate::lex::{Span, Tok, Token};
@@ -407,28 +406,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        // ここから先は普通の式。ただし `:` が続けば ambient の Head だったと判明する
-        let first = self.expr()?;
-        if self.at(&Tok::Comma) || self.at(&Tok::Colon) {
-            let mut exprs = vec![first];
-            while self.eat(&Tok::Comma) {
-                exprs.push(self.expr()?);
-            }
-            let mut binders = Vec::new();
-            for expr in exprs {
-                binders.push(self.legacy_provision(expr)?);
-            }
-            let body = self.head_body()?;
-            return Ok(Expr {
-                kind: ExprKind::Head {
-                    head: Head::Ambient(binders),
-                    body: Box::new(body),
-                    orelse: None,
-                },
-                span: self.to(start),
-            });
-        }
-        Ok(first)
+        self.expr()
     }
 
     /// `db<Type>` または `db(value)`。`with` が先にあるため普通の式とは衝突しない。
@@ -448,23 +426,6 @@ impl<'a> Parser<'a> {
         let value = value?;
         self.expect(&Tok::RParen, "`)`")?;
         Ok(Provision::Value { slot, value })
-    }
-
-    /// 移行中の旧構文 `db(value): { ... }` を新しいASTへ畳む。
-    fn legacy_provision(&self, expr: Expr) -> PResult<Provision> {
-        let ExprKind::Call(callee, mut args) = expr.kind else {
-            return Err(self.err("提供は `with db(値) { ... }` の形で書きます"));
-        };
-        let ExprKind::Ident(slot) = callee.kind else {
-            return Err(self.err("提供先にはスロット名が必要です"));
-        };
-        if args.len() != 1 {
-            return Err(self.err("スロットへ提供する値は1つです"));
-        }
-        Ok(Provision::Value {
-            slot,
-            value: args.remove(0),
-        })
     }
 
     /// `if`/`elif` の本体と、後続の `elif`/`else` を読む。
@@ -532,6 +493,10 @@ impl<'a> Parser<'a> {
         }
 
         let colon = self.expect(&Tok::Colon, "`:` または `{`")?;
+
+        if self.at(&Tok::LBrace) {
+            return Err(self.err("ブロックの前に `:` は要りません"));
+        }
 
         if self.line() != colon.line {
             return Err(self.err(
@@ -783,7 +748,7 @@ impl<'a> Parser<'a> {
                 let name = self.expect_ident("変数名")?;
                 self.expect(&Tok::Eq, "`=`")?;
                 // 値は `stmt` で読む。値ベースなので Head も値を産む
-                // (`let r = db(replica): { collect() }` — CONTEXT.md「第二級ブロック」)。
+                // (`let r = with db(replica) { collect() }` — CONTEXT.md「第二級ブロック」)。
                 // `expr` で読むと `:` が let の外に残り、`let` 全体が
                 // ambient の binder として読まれてしまう
                 let value = self.stmt()?;
@@ -909,10 +874,10 @@ mod tests {
     }
 
     /// 値ベースなので Head も値を産む。`let` の右辺に来られること
-    /// (CONTEXT.md「第二級ブロック」の `let r = db(replica): { collect() }`)
+    /// (CONTEXT.md「第二級ブロック」の `let r = with db(replica) { collect() }`)
     #[test]
     fn letの右辺にheadが来られる() {
-        let p = ok("fn main() {\n  let r = db(replica): { 1 }\n}\n");
+        let p = ok("fn main() {\n  let r = with db(replica) { 1 }\n}\n");
         let Item::Fn { body, .. } = &p.items[0] else {
             panic!()
         };
@@ -963,22 +928,6 @@ mod tests {
         };
         assert!(sig.params.is_empty());
         assert_eq!(sig.ret.as_ref().unwrap().name, "Time");
-    }
-
-    #[test]
-    fn ambient_の提供は_head_産出になる() {
-        let p = ok("fn main() {\n  db(pg), clock(sys): {\n    handle(id)\n  }\n}\n");
-        let Item::Fn { body, .. } = &p.items[0] else {
-            panic!()
-        };
-        let ExprKind::Head {
-            head: Head::Ambient(binders),
-            ..
-        } = &body[0].kind
-        else {
-            panic!("ambient head として読めていない: {:?}", body[0].kind)
-        };
-        assert_eq!(binders.len(), 2);
     }
 
     #[test]
@@ -1045,6 +994,18 @@ mod tests {
         // 行継続で改行が消えても、行番号で捕まえる
         let e = parse_src("fn f() {\n  if a:\n    x()\n}\n").unwrap_err();
         assert!(e.msg.contains("改行"), "{}", e.msg);
+    }
+
+    #[test]
+    fn ブロックの前にコロンは書けない() {
+        let e = parse_src("fn f() {\n  if ready: { go() }\n}\n").unwrap_err();
+        assert!(e.msg.contains("要りません"), "{}", e.msg);
+    }
+
+    #[test]
+    fn 旧ambient提供構文は受けない() {
+        let e = parse_src("fn f() {\n  db(store): { go() }\n}\n").unwrap_err();
+        assert!(e.msg.contains("1行に2つ"), "{}", e.msg);
     }
 
     #[test]

@@ -90,7 +90,7 @@ impl Clock for SystemClock {
 
 fn main(-> bool) {
     let current_user_id = 1
-    db(Postgres::new("postgres://localhost/app")), clock(SystemClock {}): {
+    with db(Postgres::new("postgres://localhost/app")), clock(SystemClock {}) {
         handle(current_user_id)
     }
 }
@@ -113,7 +113,7 @@ impl InMemoryDb {
 
 impl Database for InMemoryDb {
     fn find(self, id: UserId -> User?) {
-        for u in self.users: {
+        for u in self.users {
             if u.id == id: return u
         }
         nil
@@ -146,7 +146,7 @@ test "昇格すると Gold になり時刻が刻まれる" {
     let alice = User { id = 1, rank = Bronze, promoted_at = 0 }
     let store = InMemoryDb::new([alice])
 
-    db(store), clock(Frozen::at(1000)): {
+    with db(store), clock(Frozen::at(1000)) {
         assert handle(alice.id)
 
         let u = InMemoryDb::get(store, alice.id)
