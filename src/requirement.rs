@@ -7,14 +7,18 @@
 //! 依存が呼ばれる側にしか向かわないので、Tarjan で強連結成分に縮約すれば
 //! 逆位相順の1パスで済む(不動点反復は不要)。
 //!
-//! ただし一気に作らない。下の順で1段ずつ緑にしていく:
+//! 段は6つ:
 //!
 //!   1. collect_slots  … スロット表を作る
-//!   2. direct_uses    … 1関数の直接使用を集める(呼び出し先に潜らない)
-//!   3. calls          … 呼び出し辺を集める
-//!   4. 提供による打ち消し
-//!   5. SCC 縮約 + 逆位相1パス
+//!   2. 直接使用      ┐
+//!   3. 呼び出し辺    ├ scan が本体を1回歩いて同時に集める
+//!   4. 提供による打ち消し ┘
+//!   5. 要求の伝播(いまは素朴な不動点反復。将来 SCC 縮約 + 逆位相1パス)
 //!   6. 到達経路
+//!
+//! 手順2と3は最初 `direct_uses` / `calls` として別々に書いたが、手順4で
+//! 「いま提供されているスロットの集合」を持ち回る必要が出た時点で、
+//! 同じ走査に畳んだ。`scan` の1回の再帰が2・3・4を兼ねている。
 
 use crate::ast::{Expr, ExprKind, Head, Item, Program};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -69,75 +73,7 @@ pub fn collect_slots(program: &Program) -> Slots {
 }
 
 // ---------------------------------------------------------------------------
-// 手順2: 直接使用
-// ---------------------------------------------------------------------------
-
-/// 1つの関数の本体を歩いて、**その関数が自分で直接使っている**スロットを集める。
-///
-/// - 呼び出し先の関数には潜らない(それは手順3〜5の仕事)
-/// - 提供 (`db(pg): { ... }`) による打ち消しもまだ考えない(手順4)
-///
-/// 探すのはこの形:
-///
-/// ```text
-/// db.save(u)  →  Call( Field( Ident("db"), "save" ), [u] )
-///                      ~~~~~~~~~~~~~~~~~~~ ここの "db" が Slots にあれば要求
-/// ```
-///
-/// ヒント: 下の `walk` で全部の部分式を訪問し、`ExprKind::Field(recv, _)` を見つけて
-/// `recv` が `ExprKind::Ident(name)` かつ `slots.is_slot(name)` なら集める。
-pub fn direct_uses(body: &[Expr], slots: &Slots) -> BTreeSet<String> {
-    let mut result = BTreeSet::new();
-    for expr in body {
-        walk(expr, &mut |e| {
-            if let ExprKind::Field(recv, _) = &e.kind {
-                if let ExprKind::Ident(name) = &recv.kind {
-                    if slots.is_slot(name) {
-                        result.insert(name.clone());
-                    }
-                }
-            }
-        });
-    }
-    result
-}
-
-// ---------------------------------------------------------------------------
-// 手順3: 呼び出し辺
-// ---------------------------------------------------------------------------
-
-/// 1つの関数の本体を歩いて、**この関数が呼んでいる関数の名前**を集める。
-/// これが呼び出しグラフの辺になる。
-///
-/// 集めるのはこの形だけ:
-///
-/// ```text
-/// stamp(u)              →  Call( Ident("stamp"), [u] )        集める
-/// db.save(u)            →  Call( Field(..), [u] )             集めない(スロット使用)
-/// Postgres::new(url)    →  Call( Path([..]), [url] )          集めない(パス呼び出し)
-/// ```
-///
-/// 定義されている関数かどうかの絞り込みはここではしない(グラフを組むときの仕事)。
-pub fn calls(body: &[Expr], slots: &Slots) -> BTreeSet<String> {
-    let mut result = BTreeSet::new();
-    for x in body {
-        walk(x, &mut |x| {
-            if let ExprKind::Call(callee, _) = &x.kind
-                && let ExprKind::Ident(name) = &callee.kind
-            {
-                if slots.is_slot(name) {
-                    return;
-                }
-                result.insert(name.clone());
-            }
-        })
-    }
-    result
-    // todo!("手順3: Call(Ident(name), _) の name を集める")
-}
-
-// ---------------------------------------------------------------------------
-// 手順4: 提供による打ち消し
+// 手順2〜4: 直接使用・呼び出し辺・提供による打ち消し
 // ---------------------------------------------------------------------------
 
 /// 呼び出し1つ分の記録。
@@ -152,6 +88,20 @@ pub struct CallSite {
 }
 
 /// 関数の本体を1回歩いて分かること。
+///
+/// 拾うのはこの2つの形だけ:
+///
+/// ```text
+/// db.save(u)          →  Call( Field( Ident("db"), "save" ), [u] )
+///                              ~~~~~~~~~~~~~~~~~~~ "db" が Slots にあれば escaping
+/// stamp(u)            →  Call( Ident("stamp"), [u] )     calls の辺になる
+/// db(pg): { ... }     →  Head( Ambient([Call(Ident("db"), [pg])]), .. )
+///                        辺ではない。提供。ブロックの中だけ打ち消す
+/// Postgres::new(url)  →  Call( Path([..]), [url] )       どちらでもない
+/// ```
+///
+/// 呼び出し先には潜らない。定義されている関数かどうかの絞り込みもしない
+/// (それは `analyze` の仕事)。
 #[derive(Debug, Default)]
 pub struct BodyFacts {
     /// 提供されないまま漏れた直接使用
@@ -169,7 +119,8 @@ pub fn scan_body(body: &[Expr], slots: &Slots) -> BodyFacts {
     facts
 }
 
-/// `walk` を使わず自前で再帰する。理由は `provided` を枝ごとに変えて下へ運ぶため。
+/// 汎用の木歩き(訪問関数を渡す形)ではなく自前で再帰する。理由は
+/// `provided` を枝ごとに変えて下へ運ぶため — 訪問関数の形では状態を引き継げない。
 ///
 /// **スコープの終わりを書く必要がない**ことに注目。`scan(body, &inner, ..)` から
 /// 戻った時点で `inner` は消えていて、呼び出し元は元の `provided` を持ったまま。
@@ -281,79 +232,6 @@ fn provided_slot_name(binder: &Expr) -> Option<String> {
         }
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// 木歩きの道具(ボイラープレート)
-// ---------------------------------------------------------------------------
-
-/// 式とそのすべての部分式を前順(自分 → 子)で訪問する。
-///
-/// 注意: これは**手順2と3までの道具**。手順4で「いま提供されているスロットの集合」を
-/// 持ち回る必要が出ると、この形では足りなくなる(訪問中に状態を引き継げないため)。
-/// そのときは `walk` を使うのをやめて、自分で再帰関数を書くことになる。
-pub fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
-    f(e);
-    match &e.kind {
-        ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
-        ExprKind::Path(_) => {}
-        ExprKind::Field(recv, _) => walk(recv, f),
-        ExprKind::Call(callee, args) => {
-            walk(callee, f);
-            for a in args {
-                walk(a, f);
-            }
-        }
-        ExprKind::Array(items) => {
-            for i in items {
-                walk(i, f);
-            }
-        }
-        ExprKind::StructLit { fields, .. } => {
-            for (_, v) in fields {
-                walk(v, f);
-            }
-        }
-        ExprKind::Let { value, .. } => walk(value, f),
-        ExprKind::Assign { target, value } => {
-            walk(target, f);
-            walk(value, f);
-        }
-        ExprKind::Unary(_, inner) => walk(inner, f),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            walk(lhs, f);
-            walk(rhs, f);
-        }
-        ExprKind::Return(Some(v)) => walk(v, f),
-        ExprKind::Return(None) => {}
-        ExprKind::Assert(inner) => walk(inner, f),
-        ExprKind::Block(body) => {
-            for e in body {
-                walk(e, f);
-            }
-        }
-        ExprKind::Head { head, body, orelse } => {
-            walk_head(head, f);
-            walk(body, f);
-            if let Some(o) = orelse {
-                walk(o, f);
-            }
-        }
-    }
-}
-
-fn walk_head(h: &crate::ast::Head, f: &mut impl FnMut(&Expr)) {
-    use crate::ast::Head::*;
-    match h {
-        If(c) | Elif(c) | While(c) => walk(c, f),
-        For { iter, .. } => walk(iter, f),
-        Else => {}
-        Ambient(binders) => {
-            for b in binders {
-                walk(b, f);
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +418,22 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// 提供されないまま漏れたスロット(手順2の検査対象)
+    fn escaping(p: &Program, f: &str) -> BTreeSet<String> {
+        let slots = collect_slots(p);
+        scan_body(body_of(p, f), &slots).escaping
+    }
+
+    /// 呼び出し辺の行き先(手順3の検査対象)。提供の有無はここでは見ない
+    fn callees(p: &Program, f: &str) -> BTreeSet<String> {
+        let slots = collect_slots(p);
+        scan_body(body_of(p, f), &slots)
+            .calls
+            .into_iter()
+            .map(|c| c.callee)
+            .collect()
+    }
+
     // ---- 手順1 ----
 
     #[test]
@@ -573,11 +467,7 @@ mod tests {
              \x20 db.save(u)\n\
              }\n",
         );
-        let slots = collect_slots(&p);
-        assert_eq!(
-            direct_uses(body_of(&p, "stamp"), &slots),
-            set(&["clock", "db"])
-        );
+        assert_eq!(escaping(&p, "stamp"), set(&["clock", "db"]));
     }
 
     #[test]
@@ -588,8 +478,7 @@ mod tests {
              \x20 u.rank\n\
              }\n",
         );
-        let slots = collect_slots(&p);
-        assert!(direct_uses(body_of(&p, "f"), &slots).is_empty());
+        assert!(escaping(&p, "f").is_empty());
     }
 
     // ---- 手順3 ----
@@ -606,11 +495,7 @@ mod tests {
              \x20 true\n\
              }\n",
         );
-        let slots = collect_slots(&p);
-        assert_eq!(
-            calls(body_of(&p, "promote"), &slots),
-            set(&["audit", "stamp"])
-        );
+        assert_eq!(callees(&p, "promote"), set(&["audit", "stamp"]));
     }
 
     #[test]
@@ -624,8 +509,7 @@ mod tests {
              }\n",
         );
         // db.save は Field 越し、Postgres::new は Path。辺になるのは stamp だけ
-        let slots = collect_slots(&p);
-        assert_eq!(calls(body_of(&p, "f"), &slots), set(&["stamp"]));
+        assert_eq!(callees(&p, "f"), set(&["stamp"]));
     }
 
     #[test]
@@ -640,16 +524,10 @@ mod tests {
              \x20 }\n\
              }\n",
         );
-        let slots = collect_slots(&p);
-        assert_eq!(calls(body_of(&p, "main"), &slots), set(&["handle"]));
+        assert_eq!(callees(&p, "main"), set(&["handle"]));
     }
 
     // ---- 手順4 ----
-
-    fn escaping(p: &Program, f: &str) -> BTreeSet<String> {
-        let slots = collect_slots(p);
-        scan_body(body_of(p, f), &slots).escaping
-    }
 
     #[test]
     fn 手順4_提供されていれば要求は消える() {
@@ -726,24 +604,6 @@ mod tests {
         assert_eq!(facts.calls.len(), 2);
         assert!(facts.calls[0].provided.is_empty());
         assert_eq!(facts.calls[1].provided, set(&["db"]));
-    }
-
-    /// mikan が手書きした `walk` 版と、`provided` を運ぶ版が
-    /// 提供のないコードでは一致すること
-    #[test]
-    fn 手順4_提供がなければ手順2と一致する() {
-        let src = "effect db: Database\n\
-                   effect clock: Clock\n\
-                   fn f(u: User) {\n\
-                   \x20 clock.now()\n\
-                   \x20 db.save(u)\n\
-                   }\n";
-        let p = program(src);
-        let slots = collect_slots(&p);
-        assert_eq!(
-            direct_uses(body_of(&p, "f"), &slots),
-            scan_body(body_of(&p, "f"), &slots).escaping
-        );
     }
 
     // ---- 手順5 + 6 ----
@@ -845,7 +705,6 @@ mod tests {
              \x20 true\n\
              }\n",
         );
-        let slots = collect_slots(&p);
-        assert_eq!(direct_uses(body_of(&p, "promote"), &slots), set(&["db"]));
+        assert_eq!(escaping(&p, "promote"), set(&["db"]));
     }
 }

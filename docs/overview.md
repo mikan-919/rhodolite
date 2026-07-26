@@ -67,19 +67,19 @@ main: `clock` が提供されていません
 | `src/lex.rs` | 字句解析 + 行継続 | 390 |
 | `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 142 |
 | `src/parse.rs` | 再帰下降パーサ | 812 |
-| `src/requirement.rs` | **要求推論(中核)** | 851 |
+| `src/requirement.rs` | **要求推論(中核)** | 710 |
 | `src/main.rs` | 繋ぐだけ | 80 |
 
-`requirement.rs` の中は6段。手順1〜3が mikan の手書き、4〜6が写経対象。
+`requirement.rs` の中は6段。手順1〜3が mikan の手書き、4〜6は代筆。
 
 | 手順 | 関数 | やること |
 |---|---|---|
 | 1 | `collect_slots` | `effect db: Database` を表にする |
-| 2 | `direct_uses` | 本体が直接使っているスロットを集める |
-| 3 | `calls` | 呼び出し辺を集める |
-| 4 | `scan` | **`provided` を引数で下へ運ぶ**。提供が要求を打ち消す |
+| 2〜4 | `scan` | 本体を1回歩いて、直接使用・呼び出し辺・**`provided` による打ち消し**を同時に集める |
 | 5 | `analyze` | 変化がなくなるまで回して要求を伝播させる |
 | 6 | `unsatisfied` | 残った要求を到達経路付きで報告 |
+
+関数ごとの詳細は `docs/requirement-map.md`。
 
 ## 5. 決まっていること(理由は `docs/adr/`)
 
