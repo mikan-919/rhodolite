@@ -225,13 +225,9 @@ fn scan(e: &Expr, slots: &Slots, provided: &BTreeSet<String>, out: &mut BodyFact
 }
 
 /// `db(pg)` という提供から、スロット名 `db` を取り出す。
+/// 提供の形そのものは `Expr::as_provision`(ast.rs)が知っている。
 fn provided_slot_name(binder: &Expr) -> Option<String> {
-    if let ExprKind::Call(callee, _) = &binder.kind {
-        if let ExprKind::Ident(name) = &callee.kind {
-            return Some(name.clone());
-        }
-    }
-    None
+    binder.as_provision().map(|(slot, _)| slot.to_string())
 }
 
 // ---------------------------------------------------------------------------

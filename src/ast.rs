@@ -132,6 +132,21 @@ pub enum ExprKind {
     },
 }
 
+impl Expr {
+    /// `Head::Ambient` の要素を「提供」として読む。`db(pg)` → `("db", [pg])`。
+    ///
+    /// 提供の形を知っているのはこの1箇所だけにする(要求推論と評価の両方が使う)。
+    pub fn as_provision(&self) -> Option<(&str, &[Expr])> {
+        let ExprKind::Call(callee, args) = &self.kind else {
+            return None;
+        };
+        let ExprKind::Ident(slot) = &callee.kind else {
+            return None;
+        };
+        Some((slot, args))
+    }
+}
+
 #[derive(Debug)]
 pub enum Head {
     If(Box<Expr>),

@@ -1,16 +1,17 @@
 //! 評価。構文木を走らせる。
 //!
-//! 段は4つに割ってあり、これは段1(ambient なし)。
+//! 段は4つに割ってあり、いま段3まで済んでいる。
 //!
-//!   1. struct・フィールド・演算・`if`・`return`・関数呼び出し  ← いまここ
+//!   1. struct・フィールド・演算・`if`・`return`・関数呼び出し
 //!   2. `impl` とメソッド呼び出し・配列
 //!   3. **ambient** — `db(store): { ... }` が `db.save(u)` に届く
-//!   4. `test` の実行。`examples/canonical.rd` 完走
+//!   4. `test` の実行。`examples/canonical.rd` 完走  ← 次
 //!
-//! 段3が本番だが、そこで足すのは `Ambient` を引数で下へ渡す1本だけになる。
-//! `Env` は関数呼び出しで作り直し、`Ambient` は渡す — **この差が言語の全部。**
+//! `Env` は `invoke` で作り直し、`Ambient` はそのまま渡す。
+//! **この差1行が言語の全部**(CONTEXT.md「ambient」)。
 
 use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Sig, UnOp};
+use crate::requirement::{collect_slots, Slots};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -145,6 +146,14 @@ fn fail<T>(msg: impl Into<String>) -> Result<T, Flow> {
 /// ローカル束縛。**関数呼び出しで切れる。**
 type Env = HashMap<String, Value>;
 
+/// ambient 束縛。スロット名 → 提供された値。**関数呼び出しで切れない。**
+///
+/// `Env` との差はこれだけ: `invoke` が `Env` を作り直すのに対し、`Ambient` は
+/// そのまま渡す。CONTEXT.md「ambient」の「関数呼び出しで切れないもの」の実装が
+/// この1行の違い。requirement.rs の `scan` が `provided` を引数で運ぶのと同じ形で、
+/// スコープの終わりを書く必要がない(戻った時点で `inner` は消えている)。
+type Ambient = BTreeMap<String, Value>;
+
 // ---------------------------------------------------------------------------
 // インタプリタ
 // ---------------------------------------------------------------------------
@@ -173,6 +182,8 @@ pub struct Interp<'a> {
     /// ponytail: 宣言されたフィールドは検査しない。struct 生成で与えたものが
     /// そのまま入る。型検査を入れるときに突き合わせる
     structs: HashSet<&'a str>,
+    /// スロット名 → trait 名。requirement.rs のものを再利用する
+    slots: Slots,
 }
 
 impl<'a> Interp<'a> {
@@ -210,6 +221,7 @@ impl<'a> Interp<'a> {
             fns,
             methods,
             structs,
+            slots: collect_slots(program),
         }
     }
 
@@ -252,25 +264,56 @@ impl<'a> Interp<'a> {
         Ok(first)
     }
 
+    /// 式がスロット名そのものなら、その名前。`db.save(u)` の `db` を見分ける。
+    ///
+    /// ローカル変数が同じ名前を持っていてもスロットが勝つ。スロット名は
+    /// トップレベルの宣言物なので、影に隠れる方がおかしい
+    fn slot_of<'e>(&self, e: &'e Expr) -> Option<&'e str> {
+        let ExprKind::Ident(name) = &e.kind else {
+            return None;
+        };
+        self.slots.is_slot(name).then_some(name.as_str())
+    }
+
+    /// その型が trait を実装しているか。提供の検査に使う。
+    fn implements(&self, type_name: &str, trait_name: &str) -> bool {
+        self.methods
+            .get(type_name)
+            .is_some_and(|ms| ms.iter().any(|m| m.trait_name == Some(trait_name)))
+    }
+
+    /// エントリ(`main` やテスト)を呼ぶ。
+    ///
+    /// **ambient は空から始まる。**提供されていないものは何も届かない、が出発点。
+    pub fn run(&self, name: &str) -> Eval {
+        self.call(name, Vec::new(), &Ambient::new())
+    }
+
     /// 名前で関数を呼ぶ。
     ///
     /// **`Env` をここで作り直す。**呼び出し元のローカル束縛は届かない。
     /// 段3で足す `Ambient` はこの境界を越える — それが推移性。
-    pub fn call(&self, name: &str, args: Vec<Value>) -> Eval {
+    pub fn call(&self, name: &str, args: Vec<Value>, ambient: &Ambient) -> Eval {
         let Some((sig, body)) = self.fns.get(name) else {
             return fail(format!("関数 `{name}` がありません"));
         };
-        self.invoke(name, sig, body, args, None)
+        self.invoke(name, sig, body, args, None, ambient)
     }
 
     /// `Postgres::new(url)` — レシーバを取らない、型に属する関数。
-    fn call_path(&self, type_name: &str, method: &str, args: Vec<Value>) -> Eval {
+    fn call_path(
+        &self,
+        type_name: &str,
+        method: &str,
+        args: Vec<Value>,
+        ambient: &Ambient,
+    ) -> Eval {
         let m = self.find_method(type_name, method, None)?;
         let what = format!("{type_name}::{method}");
         if m.sig.has_self {
             return fail(format!("`{what}` はレシーバが必要です"));
         }
-        self.invoke(&what, m.sig, m.body, args, None)
+        self.invoke(&what, m.sig, m.body, args, None, ambient)
     }
 
     /// `store.get(id)` — レシーバを取るメソッド。
@@ -282,6 +325,7 @@ impl<'a> Interp<'a> {
         method: &str,
         args: Vec<Value>,
         want_trait: Option<&str>,
+        ambient: &Ambient,
     ) -> Eval {
         let Value::Struct(o) = &recv else {
             return fail(format!(
@@ -298,7 +342,7 @@ impl<'a> Interp<'a> {
                 "`{what}` は self を取りません。`{type_name}::{method}` で呼びます"
             ));
         }
-        self.invoke(&what, m.sig, m.body, args, Some(recv))
+        self.invoke(&what, m.sig, m.body, args, Some(recv), ambient)
     }
 
     /// 本体を新しい `Env` で走らせる。呼び出し3種の共通部分。
@@ -309,6 +353,7 @@ impl<'a> Interp<'a> {
         body: &[Expr],
         args: Vec<Value>,
         recv: Option<Value>,
+        ambient: &Ambient,
     ) -> Eval {
         if sig.params.len() != args.len() {
             return fail(format!(
@@ -327,7 +372,8 @@ impl<'a> Interp<'a> {
             env.insert(p.name.clone(), a);
         }
 
-        match self.block(body, &mut env) {
+        // **ここが言語の全部。**`env` は上で新しく作った。`ambient` はそのまま渡す
+        match self.block(body, &mut env, ambient) {
             Err(Flow::Return(v)) => Ok(v),
             other => other,
         }
@@ -337,15 +383,15 @@ impl<'a> Interp<'a> {
     ///
     /// ponytail: ブロックごとに新しいスコープを作らない。`let` は外へ漏れる。
     /// 外の変数への代入が消えないほうを優先した。シャドーイングが要るときに分ける
-    fn block(&self, body: &[Expr], env: &mut Env) -> Eval {
+    fn block(&self, body: &[Expr], env: &mut Env, ambient: &Ambient) -> Eval {
         let mut last = Value::Unit;
         for e in body {
-            last = self.eval(e, env)?;
+            last = self.eval(e, env, ambient)?;
         }
         Ok(last)
     }
 
-    fn eval(&self, e: &Expr, env: &mut Env) -> Eval {
+    fn eval(&self, e: &Expr, env: &mut Env, ambient: &Ambient) -> Eval {
         match &e.kind {
             ExprKind::Int(n) => Ok(Value::Int(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
@@ -360,7 +406,7 @@ impl<'a> Interp<'a> {
             },
 
             ExprKind::Let { name, value } => {
-                let v = self.eval(value, env)?;
+                let v = self.eval(value, env, ambient)?;
                 env.insert(name.clone(), v);
                 Ok(Value::Unit)
             }
@@ -368,14 +414,14 @@ impl<'a> Interp<'a> {
             ExprKind::StructLit { name, fields } => {
                 let mut obj = BTreeMap::new();
                 for (k, v) in fields {
-                    let v = self.eval(v, env)?;
+                    let v = self.eval(v, env, ambient)?;
                     obj.insert(k.clone(), v);
                 }
                 Ok(new_obj(name, obj))
             }
 
             ExprKind::Field(recv, name) => {
-                let Value::Struct(o) = self.eval(recv, env)? else {
+                let Value::Struct(o) = self.eval(recv, env, ambient)? else {
                     return fail(format!("`.{name}` を読めません。struct ではありません"));
                 };
                 match o.borrow().fields.get(name) {
@@ -385,13 +431,13 @@ impl<'a> Interp<'a> {
             }
 
             ExprKind::Assign { target, value } => {
-                let v = self.eval(value, env)?;
+                let v = self.eval(value, env, ambient)?;
                 match &target.kind {
                     ExprKind::Ident(n) => {
                         env.insert(n.clone(), v);
                     }
                     ExprKind::Field(recv, f) => {
-                        let Value::Struct(o) = self.eval(recv, env)? else {
+                        let Value::Struct(o) = self.eval(recv, env, ambient)? else {
                             return fail(format!("`.{f}` に代入できません。struct ではありません"));
                         };
                         o.borrow_mut().fields.insert(f.clone(), v);
@@ -403,60 +449,71 @@ impl<'a> Interp<'a> {
 
             ExprKind::Return(v) => {
                 let v = match v {
-                    Some(e) => self.eval(e, env)?,
+                    Some(e) => self.eval(e, env, ambient)?,
                     None => Value::Unit,
                 };
                 Err(Flow::Return(v))
             }
 
-            ExprKind::Assert(inner) => match self.eval(inner, env)? {
+            ExprKind::Assert(inner) => match self.eval(inner, env, ambient)? {
                 Value::Bool(true) => Ok(Value::Unit),
                 Value::Bool(false) => fail("assert が偽になりました"),
                 other => fail(format!("assert には bool が必要です ({})", other.show())),
             },
 
-            ExprKind::Unary(UnOp::Neg, inner) => match self.eval(inner, env)? {
+            ExprKind::Unary(UnOp::Neg, inner) => match self.eval(inner, env, ambient)? {
                 Value::Int(n) => Ok(Value::Int(-n)),
                 other => fail(format!("`-` は整数だけです ({})", other.show())),
             },
 
-            ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, env),
+            ExprKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, env, ambient),
 
-            ExprKind::Block(body) => self.block(body, env),
+            ExprKind::Block(body) => self.block(body, env, ambient),
 
             // レシーバ → 引数 の順に評価する(左から右)
             ExprKind::Call(callee, args) => {
-                // ここでレシーバがスロットなら trait が分かるので候補を絞れる。
-                // それは段3(ambient)の仕事。いまは常に None
+                // レシーバがスロットなら、値は ambient から来て、trait が
+                // `effect db: Database` から分かる。**スロット経由は必ず一意に決まる**
+                // (CONTEXT.md「スロットは常に名前を持つので曖昧性が発生しない」)
                 let recv = match &callee.kind {
-                    ExprKind::Field(r, _) => Some(self.eval(r, env)?),
+                    ExprKind::Field(r, m) => Some(match self.slot_of(r) {
+                        Some(slot) => {
+                            let Some(v) = ambient.get(slot) else {
+                                return fail(format!(
+                                    "`{slot}` が提供されていません(`.{m}` の呼び出し)"
+                                ));
+                            };
+                            (v.clone(), self.slots.trait_of(slot))
+                        }
+                        None => (self.eval(r, env, ambient)?, None),
+                    }),
                     _ => None,
                 };
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    vals.push(self.eval(a, env)?);
+                    vals.push(self.eval(a, env, ambient)?);
                 }
                 match (&callee.kind, recv) {
-                    (ExprKind::Ident(name), _) => self.call(name, vals),
+                    (ExprKind::Ident(name), _) => self.call(name, vals, ambient),
                     (ExprKind::Path(parts), _) => match parts.as_slice() {
-                        [type_name, method] => self.call_path(type_name, method, vals),
+                        [type_name, method] => self.call_path(type_name, method, vals, ambient),
                         _ => fail(format!("`{}` は呼べません", parts.join("::"))),
                     },
-                    (ExprKind::Field(_, m), Some(recv)) => {
-                        self.call_method(recv, m, vals, None)
+                    (ExprKind::Field(_, m), Some((recv, want_trait))) => {
+                        self.call_method(recv, m, vals, want_trait, ambient)
                     }
                     _ => fail("呼べない式です"),
                 }
             }
 
             ExprKind::Head { head, body, orelse } => {
-                self.head(head, body, orelse.as_deref(), env)
+                self.head(head, body, orelse.as_deref(), env, ambient)
             }
 
             ExprKind::Array(items) => {
                 let mut xs = Vec::with_capacity(items.len());
                 for i in items {
-                    xs.push(self.eval(i, env)?);
+                    xs.push(self.eval(i, env, ambient)?);
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(xs))))
             }
@@ -465,20 +522,27 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn binary(&self, op: BinOp, lhs: &Expr, rhs: &Expr, env: &mut Env) -> Eval {
+    fn binary(
+        &self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        env: &mut Env,
+        ambient: &Ambient,
+    ) -> Eval {
         // `??` は短絡する。`db.find(id) ?? return false` の右辺は
         // 左辺が nil のときだけ走らないといけない
         if let BinOp::Coalesce = op {
-            let l = self.eval(lhs, env)?;
+            let l = self.eval(lhs, env, ambient)?;
             return if matches!(l, Value::Nil) {
-                self.eval(rhs, env)
+                self.eval(rhs, env, ambient)
             } else {
                 Ok(l)
             };
         }
 
-        let l = self.eval(lhs, env)?;
-        let r = self.eval(rhs, env)?;
+        let l = self.eval(lhs, env, ambient)?;
+        let r = self.eval(rhs, env, ambient)?;
 
         if let BinOp::Eq = op {
             return Ok(Value::Bool(l.eq(&r)?));
@@ -501,26 +565,33 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn head(&self, head: &Head, body: &Expr, orelse: Option<&Expr>, env: &mut Env) -> Eval {
+    fn head(
+        &self,
+        head: &Head,
+        body: &Expr,
+        orelse: Option<&Expr>,
+        env: &mut Env,
+        ambient: &Ambient,
+    ) -> Eval {
         match head {
             Head::If(c) | Head::Elif(c) => {
-                if self.cond(c, env)? {
-                    self.eval(body, env)
+                if self.cond(c, env, ambient)? {
+                    self.eval(body, env, ambient)
                 } else if let Some(o) = orelse {
-                    self.eval(o, env)
+                    self.eval(o, env, ambient)
                 } else {
                     Ok(Value::Unit)
                 }
             }
-            Head::Else => self.eval(body, env),
+            Head::Else => self.eval(body, env, ambient),
             Head::While(c) => {
-                while self.cond(c, env)? {
-                    self.eval(body, env)?;
+                while self.cond(c, env, ambient)? {
+                    self.eval(body, env, ambient)?;
                 }
                 Ok(Value::Unit)
             }
             Head::For { var, iter } => {
-                let Value::Array(xs) = self.eval(iter, env)? else {
+                let Value::Array(xs) = self.eval(iter, env, ambient)? else {
                     return fail("for で回せるのは配列だけです");
                 };
                 // ponytail: 開始時点のスナップショットを回す。本体が同じ配列を
@@ -528,16 +599,56 @@ impl<'a> Interp<'a> {
                 let snapshot: Vec<Value> = xs.borrow().clone();
                 for v in snapshot {
                     env.insert(var.clone(), v);
-                    self.eval(body, env)?;
+                    self.eval(body, env, ambient)?;
                 }
                 Ok(Value::Unit)
             }
-            Head::Ambient(_) => fail("段3で実装: ambient の提供"),
+            // `db(store), clock(Frozen::at(1000)): { ... }` — 提供。
+            //
+            // requirement.rs の `scan` と同じ形。**スコープの終わりを書かない** —
+            // `self.eval(body, env, &inner)` から戻れば `inner` は消えていて、
+            // 呼び出し元は元の `ambient` を持ったまま。字句スコープを
+            // 呼び出しスタックがそのまま表現している。
+            Head::Ambient(binders) => {
+                let mut inner = ambient.clone();
+                for b in binders {
+                    let Some((slot, args)) = b.as_provision() else {
+                        return fail("提供は `db(値)` の形で書きます");
+                    };
+                    let Some(want_trait) = self.slots.trait_of(slot) else {
+                        return fail(format!("`{slot}` はスロットではありません"));
+                    };
+                    let [value] = args else {
+                        return fail(format!("`{slot}(...)` に渡す値は1つです"));
+                    };
+
+                    // 提供する値は**提供の外**で評価する。`db(make(clock.now()))` の
+                    // clock は db が立つ前に走る(requirement.rs の手順4と同じ規則)
+                    let v = self.eval(value, env, ambient)?;
+
+                    let Value::Struct(o) = &v else {
+                        return fail(format!(
+                            "`{slot}` に渡せるのは struct だけです ({})",
+                            v.show()
+                        ));
+                    };
+                    let type_name = o.borrow().type_name.clone();
+                    if !self.implements(&type_name, want_trait) {
+                        return fail(format!(
+                            "`{type_name}` は `{want_trait}` を実装していないので `{slot}` に渡せません"
+                        ));
+                    }
+
+                    // 内側勝ち。同じスロットの入れ子は上書きになる
+                    inner.insert(slot.to_string(), v);
+                }
+                self.eval(body, env, &inner)
+            }
         }
     }
 
-    fn cond(&self, c: &Expr, env: &mut Env) -> Result<bool, Flow> {
-        match self.eval(c, env)? {
+    fn cond(&self, c: &Expr, env: &mut Env, ambient: &Ambient) -> Result<bool, Flow> {
+        match self.eval(c, env, ambient)? {
             Value::Bool(b) => Ok(b),
             other => fail(format!("条件には bool が必要です ({})", other.show())),
         }
@@ -564,7 +675,7 @@ mod tests {
     /// ソースを評価して、指定した関数を引数なしで呼ぶ
     fn run(src: &str, entry: &str) -> Result<Value, String> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        Interp::new(&program).call(entry, vec![]).map_err(|f| match f {
+        Interp::new(&program).run(entry).map_err(|f| match f {
             Flow::Error(m) => m,
             Flow::Return(v) => panic!("return が関数境界を越えた: {}", v.show()),
         })
@@ -865,15 +976,163 @@ mod tests {
         assert!(run(src, "main").is_err());
     }
 
+    // ---- 段3: ambient ----
+
+    /// 土台。`Frozen` を `clock` に提供して `clock.now()` が届く
+    const CLOCK: &str = "effect clock: Clock\n\
+                         struct Frozen { t: Time }\n\
+                         impl Frozen {\n\
+                         \x20 fn at(t: Time -> Frozen) {\n\
+                         \x20   Frozen { t = t }\n\
+                         \x20 }\n\
+                         }\n\
+                         impl Clock for Frozen {\n\
+                         \x20 fn now(self -> Time) {\n\
+                         \x20   self.t\n\
+                         \x20 }\n\
+                         }\n";
+
     #[test]
-    fn ambientはまだ段3() {
-        let src = "effect db: Database\n\
+    fn 提供したハンドラがスロット経由で呼ばれる() {
+        let src = format!(
+            "{CLOCK}\
+             fn main() {{\n\
+             \x20 clock(Frozen::at(1000)): {{\n\
+             \x20   clock.now()\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 1000);
+    }
+
+    /// **この言語の一点突破。**
+    /// `promote` は1文字も書いていないのに `stamp` の要求が `main` から届く
+    #[test]
+    fn ambientは関数呼び出しで切れない() {
+        let src = format!(
+            "{CLOCK}\
+             fn stamp(-> Time) {{\n\
+             \x20 clock.now()\n\
+             }}\n\
+             fn promote(-> Time) {{\n\
+             \x20 stamp()\n\
+             }}\n\
+             fn handle(-> Time) {{\n\
+             \x20 promote()\n\
+             }}\n\
+             fn main() {{\n\
+             \x20 clock(Frozen::at(1000)): {{\n\
+             \x20   handle()\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 1000);
+    }
+
+    /// 対になる確認。`let` はどれだけ近くても呼び出し先に届かない
+    #[test]
+    fn 通常の束縛は呼び出しで切れる() {
+        let src = "fn callee(-> Int) {\n\
+                   \x20 c\n\
+                   }\n\
                    fn main() {\n\
-                   \x20 db(pg): {\n\
-                   \x20   1\n\
-                   \x20 }\n\
+                   \x20 let c = 1\n\
+                   \x20 callee()\n\
                    }\n";
         assert!(run(src, "main").is_err());
+    }
+
+    /// 差し替え。**呼ばれる側を一切変更しない**
+    #[test]
+    fn 同じ関数が提供を変えると別の答えを返す() {
+        let src = format!(
+            "{CLOCK}\
+             fn stamp(-> Time) {{\n\
+             \x20 clock.now()\n\
+             }}\n\
+             fn main(-> Int) {{\n\
+             \x20 let a = clock(Frozen::at(1)): {{ stamp() }}\n\
+             \x20 let b = clock(Frozen::at(2)): {{ stamp() }}\n\
+             \x20 b - a\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 1);
+    }
+
+    #[test]
+    fn 提供はブロックの外へ出ない() {
+        let src = format!(
+            "{CLOCK}\
+             fn main() {{\n\
+             \x20 clock(Frozen::at(1000)): {{ clock.now() }}\n\
+             \x20 clock.now()\n\
+             }}\n"
+        );
+        let e = run(&src, "main").expect_err("外では提供されていない");
+        assert!(e.contains("提供されていません"), "{e}");
+    }
+
+    #[test]
+    fn 入れ子は内側が勝つ() {
+        let src = format!(
+            "{CLOCK}\
+             fn main() {{\n\
+             \x20 clock(Frozen::at(1)): {{\n\
+             \x20   clock(Frozen::at(2)): {{\n\
+             \x20     clock.now()\n\
+             \x20   }}\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 2);
+    }
+
+    /// 提供する値は提供の**外**で評価される(requirement.rs 手順4と同じ規則)
+    #[test]
+    fn 提供する値は提供の外で評価される() {
+        let src = format!(
+            "{CLOCK}\
+             fn main() {{\n\
+             \x20 clock(Frozen::at(clock.now())): {{ 1 }}\n\
+             }}\n"
+        );
+        let e = run(&src, "main").expect_err("clock はまだ立っていない");
+        assert!(e.contains("提供されていません"), "{e}");
+    }
+
+    /// トレイトを実装していない値はスロットに入らない
+    #[test]
+    fn 実装していない値は提供できない() {
+        let src = "effect clock: Clock\n\
+                   struct Nope {}\n\
+                   fn main() {\n\
+                   \x20 clock(Nope {}): { 1 }\n\
+                   }\n";
+        let e = run(src, "main").expect_err("Clock を実装していない");
+        assert!(e.contains("実装していない"), "{e}");
+    }
+
+    /// 同じ型が2つの trait に同名メソッドを持っていても、スロット経由なら決まる
+    #[test]
+    fn スロット経由なら同名メソッドでも曖昧にならない() {
+        let src = "effect clock: Clock\n\
+                   struct Both {}\n\
+                   impl Clock for Both {\n\
+                   \x20 fn now(self -> Int) {\n\
+                   \x20   1\n\
+                   \x20 }\n\
+                   }\n\
+                   impl Other for Both {\n\
+                   \x20 fn now(self -> Int) {\n\
+                   \x20   2\n\
+                   \x20 }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 clock(Both {}): { clock.now() }\n\
+                   }\n";
+        // ただの変数なら「どの trait か決まらない」になる場面。
+        // スロットには trait 名が付いているので Clock 側が選ばれる
+        assert_eq!(int(src), 1);
     }
 
     /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと

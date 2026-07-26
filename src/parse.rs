@@ -716,7 +716,11 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let name = self.expect_ident("変数名")?;
                 self.expect(&Tok::Eq, "`=`")?;
-                let value = self.expr()?;
+                // 値は `stmt` で読む。値ベースなので Head も値を産む
+                // (`let r = db(replica): { collect() }` — CONTEXT.md「第二級ブロック」)。
+                // `expr` で読むと `:` が let の外に残り、`let` 全体が
+                // ambient の binder として読まれてしまう
+                let value = self.stmt()?;
                 ExprKind::Let {
                     name,
                     value: Box::new(value),
@@ -819,6 +823,24 @@ mod tests {
         assert!(
             matches!(&p.items[1], Item::Effect { slot, trait_name, .. }
                      if slot == "db" && trait_name == "Database")
+        );
+    }
+
+    /// 値ベースなので Head も値を産む。`let` の右辺に来られること
+    /// (CONTEXT.md「第二級ブロック」の `let r = db(replica): { collect() }`)
+    #[test]
+    fn letの右辺にheadが来られる() {
+        let p = ok("fn main() {\n  let r = db(replica): { 1 }\n}\n");
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!()
+        };
+        let ExprKind::Let { value, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Head { head: Head::Ambient(bs), .. } if bs.len() == 1),
+            "右辺が Head になっていない: {:?}",
+            value.kind
         );
     }
 
