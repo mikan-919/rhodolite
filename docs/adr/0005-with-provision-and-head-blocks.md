@@ -148,7 +148,8 @@ if user == (User { id = 1 }) { ... }  // 書ける
 
 ADR-0004に従い、この判断を実装するために次の構造を追加する。
 
-- `Tok::With` — `with`を予約語として字句解析する
+- `Tok::With` / `Tok::Less` / `Tok::Greater` — `with`と型提供の`<...>`を字句解析する。
+  `<`と`>`へ比較演算子の意味はまだ持たせない
 - `Provision` — 型提供と実体提供をAST上で区別する
   - `Type { slot, type_name }`
   - `Value { slot, value }`
