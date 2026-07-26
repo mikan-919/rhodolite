@@ -100,6 +100,7 @@ main: `clock` が提供されていません
 | 0002 | `effect` は**スロット宣言**。契約は trait。記述は4箇所だけ |
 | 0003 | whole-program 単相化でエフェクト変数を型から消す |
 | 0004 | 構造の追加は mikan が決める(申告制)。それ以外は代筆 |
+| 0005 | ブロック形から `:` を外し、ambient 提供を `with` で書く |
 
 文法は `docs/grammar.md`、用語は `CONTEXT.md`、プロジェクトの目的は `README.md`。
 **まだ決まっていない設計は `docs/design-notes/`**（測った結果・却下案・未決の問い）。
