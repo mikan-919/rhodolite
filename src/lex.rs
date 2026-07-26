@@ -37,6 +37,8 @@ pub enum Tok {
     SelfKw,
     Effect,
     Test,
+    Use,
+    As,
     Return,
     Assert,
     True,
@@ -239,6 +241,8 @@ fn keyword_or_ident(w: &str) -> Tok {
         "self" => Tok::SelfKw,
         "effect" => Tok::Effect,
         "test" => Tok::Test,
+        "use" => Tok::Use,
+        "as" => Tok::As,
         "return" => Tok::Return,
         "assert" => Tok::Assert,
         "true" => Tok::True,
@@ -352,6 +356,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::Impl
             | Tok::Effect
             | Tok::Test
+            | Tok::Use
             | Tok::Return
             | Tok::Assert
             | Tok::RBrace // ブロックの終わりは「次の文」ではないが改行は残したい

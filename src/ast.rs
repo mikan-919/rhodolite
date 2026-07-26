@@ -7,7 +7,23 @@ use crate::lex::Span;
 
 #[derive(Debug)]
 pub struct Program {
+    pub uses: Vec<UseDecl>,
     pub items: Vec<Item>,
+}
+
+/// `use data::database` / `use data::database::{Database, db}`
+#[derive(Debug, Clone)]
+pub struct UseDecl {
+    pub path: Vec<String>,
+    pub alias: Option<String>,
+    pub members: Option<Vec<UseMember>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct UseMember {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug)]

@@ -3,9 +3,11 @@
 mod ast;
 mod eval;
 mod lex;
+mod module;
 mod parse;
 mod requirement;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -13,29 +15,17 @@ fn main() -> ExitCode {
         .nth(1)
         .unwrap_or_else(|| "examples/canonical.rd".to_string());
 
-    let src = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("{path} を読めません: {e}");
+    let loaded = match module::load(Path::new(&path)) {
+        Ok(program) => program,
+        Err(errors) => {
+            for error in errors {
+                eprintln!("{error}");
+            }
             return ExitCode::FAILURE;
         }
     };
-
-    let tokens = match lex::lex(&src) {
-        Ok(t) => lex::join(t),
-        Err(e) => {
-            eprintln!("{path}: 字句解析エラー: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let program = match parse::parse(&tokens) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let program = loaded.program;
+    let entry = loaded.entry;
 
     println!("{path}: {} 個の宣言", program.items.len());
     for item in &program.items {
@@ -54,7 +44,7 @@ fn main() -> ExitCode {
     println!("\n推論された要求:");
     print!("{}", analysis.render());
 
-    let errors = analysis.errors();
+    let errors = analysis.errors_for(&entry);
     if !errors.is_empty() {
         eprintln!();
         for e in &errors {
@@ -64,11 +54,11 @@ fn main() -> ExitCode {
     }
 
     // 検査を通ったので走らせる
-    run(&program)
+    run(&program, &entry)
 }
 
 /// `test` があれば全部走らせる。無ければ `main` を走らせる。
-fn run(program: &ast::Program) -> ExitCode {
+fn run(program: &ast::Program, entry: &str) -> ExitCode {
     let interp = eval::Interp::new(program);
 
     let tests: Vec<(&str, &[ast::Expr])> = program
@@ -82,7 +72,7 @@ fn run(program: &ast::Program) -> ExitCode {
 
     if tests.is_empty() {
         println!("\n実行:");
-        return match interp.run("main") {
+        return match interp.run(entry) {
             Ok(v) => {
                 println!("  main -> {}", v.show());
                 ExitCode::SUCCESS

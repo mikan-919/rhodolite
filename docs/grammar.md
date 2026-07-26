@@ -3,6 +3,32 @@
 `examples/canonical.rd` をパースできるところまでの確定分。
 用語は [CONTEXT.md](../CONTEXT.md)、設計判断の理由は [adr/](./adr/)。
 
+## モジュールと `use`
+
+エントリーファイルの親ディレクトリをソースルートとし、`.rd` ファイルと
+ディレクトリをモジュール木に対応させる。依存先の読み込みと名前導入は、モジュール
+先頭の接頭部に置く `use` が同時に行う。
+
+```ebnf
+use_decl   ::= 'use' module_path ('as' ident)?
+             | 'use' module_path '::' '{' use_member (',' use_member)* ','? '}'
+use_member ::= ident ('as' ident)?
+module_path ::= ident ('::' ident)*
+```
+
+```rhodolite
+use data::database
+use services::{
+    users,
+    billing as payments,
+}
+```
+
+波括弧なしはモジュール自身、波括弧ありはそのメンバーを導入する。パスは常に
+ソースルート基準で、相対パス・glob・外部パッケージはない。詳細な読み込み規則、
+名前衝突、循環 `use` は
+[ADR-0006](./adr/0006-modules-are-loaded-by-use.md)による。
+
 ## 産出は4つ。例外なし
 
 ```

@@ -93,6 +93,12 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(s)
             }
+            // `use` はトップレベル接頭部でだけキーワードとして扱う。
+            // 既存プログラムの `fn use()` / `use(x)` は引き続き識別子として読める。
+            Tok::Use => {
+                self.bump();
+                Ok("use".to_string())
+            }
             other => Err(self.err(&format!("{} が必要です (実際は {:?})", what, other))),
         }
     }
@@ -125,15 +131,77 @@ impl<'a> Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn program(&mut self) -> PResult<Program> {
+        let mut uses = Vec::new();
         let mut items = Vec::new();
+        self.skip_newlines();
+        while self.at(&Tok::Use) {
+            uses.push(self.use_decl()?);
+            self.skip_newlines();
+        }
         loop {
             self.skip_newlines();
             if self.at(&Tok::Eof) {
                 break;
             }
+            if self.at(&Tok::Use) {
+                return Err(self.err("`use` はモジュール先頭の接頭部にだけ書けます"));
+            }
             items.push(self.item()?);
         }
-        Ok(Program { items })
+        Ok(Program { uses, items })
+    }
+
+    fn use_decl(&mut self) -> PResult<UseDecl> {
+        let start = self.span();
+        self.expect(&Tok::Use, "`use`")?;
+        let mut path = vec![self.expect_ident("モジュール名")?];
+
+        while self.eat(&Tok::ColonColon) {
+            if self.eat(&Tok::LBrace) {
+                let mut members = Vec::new();
+                self.skip_newlines();
+                if self.at(&Tok::RBrace) {
+                    return Err(self.err("`use` の選択リストは空にできません"));
+                }
+                loop {
+                    let name = self.expect_ident("選択するメンバー名")?;
+                    let alias = if self.eat(&Tok::As) {
+                        Some(self.expect_ident("別名")?)
+                    } else {
+                        None
+                    };
+                    members.push(UseMember { name, alias });
+                    self.skip_newlines();
+                    if !self.eat(&Tok::Comma) {
+                        self.expect(&Tok::RBrace, "`}`")?;
+                        break;
+                    }
+                    self.skip_newlines();
+                    if self.eat(&Tok::RBrace) {
+                        break;
+                    }
+                }
+                return Ok(UseDecl {
+                    path,
+                    alias: None,
+                    members: Some(members),
+                    span: self.to(start),
+                });
+            }
+            path.push(self.expect_ident("モジュールパスの続き")?);
+        }
+
+        let alias = if self.eat(&Tok::As) {
+            Some(self.expect_ident("別名")?)
+        } else {
+            None
+        };
+        Ok(UseDecl {
+            path,
+            alias,
+            members: None,
+            span: self.to(start),
+        })
     }
 
     fn item(&mut self) -> PResult<Item> {
@@ -186,9 +254,9 @@ impl<'a> Parser<'a> {
             // ハンドラに専用構文は無い(CONTEXT.md「ハンドラ」)。ただの impl。
             Tok::Impl => {
                 self.bump();
-                let first = self.expect_ident("trait 名または型名")?;
+                let first = self.name_path("trait 名または型名")?;
                 let (trait_name, type_name) = if self.eat(&Tok::For) {
-                    (Some(first), self.expect_ident("型名")?)
+                    (Some(first), self.name_path("型名")?)
                 } else {
                     (None, first)
                 };
@@ -217,7 +285,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let slot = self.expect_ident("スロット名")?;
                 self.expect(&Tok::Colon, "`:`")?;
-                let trait_name = self.expect_ident("trait 名")?;
+                let trait_name = self.name_path("trait 名")?;
                 Ok(Item::Effect {
                     slot,
                     trait_name,
@@ -262,6 +330,14 @@ impl<'a> Parser<'a> {
                 other
             ))),
         }
+    }
+
+    fn name_path(&mut self, what: &str) -> PResult<String> {
+        let mut parts = vec![self.expect_ident(what)?];
+        while self.eat(&Tok::ColonColon) {
+            parts.push(self.expect_ident("パスの続き")?);
+        }
+        Ok(parts.join("::"))
     }
 
     /// `fn find(id: UserId -> User?)` — 戻り値の `->` は括弧の内側にある。
@@ -309,7 +385,7 @@ impl<'a> Parser<'a> {
     }
 
     fn ty(&mut self) -> PResult<Type> {
-        let name = self.expect_ident("型名")?;
+        let name = self.name_path("型名")?;
         let optional = self.eat(&Tok::Question);
         Ok(Type { name, optional })
     }
@@ -411,10 +487,10 @@ impl<'a> Parser<'a> {
 
     /// `db<Type>` または `db(value)`。`with` が先にあるため普通の式とは衝突しない。
     fn provision(&mut self) -> PResult<Provision> {
-        let slot = self.expect_ident("スロット名")?;
+        let slot = self.name_path("スロット名")?;
 
         if self.eat(&Tok::Less) {
-            let type_name = self.expect_ident("実装型")?;
+            let type_name = self.name_path("実装型")?;
             self.expect(&Tok::Greater, "`>`")?;
             return Ok(Provision::Type { slot, type_name });
         }
@@ -656,6 +732,17 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Path(segs),
                     span: self.to(start),
                 };
+            } else if self.at(&Tok::LBrace) && !self.no_struct {
+                let name = match e.kind {
+                    ExprKind::Ident(name) => name,
+                    ExprKind::Path(parts) => parts.join("::"),
+                    _ => break,
+                };
+                let fields = self.struct_fields()?;
+                e = Expr {
+                    kind: ExprKind::StructLit { name, fields },
+                    span: self.to(start),
+                };
             } else {
                 break;
             }
@@ -680,6 +767,28 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::RParen, "`)`")?;
         Ok(args)
+    }
+
+    fn struct_fields(&mut self) -> PResult<Vec<(String, Expr)>> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.eat(&Tok::RBrace) {
+                break;
+            }
+            let fname = self.expect_ident("フィールド名")?;
+            self.expect(&Tok::Eq, "`=`")?;
+            let value = self.expr()?;
+            fields.push((fname, value));
+            self.skip_newlines();
+            if !self.eat(&Tok::Comma) {
+                self.skip_newlines();
+                self.expect(&Tok::RBrace, "`}`")?;
+                break;
+            }
+        }
+        Ok(fields)
     }
 
     fn primary(&mut self) -> PResult<Expr> {
@@ -716,31 +825,11 @@ impl<'a> Parser<'a> {
 
             Tok::Ident(name) => {
                 self.bump();
-                // `Circle { r = 1.0 }` — struct 生成。`=` は「束縛」で let と一貫。
-                // `:` を Head 専用に保つための選択(ADR / docs/grammar.md)。
-                if self.at(&Tok::LBrace) && !self.no_struct {
-                    self.bump();
-                    let mut fields = Vec::new();
-                    loop {
-                        self.skip_newlines();
-                        if self.eat(&Tok::RBrace) {
-                            break;
-                        }
-                        let fname = self.expect_ident("フィールド名")?;
-                        self.expect(&Tok::Eq, "`=`")?;
-                        let value = self.expr()?;
-                        fields.push((fname, value));
-                        self.skip_newlines();
-                        if !self.eat(&Tok::Comma) {
-                            self.skip_newlines();
-                            self.expect(&Tok::RBrace, "`}`")?;
-                            break;
-                        }
-                    }
-                    ExprKind::StructLit { name, fields }
-                } else {
-                    ExprKind::Ident(name)
-                }
+                ExprKind::Ident(name)
+            }
+            Tok::Use => {
+                self.bump();
+                ExprKind::Ident("use".to_string())
             }
 
             Tok::Let => {
@@ -1023,5 +1112,33 @@ mod tests {
     fn 条件直後のbraceはhead本体になる() {
         // `while c { }` の `{ }` を `c` の struct リテラルにはしない
         ok("fn f() {\n  while c { x() }\n}\n");
+    }
+
+    #[test]
+    fn useは先頭でモジュールと選択メンバーを導入する() {
+        let p = ok("use data::database as db_module\n\
+             use services::{\n\
+             \x20 users,\n\
+             \x20 billing as payments,\n\
+             }\n\
+             fn main() { db_module::connect() }\n");
+        assert_eq!(p.uses.len(), 2);
+        assert_eq!(p.uses[0].path, ["data", "database"]);
+        assert_eq!(p.uses[0].alias.as_deref(), Some("db_module"));
+        let members = p.uses[1].members.as_ref().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[1].alias.as_deref(), Some("payments"));
+    }
+
+    #[test]
+    fn useの選択リストは空にできない() {
+        let error = parse_src("use services::{}\nfn main() { 0 }\n").unwrap_err();
+        assert!(error.msg.contains("空にできません"), "{}", error.msg);
+    }
+
+    #[test]
+    fn useはトップレベル接頭部にだけ書ける() {
+        let error = parse_src("fn first() { 1 }\nuse services\n").unwrap_err();
+        assert!(error.msg.contains("先頭"), "{}", error.msg);
     }
 }

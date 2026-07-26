@@ -525,12 +525,11 @@ fn duplicate_slot_diagnostics(program: &Program) -> Vec<String> {
         if let Item::Effect {
             slot, trait_name, ..
         } = item
+            && let Some(previous_trait) = declared.insert(slot, trait_name)
         {
-            if let Some(previous_trait) = declared.insert(slot, trait_name) {
-                diagnostics.push(format!(
-                    "effect `{slot}` が重複しています (`{previous_trait}` と `{trait_name}`)"
-                ));
-            }
+            diagnostics.push(format!(
+                "effect `{slot}` が重複しています (`{previous_trait}` と `{trait_name}`)"
+            ));
         }
     }
 
@@ -554,9 +553,16 @@ fn merge_requirement(reqs: &mut Reqs, slot: &str, level: SlotLevel, path: Vec<St
 
 impl Analysis {
     /// 要求解析より前に見つかる宣言・名前解決エラーと、提供忘れをまとめて返す。
+    #[cfg(test)]
     pub fn errors(&self) -> Vec<String> {
         let mut errors = self.diagnostics.clone();
         errors.extend(self.unsatisfied());
+        errors
+    }
+
+    pub fn errors_for(&self, entry: &str) -> Vec<String> {
+        let mut errors = self.diagnostics.clone();
+        errors.extend(self.unsatisfied_for(entry));
         errors
     }
 
@@ -584,11 +590,16 @@ impl Analysis {
     /// エントリ(`main` とテスト)に要求が残っていたら、それは提供忘れ。
     ///
     /// 到達経路を添えて返す。原因は数階層下にあるので、経路がないと直せない。
+    #[cfg(test)]
     pub fn unsatisfied(&self) -> Vec<String> {
+        self.unsatisfied_for("main")
+    }
+
+    pub fn unsatisfied_for(&self, entry: &str) -> Vec<String> {
         let mut errors = Vec::new();
 
         for name in &self.order {
-            let is_entry = name == "main" || name.starts_with("test \"");
+            let is_entry = name == entry || name.starts_with("test \"");
             if !is_entry {
                 continue;
             }
