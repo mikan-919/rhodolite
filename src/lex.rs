@@ -54,6 +54,8 @@ pub enum Tok {
     ColonColon, // パス
     Comma,
     Dot,
+    Less,
+    Greater,
     Eq,       // 束縛
     EqEq,     // 比較
     Arrow,    // -> 戻り値
@@ -176,6 +178,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b':' => Tok::Colon,
             b',' => Tok::Comma,
             b'.' => Tok::Dot,
+            b'<' => Tok::Less,
+            b'>' => Tok::Greater,
             b'=' => Tok::Eq,
             b'?' => Tok::Question,
             b'+' => Tok::Plus,

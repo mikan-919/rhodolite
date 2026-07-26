@@ -363,9 +363,9 @@ impl<'a> Parser<'a> {
         // `with db(value), clock(value) { ... }` — ambient の提供。
         if self.at(&Tok::With) {
             self.bump();
-            let mut binders = vec![self.expr()?];
+            let mut binders = vec![self.provision()?];
             while self.eat(&Tok::Comma) {
-                binders.push(self.expr()?);
+                binders.push(self.provision()?);
             }
             let body = self.head_body()?;
             return Ok(Expr {
@@ -410,9 +410,13 @@ impl<'a> Parser<'a> {
         // ここから先は普通の式。ただし `:` が続けば ambient の Head だったと判明する
         let first = self.expr()?;
         if self.at(&Tok::Comma) || self.at(&Tok::Colon) {
-            let mut binders = vec![first];
+            let mut exprs = vec![first];
             while self.eat(&Tok::Comma) {
-                binders.push(self.expr()?);
+                exprs.push(self.expr()?);
+            }
+            let mut binders = Vec::new();
+            for expr in exprs {
+                binders.push(self.legacy_provision(expr)?);
             }
             let body = self.head_body()?;
             return Ok(Expr {
@@ -425,6 +429,42 @@ impl<'a> Parser<'a> {
             });
         }
         Ok(first)
+    }
+
+    /// `db<Type>` または `db(value)`。`with` が先にあるため普通の式とは衝突しない。
+    fn provision(&mut self) -> PResult<Provision> {
+        let slot = self.expect_ident("スロット名")?;
+
+        if self.eat(&Tok::Less) {
+            let type_name = self.expect_ident("実装型")?;
+            self.expect(&Tok::Greater, "`>`")?;
+            return Ok(Provision::Type { slot, type_name });
+        }
+
+        self.expect(&Tok::LParen, "`<型>` または `(値)`")?;
+        let saved = std::mem::replace(&mut self.no_struct, false);
+        let value = self.expr();
+        self.no_struct = saved;
+        let value = value?;
+        self.expect(&Tok::RParen, "`)`")?;
+        Ok(Provision::Value { slot, value })
+    }
+
+    /// 移行中の旧構文 `db(value): { ... }` を新しいASTへ畳む。
+    fn legacy_provision(&self, expr: Expr) -> PResult<Provision> {
+        let ExprKind::Call(callee, mut args) = expr.kind else {
+            return Err(self.err("提供は `with db(値) { ... }` の形で書きます"));
+        };
+        let ExprKind::Ident(slot) = callee.kind else {
+            return Err(self.err("提供先にはスロット名が必要です"));
+        };
+        if args.len() != 1 {
+            return Err(self.err("スロットへ提供する値は1つです"));
+        }
+        Ok(Provision::Value {
+            slot,
+            value: args.remove(0),
+        })
     }
 
     /// `if`/`elif` の本体と、後続の `elif`/`else` を読む。
@@ -968,6 +1008,26 @@ mod tests {
             panic!("with が ambient head になっていない: {:?}", body[0].kind)
         };
         assert_eq!(binders.len(), 2);
+    }
+
+    #[test]
+    fn withは型だけを提供できる() {
+        let p = ok("fn main() {\n  with db<Postgres> { db::new() }\n}\n");
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!()
+        };
+        let ExprKind::Head {
+            head: Head::Ambient(binders),
+            ..
+        } = &body[0].kind
+        else {
+            panic!("with が ambient head になっていない: {:?}", body[0].kind)
+        };
+        assert!(matches!(
+            binders.as_slice(),
+            [Provision::Type { slot, type_name }]
+                if slot == "db" && type_name == "Postgres"
+        ));
     }
 
     #[test]

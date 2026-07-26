@@ -134,18 +134,19 @@ pub enum ExprKind {
     },
 }
 
-impl Expr {
-    /// `Head::Ambient` の要素を「提供」として読む。`db(pg)` → `("db", [pg])`。
-    ///
-    /// 提供の形を知っているのはこの1箇所だけにする(要求推論と評価の両方が使う)。
-    pub fn as_provision(&self) -> Option<(&str, &[Expr])> {
-        let ExprKind::Call(callee, args) = &self.kind else {
-            return None;
-        };
-        let ExprKind::Ident(slot) = &callee.kind else {
-            return None;
-        };
-        Some((slot, args))
+#[derive(Debug)]
+pub enum Provision {
+    /// `with db<Postgres> { ... }` — 実装型だけを選ぶ。
+    Type { slot: String, type_name: String },
+    /// `with db(store) { ... }` — 値の具体型と実体を置く。
+    Value { slot: String, value: Expr },
+}
+
+impl Provision {
+    pub fn slot(&self) -> &str {
+        match self {
+            Provision::Type { slot, .. } | Provision::Value { slot, .. } => slot,
+        }
     }
 }
 
@@ -154,10 +155,13 @@ pub enum Head {
     If(Box<Expr>),
     Elif(Box<Expr>),
     Else,
-    For { var: String, iter: Box<Expr> },
+    For {
+        var: String,
+        iter: Box<Expr>,
+    },
     While(Box<Expr>),
-    /// `db(pg), clock(sys)` — ambient 束縛の導入。各要素は呼び出し形
-    Ambient(Vec<Expr>),
+    /// `with db(pg), clock<SystemClock>` — ambient 束縛の導入
+    Ambient(Vec<Provision>),
 }
 
 #[derive(Debug, Clone, Copy)]

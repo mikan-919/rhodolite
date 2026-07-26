@@ -10,8 +10,8 @@
 //! `Env` は `invoke` で作り直し、`Ambient` はそのまま渡す。
 //! **この差1行が言語の全部**(CONTEXT.md「ambient」)。
 
-use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Sig, UnOp};
-use crate::requirement::{collect_slots, Slots};
+use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Sig, UnOp};
+use crate::requirement::{Slots, collect_slots};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -152,16 +152,84 @@ fn fail<T>(msg: impl Into<String>) -> Result<T, Flow> {
     Err(Flow::Error(msg.into()))
 }
 
-/// ローカル束縛。**関数呼び出しで切れる。**
-type Env = HashMap<String, Value>;
+#[derive(Clone)]
+enum Binding {
+    Local(Value),
+    Slot,
+}
 
-/// ambient 束縛。スロット名 → 提供された値。**関数呼び出しで切れない。**
+/// 字句的な束縛。内側のフレームから名前を探す。**関数呼び出しで切れる。**
+struct Env {
+    scopes: Vec<HashMap<String, Binding>>,
+}
+
+impl Env {
+    fn new() -> Self {
+        Env {
+            scopes: vec![HashMap::new()],
+        }
+    }
+
+    fn binding(&self, name: &str) -> Option<&Binding> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                return Some(binding);
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, name: String, value: Value) {
+        self.scopes
+            .last_mut()
+            .expect("Env には必ずスコープが1つある")
+            .insert(name, Binding::Local(value));
+    }
+
+    fn assign(&mut self, name: &str, value: Value) -> Result<(), ()> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(binding) = scope.get_mut(name) {
+                return match binding {
+                    Binding::Local(current) => {
+                        *current = value;
+                        Ok(())
+                    }
+                    Binding::Slot => Err(()),
+                };
+            }
+        }
+        self.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    fn push_slots<'s>(&mut self, slots: impl Iterator<Item = &'s str>) {
+        let mut scope = HashMap::new();
+        for slot in slots {
+            scope.insert(slot.to_string(), Binding::Slot);
+        }
+        self.scopes.push(scope);
+    }
+
+    fn pop_scope(&mut self) {
+        assert!(self.scopes.len() > 1, "最外スコープは外せない");
+        self.scopes.pop();
+    }
+}
+
+/// ambient 束縛。型だけ選んだ状態と、実体まで置いた状態を区別する。
+#[derive(Clone)]
+enum AmbientBinding {
+    Type(String),
+    Value(Value),
+}
+
+/// ambient 束縛。スロット名 → 選ばれた型または実体。**関数呼び出しで切れない。**
 ///
 /// `Env` との差はこれだけ: `invoke` が `Env` を作り直すのに対し、`Ambient` は
 /// そのまま渡す。CONTEXT.md「ambient」の「関数呼び出しで切れないもの」の実装が
 /// この1行の違い。requirement.rs の `scan` が `provided` を引数で運ぶのと同じ形で、
 /// スコープの終わりを書く必要がない(戻った時点で `inner` は消えている)。
-type Ambient = BTreeMap<String, Value>;
+type Ambient = BTreeMap<String, AmbientBinding>;
 
 // ---------------------------------------------------------------------------
 // インタプリタ
@@ -244,7 +312,11 @@ impl<'a> Interp<'a> {
         method: &str,
         want_trait: Option<&str>,
     ) -> Result<&Method<'a>, Flow> {
-        let all = self.methods.get(type_name).map(Vec::as_slice).unwrap_or(&[]);
+        let all = self
+            .methods
+            .get(type_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let mut named = all.iter().filter(|m| m.sig.name == method);
 
         let Some(first) = named.next() else {
@@ -275,13 +347,21 @@ impl<'a> Interp<'a> {
 
     /// 式がスロット名そのものなら、その名前。`db.save(u)` の `db` を見分ける。
     ///
-    /// ローカル変数が同じ名前を持っていてもスロットが勝つ。スロット名は
-    /// トップレベルの宣言物なので、影に隠れる方がおかしい
-    fn slot_of<'e>(&self, e: &'e Expr) -> Option<&'e str> {
+    /// 最も内側の束縛が勝つ。通常はローカルがトップレベルのスロットを隠すが、
+    /// `with db(value)` の本体ではスロットの束縛を1段内側へ積む。
+    fn slot_of<'e>(&self, e: &'e Expr, env: &Env) -> Option<&'e str> {
         let ExprKind::Ident(name) = &e.kind else {
             return None;
         };
-        self.slots.is_slot(name).then_some(name.as_str())
+        self.name_is_slot(name, env).then_some(name)
+    }
+
+    fn name_is_slot(&self, name: &str, env: &Env) -> bool {
+        match env.binding(name) {
+            Some(Binding::Local(_)) => false,
+            Some(Binding::Slot) => true,
+            None => self.slots.is_slot(name),
+        }
     }
 
     /// その型が trait を実装しているか。提供の検査に使う。
@@ -311,7 +391,7 @@ impl<'a> Interp<'a> {
     ///
     /// **`Env` をここで作り直す。**呼び出し元のローカル束縛は届かない。
     /// 段3で足す `Ambient` はこの境界を越える — それが推移性。
-    pub fn call(&self, name: &str, args: Vec<Value>, ambient: &Ambient) -> Eval {
+    fn call(&self, name: &str, args: Vec<Value>, ambient: &Ambient) -> Eval {
         let Some((sig, body)) = self.fns.get(name) else {
             return fail(format!("関数 `{name}` がありません"));
         };
@@ -416,8 +496,9 @@ impl<'a> Interp<'a> {
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
 
-            ExprKind::Ident(name) => match env.get(name) {
-                Some(v) => Ok(v.clone()),
+            ExprKind::Ident(name) => match env.binding(name) {
+                Some(Binding::Local(v)) => Ok(v.clone()),
+                Some(Binding::Slot) => fail(format!("スロット `{name}` は値として取り出せません")),
                 // `Gold` — フィールド0個の struct は名前だけで値になる。
                 // ponytail: enum は無い。列挙が要るまでこれで足りる
                 None if self.structs.contains(name.as_str()) => Ok(new_obj(name, BTreeMap::new())),
@@ -453,7 +534,9 @@ impl<'a> Interp<'a> {
                 let v = self.eval(value, env, ambient)?;
                 match &target.kind {
                     ExprKind::Ident(n) => {
-                        env.insert(n.clone(), v);
+                        if env.assign(n, v).is_err() {
+                            return fail(format!("スロット `{n}` には代入できません"));
+                        }
                     }
                     ExprKind::Field(recv, f) => {
                         let Value::Struct(o) = self.eval(recv, env, ambient)? else {
@@ -495,11 +578,16 @@ impl<'a> Interp<'a> {
                 // `effect db: Database` から分かる。**スロット経由は必ず一意に決まる**
                 // (CONTEXT.md「スロットは常に名前を持つので曖昧性が発生しない」)
                 let recv = match &callee.kind {
-                    ExprKind::Field(r, m) => Some(match self.slot_of(r) {
+                    ExprKind::Field(r, m) => Some(match self.slot_of(r, env) {
                         Some(slot) => {
-                            let Some(v) = ambient.get(slot) else {
+                            let Some(binding) = ambient.get(slot) else {
                                 return fail(format!(
                                     "`{slot}` が提供されていません(`.{m}` の呼び出し)"
+                                ));
+                            };
+                            let AmbientBinding::Value(v) = binding else {
+                                return fail(format!(
+                                    "`{slot}` は型だけが提供されています。実体が必要です(`.{m}` の呼び出し)"
                                 ));
                             };
                             (v.clone(), self.slots.trait_of(slot))
@@ -515,6 +603,26 @@ impl<'a> Interp<'a> {
                 match (&callee.kind, recv) {
                     (ExprKind::Ident(name), _) => self.call(name, vals, ambient),
                     (ExprKind::Path(parts), _) => match parts.as_slice() {
+                        [name, method] if self.name_is_slot(name, env) => {
+                            let Some(binding) = ambient.get(name) else {
+                                return fail(format!(
+                                    "`{name}` が提供されていません(`::{method}` の呼び出し)"
+                                ));
+                            };
+                            let type_name = match binding {
+                                AmbientBinding::Type(type_name) => type_name.clone(),
+                                AmbientBinding::Value(Value::Struct(value)) => {
+                                    value.borrow().type_name.clone()
+                                }
+                                AmbientBinding::Value(value) => {
+                                    return fail(format!(
+                                        "`{name}` の実体から型を選べません ({})",
+                                        value.show()
+                                    ));
+                                }
+                            };
+                            self.call_path(&type_name, method, vals, ambient)
+                        }
                         [type_name, method] => self.call_path(type_name, method, vals, ambient),
                         _ => fail(format!("`{}` は呼べません", parts.join("::"))),
                     },
@@ -541,14 +649,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    fn binary(
-        &self,
-        op: BinOp,
-        lhs: &Expr,
-        rhs: &Expr,
-        env: &mut Env,
-        ambient: &Ambient,
-    ) -> Eval {
+    fn binary(&self, op: BinOp, lhs: &Expr, rhs: &Expr, env: &mut Env, ambient: &Ambient) -> Eval {
         // `??` は短絡する。`db.find(id) ?? return false` の右辺は
         // 左辺が nil のときだけ走らないといけない
         if let BinOp::Coalesce = op {
@@ -631,37 +732,48 @@ impl<'a> Interp<'a> {
             Head::Ambient(binders) => {
                 let mut inner = ambient.clone();
                 for b in binders {
-                    let Some((slot, args)) = b.as_provision() else {
-                        return fail("提供は `db(値)` の形で書きます");
-                    };
+                    let slot = b.slot();
                     let Some(want_trait) = self.slots.trait_of(slot) else {
                         return fail(format!("`{slot}` はスロットではありません"));
                     };
-                    let [value] = args else {
-                        return fail(format!("`{slot}(...)` に渡す値は1つです"));
-                    };
 
-                    // 提供する値は**提供の外**で評価する。`db(make(clock.now()))` の
-                    // clock は db が立つ前に走る(requirement.rs の手順4と同じ規則)
-                    let v = self.eval(value, env, ambient)?;
+                    let binding = match b {
+                        Provision::Type { type_name, .. } => {
+                            if !self.implements(type_name, want_trait) {
+                                return fail(format!(
+                                    "`{type_name}` は `{want_trait}` を実装していないので `{slot}` に指定できません"
+                                ));
+                            }
+                            AmbientBinding::Type(type_name.clone())
+                        }
+                        Provision::Value { value, .. } => {
+                            // 提供する値は**提供の外**で評価する。`db(make(clock.now()))` の
+                            // clock は db が立つ前に走る(requirement.rs の手順4と同じ規則)
+                            let v = self.eval(value, env, ambient)?;
 
-                    let Value::Struct(o) = &v else {
-                        return fail(format!(
-                            "`{slot}` に渡せるのは struct だけです ({})",
-                            v.show()
-                        ));
+                            let Value::Struct(o) = &v else {
+                                return fail(format!(
+                                    "`{slot}` に渡せるのは struct だけです ({})",
+                                    v.show()
+                                ));
+                            };
+                            let type_name = o.borrow().type_name.clone();
+                            if !self.implements(&type_name, want_trait) {
+                                return fail(format!(
+                                    "`{type_name}` は `{want_trait}` を実装していないので `{slot}` に渡せません"
+                                ));
+                            }
+                            AmbientBinding::Value(v)
+                        }
                     };
-                    let type_name = o.borrow().type_name.clone();
-                    if !self.implements(&type_name, want_trait) {
-                        return fail(format!(
-                            "`{type_name}` は `{want_trait}` を実装していないので `{slot}` に渡せません"
-                        ));
-                    }
 
                     // 内側勝ち。同じスロットの入れ子は上書きになる
-                    inner.insert(slot.to_string(), v);
+                    inner.insert(slot.to_string(), binding);
                 }
-                self.eval(body, env, &inner)
+                env.push_slots(binders.iter().map(|b| b.slot()));
+                let result = self.eval(body, env, &inner);
+                env.pop_scope();
+                result
             }
         }
     }
@@ -1196,6 +1308,42 @@ mod tests {
         assert_eq!(int(src), 1);
     }
 
+    #[test]
+    fn 型提供から内側で実体を初期化できる() {
+        let src = "trait Database {\n\
+                   \x20 fn new(-> Postgres)\n\
+                   \x20 fn value(self -> Int)\n\
+                   }\n\
+                   effect db: Database\n\
+                   struct Postgres {}\n\
+                   impl Database for Postgres {\n\
+                   \x20 fn new(-> Postgres) { Postgres {} }\n\
+                   \x20 fn value(self -> Int) { 7 }\n\
+                   }\n\
+                   fn main(-> Int) {\n\
+                   \x20 with db<Postgres> {\n\
+                   \x20   let db = db::new()\n\
+                   \x20   with db(db) { db.value() }\n\
+                   \x20 }\n\
+                   }\n";
+        assert_eq!(run(src, "main").unwrap().show(), "7");
+    }
+
+    #[test]
+    fn 型だけの提供では値射影を使えない() {
+        let src = "trait Database { fn value(self -> Int) }\n\
+                   effect db: Database\n\
+                   struct Postgres {}\n\
+                   impl Database for Postgres {\n\
+                   \x20 fn value(self -> Int) { 7 }\n\
+                   }\n\
+                   fn main(-> Int) {\n\
+                   \x20 with db<Postgres> { db.value() }\n\
+                   }\n";
+        let error = run(src, "main").unwrap_err();
+        assert!(error.contains("型だけ"), "{error}");
+    }
+
     /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと
     #[test]
     fn 自己参照structを比較しても落ちない() {
@@ -1221,5 +1369,47 @@ mod tests {
                    \x20 a == b\n\
                    }\n";
         assert!(run(src, "main").is_err());
+    }
+
+    #[test]
+    fn 同名の引数はスロットを一貫して隠す() {
+        let src = "trait Database { fn save(self, u: Int -> unit) }\n\
+                   effect db: Database\n\
+                   struct Slot { n: Int }\n\
+                   impl Database for Slot {\n\
+                   \x20 fn save(self, u: Int -> unit) { self.n = 1 }\n\
+                   }\n\
+                   struct Local { n: Int }\n\
+                   impl Database for Local {\n\
+                   \x20 fn save(self, u: Int -> unit) { self.n = 2 }\n\
+                   }\n\
+                   fn handle(db: Local -> Int) {\n\
+                   \x20 db.save(0)\n\
+                   \x20 db.n\n\
+                   }\n\
+                   fn main(-> Int) {\n\
+                   \x20 let slot = Slot { n = 0 }\n\
+                   \x20 with db(slot) {\n\
+                   \x20   let result = handle(Local { n = 7 })\n\
+                   \x20   result * 10 + slot.n\n\
+                   \x20 }\n\
+                   }\n";
+        assert_eq!(run(src, "main").unwrap().show(), "20");
+    }
+
+    #[test]
+    fn withの右辺は外側で本体はスロットとして解決する() {
+        let src = "trait Database { fn save(self, u: Int -> unit) }\n\
+                   effect db: Database\n\
+                   struct Store { n: Int }\n\
+                   impl Database for Store {\n\
+                   \x20 fn save(self, u: Int -> unit) { self.n = u }\n\
+                   }\n\
+                   fn main(-> Int) {\n\
+                   \x20 let db = Store { n = 0 }\n\
+                   \x20 with db(db) { db.save(9) }\n\
+                   \x20 db.n\n\
+                   }\n";
+        assert_eq!(run(src, "main").unwrap().show(), "9");
     }
 }

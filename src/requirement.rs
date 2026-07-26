@@ -20,7 +20,7 @@
 //! 「いま提供されているスロットの集合」を持ち回る必要が出た時点で、
 //! 同じ走査に畳んだ。`scan` の1回の再帰が2・3・4を兼ねている。
 
-use crate::ast::{Expr, ExprKind, Head, Item, Program};
+use crate::ast::{Expr, ExprKind, Head, Item, Program, Provision};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -84,7 +84,16 @@ pub fn collect_slots(program: &Program) -> Slots {
 #[derive(Debug, Clone)]
 pub struct CallSite {
     pub callee: String,
-    pub provided: BTreeSet<String>,
+    pub provided: BTreeMap<String, SlotLevel>,
+}
+
+/// スロットの型だけが要るか、実体まで要るか。
+///
+/// 宣言順が強さの順でもある。実体があれば具体型も分かるため `Value > Type`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SlotLevel {
+    Type,
+    Value,
 }
 
 /// 関数の本体を1回歩いて分かること。
@@ -105,18 +114,32 @@ pub struct CallSite {
 #[derive(Debug, Default)]
 pub struct BodyFacts {
     /// 提供されないまま漏れた直接使用
-    pub escaping: BTreeSet<String>,
+    pub escaping: BTreeMap<String, SlotLevel>,
     pub calls: Vec<CallSite>,
 }
 
 /// 本体を1回歩いて `BodyFacts` を作る。
 pub fn scan_body(body: &[Expr], slots: &Slots) -> BodyFacts {
+    scan_body_with_locals(body, slots, BTreeSet::new())
+}
+
+fn scan_body_with_locals(body: &[Expr], slots: &Slots, mut locals: BTreeSet<String>) -> BodyFacts {
     let mut facts = BodyFacts::default();
-    let nothing_provided = BTreeSet::new();
-    for e in body {
-        scan(e, slots, &nothing_provided, &mut facts);
-    }
+    let nothing_provided = BTreeMap::new();
+    scan_exprs(body, slots, &nothing_provided, &mut locals, &mut facts);
     facts
+}
+
+fn scan_exprs(
+    body: &[Expr],
+    slots: &Slots,
+    provided: &BTreeMap<String, SlotLevel>,
+    locals: &mut BTreeSet<String>,
+    out: &mut BodyFacts,
+) {
+    for e in body {
+        scan(e, slots, provided, locals, out);
+    }
 }
 
 /// 汎用の木歩き(訪問関数を渡す形)ではなく自前で再帰する。理由は
@@ -125,109 +148,137 @@ pub fn scan_body(body: &[Expr], slots: &Slots) -> BodyFacts {
 /// **スコープの終わりを書く必要がない**ことに注目。`scan(body, &inner, ..)` から
 /// 戻った時点で `inner` は消えていて、呼び出し元は元の `provided` を持ったまま。
 /// 字句スコープを呼び出しスタックがそのまま表現している。
-fn scan(e: &Expr, slots: &Slots, provided: &BTreeSet<String>, out: &mut BodyFacts) {
+fn scan(
+    e: &Expr,
+    slots: &Slots,
+    provided: &BTreeMap<String, SlotLevel>,
+    locals: &mut BTreeSet<String>,
+    out: &mut BodyFacts,
+) {
     match &e.kind {
-        // --- ここが本題 ---
         ExprKind::Head { head, body, orelse } => {
             match head {
                 Head::Ambient(binders) => {
-                    // binders はブロックの「外」で評価される。
-                    // `db(Postgres::new(url))` の `Postgres::new(url)` は
-                    // db が使えるようになる前に走るので、provided は増やさない。
+                    // 提供値は全て外側で評価する。`with db(db)` の右の db は
+                    // ここではまだローカルを指している。
                     for b in binders {
-                        scan(b, slots, provided, out);
-                    }
-
-                    // ブロックの中だけ、提供されたスロットが増える
-                    let mut inner = provided.clone();
-                    for b in binders {
-                        if let Some(name) = provided_slot_name(b) {
-                            inner.insert(name);
+                        if let Provision::Value { value, .. } = b {
+                            scan(value, slots, provided, locals, out);
                         }
                     }
-                    scan(body, slots, &inner, out);
+
+                    let mut inner = provided.clone();
+                    let mut inner_locals = locals.clone();
+                    for b in binders {
+                        let level = match b {
+                            Provision::Type { .. } => SlotLevel::Type,
+                            Provision::Value { .. } => SlotLevel::Value,
+                        };
+                        inner.insert(b.slot().to_string(), level);
+                        // with の本体では、提供したスロットが同名の外側ローカルを隠す。
+                        inner_locals.remove(b.slot());
+                    }
+                    scan(body, slots, &inner, &mut inner_locals, out);
                 }
                 Head::If(c) | Head::Elif(c) | Head::While(c) => {
-                    scan(c, slots, provided, out);
-                    scan(body, slots, provided, out);
+                    scan(c, slots, provided, locals, out);
+                    scan(body, slots, provided, locals, out);
                 }
-                Head::For { iter, .. } => {
-                    scan(iter, slots, provided, out);
-                    scan(body, slots, provided, out);
+                Head::For { var, iter } => {
+                    scan(iter, slots, provided, locals, out);
+                    locals.insert(var.clone());
+                    scan(body, slots, provided, locals, out);
                 }
                 Head::Else => {
-                    scan(body, slots, provided, out);
+                    scan(body, slots, provided, locals, out);
                 }
             }
             if let Some(o) = orelse {
-                scan(o, slots, provided, out);
+                scan(o, slots, provided, locals, out);
             }
         }
 
-        // --- スロットの使用 ---
         ExprKind::Field(recv, _) => {
             if let ExprKind::Ident(name) = &recv.kind {
-                if slots.is_slot(name) && !provided.contains(name) {
-                    out.escaping.insert(name.clone());
-                }
+                record_access(name, SlotLevel::Value, slots, provided, locals, out);
             }
-            scan(recv, slots, provided, out);
+            scan(recv, slots, provided, locals, out);
         }
 
-        // --- 呼び出し辺 ---
         ExprKind::Call(callee, args) => {
             if let ExprKind::Ident(name) = &callee.kind {
-                if !slots.is_slot(name) {
+                if !slots.is_slot(name) && !locals.contains(name) {
                     out.calls.push(CallSite {
                         callee: name.clone(),
                         provided: provided.clone(),
                     });
                 }
             }
-            scan(callee, slots, provided, out);
+            scan(callee, slots, provided, locals, out);
             for a in args {
-                scan(a, slots, provided, out);
+                scan(a, slots, provided, locals, out);
             }
         }
 
-        // --- 以下は素通り。子に同じ provided を渡すだけ ---
         ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Nil => {}
-        ExprKind::Ident(_) | ExprKind::Path(_) => {}
+        ExprKind::Ident(_) => {}
+        ExprKind::Path(parts) => {
+            if let Some(name) = parts.first() {
+                record_access(name, SlotLevel::Type, slots, provided, locals, out);
+            }
+        }
         ExprKind::Array(items) => {
             for i in items {
-                scan(i, slots, provided, out);
+                scan(i, slots, provided, locals, out);
             }
         }
         ExprKind::StructLit { fields, .. } => {
             for (_, v) in fields {
-                scan(v, slots, provided, out);
+                scan(v, slots, provided, locals, out);
             }
         }
-        ExprKind::Let { value, .. } => scan(value, slots, provided, out),
+        ExprKind::Let { name, value } => {
+            scan(value, slots, provided, locals, out);
+            locals.insert(name.clone());
+        }
         ExprKind::Assign { target, value } => {
-            scan(target, slots, provided, out);
-            scan(value, slots, provided, out);
+            scan(target, slots, provided, locals, out);
+            scan(value, slots, provided, locals, out);
         }
-        ExprKind::Unary(_, inner) => scan(inner, slots, provided, out),
+        ExprKind::Unary(_, inner) => scan(inner, slots, provided, locals, out),
         ExprKind::Binary { lhs, rhs, .. } => {
-            scan(lhs, slots, provided, out);
-            scan(rhs, slots, provided, out);
+            scan(lhs, slots, provided, locals, out);
+            scan(rhs, slots, provided, locals, out);
         }
-        ExprKind::Return(Some(v)) => scan(v, slots, provided, out),
+        ExprKind::Return(Some(v)) => scan(v, slots, provided, locals, out),
         ExprKind::Return(None) => {}
-        ExprKind::Assert(inner) => scan(inner, slots, provided, out),
-        ExprKind::Block(body) => {
-            for e in body {
-                scan(e, slots, provided, out);
-            }
-        }
+        ExprKind::Assert(inner) => scan(inner, slots, provided, locals, out),
+        ExprKind::Block(body) => scan_exprs(body, slots, provided, locals, out),
     }
 }
 
-/// `db(pg)` という提供から、スロット名 `db` を取り出す。
-/// 提供の形そのものは `Expr::as_provision`(ast.rs)が知っている。
-fn provided_slot_name(binder: &Expr) -> Option<String> {
-    binder.as_provision().map(|(slot, _)| slot.to_string())
+fn record_access(
+    name: &str,
+    level: SlotLevel,
+    slots: &Slots,
+    provided: &BTreeMap<String, SlotLevel>,
+    locals: &BTreeSet<String>,
+    out: &mut BodyFacts,
+) {
+    if !slots.is_slot(name) || locals.contains(name) {
+        return;
+    }
+    if provided.get(name).is_some_and(|given| *given >= level) {
+        return;
+    }
+
+    match out.escaping.get_mut(name) {
+        Some(existing) if *existing < level => *existing = level,
+        Some(_) => {}
+        None => {
+            out.escaping.insert(name.to_string(), level);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +291,13 @@ fn provided_slot_name(binder: &Expr) -> Option<String> {
 /// 空なら「この関数自身が使っている」。
 /// `{"clock": ["handle", "promote", "stamp"]}` は
 /// 「clock が要る ← handle ← promote ← stamp」と読む。
-pub type Reqs = BTreeMap<String, Vec<String>>;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub level: SlotLevel,
+    pub path: Vec<String>,
+}
+
+pub type Reqs = BTreeMap<String, Requirement>;
 
 #[derive(Debug)]
 pub struct Analysis {
@@ -266,7 +323,11 @@ pub fn analyze(program: &Program) -> Analysis {
     for item in &program.items {
         match item {
             Item::Fn { sig, body, .. } => {
-                facts.insert(sig.name.clone(), scan_body(body, &slots));
+                let locals = sig.params.iter().map(|p| p.name.clone()).collect();
+                facts.insert(
+                    sig.name.clone(),
+                    scan_body_with_locals(body, &slots, locals),
+                );
                 order.push(sig.name.clone());
             }
             Item::Test { name, body, .. } => {
@@ -297,11 +358,8 @@ pub fn analyze(program: &Program) -> Analysis {
             let mut next = reqs[name].clone();
 
             // (1) この関数自身が使っていて、提供されていないもの。経路は空
-            for slot in &f.escaping {
-                if !next.contains_key(slot) {
-                    next.insert(slot.clone(), Vec::new());
-                    changed = true;
-                }
+            for (slot, level) in &f.escaping {
+                changed |= merge_requirement(&mut next, slot, *level, Vec::new());
             }
 
             // (2) 呼び出し先から上がってくるもの
@@ -312,24 +370,22 @@ pub fn analyze(program: &Program) -> Analysis {
                     continue;
                 };
 
-                for (slot, path_below) in callee_reqs {
+                for (slot, requirement) in callee_reqs {
                     // この呼び出し地点で提供されているなら、ここで止まる
-                    if site.provided.contains(slot) {
-                        continue;
-                    }
-                    // 最初に見つかった経路を採る。回を追うごとに深くなるので、
-                    // 最初に見つかるものが最短になる
-                    if next.contains_key(slot) {
+                    if site
+                        .provided
+                        .get(slot)
+                        .is_some_and(|given| *given >= requirement.level)
+                    {
                         continue;
                     }
 
                     let mut path = Vec::new();
                     path.push(site.callee.clone());
-                    for step in path_below {
+                    for step in &requirement.path {
                         path.push(step.clone());
                     }
-                    next.insert(slot.clone(), path);
-                    changed = true;
+                    changed |= merge_requirement(&mut next, slot, requirement.level, path);
                 }
             }
 
@@ -343,6 +399,21 @@ pub fn analyze(program: &Program) -> Analysis {
     }
 
     Analysis { slots, reqs, order }
+}
+
+fn merge_requirement(reqs: &mut Reqs, slot: &str, level: SlotLevel, path: Vec<String>) -> bool {
+    match reqs.get_mut(slot) {
+        Some(existing) if existing.level < level => {
+            existing.level = level;
+            existing.path = path;
+            true
+        }
+        Some(_) => false,
+        None => {
+            reqs.insert(slot.to_string(), Requirement { level, path });
+            true
+        }
+    }
 }
 
 impl Analysis {
@@ -373,10 +444,17 @@ impl Analysis {
                 continue;
             }
 
-            for (slot, path) in &self.reqs[name] {
-                let mut line = format!("{name}: `{slot}` が提供されていません\n");
+            for (slot, requirement) in &self.reqs[name] {
+                let mut line = match requirement.level {
+                    SlotLevel::Type => {
+                        format!("{name}: `{slot}` の実装型が提供されていません\n")
+                    }
+                    SlotLevel::Value => {
+                        format!("{name}: `{slot}` が提供されていません\n")
+                    }
+                };
                 line.push_str(&format!("  {slot} が要る"));
-                for step in path {
+                for step in &requirement.path {
                     line.push_str(&format!(" ← {step}"));
                 }
                 errors.push(line);
@@ -400,34 +478,32 @@ mod tests {
         parse::parse(&join(lex(src).unwrap())).expect("パースできるはず")
     }
 
-    fn body_of<'a>(p: &'a Program, name: &str) -> &'a [Expr] {
-        p.items
-            .iter()
-            .find_map(|i| match i {
-                Item::Fn { sig, body, .. } if sig.name == name => Some(body.as_slice()),
-                _ => None,
-            })
-            .expect("その名前の関数がない")
-    }
-
     fn set(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    fn facts_of(p: &Program, f: &str) -> BodyFacts {
+        let slots = collect_slots(p);
+        let (sig, body) = p
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::Fn { sig, body, .. } if sig.name == f => Some((sig, body.as_slice())),
+                _ => None,
+            })
+            .expect("その名前の関数がない");
+        let locals = sig.params.iter().map(|p| p.name.clone()).collect();
+        scan_body_with_locals(body, &slots, locals)
+    }
+
     /// 提供されないまま漏れたスロット(手順2の検査対象)
     fn escaping(p: &Program, f: &str) -> BTreeSet<String> {
-        let slots = collect_slots(p);
-        scan_body(body_of(p, f), &slots).escaping
+        facts_of(p, f).escaping.into_keys().collect()
     }
 
     /// 呼び出し辺の行き先(手順3の検査対象)。提供の有無はここでは見ない
     fn callees(p: &Program, f: &str) -> BTreeSet<String> {
-        let slots = collect_slots(p);
-        scan_body(body_of(p, f), &slots)
-            .calls
-            .into_iter()
-            .map(|c| c.callee)
-            .collect()
+        facts_of(p, f).calls.into_iter().map(|c| c.callee).collect()
     }
 
     // ---- 手順1 ----
@@ -594,12 +670,11 @@ mod tests {
              \x20 }\n\
              }\n",
         );
-        let slots = collect_slots(&p);
-        let facts = scan_body(body_of(&p, "f"), &slots);
+        let facts = facts_of(&p, "f");
 
         assert_eq!(facts.calls.len(), 2);
         assert!(facts.calls[0].provided.is_empty());
-        assert_eq!(facts.calls[1].provided, set(&["db"]));
+        assert_eq!(facts.calls[1].provided.get("db"), Some(&SlotLevel::Value));
     }
 
     // ---- 手順5 + 6 ----
@@ -634,10 +709,10 @@ mod tests {
         );
         let a = analyze(&p);
 
-        assert_eq!(a.reqs["stamp"]["clock"], Vec::<String>::new());
-        assert_eq!(a.reqs["promote"]["clock"], vec!["stamp".to_string()]);
+        assert_eq!(a.reqs["stamp"]["clock"].path, Vec::<String>::new());
+        assert_eq!(a.reqs["promote"]["clock"].path, vec!["stamp".to_string()]);
         assert_eq!(
-            a.reqs["handle"]["clock"],
+            a.reqs["handle"]["clock"].path,
             vec!["promote".to_string(), "stamp".to_string()]
         );
     }
@@ -659,7 +734,11 @@ mod tests {
         let errors = analyze(&p).unsatisfied();
 
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("clock が要る ← promote ← stamp"), "{}", errors[0]);
+        assert!(
+            errors[0].contains("clock が要る ← promote ← stamp"),
+            "{}",
+            errors[0]
+        );
     }
 
     #[test]
@@ -702,5 +781,69 @@ mod tests {
              }\n",
         );
         assert_eq!(escaping(&p, "promote"), set(&["db"]));
+    }
+
+    #[test]
+    fn 同名の引数はスロットを隠す() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(db: LocalDb) {\n\
+             \x20 db.save(user)\n\
+             }\n",
+        );
+        assert!(escaping(&p, "f").is_empty());
+    }
+
+    #[test]
+    fn withの本体では提供したスロットが同名ローカルを隠す() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(db: LocalDb) {\n\
+             \x20 with db(db) { db.save(user) }\n\
+             }\n",
+        );
+        assert!(escaping(&p, "f").is_empty());
+    }
+
+    #[test]
+    fn 型射影と値射影は異なる強さの要求になる() {
+        let p = program(
+            "effect db: Database\n\
+             fn make() { db::new() }\n\
+             fn use() { db.save(user) }\n",
+        );
+        let analysis = analyze(&p);
+        assert_eq!(analysis.reqs["make"]["db"].level, SlotLevel::Type);
+        assert_eq!(analysis.reqs["use"]["db"].level, SlotLevel::Value);
+    }
+
+    #[test]
+    fn 型提供は型要求だけを満たす() {
+        let p = program(
+            "effect db: Database\n\
+             fn make() { db::new() }\n\
+             fn use() { db.save(user) }\n\
+             fn typed() { with db<Postgres> { make() } }\n\
+             fn valued() { with db<Postgres> { use() } }\n",
+        );
+        let analysis = analyze(&p);
+        assert!(analysis.reqs["typed"].is_empty());
+        assert_eq!(analysis.reqs["valued"]["db"].level, SlotLevel::Value);
+    }
+
+    #[test]
+    fn 実体提供は型要求と値要求の両方を満たす() {
+        let p = program(
+            "effect db: Database\n\
+             fn make() { db::new() }\n\
+             fn use() { db.save(user) }\n\
+             fn f() {\n\
+             \x20 with db(store) {\n\
+             \x20   make()\n\
+             \x20   use()\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert!(analyze(&p).reqs["f"].is_empty());
     }
 }
