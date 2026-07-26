@@ -40,7 +40,6 @@ impl std::fmt::Display for ModulePath {
 #[derive(Debug)]
 struct ParsedModule {
     path: ModulePath,
-    directory: bool,
     uses: Vec<UseDecl>,
     items: Vec<Item>,
 }
@@ -74,195 +73,221 @@ pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<String>> {
     }
 
     let entry_path = ModulePath(vec![stem.to_string()]);
-    let mut loader = Loader {
-        root: root.to_path_buf(),
-        modules: BTreeMap::new(),
-        diagnostics: Vec::new(),
-    };
-    loader.load_module(&entry_path);
-    if !loader.diagnostics.is_empty() {
-        return Err(loader.diagnostics);
+    let mut modules = BTreeMap::new();
+    let mut directories = BTreeSet::new();
+    let mut diagnostics = Vec::new();
+    load_module(
+        root,
+        &mut modules,
+        &mut directories,
+        &mut diagnostics,
+        &entry_path,
+    );
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
     }
-    resolve(loader.modules, &entry_path)
+    resolve(modules, directories, &entry_path)
 }
 
-struct Loader {
-    root: PathBuf,
-    modules: BTreeMap<ModulePath, ParsedModule>,
-    diagnostics: Vec<String>,
-}
-
-impl Loader {
-    fn load_module(&mut self, path: &ModulePath) {
-        if self.modules.contains_key(path) {
+fn load_module(
+    root: &Path,
+    modules: &mut BTreeMap<ModulePath, ParsedModule>,
+    directories: &mut BTreeSet<ModulePath>,
+    diagnostics: &mut Vec<String>,
+    path: &ModulePath,
+) {
+    if modules.contains_key(path) || directories.contains(path) {
+        return;
+    }
+    for part in &path.0 {
+        if !valid_ident(part) {
+            diagnostics.push(format!(
+                "モジュールパス `{path}` の `{part}` は有効な識別子ではありません"
+            ));
             return;
         }
-        for part in &path.0 {
-            if !valid_ident(part) {
-                self.diagnostics.push(format!(
-                    "モジュールパス `{path}` の `{part}` は有効な識別子ではありません"
-                ));
-                return;
-            }
-        }
+    }
 
-        let relative = path.0.iter().fold(PathBuf::new(), |p, part| p.join(part));
-        let leaf = self.root.join(&relative).with_extension("rd");
-        let directory = self.root.join(&relative);
+    for length in 1..=path.0.len() {
+        let prefix = ModulePath(path.0[..length].to_vec());
+        let relative = prefix
+            .0
+            .iter()
+            .fold(PathBuf::new(), |built, part| built.join(part));
+        let leaf = root.join(&relative).with_extension("rd");
+        let directory = root.join(&relative);
         let has_leaf = leaf.is_file();
         let has_directory = directory.is_dir();
 
+        if (has_leaf && !exact_spelling(&leaf)) || (has_directory && !exact_spelling(&directory)) {
+            diagnostics.push(format!(
+                "モジュール `{prefix}` のパスはファイルシステム上の綴りと完全一致しません"
+            ));
+            return;
+        }
         if has_leaf && has_directory {
-            self.diagnostics.push(format!(
-                "モジュール `{path}` に `{}` と `{}` の両方があります",
+            diagnostics.push(format!(
+                "モジュール `{prefix}` に `{}` と `{}` の両方があります",
                 leaf.display(),
                 directory.display()
             ));
             return;
         }
-        if !has_leaf && !has_directory {
-            self.diagnostics
-                .push(format!("モジュール `{path}` が見つかりません"));
+        if length < path.0.len() && has_leaf {
+            diagnostics.push(format!(
+                "リーフモジュール `{prefix}` は子モジュールを持てません"
+            ));
             return;
         }
-        if has_directory {
-            self.modules.insert(
-                path.clone(),
-                ParsedModule {
-                    path: path.clone(),
-                    directory: true,
-                    uses: Vec::new(),
-                    items: Vec::new(),
-                },
-            );
+        if length < path.0.len() && !has_directory {
+            diagnostics.push(format!("モジュール `{prefix}` が見つかりません"));
             return;
         }
+    }
 
-        let source = match std::fs::read_to_string(&leaf) {
-            Ok(source) => source,
-            Err(error) => {
-                self.diagnostics
-                    .push(format!("{} を読めません: {error}", leaf.display()));
-                return;
-            }
-        };
-        let tokens = match lex::lex(&source) {
-            Ok(tokens) => lex::join(tokens),
-            Err(error) => {
-                self.diagnostics
-                    .push(format!("{}: 字句解析エラー: {error}", leaf.display()));
-                return;
-            }
-        };
-        let program = match parse::parse(&tokens) {
-            Ok(program) => program,
-            Err(error) => {
-                self.diagnostics
-                    .push(format!("{}: {error}", leaf.display()));
-                return;
-            }
-        };
-        let uses = program.uses.clone();
-        self.modules.insert(
-            path.clone(),
-            ParsedModule {
-                path: path.clone(),
-                directory: false,
-                uses: program.uses,
-                items: program.items,
-            },
-        );
+    let relative = path
+        .0
+        .iter()
+        .fold(PathBuf::new(), |built, part| built.join(part));
+    let leaf = root.join(&relative).with_extension("rd");
+    let directory = root.join(relative);
+    let has_leaf = leaf.is_file();
+    let has_directory = directory.is_dir();
+    if !has_leaf && !has_directory {
+        diagnostics.push(format!("モジュール `{path}` が見つかりません"));
+        return;
+    }
+    if has_directory {
+        directories.insert(path.clone());
+        return;
+    }
 
-        // 先に現在のモジュールを登録するため、循環 use はここで自然に止まる。
-        for use_decl in uses {
-            let target = ModulePath::from_parts(&use_decl.path);
-            self.load_module(&target);
-            if use_decl.members.is_some() {
-                let target_is_directory = self
-                    .modules
-                    .get(&target)
-                    .is_some_and(|module| module.directory);
-                if target_is_directory {
-                    for member in use_decl.members.unwrap_or_default() {
-                        let child = target.child(&member.name);
-                        if self.module_exists(&child) {
-                            self.load_module(&child);
-                        }
-                    }
-                }
-            }
-        }
-
-        // ディレクトリモジュールは、修飾参照に現れた子だけを辿る。
-        // ディレクトリ全体を走査しないため、未参照ファイルは読まれない。
-        let Some(module) = self.modules.get(path) else {
+    let source = match std::fs::read_to_string(&leaf) {
+        Ok(source) => source,
+        Err(error) => {
+            diagnostics.push(format!("{} を読めません: {error}", leaf.display()));
             return;
-        };
-        let references = module_references(&module.items);
-        let mut directory_imports = Vec::new();
-        for use_decl in &module.uses {
-            let target = ModulePath::from_parts(&use_decl.path);
-            if let Some(members) = &use_decl.members {
-                for member in members {
-                    let child = target.child(&member.name);
-                    if self
-                        .modules
-                        .get(&child)
-                        .is_some_and(|module| module.directory)
-                    {
-                        directory_imports.push((
-                            member.alias.clone().unwrap_or_else(|| member.name.clone()),
-                            child,
-                        ));
-                    }
-                }
-            } else if self
-                .modules
-                .get(&target)
-                .is_some_and(|module| module.directory)
-            {
-                directory_imports.push((
-                    use_decl
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| target.name().to_string()),
-                    target,
-                ));
-            }
         }
+    };
+    let tokens = match lex::lex(&source) {
+        Ok(tokens) => lex::join(tokens),
+        Err(error) => {
+            diagnostics.push(format!("{}: 字句解析エラー: {error}", leaf.display()));
+            return;
+        }
+    };
+    let program = match parse::parse(&tokens) {
+        Ok(program) => program,
+        Err(error) => {
+            diagnostics.push(format!("{}: {error}", leaf.display()));
+            return;
+        }
+    };
+    let uses = program.uses.clone();
+    modules.insert(
+        path.clone(),
+        ParsedModule {
+            path: path.clone(),
+            uses: program.uses,
+            items: program.items,
+        },
+    );
 
-        for reference in references {
-            let Some((_, mut current)) = directory_imports
-                .iter()
-                .find(|(alias, _)| reference.first() == Some(alias))
-                .cloned()
-            else {
-                continue;
-            };
-            for part in reference.iter().skip(1) {
-                let child = current.child(part);
-                if !self.module_exists(&child) {
-                    break;
+    // 先に現在のモジュールを登録するため、循環 use はここで自然に止まる。
+    for use_decl in uses {
+        let target = ModulePath::from_parts(&use_decl.path);
+        load_module(root, modules, directories, diagnostics, &target);
+        if use_decl.members.is_some() && directories.contains(&target) {
+            for member in use_decl.members.unwrap_or_default() {
+                let child = target.child(&member.name);
+                if module_exists(root, &child) {
+                    load_module(root, modules, directories, diagnostics, &child);
                 }
-                self.load_module(&child);
-                current = child;
             }
         }
     }
 
-    fn module_exists(&self, path: &ModulePath) -> bool {
-        let relative = path.0.iter().fold(PathBuf::new(), |p, part| p.join(part));
-        self.root.join(&relative).with_extension("rd").is_file()
-            || self.root.join(relative).is_dir()
+    // ディレクトリモジュールは、修飾参照に現れた子だけを辿る。
+    // ディレクトリ全体を走査しないため、未参照ファイルは読まれない。
+    let Some(module) = modules.get(path) else {
+        return;
+    };
+    let references = module_references(&module.items);
+    let mut directory_imports = Vec::new();
+    for use_decl in &module.uses {
+        let target = ModulePath::from_parts(&use_decl.path);
+        if let Some(members) = &use_decl.members {
+            for member in members {
+                let child = target.child(&member.name);
+                if directories.contains(&child) {
+                    directory_imports.push((
+                        member.alias.clone().unwrap_or_else(|| member.name.clone()),
+                        child,
+                    ));
+                }
+            }
+        } else if directories.contains(&target) {
+            directory_imports.push((
+                use_decl
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| target.name().to_string()),
+                target,
+            ));
+        }
     }
+
+    for reference in references {
+        let Some((_, mut current)) = directory_imports
+            .iter()
+            .find(|(alias, _)| reference.first() == Some(alias))
+            .cloned()
+        else {
+            continue;
+        };
+        for part in reference.iter().skip(1) {
+            let child = current.child(part);
+            if !module_exists(root, &child) {
+                break;
+            }
+            load_module(root, modules, directories, diagnostics, &child);
+            current = child;
+        }
+    }
+}
+
+fn module_exists(root: &Path, path: &ModulePath) -> bool {
+    let relative = path
+        .0
+        .iter()
+        .fold(PathBuf::new(), |built, part| built.join(part));
+    root.join(&relative).with_extension("rd").is_file() || root.join(relative).is_dir()
+}
+
+fn exact_spelling(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(file_name) = path.file_name() else {
+        return false;
+    };
+    std::fs::read_dir(parent).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == file_name)
+    })
 }
 
 fn resolve(
     modules: BTreeMap<ModulePath, ParsedModule>,
+    directories: BTreeSet<ModulePath>,
     entry_path: &ModulePath,
 ) -> Result<LoadedProgram, Vec<String>> {
     let mut diagnostics = Vec::new();
     let mut declarations: BTreeMap<ModulePath, BTreeMap<String, String>> = BTreeMap::new();
+    for directory in directories {
+        declarations.insert(directory, BTreeMap::new());
+    }
 
     for module in modules.values() {
         let mut names = BTreeMap::new();
@@ -302,7 +327,7 @@ fn resolve(
                         || imported_modules.contains_key(alias)
                     {
                         diagnostics.push(format!("import名 `{alias}` が衝突しています"));
-                    } else if modules.contains_key(&child) {
+                    } else if declarations.contains_key(&child) {
                         imported_modules.insert(alias.to_string(), child);
                     } else if let Some(name) = declarations
                         .get(&target)
@@ -316,7 +341,7 @@ fn resolve(
                         ));
                     }
                 }
-            } else if modules.contains_key(&target) {
+            } else if declarations.contains_key(&target) {
                 let alias = use_decl.alias.as_deref().unwrap_or_else(|| target.name());
                 if local.contains_key(alias) {
                     diagnostics.push(format!("import名 `{alias}` がローカル宣言と衝突しています"));
@@ -341,14 +366,8 @@ fn resolve(
 
     let mut items = Vec::new();
     for (path, mut module) in modules {
-        if module.directory {
-            continue;
-        }
         let (local, imported_declarations, imported_modules) = &scopes[&path];
         for mut item in module.items.drain(..) {
-            if path != *entry_path && matches!(item, Item::Test { .. }) {
-                continue;
-            }
             resolve_item(
                 &mut item,
                 local,
@@ -943,18 +962,58 @@ fn module_references(items: &[Item]) -> Vec<Vec<String>> {
     let mut paths = Vec::new();
     for item in items {
         match item {
-            Item::Impl { methods, .. } => {
-                for (_, body) in methods {
+            Item::Trait { methods, .. } => {
+                for sig in methods {
+                    collect_sig_paths(sig, &mut paths);
+                }
+            }
+            Item::Struct { fields, .. } => {
+                for (_, ty) in fields {
+                    collect_name_path(&ty.name, &mut paths);
+                }
+            }
+            Item::Impl {
+                trait_name,
+                type_name,
+                methods,
+                ..
+            } => {
+                if let Some(trait_name) = trait_name {
+                    collect_name_path(trait_name, &mut paths);
+                }
+                collect_name_path(type_name, &mut paths);
+                for (sig, body) in methods {
+                    collect_sig_paths(sig, &mut paths);
                     collect_expr_paths(body, &mut paths);
                 }
             }
-            Item::Fn { body, .. } | Item::Test { body, .. } => {
+            Item::Effect { trait_name, .. } => collect_name_path(trait_name, &mut paths),
+            Item::Fn { sig, body, .. } => {
+                collect_sig_paths(sig, &mut paths);
                 collect_expr_paths(body, &mut paths);
             }
-            _ => {}
+            Item::Test { body, .. } => {
+                collect_expr_paths(body, &mut paths);
+            }
         }
     }
     paths
+}
+
+fn collect_sig_paths(sig: &Sig, paths: &mut Vec<Vec<String>>) {
+    for param in &sig.params {
+        collect_name_path(&param.ty.name, paths);
+    }
+    if let Some(ret) = &sig.ret {
+        collect_name_path(&ret.name, paths);
+    }
+}
+
+fn collect_name_path(name: &str, paths: &mut Vec<Vec<String>>) {
+    let parts: Vec<String> = name.split("::").map(str::to_string).collect();
+    if parts.len() > 1 {
+        paths.push(parts);
+    }
 }
 
 fn collect_expr_paths(body: &[Expr], paths: &mut Vec<Vec<String>>) {
@@ -970,10 +1029,7 @@ fn collect_expr_paths(body: &[Expr], paths: &mut Vec<Vec<String>>) {
             }
             ExprKind::Array(items) | ExprKind::Block(items) => collect_expr_paths(items, paths),
             ExprKind::StructLit { name, fields } => {
-                let parts: Vec<String> = name.split("::").map(str::to_string).collect();
-                if parts.len() > 1 {
-                    paths.push(parts);
-                }
+                collect_name_path(name, paths);
                 for (_, value) in fields {
                     collect_expr_paths(std::slice::from_ref(value), paths);
                 }
@@ -1006,19 +1062,11 @@ fn collect_expr_paths(body: &[Expr], paths: &mut Vec<Vec<String>>) {
                             match provision {
                                 Provision::Type { slot, type_name } => {
                                     for name in [slot, type_name] {
-                                        let parts: Vec<String> =
-                                            name.split("::").map(str::to_string).collect();
-                                        if parts.len() > 1 {
-                                            paths.push(parts);
-                                        }
+                                        collect_name_path(name, paths);
                                     }
                                 }
                                 Provision::Value { slot, value } => {
-                                    let parts: Vec<String> =
-                                        slot.split("::").map(str::to_string).collect();
-                                    if parts.len() > 1 {
-                                        paths.push(parts);
-                                    }
+                                    collect_name_path(slot, paths);
                                     collect_expr_paths(std::slice::from_ref(value), paths);
                                 }
                             }

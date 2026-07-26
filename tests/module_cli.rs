@@ -298,3 +298,47 @@ fn 選択導入したディレクトリから参照した子だけを読み込�
     assert!(text.contains("main -> 9"), "{text}");
     assert!(!text.contains("broken"), "{text}");
 }
+
+#[test]
+fn 深いパスでも親のリーフとディレクトリの衝突を報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use conflict::child\n\
+         fn main() { child::value() }\n",
+    );
+    project.write("conflict.rd", "fn value() { 1 }\n");
+    project.write("conflict/child.rd", "fn value() { 2 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("モジュール `conflict`"), "{text}");
+    assert!(text.contains("両方があります"), "{text}");
+}
+
+#[test]
+fn 宣言位置の修飾参照から子モジュールを読み込む() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use services\n\
+         effect db: services::users::StoreApi\n\
+         fn main() { 0 }\n",
+    );
+    project.write(
+        "services/users.rd",
+        "trait StoreApi {\n\
+         \x20 fn read(self -> Int)\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("main::db: services::users::StoreApi"),
+        "{text}"
+    );
+    assert!(!text.contains("use` されていません"), "{text}");
+}

@@ -357,6 +357,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::Effect
             | Tok::Test
             | Tok::Use
+            | Tok::As
             | Tok::Return
             | Tok::Assert
             | Tok::RBrace // ブロックの終わりは「次の文」ではないが改行は残したい

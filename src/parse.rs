@@ -99,6 +99,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok("use".to_string())
             }
+            Tok::As => {
+                self.bump();
+                Ok("as".to_string())
+            }
             other => Err(self.err(&format!("{} が必要です (実際は {:?})", what, other))),
         }
     }
@@ -831,6 +835,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 ExprKind::Ident("use".to_string())
             }
+            Tok::As => {
+                self.bump();
+                ExprKind::Ident("as".to_string())
+            }
 
             Tok::Let => {
                 self.bump();
@@ -1140,5 +1148,10 @@ mod tests {
     fn useはトップレベル接頭部にだけ書ける() {
         let error = parse_src("fn first() { 1 }\nuse services\n").unwrap_err();
         assert!(error.msg.contains("先頭"), "{}", error.msg);
+    }
+
+    #[test]
+    fn asはuse以外では既存どおり識別子として使える() {
+        ok("fn as() { 1 }\nfn main() { as() }\n");
     }
 }
