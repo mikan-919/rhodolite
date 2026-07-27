@@ -27,8 +27,6 @@ use std::collections::{BTreeMap, BTreeSet};
 struct Decls {
     /// struct 名 → フィールド名 → 宣言された型
     structs: BTreeMap<String, BTreeMap<String, KnownType>>,
-    /// enum 名
-    enums: BTreeSet<String>,
     /// variant の正準名 → 所属 enum の正準名
     variants: BTreeMap<String, String>,
     /// トップレベル関数の正準名 → 署名。本体を見る前に全部集めるので、
@@ -138,7 +136,6 @@ pub fn check(program: &Program) -> Vec<String> {
 
 fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut structs = BTreeMap::new();
-    let mut enums = BTreeSet::new();
     let mut variants = BTreeMap::new();
     let mut fns = BTreeMap::new();
     let mut others = BTreeSet::new();
@@ -173,7 +170,6 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
             Item::Enum {
                 name, variants: vs, ..
             } => {
-                enums.insert(name.clone());
                 others.insert(name.clone());
                 for variant in vs {
                     variants.insert(variant.clone(), name.clone());
@@ -202,7 +198,6 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
 
     Decls {
         structs,
-        enums,
         variants,
         fns,
         others,
@@ -255,7 +250,7 @@ fn check_expr(
             check_literal(name, fields, decls, ctx, out);
             for (field, v) in fields {
                 check_expr(v, decls, locals, ctx, ret, out);
-                check_enum_field(name, field, v, decls, locals, ctx, out);
+                check_field_value(name, field, v, decls, locals, ctx, out);
             }
         }
 
@@ -294,16 +289,33 @@ fn check_expr(
 
         ExprKind::Assign { target, value } => {
             check_expr(value, decls, locals, ctx, ret, out);
-            // 代入先の裸の名前は書き込み先であって値の読みではない
-            if let ExprKind::Field(recv, field) = &target.kind {
-                check_expr(recv, decls, locals, ctx, ret, out);
-                // optional の中身を取り出す規則はまだ無いので、レシーバは
-                // 非 optional と分かるときだけ見る
-                if let Some(ty) = infer(recv, decls, locals)
-                    && !ty.optional
-                {
-                    check_enum_field(&ty.name, field, value, decls, locals, ctx, out);
+            match &target.kind {
+                // 代入先の裸の名前は書き込み先であって値の読みではない。
+                // 束縛の型は宣言時に決まるので、後の代入では変えない(design.md 決定4)
+                ExprKind::Ident(name) => {
+                    if let Some(Some(expected)) = locals.get(name) {
+                        require(
+                            value,
+                            expected,
+                            &format!("`{name}` への代入"),
+                            decls,
+                            locals,
+                            ctx,
+                            out,
+                        );
+                    }
                 }
+                ExprKind::Field(recv, field) => {
+                    check_expr(recv, decls, locals, ctx, ret, out);
+                    // optional の中身を取り出す規則はまだ無いので、レシーバは
+                    // 非 optional と分かるときだけ見る
+                    if let Some(ty) = infer(recv, decls, locals)
+                        && !ty.optional
+                    {
+                        check_field_value(&ty.name, field, value, decls, locals, ctx, out);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -581,8 +593,9 @@ fn check_field_read(
     }
 }
 
-/// 「宛先が非 optional の enum 型」かつ「値の型も enum と分かる」ときだけ照合する。
-fn check_enum_field(
+/// 宛先の宣言型と値の型が**両方分かる**ときだけ照合する。enum の取り違えも
+/// スカラーの取り違えも optional の有無も、この1本が吸収する(design.md 決定4)。
+fn check_field_value(
     type_name: &str,
     field: &str,
     value: &Expr,
@@ -594,19 +607,14 @@ fn check_enum_field(
     let Some(declared) = decls.structs.get(type_name).and_then(|f| f.get(field)) else {
         return;
     };
-    if declared.optional || !decls.enums.contains(&declared.name) {
-        return;
-    }
     let Some(actual) = infer(value, decls, locals) else {
         return;
     };
-    if actual.optional || !decls.enums.contains(&actual.name) || actual.name == declared.name {
-        return;
+    if actual != *declared {
+        out.push(format!(
+            "{ctx}: `{type_name}` のフィールド `{field}` は `{declared}` ですが、`{actual}` を与えています"
+        ));
     }
-    out.push(format!(
-        "{ctx}: `{type_name}` のフィールド `{field}` は enum `{}` ですが、enum `{}` の値を与えています",
-        declared.name, actual.name
-    ));
 }
 
 /// 裸の名前が値になれるのは、隠されていないフィールド0個の struct か
@@ -730,7 +738,7 @@ mod tests {
     fn 宣言どおりのリテラルは通る() {
         assert!(
             errors(
-                "struct User { id: int\nrank: Rank }\n\
+                "struct User { id: int\nrank: int }\n\
                  fn main() { User { id = 1, rank = 2 } }\n",
             )
             .is_empty()
@@ -741,7 +749,7 @@ mod tests {
     fn 宣言と順序が違っても通る() {
         assert!(
             errors(
-                "struct User { id: int\nrank: Rank }\n\
+                "struct User { id: int\nrank: int }\n\
                  fn main() { User { rank = 2, id = 1 } }\n",
             )
             .is_empty()
@@ -770,7 +778,7 @@ mod tests {
     #[test]
     fn 不足フィールドを報告する() {
         let e = only(
-            "struct User { id: int\nrank: Rank }\n\
+            "struct User { id: int\nrank: int }\n\
              fn main() { User { id = 1 } }\n",
         );
         assert!(e.contains("`rank`"), "{e}");
@@ -891,8 +899,8 @@ mod tests {
     #[test]
     fn 別のenumのvariantをstruct生成で報告する() {
         let e = only(&format!("{RANKS}fn main() {{ User {{ rank = High }} }}\n"));
-        assert!(e.contains("enum `Rank`"), "{e}");
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
         assert!(e.contains("`rank`"), "{e}");
     }
 
@@ -901,7 +909,7 @@ mod tests {
         let e = only(&format!(
             "{RANKS}fn main() {{\n let g = High\n User {{ rank = g }}\n}}\n"
         ));
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -917,8 +925,8 @@ mod tests {
     #[test]
     fn 型の分かるレシーバへの代入で別のenumを報告する() {
         let e = only(&format!("{RANKS}fn stamp(u: User) {{\n u.rank = Low\n}}\n"));
-        assert!(e.contains("enum `Rank`"), "{e}");
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -927,7 +935,7 @@ mod tests {
             "{RANKS}impl User {{\n fn demote(self) {{ self.rank = Low }}\n}}\n"
         ));
         assert!(e.contains("impl User::demote"), "{e}");
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -935,20 +943,15 @@ mod tests {
         let e = only(&format!(
             "{RANKS}fn main() {{\n let u = User {{ rank = Gold }}\n u.rank = Low\n}}\n"
         ));
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     // ---- 5. 今回の保証外 ----
 
     #[test]
     fn 型の分からない値は診断しない() {
-        // 引数の型注釈も struct リテラルも通っていない値
-        assert!(
-            errors(&format!(
-                "{RANKS}fn main(n: int) {{ User {{ rank = n }} }}\n"
-            ))
-            .is_empty()
-        );
+        // `nil` はまだ推論の外。宛先が分かっていても照合しない
+        assert!(errors(&format!("{RANKS}fn main() {{ User {{ rank = nil }} }}\n")).is_empty());
     }
 
     #[test]
@@ -982,36 +985,11 @@ mod tests {
     }
 
     #[test]
-    fn optionalなenumフィールドは診断しない() {
-        assert!(
-            errors(
-                "enum Rank { Bronze Gold }\n\
-                 enum Grade { Low High }\n\
-                 struct Draft { rank: Rank? }\n\
-                 fn main() { Draft { rank = Low } }\n",
-            )
-            .is_empty()
-        );
-    }
-
-    #[test]
     fn 配列の要素は診断しない() {
         assert!(
             errors(&format!(
                 "{RANKS}fn main() {{\n for r in [Low] {{ User {{ rank = r }} }}\n}}\n"
             ))
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn enum型でないフィールドは診断しない() {
-        assert!(
-            errors(
-                "enum Grade { Low High }\n\
-                 struct User { id: int }\n\
-                 fn main() { User { id = Low } }\n",
-            )
             .is_empty()
         );
     }
@@ -1115,7 +1093,7 @@ mod tests {
             "{RANKS}fn pick(-> Grade) {{ Low }}\n\
              fn main() {{\n let g = pick()\n User {{ rank = g }}\n}}\n"
         ));
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -1123,8 +1101,8 @@ mod tests {
         let e = only(&format!(
             "{RANKS}fn pick(-> Grade) {{ Low }}\nfn main() {{ User {{ rank = pick() }} }}\n"
         ));
-        assert!(e.contains("enum `Rank`"), "{e}");
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -1133,7 +1111,7 @@ mod tests {
             "{RANKS}fn get(-> User) {{ User {{ rank = Gold }} }}\n\
              fn main() {{ get().rank = Low }}\n"
         ));
-        assert!(e.contains("enum `Grade`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -1411,6 +1389,100 @@ mod tests {
     #[test]
     fn 型の分からない条件と表明は診断しない() {
         assert!(errors("fn f(u: Users) { for x in u { if x { assert x } } }\n").is_empty());
+    }
+
+    // ---- 12. 分かる代入の照合 ----
+
+    /// 代入の検査環境。スカラー・struct・enum・optional を1つずつ持たせてある
+    const FIELDS: &str = "enum Rank { Bronze Gold }\n\
+                          enum Grade { Low High }\n\
+                          struct Tag {}\n\
+                          struct Card { n: int\ntag: Tag\nrank: Rank\nnote: Rank? }\n";
+
+    #[test]
+    fn 型の合うstruct生成のフィールド値は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{FIELDS}fn f(o: Rank? -> Card) {{ Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = o }} }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の違うstruct生成のフィールド値を報告する() {
+        for (fields, actual) in [
+            ("n = \"x\", tag = Tag {}, rank = Gold, note = nil", "str"),
+            ("n = 1, tag = 1, rank = Gold, note = nil", "int"),
+            ("n = 1, tag = Tag {}, rank = Low, note = nil", "Grade"),
+            // optional の有無も型の違い
+            ("n = 1, tag = Tag {}, rank = Gold, note = Gold", "Rank"),
+        ] {
+            let e = only(&format!(
+                "{FIELDS}fn f(-> Card) {{ Card {{ {fields} }} }}\n"
+            ));
+            assert!(e.contains(&format!("`{actual}` を与えています")), "{e}");
+        }
+    }
+
+    #[test]
+    fn 型の合うフィールド代入は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{FIELDS}fn f(c: Card) {{ c.n = 2\nc.rank = Bronze }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の違うフィールド代入を報告する() {
+        let e = only(&format!("{FIELDS}fn f(c: Card) {{ c.n = Low }}\n"));
+        assert!(e.contains("`n`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 型の合う再代入は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{FIELDS}fn f(n: int) {{\n let r = Gold\n r = Bronze\n n = 2\n}}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の違う再代入を報告する() {
+        let e = only(&format!("{FIELDS}fn f(n: int) {{ n = Low }}\n"));
+        assert!(e.contains("`n` への代入"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+
+        let e = only(&format!("{FIELDS}fn f() {{\n let r = Gold\n r = Low\n}}\n"));
+        assert!(e.contains("`r` への代入"), "{e}");
+    }
+
+    #[test]
+    fn 型の分からない初期化子の束縛は後の代入で型を得ない() {
+        // 代入から遡って型を決めるには分岐の合流と到達性が要る(design.md 決定4)
+        assert!(
+            errors(&format!(
+                "{FIELDS}fn f() {{\n let r = nil\n r = Gold\n r = Low\n}}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の分からない代入元は診断しない() {
+        assert!(
+            errors(&format!(
+                "{FIELDS}fn f(c: Card, n: int) {{\n c.n = nil\n n = nil\n}}\n"
+            ))
+            .is_empty()
+        );
     }
 
     // ---- 正典 ----

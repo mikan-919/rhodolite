@@ -451,7 +451,7 @@ fn モジュールを跨ぐstruct生成を正準名で報告する() {
         "use dep::{User}\n\
          fn main() { User { id = 1 } }\n",
     );
-    project.write("dep.rd", "struct User { id: int\nrank: Rank }\n");
+    project.write("dep.rd", "struct User { id: int\nrank: int }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -471,7 +471,7 @@ fn 宣言どおりのstruct生成はモジュールを跨いでも実行され�
            u.rank\n\
          }\n",
     );
-    project.write("dep.rd", "struct User { id: int\nrank: Rank }\n");
+    project.write("dep.rd", "struct User { id: int\nrank: int }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -622,8 +622,8 @@ fn 別のenumのvariantをenum型フィールドへ与えると実行前に失�
     let output = project.run("main.rd");
     let text = output_text(&output);
     assert!(!output.status.success(), "{text}");
-    assert!(text.contains("enum `main::Rank`"), "{text}");
-    assert!(text.contains("enum `dep::Grade`"), "{text}");
+    assert!(text.contains("`main::Rank`"), "{text}");
+    assert!(text.contains("`dep::Grade`"), "{text}");
     assert!(!text.contains("main ->"), "{text}");
 }
 
