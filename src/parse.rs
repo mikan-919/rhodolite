@@ -625,6 +625,9 @@ impl<'a> Parser<'a> {
         let start = self.span();
         let lhs = self.coalesce()?;
         if self.eat(&Tok::Eq) {
+            if matches!(&lhs.kind, ExprKind::OptionalField(_, _)) {
+                return Err(self.err("optional field access `.?` は読み取り専用です"));
+            }
             let value = self.assign()?; // 右結合
             return Ok(Expr {
                 kind: ExprKind::Assign {
@@ -731,18 +734,26 @@ impl<'a> Parser<'a> {
         self.postfix()
     }
 
-    /// 後置。`.field` / `(args)` / `::name` を左から積む
+    /// 後置。`.field` / `.?field` / `(args)` / `::name` を左から積む
     fn postfix(&mut self) -> PResult<Expr> {
         let start = self.span();
         let mut e = self.primary()?;
         loop {
             if self.eat(&Tok::Dot) {
+                let optional = self.eat(&Tok::Question);
                 let name = self.expect_ident("フィールド名かメソッド名")?;
                 e = Expr {
-                    kind: ExprKind::Field(Box::new(e), name),
+                    kind: if optional {
+                        ExprKind::OptionalField(Box::new(e), name)
+                    } else {
+                        ExprKind::Field(Box::new(e), name)
+                    },
                     span: self.to(start),
                 };
             } else if self.at(&Tok::LParen) {
+                if matches!(&e.kind, ExprKind::OptionalField(_, _)) {
+                    return Err(self.err("optional method call `.?method(...)` は未対応です"));
+                }
                 let args = self.args()?;
                 e = Expr {
                     kind: ExprKind::Call(Box::new(e), args),
@@ -1041,6 +1052,35 @@ mod tests {
             "右辺が Head になっていない: {:?}",
             value.kind
         );
+    }
+
+    #[test]
+    fn optional_field_accessと連鎖を読む() {
+        for src in [
+            "fn f(u: User?) { u.?profile.?name }\n",
+            "fn f(u: User?) {\n u\n .?profile\n .?name\n}\n",
+        ] {
+            let p = ok(src);
+            let Item::Fn { body, .. } = &p.items[0] else {
+                panic!()
+            };
+            let ExprKind::OptionalField(profile, name) = &body[0].kind else {
+                panic!("外側が optional field ではない: {:?}", body[0].kind)
+            };
+            assert_eq!(name, "name");
+            assert!(
+                matches!(&profile.kind, ExprKind::OptionalField(_, field) if field == "profile")
+            );
+        }
+    }
+
+    #[test]
+    fn optional_field_accessは代入とメソッド呼び出しに使えない() {
+        let assignment = parse_src("fn f(u: User?) { u.?name = \"x\" }\n").unwrap_err();
+        assert!(assignment.msg.contains("読み取り専用"), "{assignment}");
+
+        let call = parse_src("fn f(u: User?) { u.?save() }\n").unwrap_err();
+        assert!(call.msg.contains("optional method"), "{call}");
     }
 
     /// `self` の有無だけがメソッドと関連関数の区別

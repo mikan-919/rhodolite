@@ -118,6 +118,8 @@ pub enum ExprKind {
     Path(Vec<String>),
     /// `u.rank`
     Field(Box<Expr>, String),
+    /// `u.?rank` — nil を伝播する読み取り専用のフィールド射影
+    OptionalField(Box<Expr>, String),
     /// `f(a, b)`。`db.save(u)` は `Call(Field(db, "save"), [u])`
     Call(Box<Expr>, Vec<Expr>),
     Array(Vec<Expr>),

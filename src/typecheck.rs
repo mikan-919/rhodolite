@@ -294,6 +294,10 @@ fn check_expr(
             check_expr(recv, decls, locals, ctx, ret, out);
             check_field_read(recv, field, decls, locals, ctx, out);
         }
+        // 型規則と診断は optional field change の次の安定点で足す。
+        ExprKind::OptionalField(recv, _) => {
+            check_expr(recv, decls, locals, ctx, ret, out);
+        }
 
         ExprKind::Assign { target, value } => {
             check_expr(value, decls, locals, ctx, ret, out);

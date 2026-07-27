@@ -1,10 +1,10 @@
 ## 1. Syntax, Runtime, and Traversal
 
-- [ ] 1.1 Add the approved `ExprKind::OptionalField` variant and parser tests for `receiver.?field`, chaining, and continued dotted lines
-- [ ] 1.2 Reject `OptionalField` as an assignment target and as a call suffix with focused parser diagnostics
-- [ ] 1.3 Implement evaluator tests and behavior for present receivers, nil propagation, single receiver evaluation, and chained short-circuiting
-- [ ] 1.4 Add exhaustive module-rewrite and requirement-scan handling with regression tests for receiver traversal
-- [ ] 1.5 Run focused and full tests and commit the stable syntax/runtime snapshot
+- [x] 1.1 Add the approved `ExprKind::OptionalField` variant and parser tests for `receiver.?field`, chaining, and continued dotted lines
+- [x] 1.2 Reject `OptionalField` as an assignment target and as a call suffix with focused parser diagnostics
+- [x] 1.3 Implement evaluator tests and behavior for present receivers, nil propagation, single receiver evaluation, and chained short-circuiting
+- [x] 1.4 Add exhaustive module-rewrite and requirement-scan handling with regression tests for receiver traversal
+- [x] 1.5 Run focused and full tests and commit the stable syntax/runtime snapshot
 
 ## 2. Static Optional Field Typing
 

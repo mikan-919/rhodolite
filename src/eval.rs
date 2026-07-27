@@ -567,6 +567,20 @@ impl<'a> Interp<'a> {
                 }
             }
 
+            ExprKind::OptionalField(recv, name) => {
+                let value = self.eval(recv, env, ambient)?;
+                if matches!(value, Value::Nil) {
+                    return Ok(Value::Nil);
+                }
+                let Value::Struct(o) = value else {
+                    return fail(format!("`.?{name}` を読めません。struct ではありません"));
+                };
+                match o.borrow().fields.get(name) {
+                    Some(v) => Ok(v.clone()),
+                    None => fail(format!("フィールド `{name}` がありません")),
+                }
+            }
+
             ExprKind::Assign { target, value } => {
                 let v = self.eval(value, env, ambient)?;
                 match &target.kind {
@@ -917,6 +931,50 @@ mod tests {
                    \x20 u.rank\n\
                    }\n";
         assert_eq!(int(src), 2);
+    }
+
+    #[test]
+    fn optional_field_accessは値を読みnilを伝播する() {
+        let present = "struct User { id: int }\n\
+                       fn find(-> User?) { User { id = 7 } }\n\
+                       fn main() { find().?id ?? 0 }\n";
+        assert_eq!(int(present), 7);
+
+        let absent = "struct User { id: int }\n\
+                      fn find(-> User?) { nil }\n\
+                      fn main() { find().?id }\n";
+        assert!(matches!(run(absent, "main"), Ok(Value::Nil)));
+    }
+
+    #[test]
+    fn optional_field_accessの連鎖は途中のnilを伝播する() {
+        let present = "struct Inner { n: int }\n\
+                       struct Outer { inner: Inner? }\n\
+                       fn find(-> Outer?) { Outer { inner = Inner { n = 9 } } }\n\
+                       fn main() { find().?inner.?n ?? 0 }\n";
+        assert_eq!(int(present), 9);
+
+        let absent = "struct Inner { n: int }\n\
+                      struct Outer { inner: Inner? }\n\
+                      fn find(-> Outer?) { Outer { inner = nil } }\n\
+                      fn main() { find().?inner.?n }\n";
+        assert!(matches!(run(absent, "main"), Ok(Value::Nil)));
+    }
+
+    #[test]
+    fn optional_field_accessはレシーバを一度だけ評価する() {
+        let src = "struct Counter { n: int }\n\
+                   struct Box { n: int }\n\
+                   fn next(c: Counter -> Box?) {\n\
+                   \x20 c.n = c.n + 1\n\
+                   \x20 Box { n = c.n }\n\
+                   }\n\
+                   fn main() {\n\
+                   \x20 let c = Counter { n = 0 }\n\
+                   \x20 let n = next(c).?n\n\
+                   \x20 c.n * 10 + (n ?? 0)\n\
+                   }\n";
+        assert_eq!(int(src), 11);
     }
 
     /// **差し替えが成立する条件。**呼び出し先での変更が呼び出し元から見えること

@@ -211,7 +211,7 @@ fn scan(
             }
         }
 
-        ExprKind::Field(recv, _) => {
+        ExprKind::Field(recv, _) | ExprKind::OptionalField(recv, _) => {
             if let ExprKind::Ident(name) = &recv.kind {
                 record_access(name, SlotLevel::Value, slots, provided, locals, out);
             }
@@ -746,6 +746,18 @@ mod tests {
              }\n",
         );
         assert!(escaping(&p, "f").is_empty());
+    }
+
+    #[test]
+    fn 手順2_optional_fieldもレシーバの要求だけを集める() {
+        let p = program(
+            "effect db: Database\n\
+             fn f() {\n\
+             \x20 db.?state\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db"]));
+        assert!(callees(&p, "f").is_empty());
     }
 
     // ---- 手順3 ----

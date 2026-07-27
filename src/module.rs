@@ -706,7 +706,7 @@ fn resolve_expr(
                 ExprKind::Path(resolved)
             };
         }
-        ExprKind::Field(recv, _) => resolve_expr(
+        ExprKind::Field(recv, _) | ExprKind::OptionalField(recv, _) => resolve_expr(
             recv,
             locals,
             local,
@@ -1119,7 +1119,10 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             ExprKind::Path(parts) if !parts.first().is_some_and(|first| locals.contains(first)) => {
                 paths.push(parts.clone());
             }
-            ExprKind::Field(recv, _) | ExprKind::Unary(_, recv) | ExprKind::Assert(recv) => {
+            ExprKind::Field(recv, _)
+            | ExprKind::OptionalField(recv, _)
+            | ExprKind::Unary(_, recv)
+            | ExprKind::Assert(recv) => {
                 collect_expr_paths(std::slice::from_ref(recv), locals, paths);
             }
             ExprKind::Call(callee, args) => {
@@ -1216,6 +1219,8 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lex::{join, lex};
+    use crate::parse;
 
     /// ロード後の不変条件(design.md 決定2)。
     ///
@@ -1240,5 +1245,41 @@ mod tests {
             }
         }
         assert_eq!(checked, 2, "正典の `Rank` は variant を2つ持つ");
+    }
+
+    #[test]
+    fn optional_fieldのレシーバも正準名へ解決する() {
+        let mut program =
+            parse::parse(&join(lex("fn main() { dep::make().?value }\n").unwrap())).unwrap();
+        let Item::Fn { body, .. } = &mut program.items[0] else {
+            panic!()
+        };
+
+        let module = ModulePath(vec!["dep".to_string()]);
+        let imported_modules = BTreeMap::from([("dep".to_string(), module.clone())]);
+        let declarations = BTreeMap::from([(
+            module,
+            BTreeMap::from([("make".to_string(), "dep::make".to_string())]),
+        )]);
+        let mut diagnostics = Vec::new();
+        resolve_expr(
+            &mut body[0],
+            &mut BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &imported_modules,
+            &declarations,
+            &mut diagnostics,
+        );
+
+        let ExprKind::OptionalField(recv, field) = &body[0].kind else {
+            panic!("optional field ではない: {:?}", body[0].kind)
+        };
+        let ExprKind::Call(callee, _) = &recv.kind else {
+            panic!("receiver が call ではない: {:?}", recv.kind)
+        };
+        assert!(matches!(&callee.kind, ExprKind::Ident(name) if name == "dep::make"));
+        assert_eq!(field, "value");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 }
