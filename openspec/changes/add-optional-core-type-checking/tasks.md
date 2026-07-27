@@ -1,9 +1,9 @@
 ## 1. Contextual Nil Compatibility
 
-- [ ] 1.1 Add type-checker tests for `nil` in optional and non-optional arguments, returns, struct fields, field assignments, and typed local reassignments
-- [ ] 1.2 Centralize expected-type compatibility so contextual `nil` is accepted only for `T?` across every existing use site
-- [ ] 1.3 Add and implement equality tests for optional-versus-`nil`, non-optional-versus-`nil`, and `nil == nil`
-- [ ] 1.4 Verify focused and full tests and commit the stable contextual-`nil` snapshot
+- [x] 1.1 Add type-checker tests for `nil` in optional and non-optional arguments, returns, struct fields, field assignments, and typed local reassignments
+- [x] 1.2 Centralize expected-type compatibility so contextual `nil` is accepted only for `T?` across every existing use site
+- [x] 1.3 Add and implement equality tests for optional-versus-`nil`, non-optional-versus-`nil`, and `nil == nil`
+- [x] 1.4 Verify focused and full tests and commit the stable contextual-`nil` snapshot
 
 ## 2. Fallback Typing
 

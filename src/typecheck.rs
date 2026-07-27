@@ -393,17 +393,9 @@ fn check_expr(
                         out,
                     );
                 }
-                // 片側が分からないうちは比べない。結果はどちらにせよ `bool`
-                BinOp::Eq => {
-                    if let (Some(l), Some(r)) =
-                        (infer(lhs, decls, locals), infer(rhs, decls, locals))
-                        && l != r
-                    {
-                        out.push(format!(
-                            "{ctx}: `==` の両辺は同じ型である必要がありますが、`{l}` と `{r}` です"
-                        ));
-                    }
-                }
+                // `nil` は相手側の optional 性を文脈にする。それ以外は両方の型が
+                // 分かるときだけ比べる。結果はどちらにせよ `bool`
+                BinOp::Eq => check_equality(lhs, rhs, decls, locals, ctx, out),
                 // `??` は optional の規則が要るので今回の保証外
                 BinOp::Coalesce => {}
             }
@@ -446,7 +438,19 @@ fn check_expr(
     }
 }
 
-/// 直接呼び出しの検査。引数の個数は常に、型は**分かるときだけ**見る。
+/// 期待型のある位置で値を照合し、不一致なら診断用の実型名を返す。
+///
+/// `nil` は自分だけでは nominal 型を持たず、文脈が optional のときだけ適合する。
+/// それ以外の型不明式は後続 change のために従来どおり保留する。
+fn mismatch(value: &Expr, expected: &KnownType, decls: &Decls, locals: &Locals) -> Option<String> {
+    if matches!(value.kind, ExprKind::Nil) {
+        return (!expected.optional).then(|| "nil".to_string());
+    }
+    let actual = infer(value, decls, locals)?;
+    (actual != *expected).then(|| actual.to_string())
+}
+
+/// 直接呼び出しの検査。引数の個数は常に、型は文脈と照合できるときだけ見る。
 fn check_call(
     name: &str,
     sig: &FnSig,
@@ -465,15 +469,13 @@ fn check_call(
         return;
     }
     for (i, (arg, expected)) in args.iter().zip(&sig.params).enumerate() {
-        let Some(actual) = infer(arg, decls, locals) else {
+        let Some(actual) = mismatch(arg, expected, decls, locals) else {
             continue;
         };
-        if actual != *expected {
-            out.push(format!(
-                "{ctx}: `{name}` の第 {} 引数は `{expected}` ですが、`{actual}` を渡しています",
-                i + 1
-            ));
-        }
+        out.push(format!(
+            "{ctx}: `{name}` の第 {} 引数は `{expected}` ですが、`{actual}` を渡しています",
+            i + 1
+        ));
     }
 }
 
@@ -490,14 +492,12 @@ fn check_return(
     let Some(expected) = ret else {
         return;
     };
-    let Some(actual) = infer(value, decls, locals) else {
+    let Some(actual) = mismatch(value, expected, decls, locals) else {
         return;
     };
-    if actual != *expected {
-        out.push(format!(
-            "{ctx}: 戻り値は `{expected}` ですが、`{actual}` を返しています"
-        ));
-    }
+    out.push(format!(
+        "{ctx}: 戻り値は `{expected}` ですが、`{actual}` を返しています"
+    ));
 }
 
 /// 式の型が分かるならそれ。分からないなら `None`。
@@ -550,12 +550,39 @@ fn require(
     ctx: &str,
     out: &mut Vec<String>,
 ) {
-    let Some(actual) = infer(e, decls, locals) else {
+    let Some(actual) = mismatch(e, expected, decls, locals) else {
         return;
     };
-    if actual != *expected {
+    out.push(format!(
+        "{ctx}: {what}は `{expected}` ですが、`{actual}` です"
+    ));
+}
+
+/// 等価比較の互換性。`nil` は反対側の optional 性を文脈にする。
+fn check_equality(
+    lhs: &Expr,
+    rhs: &Expr,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    let pair = match (&lhs.kind, &rhs.kind) {
+        (ExprKind::Nil, ExprKind::Nil) => return,
+        (ExprKind::Nil, _) => infer(rhs, decls, locals)
+            .filter(|ty| !ty.optional)
+            .map(|ty| ("nil".to_string(), ty.to_string())),
+        (_, ExprKind::Nil) => infer(lhs, decls, locals)
+            .filter(|ty| !ty.optional)
+            .map(|ty| (ty.to_string(), "nil".to_string())),
+        _ => match (infer(lhs, decls, locals), infer(rhs, decls, locals)) {
+            (Some(l), Some(r)) if l != r => Some((l.to_string(), r.to_string())),
+            _ => None,
+        },
+    };
+    if let Some((left, right)) = pair {
         out.push(format!(
-            "{ctx}: {what}は `{expected}` ですが、`{actual}` です"
+            "{ctx}: `==` の両辺は同じ型である必要がありますが、`{left}` と `{right}` です"
         ));
     }
 }
@@ -614,14 +641,12 @@ fn check_field_value(
     let Some(declared) = decls.structs.get(type_name).and_then(|f| f.get(field)) else {
         return;
     };
-    let Some(actual) = infer(value, decls, locals) else {
+    let Some(actual) = mismatch(value, declared, decls, locals) else {
         return;
     };
-    if actual != *declared {
-        out.push(format!(
-            "{ctx}: `{type_name}` のフィールド `{field}` は `{declared}` ですが、`{actual}` を与えています"
-        ));
-    }
+    out.push(format!(
+        "{ctx}: `{type_name}` のフィールド `{field}` は `{declared}` ですが、`{actual}` を与えています"
+    ));
 }
 
 /// 裸の名前が値になれるのは、隠されていないフィールド0個の struct か
@@ -956,12 +981,6 @@ mod tests {
     // ---- 5. 今回の保証外 ----
 
     #[test]
-    fn 型の分からない値は診断しない() {
-        // `nil` はまだ推論の外。宛先が分かっていても照合しない
-        assert!(errors(&format!("{RANKS}fn main() {{ User {{ rank = nil }} }}\n")).is_empty());
-    }
-
-    #[test]
     fn 型の分からないレシーバへの代入は診断しない() {
         assert!(errors(&format!("{RANKS}fn f(u: User?) {{ u.rank = Low }}\n")).is_empty());
     }
@@ -1064,14 +1083,18 @@ mod tests {
     }
 
     #[test]
-    fn 型の分からない引数は診断しない() {
-        // `nil`・`??`・配列・メソッド結果はまだ推論の外
+    fn nil引数は期待するoptional性と照合する() {
         assert!(
             errors(&format!(
-                "{RANKS}fn f(r: Rank) {{ r }}\nfn main() {{ f(nil) }}\n"
+                "{RANKS}fn f(r: Rank?) {{ r }}\nfn main() {{ f(nil) }}\n"
             ))
             .is_empty()
         );
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank) {{ r }}\nfn main() {{ f(nil) }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`nil`"), "{e}");
     }
 
     #[test]
@@ -1188,8 +1211,11 @@ mod tests {
     }
 
     #[test]
-    fn 型の分からない戻り値は診断しない() {
-        assert!(errors(&format!("{RANKS}fn pick(-> Grade) {{ nil }}\n")).is_empty());
+    fn nil戻り値は期待するoptional性と照合する() {
+        assert!(errors(&format!("{RANKS}fn pick(-> Rank?) {{ nil }}\n")).is_empty());
+        let e = only(&format!("{RANKS}fn pick(-> Grade) {{ nil }}\n"));
+        assert!(e.contains("`Grade`"), "{e}");
+        assert!(e.contains("`nil`"), "{e}");
     }
 
     // ---- 9. 組み込みのスカラー型 ----
@@ -1359,10 +1385,17 @@ mod tests {
     }
 
     #[test]
-    fn 片側の型が分からない比較の結果もboolになる() {
-        assert!(errors(&format!("{RANKS}fn f(a: Rank -> bool) {{ a == nil }}\n")).is_empty());
-        let e = only(&format!("{RANKS}fn f(a: Rank -> Rank) {{ a == nil }}\n"));
-        assert!(e.contains("`bool`"), "{e}");
+    fn nilとの比較は相手のoptional性を使う() {
+        for expr in ["a == nil", "nil == a"] {
+            assert!(
+                errors(&format!("{RANKS}fn f(a: Rank? -> bool) {{ {expr} }}\n")).is_empty(),
+                "{expr}"
+            );
+            let e = only(&format!("{RANKS}fn f(a: Rank -> bool) {{ {expr} }}\n"));
+            assert!(e.contains("`Rank`"), "{expr}: {e}");
+            assert!(e.contains("`nil`"), "{expr}: {e}");
+        }
+        assert!(errors("fn f(-> bool) { nil == nil }\n").is_empty());
     }
 
     #[test]
@@ -1410,7 +1443,10 @@ mod tests {
     fn 型の合うstruct生成のフィールド値は診断を出さない() {
         assert!(
             errors(&format!(
-                "{FIELDS}fn f(o: Rank? -> Card) {{ Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = o }} }}\n"
+                "{FIELDS}fn f(o: Rank? -> Card) {{\n\
+                 Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = nil }}\n\
+                 Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = o }}\n\
+                 }}\n"
             ))
             .is_empty()
         );
@@ -1422,6 +1458,7 @@ mod tests {
             ("n = \"x\", tag = Tag {}, rank = Gold, note = nil", "str"),
             ("n = 1, tag = 1, rank = Gold, note = nil", "int"),
             ("n = 1, tag = Tag {}, rank = Low, note = nil", "Grade"),
+            ("n = 1, tag = Tag {}, rank = nil, note = nil", "nil"),
             // optional の有無も型の違い
             ("n = 1, tag = Tag {}, rank = Gold, note = Gold", "Rank"),
         ] {
@@ -1436,7 +1473,7 @@ mod tests {
     fn 型の合うフィールド代入は診断を出さない() {
         assert!(
             errors(&format!(
-                "{FIELDS}fn f(c: Card) {{ c.n = 2\nc.rank = Bronze }}\n"
+                "{FIELDS}fn f(c: Card) {{ c.n = 2\nc.rank = Bronze\nc.note = nil }}\n"
             ))
             .is_empty()
         );
@@ -1454,7 +1491,8 @@ mod tests {
     fn 型の合う再代入は診断を出さない() {
         assert!(
             errors(&format!(
-                "{FIELDS}fn f(n: int) {{\n let r = Gold\n r = Bronze\n n = 2\n}}\n"
+                "{FIELDS}fn f(n: int, note: Rank?) {{\n\
+                 let r = Gold\n r = Bronze\n n = 2\n note = nil\n}}\n"
             ))
             .is_empty()
         );
@@ -1483,13 +1521,12 @@ mod tests {
     }
 
     #[test]
-    fn 型の分からない代入元は診断しない() {
-        assert!(
-            errors(&format!(
-                "{FIELDS}fn f(c: Card, n: int) {{\n c.n = nil\n n = nil\n}}\n"
-            ))
-            .is_empty()
-        );
+    fn nilを非optionalへ代入すると報告する() {
+        let errors = errors(&format!(
+            "{FIELDS}fn f(c: Card, n: int) {{\n c.n = nil\n n = nil\n}}\n"
+        ));
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().all(|e| e.contains("`nil`")), "{errors:?}");
     }
 
     // ---- 正典 ----
