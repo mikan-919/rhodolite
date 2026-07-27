@@ -18,11 +18,14 @@
 //!     **型の分かる**引数は宣言された引数型と適合する
 //!   - 戻り値型を宣言した関数の、**型の分かる**明示 `return` と最後の式は
 //!     その型と適合する
+//!   - 配列リテラルの要素は、期待要素型があればそれと、無ければ互いに適合する
+//!   - `for` の反復対象は非 optional な配列で、ループ変数は要素型を持つ
 //!
-//! 型の同一性は名前と後置 `?` の一致だけ(nominal)。期待型のある宛先では
+//! 型の同一性は形と後置 `?` の一致だけ(nominal)。配列は要素型まで含めて
+//! 一致しないと同じ型ではない。期待型のある宛先では
 //! `T` を同名の `T?` へ注入できるが、式の推論型と等価比較は変えない。
 //! `nil` は期待される `T?` の文脈でだけ適合し、`T? ?? T` は `T` を返す。
-//! `S?.?field` は宣言 field の型に optional を付けて返す。配列、メソッドと
+//! `S?.?field` は宣言 field の型に optional を付けて返す。メソッドと
 //! 関連関数の呼び出しはまだ型を持たない(design.md の Non-Goals)。
 //! これは**実装が未着手なだけ**で、言語の側にワイルドカード型は無い。
 //! 型の分からない式には診断を出さず、後続の change が一つずつ潰していく。
@@ -30,7 +33,7 @@
 //! 走査は `requirement::scan` と同じ字句スコープ規則を持つが、運ぶ状態が
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
-use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Type, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Type, TypeKind, UnOp};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 宣言の索引。正準名でそのまま引く。
@@ -47,16 +50,48 @@ struct Decls {
     others: BTreeSet<String>,
 }
 
-/// 分かっている型。同一性は名前と後置 `?` の一致(nominal, design.md 決定1)。
+/// 分かっている型。同一性は形と後置 `?` の一致(nominal, design.md 決定1)。
+/// 配列は要素型まで含めて一致しないと同じ型ではない(要素型は不変)。
 #[derive(Clone, PartialEq, Eq)]
 struct KnownType {
-    name: String,
+    kind: KnownKind,
     optional: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum KnownKind {
+    Named(String),
+    Array(Box<KnownType>),
+}
+
+impl KnownType {
+    /// 名前の葉。配列なら `None`。struct 表を引く前に必ず通る
+    fn name(&self) -> Option<&str> {
+        match &self.kind {
+            KnownKind::Named(name) => Some(name),
+            KnownKind::Array(_) => None,
+        }
+    }
+
+    /// 配列の要素型。後置 `?` の有無に関わらず取れる
+    fn element(&self) -> Option<&KnownType> {
+        match &self.kind {
+            KnownKind::Array(element) => Some(element),
+            KnownKind::Named(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for KnownType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}{}", self.name, if self.optional { "?" } else { "" })
+        match &self.kind {
+            KnownKind::Named(name) => write!(f, "{name}")?,
+            KnownKind::Array(element) => write!(f, "[{element}]")?,
+        }
+        if self.optional {
+            write!(f, "?")?;
+        }
+        Ok(())
     }
 }
 
@@ -76,8 +111,12 @@ type Locals = BTreeMap<String, Option<KnownType>>;
 /// 型注釈をそのまま型の事実にする。`None` は「推論できない」の意味で使うので、
 /// 注釈のある所は optional でも `Some` になる(design.md 決定1)。
 fn known(ty: &Type) -> KnownType {
+    let kind = match &ty.kind {
+        TypeKind::Named(name) => KnownKind::Named(name.clone()),
+        TypeKind::Array(element) => KnownKind::Array(Box::new(known(element))),
+    };
     KnownType {
-        name: ty.name.clone(),
+        kind,
         optional: ty.optional,
     }
 }
@@ -85,7 +124,15 @@ fn known(ty: &Type) -> KnownType {
 /// 後置 `?` の付かない型。variant / struct リテラル / self に使う。
 fn plain(name: &str) -> KnownType {
     KnownType {
-        name: name.to_string(),
+        kind: KnownKind::Named(name.to_string()),
+        optional: false,
+    }
+}
+
+/// 後置 `?` の付かない配列型。
+fn array_of(element: KnownType) -> KnownType {
+    KnownType {
+        kind: KnownKind::Array(Box::new(element)),
         optional: false,
     }
 }
@@ -222,12 +269,14 @@ fn check_body(
     ret: Option<&KnownType>,
     out: &mut Vec<String>,
 ) {
-    check_exprs(body, decls, &mut locals, ctx, ret, out);
     // ブロックは値ベースなので最後の式も戻り値。明示 `return` は走査側が見る。
     // 最後の式を見る場所をここ一箇所にして、入れ子で二重に出るのを防ぐ
-    if let Some(last) = body.last() {
-        check_return(last, decls, &locals, ctx, ret, out);
-    }
+    let Some((last, init)) = body.split_last() else {
+        return;
+    };
+    check_exprs(init, decls, &mut locals, ctx, ret, out);
+    check_expr_at(last, ret, decls, &mut locals, ctx, ret, out);
+    check_return(last, decls, &locals, ctx, ret, out);
 }
 
 fn check_exprs(
@@ -243,10 +292,27 @@ fn check_exprs(
     }
 }
 
-/// `requirement::scan` と同じく、ブロックから戻れば内側の束縛は消える。
-/// 枝へ入るときだけ `locals` を複製する。
+/// 期待型の無い位置の式。
 fn check_expr(
     e: &Expr,
+    decls: &Decls,
+    locals: &mut Locals,
+    ctx: &str,
+    ret: Option<&KnownType>,
+    out: &mut Vec<String>,
+) {
+    check_expr_at(e, None, decls, locals, ctx, ret, out);
+}
+
+/// `requirement::scan` と同じく、ブロックから戻れば内側の束縛は消える。
+/// 枝へ入るときだけ `locals` を複製する。
+///
+/// `expected` は宛先の宣言型。配列リテラルだけが要素へ配るために使い、
+/// それ以外の式は自分の型を推論するだけなので見ない。
+#[allow(clippy::too_many_arguments)]
+fn check_expr_at(
+    e: &Expr,
+    expected: Option<&KnownType>,
     decls: &Decls,
     locals: &mut Locals,
     ctx: &str,
@@ -259,7 +325,8 @@ fn check_expr(
         ExprKind::StructLit { name, fields } => {
             check_literal(name, fields, decls, ctx, out);
             for (field, v) in fields {
-                check_expr(v, decls, locals, ctx, ret, out);
+                let declared = declared_field(name, field, decls);
+                check_expr_at(v, declared.as_ref(), decls, locals, ctx, ret, out);
                 check_field_value(name, field, v, decls, locals, ctx, out);
             }
         }
@@ -280,14 +347,19 @@ fn check_expr(
                 ExprKind::Field(recv, _) => check_expr(recv, decls, locals, ctx, ret, out),
                 _ => check_expr(callee, decls, locals, ctx, ret, out),
             }
-            for a in args {
-                check_expr(a, decls, locals, ctx, ret, out);
-            }
             // メソッド (`Field`) と関連関数 (`Path`) は候補の絞り込みが要るので
             // 今回は見ない(design.md 決定3)
-            if let ExprKind::Ident(name) = &callee.kind
-                && let Some(sig) = decls.fns.get(name)
-            {
+            let sig = match &callee.kind {
+                ExprKind::Ident(name) => decls.fns.get(name),
+                _ => None,
+            };
+            // 個数が合わなければ引数と宣言の対応が取れないので期待型は配らない
+            let params = sig.map(|s| &s.params).filter(|p| p.len() == args.len());
+            for (i, a) in args.iter().enumerate() {
+                let expected = params.and_then(|p| p.get(i)).cloned();
+                check_expr_at(a, expected.as_ref(), decls, locals, ctx, ret, out);
+            }
+            if let (ExprKind::Ident(name), Some(sig)) = (&callee.kind, sig) {
                 check_call(name, sig, args, decls, locals, ctx, out);
             }
         }
@@ -302,12 +374,13 @@ fn check_expr(
         }
 
         ExprKind::Assign { target, value } => {
-            check_expr(value, decls, locals, ctx, ret, out);
             match &target.kind {
                 // 代入先の裸の名前は書き込み先であって値の読みではない。
                 // 束縛の型は宣言時に決まるので、後の代入では変えない(design.md 決定4)
                 ExprKind::Ident(name) => {
-                    if let Some(Some(expected)) = locals.get(name) {
+                    let expected = locals.get(name).cloned().flatten();
+                    check_expr_at(value, expected.as_ref(), decls, locals, ctx, ret, out);
+                    if let Some(expected) = &expected {
                         require(
                             value,
                             expected,
@@ -323,13 +396,16 @@ fn check_expr(
                     check_expr(recv, decls, locals, ctx, ret, out);
                     // optional の中身を取り出す規則はまだ無いので、レシーバは
                     // 非 optional と分かるときだけ見る
-                    if let Some(ty) = infer(recv, decls, locals)
-                        && !ty.optional
-                    {
-                        check_field_value(&ty.name, field, value, decls, locals, ctx, out);
+                    let owner = infer(recv, decls, locals)
+                        .filter(|ty| !ty.optional)
+                        .and_then(|ty| Some(ty.name()?.to_string()));
+                    let declared = owner.as_ref().and_then(|o| declared_field(o, field, decls));
+                    check_expr_at(value, declared.as_ref(), decls, locals, ctx, ret, out);
+                    if let Some(owner) = &owner {
+                        check_field_value(owner, field, value, decls, locals, ctx, out);
                     }
                 }
-                _ => {}
+                _ => check_expr(value, decls, locals, ctx, ret, out),
             }
         }
 
@@ -356,8 +432,7 @@ fn check_expr(
                 Head::For { var, iter } => {
                     check_expr(iter, decls, locals, ctx, ret, out);
                     let mut inner = locals.clone();
-                    // 配列の要素型は今回の保証外
-                    inner.insert(var.clone(), None);
+                    inner.insert(var.clone(), iterated(iter, decls, locals, ctx, out));
                     check_expr(body, decls, &mut inner, ctx, ret, out);
                 }
                 Head::Else => check_expr(body, decls, &mut locals.clone(), ctx, ret, out),
@@ -367,9 +442,20 @@ fn check_expr(
             }
         }
 
+        // 期待要素型があればそれ、無ければ最初に型の分かる要素を基準にして、
+        // 残りの要素を既存の適合規則で照合する。基準が無い(空配列・全要素が
+        // 型不明)なら何も言わない(design.md 決定3)
         ExprKind::Array(items) => {
-            for i in items {
-                check_expr(i, decls, locals, ctx, ret, out);
+            let element = match expected.and_then(KnownType::element) {
+                Some(element) => Some(element.clone()),
+                None => items.iter().find_map(|i| infer(i, decls, locals)),
+            };
+            for (n, item) in items.iter().enumerate() {
+                check_expr_at(item, element.as_ref(), decls, locals, ctx, ret, out);
+                if let Some(element) = &element {
+                    let what = format!("配列の第 {} 要素", n + 1);
+                    require(item, element, &what, decls, locals, ctx, out);
+                }
             }
         }
         ExprKind::Block(body) => check_exprs(body, decls, locals, ctx, ret, out),
@@ -407,7 +493,7 @@ fn check_expr(
             }
         }
         ExprKind::Return(Some(inner)) => {
-            check_expr(inner, decls, locals, ctx, ret, out);
+            check_expr_at(inner, ret, decls, locals, ctx, ret, out);
             check_return(inner, decls, locals, ctx, ret, out);
         }
         ExprKind::Unary(UnOp::Neg, inner) => {
@@ -453,10 +539,47 @@ fn mismatch(value: &Expr, expected: &KnownType, decls: &Decls, locals: &Locals) 
     if matches!(value.kind, ExprKind::Nil) {
         return (!expected.optional).then(|| "nil".to_string());
     }
+    // 期待型のある位置に直接書かれた配列リテラルは生成の境界。要素は
+    // `check_expr` が期待要素型で照合済みなので、ここでは配列全体を
+    // 適合として扱う(design.md 決定4)
+    if matches!(value.kind, ExprKind::Array(_)) && expected.element().is_some() {
+        return None;
+    }
     let actual = infer(value, decls, locals)?;
     let compatible = actual == *expected
-        || (actual.name == expected.name && !actual.optional && expected.optional);
+        || (actual.kind == expected.kind && !actual.optional && expected.optional);
     (!compatible).then(|| actual.to_string())
+}
+
+/// 宣言済み struct の宣言フィールドの型。期待型を配るためだけに引く。
+fn declared_field(type_name: &str, field: &str, decls: &Decls) -> Option<KnownType> {
+    decls.structs.get(type_name)?.get(field).cloned()
+}
+
+/// `for x in xs` のループ変数の型。反復対象は非 optional な配列でなければ
+/// ならない。型が分からないときは従来どおり何も言わず、変数も不明にする
+/// (design.md 決定5)。
+fn iterated(
+    iter: &Expr,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) -> Option<KnownType> {
+    let ty = infer(iter, decls, locals)?;
+    let Some(element) = ty.element() else {
+        out.push(format!(
+            "{ctx}: `for` の反復対象は配列である必要がありますが、`{ty}` です"
+        ));
+        return None;
+    };
+    if ty.optional {
+        out.push(format!(
+            "{ctx}: optional な配列 `{ty}` はそのまま反復できません。先に `??` で展開してください"
+        ));
+        return None;
+    }
+    Some(element.clone())
 }
 
 /// 直接呼び出しの検査。引数の個数は常に、型は文脈と照合できるときだけ見る。
@@ -531,14 +654,14 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             if ty.optional {
                 return None;
             }
-            decls.structs.get(&ty.name)?.get(field).cloned()
+            decls.structs.get(ty.name()?)?.get(field).cloned()
         }
         ExprKind::OptionalField(recv, field) => {
             let ty = infer(recv, decls, locals)?;
             if !ty.optional {
                 return None;
             }
-            let mut field_ty = decls.structs.get(&ty.name)?.get(field).cloned()?;
+            let mut field_ty = decls.structs.get(ty.name()?)?.get(field).cloned()?;
             // optional は1 bit。宣言型が既に T? でも結果は T? のまま。
             field_ty.optional = true;
             Some(field_ty)
@@ -547,6 +670,21 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             ExprKind::Ident(name) => decls.fns.get(name)?.ret.clone(),
             _ => None,
         },
+        // 全要素の型が分かって一致するときだけ配列型になる。空配列と、
+        // 型の分からない要素や矛盾する要素を含む配列は不明のまま
+        // (design.md 決定3)。矛盾の診断は `check_expr` の側にある
+        ExprKind::Array(items) => {
+            let mut element: Option<KnownType> = None;
+            for item in items {
+                let ty = infer(item, decls, locals)?;
+                match &element {
+                    Some(first) if *first != ty => return None,
+                    Some(_) => {}
+                    None => element = Some(ty),
+                }
+            }
+            Some(array_of(element?))
+        }
         // 演算子の結果型は被演算子に依らず決まる。被演算子の診断は
         // `check_expr` の側にある(design.md 決定3)
         ExprKind::Unary(UnOp::Neg, _) => Some(plain("int")),
@@ -612,7 +750,7 @@ fn check_coalesce(
     }
 
     let expected = KnownType {
-        name: left.name,
+        kind: left.kind,
         optional: false,
     };
     require(rhs, &expected, "`??` の右辺", decls, locals, ctx, out);
@@ -701,7 +839,7 @@ fn check_field_read(
         ));
         return;
     }
-    let Some(declared) = decls.structs.get(&ty.name) else {
+    let Some(declared) = ty.name().and_then(|name| decls.structs.get(name)) else {
         out.push(format!(
             "{ctx}: `{ty}` は struct ではないので `{field}` を読めません"
         ));
@@ -730,7 +868,7 @@ fn check_optional_field_read(
         ));
         return;
     }
-    let Some(declared) = decls.structs.get(&ty.name) else {
+    let Some(declared) = ty.name().and_then(|name| decls.structs.get(name)) else {
         out.push(format!(
             "{ctx}: `{ty}` の中身は struct ではないので `.?{field}` を読めません"
         ));
@@ -739,7 +877,7 @@ fn check_optional_field_read(
     if !declared.contains_key(field) {
         out.push(format!(
             "{ctx}: `{}` にフィールド `{field}` はありません",
-            ty.name
+            ty.name().unwrap_or_default()
         ));
     }
 }
@@ -995,7 +1133,7 @@ mod tests {
     #[test]
     fn forの束縛はstruct名を隠す() {
         assert!(
-            errors("struct User { id: int }\nfn f(xs: Users) { for User in xs { User } }\n")
+            errors("struct User { id: int }\nfn f(xs: [User]) { for User in xs { User } }\n")
                 .is_empty()
         );
     }
@@ -1122,16 +1260,6 @@ mod tests {
                 "{RANKS}struct Store {{}}\n\
                  impl Store {{ fn make(-> User) {{ User {{ rank = Gold }} }} }}\n\
                  fn main() {{ Store::make().rank = Low }}\n"
-            ))
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn 配列の要素は診断しない() {
-        assert!(
-            errors(&format!(
-                "{RANKS}fn main() {{\n for r in [Low] {{ User {{ rank = r }} }}\n}}\n"
             ))
             .is_empty()
         );
@@ -1442,12 +1570,12 @@ mod tests {
 
     #[test]
     fn 型の分からないレシーバのフィールドは診断しない() {
-        // for 束縛と、戻り値型の無い呼び出し結果はまだ推論の外
+        // 型の分からない反復対象の束縛と、戻り値型の無い呼び出し結果は推論の外
         assert!(
             errors(&format!(
                 "{NESTED}fn unknown() {{ nil }}\n\
-                 fn f(xs: Users) {{\n\
-                 \x20 for x in xs {{ x.nope }}\n\
+                 fn f() {{\n\
+                 \x20 for x in unknown() {{ x.nope }}\n\
                  \x20 unknown().?nope\n\
                  }}\n"
             ))
@@ -1752,7 +1880,10 @@ mod tests {
 
     #[test]
     fn 型の分からない条件と表明は診断しない() {
-        assert!(errors("fn f(u: Users) { for x in u { if x { assert x } } }\n").is_empty());
+        assert!(
+            errors("fn unknown() { nil }\nfn f() { for x in unknown() { if x { assert x } } }\n")
+                .is_empty()
+        );
     }
 
     // ---- 12. 分かる代入の照合 ----
@@ -1852,6 +1983,142 @@ mod tests {
         assert!(errors.iter().all(|e| e.contains("`nil`")), "{errors:?}");
     }
 
+    // ---- 13. 配列リテラルの型付け ----
+
+    #[test]
+    fn 同じ型の要素からなる配列は型が分かる() {
+        assert!(
+            errors(
+                "fn take(xs: [int]) { xs }\n\
+                 fn main() { take([1, 2, 3]) }\n",
+            )
+            .is_empty()
+        );
+        // 推論した配列型は束縛を越えて既存の照合へ届く
+        let e = only("fn take(xs: [str]) { xs }\nfn main() { let xs = [1, 2]\ntake(xs) }\n");
+        assert!(e.contains("`[str]`"), "{e}");
+        assert!(e.contains("`[int]`"), "{e}");
+    }
+
+    #[test]
+    fn 型の食い違う要素を位置付きで報告する() {
+        let e = only("fn main() { let xs = [1, true, 2]\nxs }\n");
+        assert!(e.contains("配列の第 2 要素"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`bool`"), "{e}");
+    }
+
+    #[test]
+    fn 型の分からない要素を含む配列は型を持たない() {
+        // 空配列も、`nil` しか無い配列も、後の使用から遡って型を得ない
+        assert!(
+            errors(
+                "fn take(n: int) { n }\n\
+                 fn main() {\n\
+                 \x20 let empty = []\n\
+                 \x20 let nils = [nil, nil]\n\
+                 \x20 take(empty)\n\
+                 \x20 take(nils)\n\
+                 }\n",
+            )
+            .is_empty()
+        );
+    }
+
+    /// 配列の検査環境。要素が enum・optional・入れ子のフィールドを1つずつ持つ
+    const ARRAYS: &str = "enum Rank { Bronze Gold }\n\
+                          enum Grade { Low High }\n\
+                          struct User { rank: Rank }\n\
+                          struct Store { users: [User]\nnotes: [Rank?]\ngrid: [[int]] }\n";
+
+    #[test]
+    fn 期待する配列型のある位置では要素をその型と照合する() {
+        assert!(
+            errors(&format!(
+                "{ARRAYS}fn f(u: User -> Store) {{\n\
+                 \x20 Store {{ users = [], notes = [Gold, nil], grid = [[1], []] }}\n\
+                 \x20 Store {{ users = [u], notes = [], grid = [] }}\n\
+                 }}\n"
+            ))
+            .is_empty(),
+            "空配列はどの期待配列型にも収まり、要素へは既存の nil と optional 注入が効く"
+        );
+    }
+
+    #[test]
+    fn 期待する要素型と食い違う要素を報告する() {
+        let e = only(&format!(
+            "{ARRAYS}fn f(-> Store) {{ Store {{ users = [], notes = [Low], grid = [] }} }}\n"
+        ));
+        assert!(e.contains("配列の第 1 要素"), "{e}");
+        assert!(e.contains("`Rank?`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+
+        // 入れ子でも診断は一番内側の要素に一度だけ出る
+        let e = only(&format!(
+            "{ARRAYS}fn f(-> Store) {{ Store {{ users = [], notes = [], grid = [[1], [true]] }} }}\n"
+        ));
+        assert!(e.contains("配列の第 1 要素"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`bool`"), "{e}");
+    }
+
+    #[test]
+    fn 配列の値は要素型について不変() {
+        assert!(
+            errors(&format!(
+                "{ARRAYS}fn take(xs: [User]?) {{ xs }}\nfn main(xs: [User]) {{ take(xs) }}\n"
+            ))
+            .is_empty(),
+            "外側の optional への注入は既存の規則どおり通る"
+        );
+
+        let e = only(&format!(
+            "{ARRAYS}fn take(xs: [User?]) {{ xs }}\nfn main(xs: [User]) {{ take(xs) }}\n"
+        ));
+        assert!(e.contains("`[User?]`"), "{e}");
+        assert!(e.contains("`[User]`"), "{e}");
+    }
+
+    // ---- 14. for の要素型 ----
+
+    #[test]
+    fn ループ変数は配列の要素型を得る() {
+        assert!(
+            errors(&format!(
+                "{ARRAYS}fn f(s: Store) {{ for u in s.users {{ u.rank = Gold }} }}\n"
+            ))
+            .is_empty()
+        );
+
+        let e = only(&format!(
+            "{ARRAYS}fn f(s: Store) {{ for u in s.users {{ u.rank = Low }} }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+
+        let e = only(&format!(
+            "{ARRAYS}fn f(s: Store) {{ for u in s.users {{ u.nope }} }}\n"
+        ));
+        assert!(e.contains("`User`"), "{e}");
+        assert!(e.contains("`nope`"), "{e}");
+    }
+
+    #[test]
+    fn 配列でない反復対象を報告する() {
+        let e = only(&format!("{ARRAYS}fn f(n: int) {{ for x in n {{ x }} }}\n"));
+        assert!(e.contains("`for` の反復対象は配列"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+    }
+
+    #[test]
+    fn optionalな配列の反復を報告する() {
+        let e = only(&format!(
+            "{ARRAYS}fn f(xs: [User]?) {{ for u in xs {{ u }} }}\n"
+        ));
+        assert!(e.contains("optional な配列 `[User]?`"), "{e}");
+    }
+
     // ---- 正典 ----
 
     #[test]
@@ -1859,5 +2126,18 @@ mod tests {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let errors = errors(&src);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// 正典の `for u in self.users` が静的に検査されていること。
+    /// `users: [User]` を宣言した効果は、ループ本体の誤りが実行前に出ることで見える
+    #[test]
+    fn 正典のループ本体は要素型で検査される() {
+        let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
+        let broken = src.replace("if u.id == id", "if u.nope == id");
+        assert_ne!(broken, src, "正典のループ本体が変わったらここも直す");
+
+        let e = only(&broken);
+        assert!(e.contains("`User`"), "{e}");
+        assert!(e.contains("`nope`"), "{e}");
     }
 }

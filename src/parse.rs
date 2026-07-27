@@ -413,10 +413,18 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `User` / `[User]` / `[User?]?`。後置 `?` は直前の完成した型に付く
+    /// ので、`[T]?` と `[T?]` は別物(design.md 決定2)。
     fn ty(&mut self) -> PResult<Type> {
-        let name = self.name_path("型名")?;
+        let kind = if self.eat(&Tok::LBracket) {
+            let element = self.ty()?;
+            self.expect(&Tok::RBracket, "`]`")?;
+            TypeKind::Array(Box::new(element))
+        } else {
+            TypeKind::Named(self.name_path("型名")?)
+        };
         let optional = self.eat(&Tok::Question);
-        Ok(Type { name, optional })
+        Ok(Type { kind, optional })
     }
 }
 
@@ -1119,7 +1127,53 @@ mod tests {
             panic!()
         };
         assert!(sig.params.is_empty());
-        assert_eq!(sig.ret.as_ref().unwrap().name, "int");
+        assert_eq!(sig.ret.as_ref().unwrap().name(), Some("int"));
+    }
+
+    /// `[T]` を全ての型注釈位置で受け、後置 `?` の付き先を言い分ける
+    #[test]
+    fn 配列型を全ての型位置で読む() {
+        fn named(name: &str, optional: bool) -> Type {
+            Type {
+                kind: TypeKind::Named(name.to_string()),
+                optional,
+            }
+        }
+        fn array(element: Type, optional: bool) -> Type {
+            Type {
+                kind: TypeKind::Array(Box::new(element)),
+                optional,
+            }
+        }
+
+        let p = ok("struct Store { users: [User]\ntags: [[str]?] }\n\
+                    fn pick(xs: [User], ys: [User?]? -> [User]?) {\n 1\n}\n");
+
+        let Item::Struct { fields, .. } = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(fields[0].1, array(named("User", false), false));
+        assert_eq!(
+            fields[1].1,
+            array(array(named("str", false), true), false),
+            "入れ子の要素にも後置 `?` が付く"
+        );
+
+        let Item::Fn { sig, .. } = &p.items[1] else {
+            panic!()
+        };
+        assert_eq!(sig.params[0].ty, array(named("User", false), false));
+        assert_eq!(
+            sig.params[1].ty,
+            array(named("User", true), true),
+            "`[T?]?` は optional な要素の optional な配列"
+        );
+        assert_eq!(sig.ret, Some(array(named("User", false), true)));
+    }
+
+    #[test]
+    fn 閉じない配列型を報告する() {
+        assert!(parse(&join(lex("fn f(xs: [User) { 1 }\n").unwrap())).is_err());
     }
 
     #[test]

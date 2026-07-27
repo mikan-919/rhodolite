@@ -624,13 +624,26 @@ fn resolve_type(
     imported_modules: &BTreeMap<String, ModulePath>,
     declarations: &BTreeMap<ModulePath, BTreeMap<String, String>>,
 ) {
-    ty.name = resolve_name(
-        &ty.name,
-        local,
-        imported_declarations,
-        imported_modules,
-        declarations,
-    );
+    // 正準化するのは名前の葉だけ。角括弧と後置 `?` は解決の対象ではない
+    // (design.md 決定6)
+    match &mut ty.kind {
+        TypeKind::Named(name) => {
+            *name = resolve_name(
+                name,
+                local,
+                imported_declarations,
+                imported_modules,
+                declarations,
+            );
+        }
+        TypeKind::Array(element) => resolve_type(
+            element,
+            local,
+            imported_declarations,
+            imported_modules,
+            declarations,
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1071,7 +1084,7 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
             }
             Item::Struct { fields, .. } => {
                 for (_, ty) in fields {
-                    collect_name_path(&ty.name, &mut paths);
+                    collect_type_paths(ty, &mut paths);
                 }
             }
             Item::Impl {
@@ -1099,10 +1112,18 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
 
 fn collect_sig_paths(sig: &Sig, paths: &mut Vec<Vec<String>>) {
     for param in &sig.params {
-        collect_name_path(&param.ty.name, paths);
+        collect_type_paths(&param.ty, paths);
     }
     if let Some(ret) = &sig.ret {
-        collect_name_path(&ret.name, paths);
+        collect_type_paths(ret, paths);
+    }
+}
+
+/// 型木の葉にある名前だけがモジュール参照になりうる。
+fn collect_type_paths(ty: &Type, paths: &mut Vec<Vec<String>>) {
+    match &ty.kind {
+        TypeKind::Named(name) => collect_name_path(name, paths),
+        TypeKind::Array(element) => collect_type_paths(element, paths),
     }
 }
 
@@ -1281,5 +1302,38 @@ mod tests {
         assert!(matches!(&callee.kind, ExprKind::Ident(name) if name == "dep::make"));
         assert_eq!(field, "value");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// 角括弧の内側の名前も、裸の名前と同じ規則で正準名になる
+    #[test]
+    fn 配列の要素型も正準名へ解決する() {
+        let mut program = parse::parse(&join(
+            lex("struct Store { users: [[User]?]\nowner: User }\n").unwrap(),
+        ))
+        .unwrap();
+        let Item::Struct { fields, .. } = &mut program.items[0] else {
+            panic!()
+        };
+
+        let local = BTreeMap::from([("User".to_string(), "main::User".to_string())]);
+        for (_, ty) in fields.iter_mut() {
+            resolve_type(
+                ty,
+                &local,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            );
+        }
+
+        let TypeKind::Array(outer) = &fields[0].1.kind else {
+            panic!("配列ではない: {:?}", fields[0].1)
+        };
+        let TypeKind::Array(inner) = &outer.kind else {
+            panic!("入れ子の配列ではない: {outer:?}")
+        };
+        assert_eq!(inner.name(), Some("main::User"));
+        assert!(outer.optional, "要素の後置 `?` は解決で失われない");
+        assert_eq!(fields[1].1.name(), Some("main::User"));
     }
 }

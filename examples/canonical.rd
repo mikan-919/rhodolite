@@ -101,11 +101,11 @@ fn main(-> bool) {
 // ---- 差し替え用のハンドラ。同じ trait の別の impl でしかない ----
 
 struct InMemoryDb {
-    users: Users
+    users: [User]
 }
 
 impl InMemoryDb {
-    fn new(users: Users -> InMemoryDb) {
+    fn new(users: [User] -> InMemoryDb) {
         InMemoryDb { users = users }
     }
     // テストから中を覗くための関連関数。self を取らないので `::` で呼ぶ

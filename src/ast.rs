@@ -92,11 +92,31 @@ pub struct Param {
     pub ty: Type,
 }
 
-#[derive(Debug)]
+/// 型注釈。形は再帰的で、後置 `?` は**外側の**型に付く。
+/// これで `[User]?`(optional な配列)と `[User?]`(optional な要素の配列)を
+/// 言い分けられる(design.md 決定1)
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Type {
-    pub name: String,
-    /// `User?` の後置 `?`
+    pub kind: TypeKind,
+    /// `User?` / `[User]?` の後置 `?`
     pub optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeKind {
+    Named(String),
+    /// `[T]`
+    Array(Box<Type>),
+}
+
+impl Type {
+    /// 名前の葉。配列なら `None`
+    pub fn name(&self) -> Option<&str> {
+        match &self.kind {
+            TypeKind::Named(name) => Some(name),
+            TypeKind::Array(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
