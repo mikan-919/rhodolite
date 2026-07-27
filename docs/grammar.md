@@ -113,6 +113,30 @@ if value == (Circle { r = 1.0 }) {
 頻度の低い条件内structリテラルへ括弧を課す代わりに、すべてのブロック形Headから
 コロンを外した（→ ADR-0005）。
 
+## enum
+
+データを持たない有限個の値。variant に payload も明示値も書けない。
+
+```ebnf
+enum_decl ::= 'enum' ident '{' ident* '}'
+```
+
+```rhodolite
+enum Rank {
+    Bronze
+    Gold
+}
+```
+
+variant は宣言モジュールの**普通の宣言**で、`Gold` という裸の名前で参照する。
+`Rank::Gold` のような限定参照は無い。名前の解決・衝突・`use` での導入・ローカル
+束縛によるシャドーイングは、struct や fn と同じ規則がそのまま効く。
+
+variant は struct ではない。フィールドアクセスもメソッド解決もできず、
+等しいのは**同じ enum の同じ variant** のときだけ。
+
+`match`、網羅性検査、データ付き variant、enum のメソッドは無い。
+
 ## ambient は4箇所にしか現れない
 
 ```rhodolite
@@ -146,7 +170,8 @@ trait の中の `fn` が同じ見た目で違う意味になる。宣言に出�
 ## まだ決めていない
 
 - `??` の正確な意味論(`Option` の unwrap-or-else? 型は?)
-- パターンマッチ(`match`)を v1 に入れるか — 正典には出てこない
+- パターンマッチ(`match`)を v1 に入れるか — 正典には出てこない。
+  enum が入ったので、必要になったときに限定参照(`Rank::Gold`)と一緒に決める
 - `elif`/`else` を `}` と同じ行に置くか次行かは**フォーマッタ規約**
   (行継続規則がどちらも受けるため文法の問題ではない)
 - 非局所制御フローの細則(break のラベル、ネストした Head からの early return)

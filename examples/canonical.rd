@@ -19,15 +19,18 @@ trait Clock {
 
 // ---- データ ----
 
+// データを持たない enum。`Bronze` / `Gold` はここでだけ宣言される値で、
+// 裸の名前として参照できる
+enum Rank {
+    Bronze
+    Gold
+}
+
 struct User {
     id: UserId
     rank: Rank
     promoted_at: Time
 }
-
-// v1 に enum は無い。フィールド0個の struct を名札として使う
-struct Bronze {}
-struct Gold {}
 
 // ---- スロット宣言: 役割に名前を与える ----
 

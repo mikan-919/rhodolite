@@ -258,6 +258,27 @@ impl<'a> Parser<'a> {
                 })
             }
 
+            // `enum Rank { Bronze Gold }`。`enum Never {}` のように variant 0個も書ける
+            Tok::Enum => {
+                self.bump();
+                let name = self.expect_ident("enum 名")?;
+                self.expect(&Tok::LBrace, "`{`")?;
+                let mut variants = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if self.eat(&Tok::RBrace) {
+                        break;
+                    }
+                    variants.push(self.expect_ident("variant 名")?);
+                    self.eat(&Tok::Comma);
+                }
+                Ok(Item::Enum {
+                    name,
+                    variants,
+                    span: self.to(start),
+                })
+            }
+
             // `impl Database for Postgres { ... }` / `impl Postgres { ... }`
             // ハンドラに専用構文は無い(CONTEXT.md「ハンドラ」)。ただの impl。
             Tok::Impl => {
@@ -334,7 +355,7 @@ impl<'a> Parser<'a> {
             }
 
             other => Err(self.err(&format!(
-                "trait / struct / impl / effect / fn / test のいずれかが必要です (実際は {:?})",
+                "trait / struct / enum / impl / effect / fn / test のいずれかが必要です (実際は {:?})",
                 other
             ))),
         }
@@ -952,6 +973,7 @@ mod tests {
             kinds.insert(match i {
                 Item::Trait { .. } => "trait",
                 Item::Struct { .. } => "struct",
+                Item::Enum { .. } => "enum",
                 Item::Impl { .. } => "impl",
                 Item::Effect { .. } => "effect",
                 Item::Fn { .. } => "fn",
@@ -960,10 +982,39 @@ mod tests {
         }
         assert_eq!(
             kinds,
-            ["effect", "fn", "impl", "struct", "test", "trait"]
+            ["effect", "enum", "fn", "impl", "struct", "test", "trait"]
                 .into_iter()
                 .collect()
         );
+    }
+
+    #[test]
+    fn enum宣言はデータを持たないvariantを並べる() {
+        // 改行区切りでも1行でも同じ形に読める
+        for src in [
+            "enum Rank {\n  Bronze\n  Gold\n}\n",
+            "enum Rank { Bronze Gold }\n",
+            "enum Rank { Bronze, Gold }\n",
+        ] {
+            let p = ok(src);
+            let Item::Enum { name, variants, .. } = &p.items[0] else {
+                panic!("enum ではない: {:?}", p.items[0])
+            };
+            assert_eq!(name, "Rank");
+            assert_eq!(variants, &["Bronze", "Gold"]);
+        }
+    }
+
+    #[test]
+    fn 空のenumも書ける() {
+        let p = ok("enum Never {}\n");
+        assert!(matches!(&p.items[0], Item::Enum { variants, .. } if variants.is_empty()));
+    }
+
+    #[test]
+    fn enumのvariantは値を持てない() {
+        let e = parse_src("enum Rank { Bronze = 1 }\n").unwrap_err();
+        assert!(e.msg.contains("variant 名"), "{}", e.msg);
     }
 
     #[test]

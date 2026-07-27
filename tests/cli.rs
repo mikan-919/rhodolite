@@ -478,3 +478,151 @@ fn 宣言どおりのstruct生成はモジュールを跨いでも実行され�
     assert!(output.status.success(), "{text}");
     assert!(text.contains("main -> 2"), "{text}");
 }
+
+// ---- enum の宣言と名前解決 (src/module.rs) ----
+
+#[test]
+fn 同一モジュールの裸variantは宣言元へ解決される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "enum Rank { Bronze Gold }\n\
+         fn main() { Gold == Gold }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("enum   main::Rank (2 variant)"), "{text}");
+    assert!(text.contains("main -> true"), "{text}");
+}
+
+#[test]
+fn 別モジュールのvariantをmember_importで導入できる() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Gold, Bronze}\n\
+         fn main() { Gold == Bronze }\n",
+    );
+    project.write("dep.rd", "enum Rank { Bronze Gold }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> false"), "{text}");
+}
+
+#[test]
+fn importしたvariantに別名を付けられる() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Gold as Best}\n\
+         fn main() { Best }\n",
+    );
+    project.write("dep.rd", "enum Rank { Bronze Gold }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    // 別名は参照側の綴りでしかない。値は宣言元の正準名を持つ
+    assert!(text.contains("main -> dep::Rank.dep::Gold"), "{text}");
+}
+
+#[test]
+fn variantと同名の宣言を衝突として報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "enum Rank { Bronze Gold }\n\
+         struct Gold {}\n\
+         fn main() { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("モジュール `main` で名前 `Gold` が重複しています"),
+        "{text}"
+    );
+}
+
+#[test]
+fn 同じvariantを二度並べたenumを報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "enum Rank { Gold Gold }\n\
+         fn main() { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("enum `Rank`: variant `Gold` が重複して宣言されています"),
+        "{text}"
+    );
+}
+
+#[test]
+fn ローカル束縛はvariantを隠す() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "enum Rank { Bronze Gold }\n\
+         fn main() {\n\
+           let Gold = 7\n\
+           Gold\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 7"), "{text}");
+}
+
+// ---- enum 型の検査 (src/typecheck.rs) ----
+
+#[test]
+fn enum型フィールドに同じenumのvariantを入れたプログラムは走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "enum Rank { Bronze Gold }\n\
+         struct User { rank: Rank }\n\
+         fn main() {\n\
+           let u = User { rank = Bronze }\n\
+           u.rank = Gold\n\
+           u.rank == Gold\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> true"), "{text}");
+}
+
+#[test]
+fn 別のenumのvariantをenum型フィールドへ与えると実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Grade, Low}\n\
+         enum Rank { Bronze Gold }\n\
+         struct User { rank: Rank }\n\
+         fn main() { User { rank = Low } }\n",
+    );
+    project.write("dep.rd", "enum Grade { Low High }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("enum `main::Rank`"), "{text}");
+    assert!(text.contains("enum `dep::Grade`"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}

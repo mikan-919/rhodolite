@@ -33,6 +33,7 @@ pub enum Tok {
     With,
     Trait,
     Struct,
+    Enum,
     Impl,
     SelfKw,
     Effect,
@@ -237,6 +238,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "with" => Tok::With,
         "trait" => Tok::Trait,
         "struct" => Tok::Struct,
+        "enum" => Tok::Enum,
         "impl" => Tok::Impl,
         "self" => Tok::SelfKw,
         "effect" => Tok::Effect,
@@ -353,6 +355,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::With
             | Tok::Trait
             | Tok::Struct
+            | Tok::Enum
             | Tok::Impl
             | Tok::Effect
             | Tok::Test
@@ -401,6 +404,24 @@ mod tests {
         assert_eq!(newlines("a()\n\n\nb()\n"), 2);
         // `{` 直後の改行は落ちるので、残る区切りは `a()` の後の1つだけ
         assert_eq!(newlines("{\na()\n}"), 1);
+    }
+
+    #[test]
+    fn enumはキーワードで宣言の行頭に立てる() {
+        assert_eq!(
+            toks("enum Rank { Bronze Gold }"),
+            vec![
+                Tok::Enum,
+                Tok::Ident("Rank".into()),
+                Tok::LBrace,
+                Tok::Ident("Bronze".into()),
+                Tok::Ident("Gold".into()),
+                Tok::RBrace,
+                Tok::Eof
+            ]
+        );
+        // 行頭に立てる = 直前の改行が文の区切りとして残る
+        assert_eq!(newlines("a()\nenum Rank {}\n"), 2);
     }
 
     #[test]

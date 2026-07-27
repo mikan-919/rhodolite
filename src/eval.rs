@@ -34,6 +34,14 @@ pub enum Value {
     /// `User?` の無い方
     Nil,
     Struct(Rc<RefCell<Obj>>),
+    /// `Gold`。所属 enum と variant の名前だけを持つ**不変**な値。
+    ///
+    /// struct を流用しないのは、フィールドアクセス・メソッド解決・表示が
+    /// enum と struct を取り違えない不変条件を作るため(design.md 決定3)
+    Enum {
+        enum_name: String,
+        variant: String,
+    },
     /// `[alice]`。struct と同じく**参照**。`let a = b` は別物にならない。
     /// 「複合値は参照」の規則1本で済ませるため(型によって代入の意味が変わらない)
     Array(Rc<RefCell<Vec<Value>>>),
@@ -76,6 +84,17 @@ impl Value {
             (Str(a), Str(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Unit, Unit) | (Nil, Nil) => true,
+            // 同じ enum の同じ variant だけが等しい
+            (
+                Enum {
+                    enum_name: ea,
+                    variant: va,
+                },
+                Enum {
+                    enum_name: eb,
+                    variant: vb,
+                },
+            ) => ea == eb && va == vb,
             (Struct(a), Struct(b)) => {
                 // 同じ実体なら中身を見ない。循環していても答えが出る
                 if Rc::ptr_eq(a, b) {
@@ -119,6 +138,7 @@ impl Value {
             Value::Unit => "unit".to_string(),
             Value::Nil => "nil".to_string(),
             Value::Struct(o) => o.borrow().type_name.clone(),
+            Value::Enum { enum_name, variant } => format!("{enum_name}.{variant}"),
             Value::Array(xs) => format!("[{} 要素]", xs.borrow().len()),
         }
     }
@@ -254,11 +274,14 @@ pub struct Interp<'a> {
     fns: HashMap<&'a str, (&'a Sig, &'a [Expr])>,
     /// 型名 → その型の全メソッド(trait 実装も inherent も混ぜて入れる)
     methods: HashMap<&'a str, Vec<Method<'a>>>,
-    /// 型名の集合。`Gold` のようなフィールド0個の struct を名前だけで値にするのに使う。
+    /// 型名の集合。フィールド0個の struct を名前だけで値にするのに使う。
     ///
     /// フィールドの過不足は `typecheck::check` が実行前に済ませているので、ここは
-    /// 名前の有無しか見ない。ponytail: フィールド**値**の型はまだ誰も見ていない
+    /// 名前の有無しか見ない。ponytail: フィールド**値**の型で実行前に分かっているのは
+    /// 「型の分かる位置に置かれた enum の所属」だけ(design.md 決定4)
     structs: HashSet<&'a str>,
+    /// variant の正準名 → 所属 enum の正準名。裸の `Gold` を値へ落とすのに使う
+    variants: HashMap<&'a str, &'a str>,
     /// スロット名 → trait 名。requirement.rs のものを再利用する
     slots: Slots,
 }
@@ -268,6 +291,7 @@ impl<'a> Interp<'a> {
         let mut fns = HashMap::new();
         let mut methods: HashMap<_, Vec<_>> = HashMap::new();
         let mut structs = HashSet::new();
+        let mut variants = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Fn { sig, body, .. } => {
@@ -275,6 +299,13 @@ impl<'a> Interp<'a> {
                 }
                 Item::Struct { name, .. } => {
                     structs.insert(name.as_str());
+                }
+                Item::Enum {
+                    name, variants: vs, ..
+                } => {
+                    for variant in vs {
+                        variants.insert(variant.as_str(), name.as_str());
+                    }
                 }
                 Item::Impl {
                     trait_name,
@@ -298,6 +329,7 @@ impl<'a> Interp<'a> {
             fns,
             methods,
             structs,
+            variants,
             slots: collect_slots(program),
         }
     }
@@ -500,8 +532,12 @@ impl<'a> Interp<'a> {
             ExprKind::Ident(name) => match env.binding(name) {
                 Some(Binding::Local(v)) => Ok(v.clone()),
                 Some(Binding::Slot) => fail(format!("スロット `{name}` は値として取り出せません")),
-                // `Gold` — フィールド0個の struct は名前だけで値になる。
-                // ponytail: enum は無い。列挙が要るまでこれで足りる
+                // `Gold` — 隠されていない variant は名前だけで値になる
+                None if self.variants.contains_key(name.as_str()) => Ok(Value::Enum {
+                    enum_name: self.variants[name.as_str()].to_string(),
+                    variant: name.clone(),
+                }),
+                // フィールド0個の struct も名前だけで値になる
                 None if self.structs.contains(name.as_str()) => Ok(new_obj(name, BTreeMap::new())),
                 None => fail(format!("`{name}` が束縛されていません")),
             },
@@ -900,7 +936,7 @@ mod tests {
 
     #[test]
     fn フィールド0個のstructは名前だけで値になる() {
-        // `Gold` を enum なしで書けるようにする回避。同じ型なら等しい
+        // enum が入っても、フィールド0個の struct はそのまま名前で値になる
         let src = "struct Gold {}\n\
                    struct Silver {}\n\
                    fn main() {\n\
@@ -908,6 +944,57 @@ mod tests {
                    \x20 Gold == Silver\n\
                    }\n";
         assert!(matches!(run(src, "main"), Ok(Value::Bool(false))));
+    }
+
+    // ---- enum ----
+
+    const RANKS: &str = "enum Rank { Bronze Gold }\n\
+                         enum Grade { Low High }\n";
+
+    #[test]
+    fn variantは裸の名前で値になる() {
+        let src = format!("{RANKS}fn main() {{\n Gold\n}}\n");
+        assert_eq!(run(&src, "main").unwrap().show(), "Rank.Gold");
+    }
+
+    #[test]
+    fn 同じvariantは等しく別のvariantは等しくない() {
+        let src = format!(
+            "{RANKS}fn main() {{\n\
+             \x20 assert Gold == Gold\n\
+             \x20 Gold == Bronze\n\
+             }}\n"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Bool(false))));
+    }
+
+    /// variant 名が同じでも所属 enum が違えば別の値。同名 variant は別モジュールに
+    /// しか置けないので、値の比較規則としてここで固定する
+    #[test]
+    fn 別のenumの同名variantとは等しくない() {
+        let same_in_a = Value::Enum {
+            enum_name: "a::Rank".into(),
+            variant: "a::Same".into(),
+        };
+        let same_in_b = Value::Enum {
+            enum_name: "b::Grade".into(),
+            variant: "b::Same".into(),
+        };
+        assert!(!same_in_a.eq(&same_in_b).unwrap());
+        assert!(same_in_a.eq(&same_in_a.clone()).unwrap());
+    }
+
+    #[test]
+    fn ローカルはvariantを隠す() {
+        let src = format!("{RANKS}fn main() {{\n let Gold = 7\n Gold\n}}\n");
+        assert_eq!(int(&src), 7);
+    }
+
+    #[test]
+    fn enumはstructではないのでフィールドを読めない() {
+        let src = format!("{RANKS}fn main() {{\n Gold.name\n}}\n");
+        let e = run(&src, "main").expect_err("enum にフィールドは無い");
+        assert!(e.contains("struct ではありません"), "{e}");
     }
 
     #[test]

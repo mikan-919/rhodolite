@@ -126,6 +126,9 @@ fn summary(item: &ast::Item) -> String {
         Struct { name, fields, .. } => {
             format!("struct {name} ({} フィールド)", fields.len())
         }
+        Enum { name, variants, .. } => {
+            format!("enum   {name} ({} variant)", variants.len())
+        }
         Impl {
             trait_name,
             type_name,

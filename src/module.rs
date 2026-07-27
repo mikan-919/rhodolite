@@ -297,17 +297,28 @@ fn resolve(
     for module in modules.values() {
         let mut names = BTreeMap::new();
         for item in &module.items {
-            let Some(name) = item_name(item) else {
-                continue;
-            };
-            if names
-                .insert(name.to_string(), module.path.qualified(name))
-                .is_some()
-            {
-                diagnostics.push(format!(
-                    "モジュール `{}` で名前 `{name}` が重複しています",
-                    module.path
-                ));
+            // 同じ enum が同じ variant を二度並べたときだけは、衝突した名前ではなく
+            // どの enum の話かを報告する。宣言名前空間の衝突判定は下の1本のまま
+            if let Item::Enum { name, variants, .. } = item {
+                let mut seen = BTreeSet::new();
+                for variant in variants {
+                    if !seen.insert(variant.as_str()) {
+                        diagnostics.push(format!(
+                            "enum `{name}`: variant `{variant}` が重複して宣言されています"
+                        ));
+                    }
+                }
+            }
+            for name in item_names(item) {
+                if names
+                    .insert(name.to_string(), module.path.qualified(name))
+                    .is_some()
+                {
+                    diagnostics.push(format!(
+                        "モジュール `{}` で名前 `{name}` が重複しています",
+                        module.path
+                    ));
+                }
             }
         }
         declarations.insert(module.path.clone(), names);
@@ -423,12 +434,27 @@ fn resolve(
     })
 }
 
-fn item_name(item: &Item) -> Option<&str> {
+/// その item がモジュールの宣言名前空間へ出す名前。
+///
+/// enum だけが複数出す。enum 名と各 variant 名が同じ表に並ぶので、
+/// `Gold` は struct や fn と同じ規則で解決・衝突・import される(design.md 決定2)。
+/// 同じ variant の重複は呼び出し側が別に報告するため、ここでは畳んでおく。
+fn item_names(item: &Item) -> Vec<&str> {
     match item {
-        Item::Trait { name, .. } | Item::Struct { name, .. } => Some(name),
-        Item::Effect { slot, .. } => Some(slot),
-        Item::Fn { sig, .. } => Some(&sig.name),
-        Item::Impl { .. } | Item::Test { .. } => None,
+        Item::Trait { name, .. } | Item::Struct { name, .. } => vec![name],
+        Item::Enum { name, variants, .. } => {
+            let mut names = vec![name.as_str()];
+            let mut seen = BTreeSet::new();
+            for variant in variants {
+                if seen.insert(variant.as_str()) {
+                    names.push(variant);
+                }
+            }
+            names
+        }
+        Item::Effect { slot, .. } => vec![slot],
+        Item::Fn { sig, .. } => vec![&sig.name],
+        Item::Impl { .. } | Item::Test { .. } => Vec::new(),
     }
 }
 
@@ -463,6 +489,12 @@ fn resolve_item(
                     imported_modules,
                     declarations,
                 );
+            }
+        }
+        Item::Enum { name, variants, .. } => {
+            *name = local[name].clone();
+            for variant in variants {
+                *variant = local[variant].clone();
             }
         }
         Item::Impl {
@@ -1022,7 +1054,7 @@ fn module_references(items: &[Item]) -> Vec<Vec<String>> {
             Item::Test { body, .. } => {
                 collect_expr_paths(body, &mut BTreeSet::new(), &mut paths);
             }
-            Item::Trait { .. } | Item::Struct { .. } | Item::Effect { .. } => {}
+            Item::Trait { .. } | Item::Struct { .. } | Item::Enum { .. } | Item::Effect { .. } => {}
         }
     }
     paths
@@ -1058,7 +1090,8 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
             }
             Item::Effect { trait_name, .. } => collect_name_path(trait_name, &mut paths),
             Item::Fn { sig, .. } => collect_sig_paths(sig, &mut paths),
-            Item::Test { .. } => {}
+            // enum は型も値も参照しない
+            Item::Enum { .. } | Item::Test { .. } => {}
         }
     }
     paths
@@ -1177,5 +1210,35 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             | ExprKind::Path(_)
             | ExprKind::Return(None) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ロード後の不変条件(design.md 決定2)。
+    ///
+    /// variant は所属 enum と同じモジュールで宣言されるので、variant の正準名の
+    /// モジュール接頭辞に enum の短い名前を繋げば、enum の正準名がそのまま出る。
+    /// 所属を別の表に持たなくても、名前だけから辿れる状態を固定する。
+    #[test]
+    fn variantの正準名から所属enumの正準名を再構成できる() {
+        let loaded = load(Path::new("examples/canonical.rd")).expect("正典はロードできる");
+
+        let mut checked = 0;
+        for item in &loaded.program.items {
+            let Item::Enum { name, variants, .. } = item else {
+                continue;
+            };
+            let (_, enum_short) = name.rsplit_once("::").expect("enum は正準名を持つ");
+            for variant in variants {
+                let (variant_module, _) =
+                    variant.rsplit_once("::").expect("variant は正準名を持つ");
+                assert_eq!(&format!("{variant_module}::{enum_short}"), name);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 2, "正典の `Rank` は variant を2つ持つ");
     }
 }

@@ -40,6 +40,13 @@ pub enum Item {
         fields: Vec<(String, Type)>,
         span: Span,
     },
+    /// `enum Rank { Bronze Gold }` — データを持たない有限個の値。
+    /// variant は payload も明示値も持たない(design.md 決定1)
+    Enum {
+        name: String,
+        variants: Vec<String>,
+        span: Span,
+    },
     /// `impl Database for Postgres { ... }` — ハンドラの正体。専用構文は持たない。
     /// `impl Postgres { ... }`(trait 無し)も書ける。`Postgres::new` はそこに置く
     Impl {
