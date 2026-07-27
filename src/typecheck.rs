@@ -63,6 +63,9 @@ struct Decls {
     /// inherent も混ぜて入れる。呼び出し地点で trait が分かるとは限らないので、
     /// 絞り込みは名前だけで行い、複数残れば曖昧とする(eval.rs `find_method`)
     impls: BTreeMap<String, Vec<(String, FnSig)>>,
+    /// `impl Trait for Type` の (具体型名, trait 名)。`with` の提供が
+    /// スロットの契約を満たすか見るためだけに持つ
+    trait_impls: BTreeSet<(String, String)>,
     /// スロット名 → trait 名。`requirement` の表をそのまま借りる
     slots: Slots,
     /// struct ではない宣言名(trait / effect / fn / enum / variant)。
@@ -238,6 +241,7 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut fns = BTreeMap::new();
     let mut traits: BTreeMap<String, BTreeMap<String, FnSig>> = BTreeMap::new();
     let mut impls: BTreeMap<String, Vec<(String, FnSig)>> = BTreeMap::new();
+    let mut trait_impls = BTreeSet::new();
     let mut others = BTreeSet::new();
 
     for item in &program.items {
@@ -296,8 +300,14 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
                 fns.insert(sig.name.clone(), signature(sig));
             }
             Item::Impl {
-                type_name, methods, ..
+                trait_name,
+                type_name,
+                methods,
+                ..
             } => {
+                if let Some(trait_name) = trait_name {
+                    trait_impls.insert((type_name.clone(), trait_name.clone()));
+                }
                 let entry = impls.entry(type_name.clone()).or_default();
                 for (sig, _) in methods {
                     entry.push((sig.name.clone(), signature(sig)));
@@ -313,6 +323,7 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
         fns,
         traits,
         impls,
+        trait_impls,
         slots: collect_slots(program),
         others,
     };
@@ -577,6 +588,7 @@ fn check_expr_at(
                         if let Provision::Value { value, .. } = b {
                             check_expr(value, decls, locals, ctx, ret, out);
                         }
+                        check_provision(b, decls, locals, ctx, out);
                     }
                     // 本体では内側の束縛が勝つ。スロットでない名前は
                     // requirement 側が報告するので、ここでは型不明の値にする
@@ -871,6 +883,44 @@ fn member(callee: &Expr) -> String {
         ExprKind::Ident(name) | ExprKind::Field(_, name) => name.clone(),
         ExprKind::Path(parts) => parts.join("::"),
         _ => String::new(),
+    }
+}
+
+/// `with` の提供がスロットの契約を満たすか見る。`with db<Postgres>` は型名が
+/// そのまま分かるので常に、`with db(v)` は `v` の型が分かるときだけ見る
+/// (design.md 決定3)。スロットでない名前は requirement / eval 側が報告する。
+///
+/// eval.rs にも同じ判定がある。あちらは型の分からない提供を実行時に止める網。
+fn check_provision(
+    b: &Provision,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    let Some(want) = decls.slots.trait_of(b.slot()) else {
+        return;
+    };
+    let ty = match b {
+        Provision::Type { type_name, .. } => plain(type_name),
+        Provision::Value { value, .. } => match infer(value, decls, locals) {
+            Some(ty) => ty,
+            None => return,
+        },
+    };
+    // 提供できるのは trait を実装した具体型そのものだけ。配列と optional は
+    // 名前を持たないので、この時点で落ちる
+    let implemented = !ty.optional
+        && ty.name().is_some_and(|name| {
+            decls
+                .trait_impls
+                .contains(&(name.to_string(), want.to_string()))
+        });
+    if !implemented {
+        out.push(format!(
+            "{ctx}: `{ty}` は `{want}` を実装していないので `{}` に提供できません",
+            b.slot()
+        ));
     }
 }
 

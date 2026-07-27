@@ -836,6 +836,28 @@ fn optional_fieldの結果型は実行前の引数検査へ届く() {
 }
 
 #[test]
+fn 契約を満たさない提供は実行前に失敗する() {
+    let contract = "trait Clock { fn now(self -> int) }\n\
+                    effect clock: Clock\n\
+                    struct NotAClock {}\n";
+    // 値の形。`with` の中は実行されなくても、宣言の時点で落ちる
+    実行前に失敗する(
+        &format!("{contract}fn main() {{ with clock(NotAClock {{}}) {{ 1 }} }}\n"),
+        "`main::NotAClock` は `main::Clock` を実装していないので `main::clock` に提供できません",
+    );
+    // 型の形
+    実行前に失敗する(
+        &format!("{contract}fn main() {{ with clock<NotAClock> {{ 1 }} }}\n"),
+        "実装していないので `main::clock` に提供できません",
+    );
+    // struct ですらない型
+    実行前に失敗する(
+        &format!("{contract}fn main() {{ with clock(1) {{ 1 }} }}\n"),
+        "`int` は `main::Clock` を実装していない",
+    );
+}
+
+#[test]
 fn 型の違う再代入は実行前に失敗する() {
     実行前に失敗する(
         "fn f(n: int) { n = \"x\" }\nfn main() { 1 }\n",
