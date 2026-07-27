@@ -396,8 +396,7 @@ fn check_expr(
                 // `nil` は相手側の optional 性を文脈にする。それ以外は両方の型が
                 // 分かるときだけ比べる。結果はどちらにせよ `bool`
                 BinOp::Eq => check_equality(lhs, rhs, decls, locals, ctx, out),
-                // `??` は optional の規則が要るので今回の保証外
-                BinOp::Coalesce => {}
+                BinOp::Coalesce => check_coalesce(lhs, rhs, decls, locals, ctx, out),
             }
         }
         ExprKind::Return(Some(inner)) => {
@@ -534,7 +533,7 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
         ExprKind::Binary { op, .. } => match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Some(plain("int")),
             BinOp::Eq => Some(plain("bool")),
-            BinOp::Coalesce => None,
+            BinOp::Coalesce => infer_coalesce(e, decls, locals),
         },
         _ => None,
     }
@@ -556,6 +555,71 @@ fn require(
     out.push(format!(
         "{ctx}: {what}は `{expected}` ですが、`{actual}` です"
     ));
+}
+
+/// `T? ?? T` の被演算子を検査する。右辺の直接 `return` は値を産まずに
+/// 枝を終えるので、中身の型との照合は不要。
+fn check_coalesce(
+    lhs: &Expr,
+    rhs: &Expr,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    if matches!(lhs.kind, ExprKind::Nil) {
+        if let Some(actual) = infer(rhs, decls, locals)
+            && actual.optional
+        {
+            out.push(format!(
+                "{ctx}: `??` の右辺には非 optional の値が必要ですが、`{actual}` です"
+            ));
+        }
+        return;
+    }
+
+    let Some(left) = infer(lhs, decls, locals) else {
+        return;
+    };
+    if !left.optional {
+        out.push(format!(
+            "{ctx}: `??` の左辺は optional である必要がありますが、`{left}` です"
+        ));
+        return;
+    }
+    if matches!(rhs.kind, ExprKind::Return(_)) {
+        return;
+    }
+
+    let expected = KnownType {
+        name: left.name,
+        optional: false,
+    };
+    require(rhs, &expected, "`??` の右辺", decls, locals, ctx, out);
+}
+
+/// 診断を出さずに `??` の継続経路の型を得る。
+fn infer_coalesce(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
+    let ExprKind::Binary {
+        op: BinOp::Coalesce,
+        lhs,
+        rhs,
+    } = &e.kind
+    else {
+        return None;
+    };
+
+    if matches!(lhs.kind, ExprKind::Nil) {
+        let right = infer(rhs, decls, locals)?;
+        return (!right.optional).then_some(right);
+    }
+
+    let mut left = infer(lhs, decls, locals)?;
+    if !left.optional {
+        return None;
+    }
+    left.optional = false;
+    Some(left)
 }
 
 /// 等価比較の互換性。`nil` は反対側の optional 性を文脈にする。
@@ -1396,6 +1460,102 @@ mod tests {
             assert!(e.contains("`nil`"), "{expr}: {e}");
         }
         assert!(errors("fn f(-> bool) { nil == nil }\n").is_empty());
+    }
+
+    // ---- 12. optional fallback ----
+
+    #[test]
+    fn optionalと同じ中身のfallbackは中身の型になる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn take(r: Rank) {{ r }}\n\
+                 fn f(o: Rank? -> Rank) {{\n\
+                 \x20 let r = o ?? Gold\n\
+                 \x20 r = o ?? Bronze\n\
+                 \x20 take(o ?? Gold)\n\
+                 \x20 assert (o ?? Gold) == Bronze\n\
+                 \x20 o ?? Gold\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn fallbackの結果型は後続の照合へ届く() {
+        let errors = errors(&format!(
+            "{RANKS}fn take(g: Grade) {{ g }}\n\
+             fn f(o: Rank?, g: Grade -> Grade) {{\n\
+             \x20 let x = g\n\
+             \x20 x = o ?? Gold\n\
+             \x20 take(o ?? Gold)\n\
+             \x20 assert (o ?? Gold) == g\n\
+             \x20 o ?? Gold\n\
+             }}\n"
+        ));
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.contains("`Rank`") && e.contains("`Grade`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn 非optionalの左辺にはfallbackを使えない() {
+        let e = only(&format!("{RANKS}fn f(r: Rank -> Rank) {{ r ?? Gold }}\n"));
+        assert!(e.contains("`??` の左辺"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+    }
+
+    #[test]
+    fn fallback値はoptionalの中身と同じ非optional型を要求する() {
+        for (rhs, actual) in [("Low", "Grade"), ("other", "Rank?"), ("nil", "nil")] {
+            let e = only(&format!(
+                "{RANKS}fn f(o: Rank?, other: Rank? -> Rank) {{ o ?? {rhs} }}\n"
+            ));
+            assert!(e.contains("`??` の右辺"), "{rhs}: {e}");
+            assert!(e.contains("`Rank`"), "{rhs}: {e}");
+            assert!(e.contains(&format!("`{actual}`")), "{rhs}: {e}");
+        }
+    }
+
+    #[test]
+    fn nilのfallbackは右辺から中身の型を得る() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn take(r: Rank) {{ r }}\nfn f() {{ take(nil ?? Gold) }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の分からない左辺のfallbackは保留する() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn unknown() {{ nil }}\n\
+                 fn f(-> Grade) {{ unknown() ?? Gold }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn returnはfallbackの枝を終了できる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(o: Rank? -> Rank) {{ o ?? return Bronze }}\n"
+            ))
+            .is_empty()
+        );
+        let e = only(&format!(
+            "{RANKS}fn f(o: Rank? -> Rank) {{ o ?? return Low }}\n"
+        ));
+        assert!(e.contains("戻り値"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]

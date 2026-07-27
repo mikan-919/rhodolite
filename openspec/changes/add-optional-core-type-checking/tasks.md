@@ -7,11 +7,11 @@
 
 ## 2. Fallback Typing
 
-- [ ] 2.1 Add type-checker tests for valid `T? ?? T`, a non-optional left operand, incompatible and optional fallback values, literal `nil ?? T`, and an unknown left operand
-- [ ] 2.2 Validate known fallback operands and infer non-optional `T` for a valid-shape `??` expression without adding inference side effects
-- [ ] 2.3 Add and implement tests for a direct `return` fallback, including ordinary validation of the returned value
-- [ ] 2.4 Verify fallback result types reach argument, assignment, equality, and function-return checks
-- [ ] 2.5 Verify focused and full tests and commit the stable fallback-typing snapshot
+- [x] 2.1 Add type-checker tests for valid `T? ?? T`, a non-optional left operand, incompatible and optional fallback values, literal `nil ?? T`, and an unknown left operand
+- [x] 2.2 Validate known fallback operands and infer non-optional `T` for a valid-shape `??` expression without adding inference side effects
+- [x] 2.3 Add and implement tests for a direct `return` fallback, including ordinary validation of the returned value
+- [x] 2.4 Verify fallback result types reach argument, assignment, equality, and function-return checks
+- [x] 2.5 Verify focused and full tests and commit the stable fallback-typing snapshot
 
 ## 3. Integration and Documentation
 
