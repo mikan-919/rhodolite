@@ -139,6 +139,10 @@ effect / fn)はこの名前を名乗れない。
 期待型のある位置で `T?` にだけ適合する。したがって `fn f(x: int?) { f(nil) }` は通るが、
 `fn f(x: int) { f(nil) }` は型エラーになる。裸の `let x = nil` から `T` は推論しない。
 
+引数・戻り値・struct field・field 代入・型の決まった local 代入では、期待型が `T?`
+なら同名の非 optional 値 `T` も渡せる。この注入は一方向で、`T?` を `T` の期待位置には
+渡せない。また式の推論型は `T` のままなので、`T == T?` は型エラーになる。
+
 fallback の型規則は1本:
 
 ```text
@@ -149,9 +153,21 @@ T? ?? T -> T
 ので、`value ?? return fallback` と書ける。`nil == value` は value が optional のときだけ
 比較でき、結果は他の `==` と同じ `bool`。
 
-optional field access の表記と伝播規則はまだ未決定。配列・optional field access・
-メソッドと関連関数の呼び出しは、まだ検査器が型を付けられない。これは**実装がそこまで
-来ていない**だけで、言語に「何でも入る型」があるわけではない(→ `src/typecheck.rs`)。
+optional な struct の field は `.?` で読む:
+
+```rhodolite
+user.?profile.?name
+```
+
+receiver が `nil` なら field を読まずに `nil` を返す。値があれば通常の field と同じく
+宣言された値を読む。型規則は `S?.?field -> T?` で、field の宣言型が `T?` でも結果は
+`T?` のまま(一段に平坦化)。通常の `.` は optional receiver を暗黙に展開しないため、
+`user.profile` は `user: User?` なら型エラーになる。
+
+`.?` は読み取り専用。`user.?name = value` と `user.?method()` は書けない。
+配列・メソッドと関連関数の呼び出しは、まだ検査器が型を付けられない。これは**実装が
+そこまで来ていない**だけで、言語に「何でも入る型」があるわけではない
+(→ `src/typecheck.rs`)。
 
 ## enum
 
@@ -209,7 +225,6 @@ trait の中の `fn` が同じ見た目で違う意味になる。宣言に出�
 
 ## まだ決めていない
 
-- optional field access の表記と、連鎖した結果の optional 伝播規則
 - パターンマッチ(`match`)を v1 に入れるか — 正典には出てこない。
   enum が入ったので、必要になったときに限定参照(`Rank::Gold`)と一緒に決める
 - `elif`/`else` を `}` と同じ行に置くか次行かは**フォーマッタ規約**

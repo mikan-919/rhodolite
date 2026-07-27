@@ -789,6 +789,53 @@ fn fallbackの結果型は実行前の戻り値検査へ届く() {
 }
 
 #[test]
+fn optional_field_accessは値を読みnilを伝播して実行できる() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "struct User { id: int }\n\
+         fn some(-> User?) { User { id = 7 } }\n\
+         fn none(-> User?) { nil }\n\
+         fn main() {\n\
+         \x20 assert (some().?id ?? 0) == 7\n\
+         \x20 none().?id == nil\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> true"), "{text}");
+}
+
+#[test]
+fn optional_field_accessのreceiver形式を実行前に検査する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         fn unused(u: User) { u.?id }\n\
+         fn main() { 1 }\n",
+        "レシーバは optional",
+    );
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         fn unused(u: User?) { u.id }\n\
+         fn main() { 1 }\n",
+        "`.?id`",
+    );
+}
+
+#[test]
+fn optional_fieldの結果型は実行前の引数検査へ届く() {
+    実行前に失敗する(
+        "struct User { name: str }\n\
+         fn take(n: int?) { n }\n\
+         fn unused(u: User?) { take(u.?name) }\n\
+         fn main() { 1 }\n",
+        "`str?`",
+    );
+}
+
+#[test]
 fn 型の違う再代入は実行前に失敗する() {
     実行前に失敗する(
         "fn f(n: int) { n = \"x\" }\nfn main() { 1 }\n",

@@ -22,7 +22,7 @@
 
 ## 4. Integration and Documentation
 
-- [ ] 4.1 Add CLI coverage for successful optional reads, nil propagation, invalid receiver forms, and inferred-result mismatches
-- [ ] 4.2 Update `README.md`, `docs/overview.md`, `docs/grammar.md`, and checker boundary documentation with `.?`, contextual optional injection, and the remaining unknown forms
-- [ ] 4.3 Run `cargo fmt --check`, the full Rust suite, the canonical example, and the missing-handler example
-- [ ] 4.4 Validate the OpenSpec change, review the final diff, and commit the completed implementation snapshot
+- [x] 4.1 Add CLI coverage for successful optional reads, nil propagation, invalid receiver forms, and inferred-result mismatches
+- [x] 4.2 Update `README.md`, `docs/overview.md`, `docs/grammar.md`, and checker boundary documentation with `.?`, contextual optional injection, and the remaining unknown forms
+- [x] 4.3 Run `cargo fmt --check`, the full Rust suite, the canonical example, and the missing-handler example
+- [x] 4.4 Validate the OpenSpec change, review the final diff, and commit the completed implementation snapshot
