@@ -14,8 +14,12 @@
 //!     **型の分かる**対象は `bool`
 //!   - struct リテラルのフィールド値・フィールドへの代入・ローカルへの再代入は、
 //!     **両辺の型が分かる限り**宛先の型と適合する
-//!   - トップレベル関数の直接呼び出しは宣言どおりの引数の個数を持ち、
-//!     **型の分かる**引数は宣言された引数型と適合する
+//!   - trait `impl` は宣言済み trait と struct を指し、契約のメソッドを
+//!     過不足なく一度ずつ、宣言どおりのレシーバ・引数型・戻り値型で持つ
+//!   - 直接呼び出し・メソッド・関連関数は、レシーバかスロットの分かる限り
+//!     一意の宣言へ解決され、`.` と `::` は宣言された `self` の有無と一致する
+//!   - 解決した呼び出しは宣言どおりの引数の個数を持ち、**型の分かる**引数は
+//!     宣言された引数型と適合する
 //!   - 戻り値型を宣言した関数の、**型の分かる**明示 `return` と最後の式は
 //!     その型と適合する
 //!   - 配列リテラルの要素は、期待要素型があればそれと、無ければ互いに適合する
@@ -25,15 +29,22 @@
 //! 一致しないと同じ型ではない。期待型のある宛先では
 //! `T` を同名の `T?` へ注入できるが、式の推論型と等価比較は変えない。
 //! `nil` は期待される `T?` の文脈でだけ適合し、`T? ?? T` は `T` を返す。
-//! `S?.?field` は宣言 field の型に optional を付けて返す。メソッドと
-//! 関連関数の呼び出しはまだ型を持たない(design.md の Non-Goals)。
-//! これは**実装が未着手なだけ**で、言語の側にワイルドカード型は無い。
+//! `S?.?field` は宣言 field の型に optional を付けて返す。
+//!
+//! 呼び出しの解決は評価器と同じ順序で、スロット経由なら宣言 trait の契約だけ、
+//! 具体型なら inherent と trait 実装をまとめて名前で絞り一意を要求する。
+//! レシーバの型が分からない呼び出しは保留する。`with` の提供値が本当に
+//! スロットの trait を実装しているかは、まだ実行時の検査
+//! (design.md の Non-Goals。次の狭い境界はここ)。
 //! 型の分からない式には診断を出さず、後続の change が一つずつ潰していく。
 //!
 //! 走査は `requirement::scan` と同じ字句スコープ規則を持つが、運ぶ状態が
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
-use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Type, TypeKind, UnOp};
+use crate::ast::{
+    BinOp, Expr, ExprKind, Head, Item, Program, Provision, Sig, Type, TypeKind, UnOp,
+};
+use crate::requirement::{Slots, collect_slots};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 宣言の索引。正準名でそのまま引く。
@@ -45,6 +56,15 @@ struct Decls {
     /// トップレベル関数の正準名 → 署名。本体を見る前に全部集めるので、
     /// 前方参照と再帰も引ける(design.md 決定2)
     fns: BTreeMap<String, FnSig>,
+    /// trait 名 → メンバー名 → 契約署名。スロット経由の呼び出しは、実行時の
+    /// 具体型が意図的に変わるので**契約だけ**を見る(design.md 決定4)
+    traits: BTreeMap<String, BTreeMap<String, FnSig>>,
+    /// 具体型名 → その型の全 `impl` メンバー(メンバー名, 署名)。trait 実装も
+    /// inherent も混ぜて入れる。呼び出し地点で trait が分かるとは限らないので、
+    /// 絞り込みは名前だけで行い、複数残れば曖昧とする(eval.rs `find_method`)
+    impls: BTreeMap<String, Vec<(String, FnSig)>>,
+    /// スロット名 → trait 名。`requirement` の表をそのまま借りる
+    slots: Slots,
     /// struct ではない宣言名(trait / effect / fn / enum / variant)。
     /// 「未知」と「struct ではない」を言い分けるためだけに持つ
     others: BTreeSet<String>,
@@ -95,18 +115,39 @@ impl std::fmt::Display for KnownType {
     }
 }
 
-/// トップレベル関数の署名のうち、呼び出し側の検査に要る分だけ。
+/// 署名のうち、呼び出し側の検査に要る分だけ。`self` は引数に数えないので
+/// 別のフラグで持つ(design.md 決定1)。
+#[derive(PartialEq, Eq)]
 struct FnSig {
+    has_self: bool,
     params: Vec<KnownType>,
     ret: Option<KnownType>,
+}
+
+/// 宣言された署名を検査用の形にする。引数名は実装側の局所名なので落とす。
+fn signature(sig: &Sig) -> FnSig {
+    FnSig {
+        has_self: sig.has_self,
+        params: sig.params.iter().map(|p| known(&p.ty)).collect(),
+        ret: sig.ret.as_ref().map(known),
+    }
 }
 
 /// ローカル束縛。**型が分かっているものだけ**型を持つ。
 ///
 /// 名前の集合ではなく表にしているのは、`u.rank = Gold` のレシーバ型を
 /// 引くため。入口は型注釈付き引数・`self`・struct リテラル・enum variant・
-/// 直接呼び出しの宣言戻り値と、それらを直接束縛・参照する式に限る。
-type Locals = BTreeMap<String, Option<KnownType>>;
+/// 呼び出しの宣言戻り値と、それらを直接束縛・参照する式に限る。
+///
+/// `with` が導入する ambient スロットは値ではないので言い分ける。同名の
+/// ローカルはスロットを隠す(design.md 決定3)。
+#[derive(Clone)]
+enum Binding {
+    Value(Option<KnownType>),
+    Slot(String),
+}
+
+type Locals = BTreeMap<String, Binding>;
 
 /// 型注釈をそのまま型の事実にする。`None` は「推論できない」の意味で使うので、
 /// 注釈のある所は optional でも `Some` になる(design.md 決定1)。
@@ -158,7 +199,7 @@ pub fn check(program: &Program) -> Vec<String> {
                 let locals = sig
                     .params
                     .iter()
-                    .map(|p| (p.name.clone(), Some(known(&p.ty))))
+                    .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
                     .collect();
                 let ret = sig.ret.as_ref().map(known);
                 check_body(body, &decls, locals, &sig.name, ret.as_ref(), &mut out);
@@ -174,10 +215,10 @@ pub fn check(program: &Program) -> Vec<String> {
                     let mut locals: Locals = sig
                         .params
                         .iter()
-                        .map(|p| (p.name.clone(), Some(known(&p.ty))))
+                        .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
                         .collect();
                     if sig.has_self {
-                        locals.insert("self".to_string(), Some(plain(type_name)));
+                        locals.insert("self".to_string(), Binding::Value(Some(plain(type_name))));
                     }
                     let ctx = format!("impl {type_name}::{}", sig.name);
                     let ret = sig.ret.as_ref().map(known);
@@ -195,6 +236,8 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut structs = BTreeMap::new();
     let mut variants = BTreeMap::new();
     let mut fns = BTreeMap::new();
+    let mut traits: BTreeMap<String, BTreeMap<String, FnSig>> = BTreeMap::new();
+    let mut impls: BTreeMap<String, Vec<(String, FnSig)>> = BTreeMap::new();
     let mut others = BTreeSet::new();
 
     for item in &program.items {
@@ -233,32 +276,143 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
                     others.insert(variant.clone());
                 }
             }
-            Item::Trait { name, .. } => {
+            // trait のメンバー名の重複は宣言の誤りだが、契約としては一意に保つ。
+            // 実装側の過不足は `check_impl` が契約と突き合わせて報告する
+            Item::Trait { name, methods, .. } => {
                 others.insert(name.clone());
+                traits.insert(
+                    name.clone(),
+                    methods
+                        .iter()
+                        .map(|sig| (sig.name.clone(), signature(sig)))
+                        .collect(),
+                );
             }
             Item::Effect { slot, .. } => {
                 others.insert(slot.clone());
             }
             Item::Fn { sig, .. } => {
                 others.insert(sig.name.clone());
-                fns.insert(
-                    sig.name.clone(),
-                    FnSig {
-                        params: sig.params.iter().map(|p| known(&p.ty)).collect(),
-                        ret: sig.ret.as_ref().map(known),
-                    },
-                );
+                fns.insert(sig.name.clone(), signature(sig));
             }
-            Item::Impl { .. } | Item::Test { .. } => {}
+            Item::Impl {
+                type_name, methods, ..
+            } => {
+                let entry = impls.entry(type_name.clone()).or_default();
+                for (sig, _) in methods {
+                    entry.push((sig.name.clone(), signature(sig)));
+                }
+            }
+            Item::Test { .. } => {}
         }
     }
 
-    Decls {
+    let decls = Decls {
         structs,
         variants,
         fns,
+        traits,
+        impls,
+        slots: collect_slots(program),
         others,
+    };
+
+    // 契約の検査は索引が揃ってから。前方参照の trait も引ける(design.md 決定2)
+    for item in &program.items {
+        if let Item::Impl {
+            trait_name: Some(trait_name),
+            type_name,
+            methods,
+            ..
+        } = item
+        {
+            check_impl(trait_name, type_name, methods, &decls, out);
+        }
     }
+
+    decls
+}
+
+/// trait `impl` を契約と突き合わせる。呼び出しの到達性に依らせないため、
+/// 宣言の時点で見る(design.md 決定2)。
+fn check_impl(
+    trait_name: &str,
+    type_name: &str,
+    methods: &[(Sig, Vec<Expr>)],
+    decls: &Decls,
+    out: &mut Vec<String>,
+) {
+    let ctx = format!("impl {trait_name} for {type_name}");
+    let Some(contract) = decls.traits.get(trait_name) else {
+        out.push(format!("{ctx}: `{trait_name}` は trait ではありません"));
+        return;
+    };
+    if !decls.structs.contains_key(type_name) {
+        out.push(format!("{ctx}: `{type_name}` は struct ではありません"));
+        return;
+    }
+
+    let mut given: BTreeSet<&str> = BTreeSet::new();
+    for (sig, _) in methods {
+        if !given.insert(&sig.name) {
+            out.push(format!("{ctx}: `{}` を二度実装しています", sig.name));
+            continue;
+        }
+        let Some(declared) = contract.get(&sig.name) else {
+            out.push(format!(
+                "{ctx}: `{}` は `{trait_name}` に宣言されていません",
+                sig.name
+            ));
+            continue;
+        };
+        // 引数名は実装側の局所名なので同一性に入れない(design.md 決定2)
+        let actual = signature(sig);
+        if actual.has_self != declared.has_self {
+            out.push(format!(
+                "{ctx}: `{}` のレシーバの形が `{trait_name}` の宣言と違います",
+                sig.name
+            ));
+        }
+        if actual.params != declared.params {
+            out.push(format!(
+                "{ctx}: `{}` の引数は {} ですが、{} を宣言しています",
+                sig.name,
+                params(&declared.params),
+                params(&actual.params)
+            ));
+        }
+        if actual.ret != declared.ret {
+            out.push(format!(
+                "{ctx}: `{}` の戻り値は {} ですが、{} を宣言しています",
+                sig.name,
+                returned(&declared.ret),
+                returned(&actual.ret)
+            ));
+        }
+    }
+
+    let missing: Vec<&str> = contract
+        .keys()
+        .map(String::as_str)
+        .filter(|m| !given.contains(m))
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!(
+            "{ctx}: `{trait_name}` のメソッド {} を実装していません",
+            quoted(&missing)
+        ));
+    }
+}
+
+/// 診断に出す引数型の並び。
+fn params(types: &[KnownType]) -> String {
+    let shown: Vec<String> = types.iter().map(|t| format!("`{t}`")).collect();
+    format!("({})", shown.join(", "))
+}
+
+/// 診断に出す戻り値型。
+fn returned(ty: &Option<KnownType>) -> String {
+    ty.as_ref().map_or("無し".to_string(), |t| format!("`{t}`"))
 }
 
 fn check_body(
@@ -334,7 +488,7 @@ fn check_expr_at(
         ExprKind::Let { name, value } => {
             check_expr(value, decls, locals, ctx, ret, out);
             let ty = infer(value, decls, locals);
-            locals.insert(name.clone(), ty);
+            locals.insert(name.clone(), Binding::Value(ty));
         }
 
         ExprKind::Call(callee, args) => {
@@ -347,11 +501,14 @@ fn check_expr_at(
                 ExprKind::Field(recv, _) => check_expr(recv, decls, locals, ctx, ret, out),
                 _ => check_expr(callee, decls, locals, ctx, ret, out),
             }
-            // メソッド (`Field`) と関連関数 (`Path`) は候補の絞り込みが要るので
-            // 今回は見ない(design.md 決定3)
-            let sig = match &callee.kind {
-                ExprKind::Ident(name) => decls.fns.get(name),
-                _ => None,
+            // 直接呼び出し・メソッド・関連関数を1本の解決に通す。以降の個数・
+            // 引数・戻り値の扱いは呼び出しの形に依らない(design.md 決定4)
+            let sig = match resolve_call(callee, decls, locals) {
+                Ok(sig) => sig,
+                Err(message) => {
+                    out.push(format!("{ctx}: {message}"));
+                    None
+                }
             };
             // 個数が合わなければ引数と宣言の対応が取れないので期待型は配らない
             let params = sig.map(|s| &s.params).filter(|p| p.len() == args.len());
@@ -359,8 +516,8 @@ fn check_expr_at(
                 let expected = params.and_then(|p| p.get(i)).cloned();
                 check_expr_at(a, expected.as_ref(), decls, locals, ctx, ret, out);
             }
-            if let (ExprKind::Ident(name), Some(sig)) = (&callee.kind, sig) {
-                check_call(name, sig, args, decls, locals, ctx, out);
+            if let Some(sig) = sig {
+                check_call(&member(callee), sig, args, decls, locals, ctx, out);
             }
         }
 
@@ -378,7 +535,10 @@ fn check_expr_at(
                 // 代入先の裸の名前は書き込み先であって値の読みではない。
                 // 束縛の型は宣言時に決まるので、後の代入では変えない(design.md 決定4)
                 ExprKind::Ident(name) => {
-                    let expected = locals.get(name).cloned().flatten();
+                    let expected = match locals.get(name) {
+                        Some(Binding::Value(ty)) => ty.clone(),
+                        _ => None,
+                    };
                     check_expr_at(value, expected.as_ref(), decls, locals, ctx, ret, out);
                     if let Some(expected) = &expected {
                         require(
@@ -418,9 +578,16 @@ fn check_expr_at(
                             check_expr(value, decls, locals, ctx, ret, out);
                         }
                     }
+                    // 本体では内側の束縛が勝つ。スロットでない名前は
+                    // requirement 側が報告するので、ここでは型不明の値にする
                     let mut inner = locals.clone();
                     for b in binders {
-                        inner.insert(b.slot().to_string(), None);
+                        let slot = b.slot();
+                        let binding = match decls.slots.trait_of(slot) {
+                            Some(trait_name) => Binding::Slot(trait_name.to_string()),
+                            None => Binding::Value(None),
+                        };
+                        inner.insert(slot.to_string(), binding);
                     }
                     check_expr(body, decls, &mut inner, ctx, ret, out);
                 }
@@ -432,7 +599,8 @@ fn check_expr_at(
                 Head::For { var, iter } => {
                     check_expr(iter, decls, locals, ctx, ret, out);
                     let mut inner = locals.clone();
-                    inner.insert(var.clone(), iterated(iter, decls, locals, ctx, out));
+                    let element = iterated(iter, decls, locals, ctx, out);
+                    inner.insert(var.clone(), Binding::Value(element));
                     check_expr(body, decls, &mut inner, ctx, ret, out);
                 }
                 Head::Else => check_expr(body, decls, &mut locals.clone(), ctx, ret, out),
@@ -582,7 +750,131 @@ fn iterated(
     Some(element.clone())
 }
 
-/// 直接呼び出しの検査。引数の個数は常に、型は文脈と照合できるときだけ見る。
+/// 呼び出し先の署名を選ぶ(design.md 決定4)。
+///
+/// `Ok(None)` はレシーバの型が分からないので保留、`Err` は候補の無さ・曖昧さ・
+/// レシーバの形の不一致で、呼び出し側が文脈を付けて報告する。選び方は評価器と
+/// 同じ順序で、スロット経由は契約だけ、具体型は inherent と trait 実装をまとめて
+/// 名前で絞り、一意になってから `.` と `::` の別を見る。
+fn resolve_call<'d>(
+    callee: &Expr,
+    decls: &'d Decls,
+    locals: &Locals,
+) -> Result<Option<&'d FnSig>, String> {
+    match &callee.kind {
+        ExprKind::Ident(name) => Ok(decls.fns.get(name)),
+        ExprKind::Field(recv, name) => {
+            if let ExprKind::Ident(recv_name) = &recv.kind
+                && let Some(trait_name) = slot_trait(recv_name, decls, locals)
+            {
+                return from_trait(&trait_name, name, true, decls);
+            }
+            let Some(ty) = infer(recv, decls, locals) else {
+                return Ok(None);
+            };
+            // optional の中身を取り出す規則はまだ無く、配列にメソッドも無い
+            match ty.name().filter(|_| !ty.optional) {
+                Some(type_name) => from_type(type_name, name, true, decls),
+                None => Ok(None),
+            }
+        }
+        ExprKind::Path(parts) => {
+            let [first, name] = parts.as_slice() else {
+                return Ok(None);
+            };
+            match slot_trait(first, decls, locals) {
+                Some(trait_name) => from_trait(&trait_name, name, false, decls),
+                None => from_type(first, name, false, decls),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// 名前がこの位置で ambient スロットなら、その宣言 trait 名。最も内側の束縛が
+/// 勝つので、同名のローカルはスロットを隠す(eval.rs `name_is_slot` と同じ規則)。
+fn slot_trait(name: &str, decls: &Decls, locals: &Locals) -> Option<String> {
+    match locals.get(name) {
+        Some(Binding::Slot(trait_name)) => Some(trait_name.clone()),
+        Some(Binding::Value(_)) => None,
+        None => decls.slots.trait_of(name).map(str::to_string),
+    }
+}
+
+/// スロット経由の選択。実行時の具体型は意図的に変わるので契約だけを見る。
+fn from_trait<'d>(
+    trait_name: &str,
+    name: &str,
+    dot: bool,
+    decls: &'d Decls,
+) -> Result<Option<&'d FnSig>, String> {
+    let Some(contract) = decls.traits.get(trait_name) else {
+        return Ok(None);
+    };
+    let Some(sig) = contract.get(name) else {
+        return Err(format!("`{trait_name}` に `{name}` はありません"));
+    };
+    receiver_form(sig, trait_name, name, dot)
+}
+
+/// 具体型からの選択。inherent と trait 実装を混ぜて名前で絞り、一意を要求する。
+fn from_type<'d>(
+    type_name: &str,
+    name: &str,
+    dot: bool,
+    decls: &'d Decls,
+) -> Result<Option<&'d FnSig>, String> {
+    let mut named = decls
+        .impls
+        .get(type_name)
+        .into_iter()
+        .flatten()
+        .filter(|(member, _)| member == name);
+    let Some((_, first)) = named.next() else {
+        // 宣言を知らない型のメンバーは今回の推論の外
+        if !decls.structs.contains_key(type_name) {
+            return Ok(None);
+        }
+        return Err(format!("`{type_name}` に `{name}` はありません"));
+    };
+    // 候補が2つ以上あるのに trait が分からない。スロット経由なら契約で絞れるので、
+    // ここに来るのは具体型から引いたときだけ
+    if named.next().is_some() {
+        return Err(format!(
+            "`{type_name}` の `{name}` がどの trait のものか決まりません"
+        ));
+    }
+    receiver_form(first, type_name, name, dot)
+}
+
+/// 呼び出しの構文と宣言されたレシーバの形を突き合わせる。
+fn receiver_form<'d>(
+    sig: &'d FnSig,
+    owner: &str,
+    name: &str,
+    dot: bool,
+) -> Result<Option<&'d FnSig>, String> {
+    match (sig.has_self, dot) {
+        (false, true) => Err(format!(
+            "`{owner}::{name}` は self を取りません。`{owner}::{name}()` で呼びます"
+        )),
+        (true, false) => Err(format!(
+            "`{owner}::{name}` はレシーバが必要です。値から `.{name}()` で呼びます"
+        )),
+        _ => Ok(Some(sig)),
+    }
+}
+
+/// 診断に出す呼び出し先の綴り。
+fn member(callee: &Expr) -> String {
+    match &callee.kind {
+        ExprKind::Ident(name) | ExprKind::Field(_, name) => name.clone(),
+        ExprKind::Path(parts) => parts.join("::"),
+        _ => String::new(),
+    }
+}
+
+/// 解決できた呼び出しの検査。引数の個数は常に、型は文脈と照合できるときだけ見る。
 fn check_call(
     name: &str,
     sig: &FnSig,
@@ -643,7 +935,9 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
         ExprKind::Bool(_) => Some(plain("bool")),
         ExprKind::Str(_) => Some(plain("str")),
         ExprKind::Ident(name) => match locals.get(name) {
-            Some(known) => known.clone(),
+            Some(Binding::Value(known)) => known.clone(),
+            // スロットは値ではない。読みの診断は requirement / eval の側にある
+            Some(Binding::Slot(_)) => None,
             None => decls.variants.get(name).map(|e| plain(e)),
         },
         ExprKind::StructLit { name, .. } => Some(plain(name)),
@@ -666,10 +960,12 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             field_ty.optional = true;
             Some(field_ty)
         }
-        ExprKind::Call(callee, _) => match &callee.kind {
-            ExprKind::Ident(name) => decls.fns.get(name)?.ret.clone(),
-            _ => None,
-        },
+        // 解決できた呼び出しは宣言戻り値を持つ。診断は `check_expr` の側にある
+        ExprKind::Call(callee, _) => resolve_call(callee, decls, locals)
+            .ok()
+            .flatten()?
+            .ret
+            .clone(),
         // 全要素の型が分かって一致するときだけ配列型になる。空配列と、
         // 型の分からない要素や矛盾する要素を含む配列は不明のまま
         // (design.md 決定3)。矛盾の診断は `check_expr` の側にある
@@ -1241,28 +1537,25 @@ mod tests {
     }
 
     #[test]
-    fn メソッド呼び出しの結果は診断しない() {
-        // レシーバ付きの呼び出しは候補の絞り込みが要るので型が分からない
-        assert!(
-            errors(&format!(
-                "{RANKS}struct Store {{ id: int }}\n\
-                 impl Store {{ fn get(self -> User) {{ User {{ rank = Gold }} }} }}\n\
-                 fn main(s: Store) {{ s.get().rank = Low }}\n"
-            ))
-            .is_empty()
-        );
+    fn メソッド呼び出しの結果はレシーバ型として届く() {
+        let e = only(&format!(
+            "{RANKS}struct Store {{ id: int }}\n\
+             impl Store {{ fn get(self -> User) {{ User {{ rank = Gold }} }} }}\n\
+             fn main(s: Store) {{ s.get().rank = Low }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
-    fn 関連関数呼び出しの結果は診断しない() {
-        assert!(
-            errors(&format!(
-                "{RANKS}struct Store {{}}\n\
-                 impl Store {{ fn make(-> User) {{ User {{ rank = Gold }} }} }}\n\
-                 fn main() {{ Store::make().rank = Low }}\n"
-            ))
-            .is_empty()
-        );
+    fn 関連関数呼び出しの結果もレシーバ型として届く() {
+        let e = only(&format!(
+            "{RANKS}struct Store {{}}\n\
+             impl Store {{ fn make(-> User) {{ User {{ rank = Gold }} }} }}\n\
+             fn main() {{ Store::make().rank = Low }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     // ---- 6. 直接呼び出しの引数 ----
@@ -1351,24 +1644,6 @@ mod tests {
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`nil`"), "{e}");
-    }
-
-    #[test]
-    fn メソッドと関連関数の呼び出しは引数を検査しない() {
-        assert!(
-            errors(
-                "struct Store {}\n\
-                 impl Store {\n\
-                 \x20 fn make(a: int -> Store) { Store {} }\n\
-                 \x20 fn take(self, a: int) { a }\n\
-                 }\n\
-                 fn main(s: Store) {\n\
-                 \x20 s.take()\n\
-                 \x20 Store::make()\n\
-                 }\n",
-            )
-            .is_empty()
-        );
     }
 
     // ---- 7. 直接呼び出しの戻り値型 ----
@@ -2117,6 +2392,269 @@ mod tests {
             "{ARRAYS}fn f(xs: [User]?) {{ for u in xs {{ u }} }}\n"
         ));
         assert!(e.contains("optional な配列 `[User]?`"), "{e}");
+    }
+
+    // ---- 15. trait 実装の契約 ----
+
+    /// 契約の検査環境。self を取るものと取らないものを1つずつ持たせてある
+    const CONTRACT: &str = "struct User { id: int }\n\
+                            trait Database {\n\
+                            \x20 fn find(self, id: int -> User?)\n\
+                            \x20 fn empty(-> User?)\n\
+                            }\n\
+                            struct Store {}\n";
+
+    #[test]
+    fn 宣言どおりのtrait実装は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{CONTRACT}impl Database for Store {{\n\
+                 \x20 fn find(self, other: int -> User?) {{ nil }}\n\
+                 \x20 fn empty(-> User?) {{ nil }}\n\
+                 }}\n"
+            ))
+            .is_empty(),
+            "引数名は実装側の局所名なので契約の同一性に入らない"
+        );
+    }
+
+    #[test]
+    fn 実装し忘れたtraitメソッドを報告する() {
+        let e = only(&format!(
+            "{CONTRACT}impl Database for Store {{ fn find(self, id: int -> User?) {{ nil }} }}\n"
+        ));
+        assert!(e.starts_with("impl Database for Store: "), "{e}");
+        assert!(e.contains("`empty`"), "{e}");
+        assert!(!e.contains("`find`"), "{e}");
+    }
+
+    #[test]
+    fn 宣言に無い実装メソッドと二度の実装を報告する() {
+        let e = only(&format!(
+            "{CONTRACT}impl Database for Store {{\n\
+             \x20 fn find(self, id: int -> User?) {{ nil }}\n\
+             \x20 fn empty(-> User?) {{ nil }}\n\
+             \x20 fn extra(self) {{ 1 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("`extra`"), "{e}");
+        assert!(e.contains("`Database` に宣言されていません"), "{e}");
+
+        let e = only(&format!(
+            "{CONTRACT}impl Database for Store {{\n\
+             \x20 fn find(self, id: int -> User?) {{ nil }}\n\
+             \x20 fn find(self, id: int -> User?) {{ nil }}\n\
+             \x20 fn empty(-> User?) {{ nil }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("`find` を二度実装しています"), "{e}");
+    }
+
+    #[test]
+    fn 契約と食い違う実装署名を報告する() {
+        for (method, expected) in [
+            ("fn find(id: int -> User?) { nil }", "レシーバの形"),
+            ("fn find(self, id: str -> User?) { nil }", "引数は (`int`)"),
+            ("fn find(self -> User?) { nil }", "引数は (`int`)"),
+            ("fn find(self, id: int -> User) { nil }", "戻り値は `User?`"),
+            ("fn find(self, id: int) { nil }", "戻り値は `User?`"),
+        ] {
+            // 本体の検査は宣言した署名に対して従来どおり走るので、契約の
+            // 診断が出ていることだけを見る
+            let errors = errors(&format!(
+                "{CONTRACT}impl Database for Store {{\n {method}\n fn empty(-> User?) {{ nil }}\n}}\n"
+            ));
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{method}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn traitでない実装対象とstructでない実装先を報告する() {
+        let e = only(&format!("{CONTRACT}impl User for Store {{}}\n"));
+        assert!(e.contains("`User` は trait ではありません"), "{e}");
+
+        let e = only(&format!("{CONTRACT}impl Database for User {{}}\n"));
+        assert!(
+            e.contains("`Database` のメソッド"),
+            "struct なら中身の検査へ進む: {e}"
+        );
+
+        let e = only(&format!(
+            "{CONTRACT}enum Rank {{ Bronze }}\nimpl Database for Rank {{}}\n"
+        ));
+        assert!(e.contains("`Rank` は struct ではありません"), "{e}");
+    }
+
+    // ---- 16. 呼び出しの解決 ----
+
+    /// 解決の検査環境。同名メソッドを持つ2つの trait と、スロットを1つ持つ
+    const CALLS: &str = "struct User { id: int }\n\
+                         trait Database { fn find(self, id: int -> User?) }\n\
+                         trait Cache { fn find(self, id: int -> User?) }\n\
+                         effect db: Database\n\
+                         struct Store {}\n\
+                         impl Store {\n\
+                         \x20 fn new(-> Store) { Store {} }\n\
+                         \x20 fn count(self -> int) { 1 }\n\
+                         }\n\
+                         impl Database for Store { fn find(self, id: int -> User?) { nil } }\n";
+
+    #[test]
+    fn 一意な候補は具体型から解決される() {
+        assert!(
+            errors(&format!(
+                "{CALLS}fn f(s: Store -> int) {{\n\
+                 \x20 let ignored = s.find(1)\n\
+                 \x20 let made = Store::new()\n\
+                 \x20 made.count()\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 同名のtraitメソッドが複数あると曖昧として報告する() {
+        let e = only(&format!(
+            "{CALLS}impl Cache for Store {{ fn find(self, id: int -> User?) {{ nil }} }}\n\
+             fn f(s: Store) {{ s.find(1) }}\n"
+        ));
+        assert!(e.contains("どの trait のものか決まりません"), "{e}");
+        assert!(e.contains("`find`"), "{e}");
+    }
+
+    #[test]
+    fn スロット経由の呼び出しは宣言traitだけを見る() {
+        // 具体型に同名の別 trait 実装があっても、スロットは契約で一意に決まる
+        assert!(
+            errors(&format!(
+                "{CALLS}impl Cache for Store {{ fn find(self, id: int -> User?) {{ nil }} }}\n\
+                 fn f(-> User?) {{ db.find(1) }}\n"
+            ))
+            .is_empty()
+        );
+
+        let e = only(&format!("{CALLS}fn f() {{ db.save(1) }}\n"));
+        assert!(e.contains("`Database` に `save` はありません"), "{e}");
+    }
+
+    #[test]
+    fn 同名のローカルはスロットを隠す() {
+        // `db` がローカルなら契約ではなく具体型から引く
+        let e = only(&format!("{CALLS}fn f(db: Store) {{ db.nope(1) }}\n"));
+        assert!(e.contains("`Store` に `nope` はありません"), "{e}");
+    }
+
+    #[test]
+    fn withの提供値は外側で本体は内側で検査する() {
+        // 提供値の `store` はまだローカル、本体の `db` はスロット
+        assert!(
+            errors(&format!(
+                "{CALLS}fn f(store: Store) {{ with db(store) {{ db.find(1) }} }}\n"
+            ))
+            .is_empty()
+        );
+
+        let e = only(&format!(
+            "{CALLS}fn f(db: Store) {{ with db(db) {{ db.save(1) }} }}\n"
+        ));
+        assert!(e.contains("`Database` に `save` はありません"), "{e}");
+    }
+
+    #[test]
+    fn 型の分からないレシーバの呼び出しは保留する() {
+        assert!(
+            errors(&format!(
+                "{CALLS}fn unknown() {{ nil }}\n\
+                 fn f() {{\n\
+                 \x20 let u = unknown()\n\
+                 \x20 u.nope(1)\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 呼び出し構文とレシーバの形の食い違いを報告する() {
+        let e = only(&format!("{CALLS}fn f(s: Store -> Store) {{ s.new() }}\n"));
+        assert!(e.contains("self を取りません"), "{e}");
+
+        let e = only(&format!(
+            "{CALLS}fn f(s: Store -> int) {{ Store::count() }}\n"
+        ));
+        assert!(e.contains("レシーバが必要です"), "{e}");
+    }
+
+    // ---- 17. 解決した呼び出しの署名 ----
+
+    #[test]
+    fn 解決した呼び出しの引数の個数と型を検査する() {
+        let e = only(&format!("{CALLS}fn f(s: Store) {{ s.find() }}\n"));
+        assert!(e.contains("`find` は引数を 1 個取ります"), "{e}");
+
+        let e = only(&format!("{CALLS}fn f(s: Store) {{ s.find(\"x\") }}\n"));
+        assert!(e.contains("`find` の第 1 引数"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+
+        let e = only(&format!("{CALLS}fn f() {{ Store::new(1) }}\n"));
+        assert!(e.contains("`Store::new` は引数を 0 個取ります"), "{e}");
+    }
+
+    #[test]
+    fn 解決した呼び出しの引数にも既存のoptional規則が効く() {
+        assert!(
+            errors(&format!(
+                "{CALLS}impl Store {{ fn take(self, u: User?) {{ u }} }}\n\
+                 fn f(s: Store, u: User) {{\n\
+                 \x20 s.take(u)\n\
+                 \x20 s.take(nil)\n\
+                 }}\n"
+            ))
+            .is_empty(),
+            "`T` から `T?` への注入は宛先の規則どおり通る"
+        );
+
+        let e = only(&format!(
+            "{CALLS}impl Store {{ fn take(self, u: User) {{ u }} }}\n\
+             fn f(s: Store, u: User?) {{ s.take(u) }}\n"
+        ));
+        assert!(e.contains("`User?`"), "{e}");
+    }
+
+    #[test]
+    fn 解決した呼び出しの戻り値は後続の検査へ届く() {
+        // optional fallback・フィールドの読み・宣言戻り値の照合まで一続き
+        assert!(
+            errors(&format!(
+                "{CALLS}fn f(s: Store -> int) {{ (s.find(1) ?? return 0).id }}\n"
+            ))
+            .is_empty()
+        );
+
+        let e = only(&format!(
+            "{CALLS}fn f(s: Store -> str) {{ (s.find(1) ?? return \"x\").id }}\n"
+        ));
+        assert!(e.contains("`str`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+
+        let e = only(&format!("{CALLS}fn f(s: Store -> int) {{ s.find(1) }}\n"));
+        assert!(e.contains("`User?`"), "{e}");
+    }
+
+    #[test]
+    fn 戻り値型の無いメソッドの結果は分からないまま() {
+        assert!(
+            errors(&format!(
+                "{CALLS}impl Store {{ fn nothing(self) {{ 1 }} }}\n\
+                 fn f(s: Store -> int) {{ s.nothing() }}\n"
+            ))
+            .is_empty()
+        );
     }
 
     // ---- 正典 ----

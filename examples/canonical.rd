@@ -152,7 +152,9 @@ test "昇格すると Gold になり時刻が刻まれる" {
     with db(store), clock(Frozen::at(1000)) {
         assert handle(alice.id)
 
-        let u = InMemoryDb::get(store, alice.id)
+        // `get` は `User?` を返す。見つからなければ Bronze の別人になるので、
+        // 下の assert がそのまま「見つかったこと」も確かめる
+        let u = InMemoryDb::get(store, alice.id) ?? User { id = 0, rank = Bronze, promoted_at = 0 }
         assert u.rank == Gold
         assert u.promoted_at == 1000
     }
