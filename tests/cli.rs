@@ -423,3 +423,58 @@ fn 裸の相対エントリ名を読み込める() {
     assert!(output.status.success(), "{text}");
     assert!(text.contains("main -> 6"), "{text}");
 }
+
+// ---- struct の形の検査 (src/typecheck.rs) ----
+
+#[test]
+fn 呼ばれない関数の不正なstruct生成でも実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "struct User { id: UserId }\n\
+         fn unused() { User { id = 1, nope = 2 } }\n\
+         fn main() { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("`nope`"), "{text}");
+    assert!(!text.contains("main -> 1"), "{text}");
+}
+
+#[test]
+fn モジュールを跨ぐstruct生成を正準名で報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{User}\n\
+         fn main() { User { id = 1 } }\n",
+    );
+    project.write("dep.rd", "struct User { id: UserId\nrank: Rank }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("dep::User"), "{text}");
+    assert!(text.contains("`rank`"), "{text}");
+}
+
+#[test]
+fn 宣言どおりのstruct生成はモジュールを跨いでも実行される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{User}\n\
+         fn main() {\n\
+           let u = User { rank = 2, id = 1 }\n\
+           u.rank\n\
+         }\n",
+    );
+    project.write("dep.rd", "struct User { id: UserId\nrank: Rank }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 2"), "{text}");
+}

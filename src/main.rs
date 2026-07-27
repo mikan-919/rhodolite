@@ -6,6 +6,7 @@ mod lex;
 mod module;
 mod parse;
 mod requirement;
+mod typecheck;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -30,6 +31,17 @@ fn main() -> ExitCode {
     println!("{path}: {} 個の宣言", program.items.len());
     for item in &program.items {
         println!("  {}", summary(item));
+    }
+
+    // 要求解析より前に struct の形を固める。ここを通れば、評価器へ届く
+    // struct 値は宣言どおりの形をしている(src/typecheck.rs)
+    let shape_errors = typecheck::check(&program);
+    if !shape_errors.is_empty() {
+        eprintln!();
+        for e in &shape_errors {
+            eprintln!("{e}");
+        }
+        return ExitCode::FAILURE;
     }
 
     let analysis = requirement::analyze(&program);

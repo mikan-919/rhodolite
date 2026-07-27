@@ -40,6 +40,8 @@ fn main() {
       ├─ lex      文字 → トークン           src/lex.rs
       ├─ join     行継続の改行を消す         src/lex.rs
       ├─ parse    トークン → 構文木          src/parse.rs → src/ast.rs
+      ├─ load     use を辿って名前解決        src/module.rs
+      ├─ check    struct の形を照合           src/typecheck.rs
       ├─ analyze  構文木 → 要求と経路        src/requirement.rs
       └─ eval     構文木を走らせる            src/eval.rs
                                             ↑ 全部つながっている
@@ -74,12 +76,14 @@ main: `clock` が提供されていません
 
 | ファイル | 役割 | 行 |
 |---|---|---|
-| `src/lex.rs` | 字句解析 + 行継続 | 421 |
-| `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 181 |
-| `src/parse.rs` | 再帰下降パーサ | 1027 |
-| `src/requirement.rs` | **要求推論(中核)** | 987 |
+| `src/lex.rs` | 字句解析 + 行継続 | 427 |
+| `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 197 |
+| `src/parse.rs` | 再帰下降パーサ | 1167 |
+| `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 1181 |
+| `src/typecheck.rs` | struct の形の検査。型検査の最初の縦切り | 499 |
+| `src/requirement.rs` | **要求推論(中核)** | 1097 |
 | `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 1459 |
-| `src/main.rs` | 繋ぐだけ | 142 |
+| `src/main.rs` | 繋ぐだけ | 144 |
 
 `requirement.rs` の中は6段。手順1〜3が mikan の手書き、4〜6は代筆。
 
@@ -109,10 +113,17 @@ main: `clock` が提供されていません
 ## 6. 次の一歩
 
 v1 完了線は越えた。未定義の直接関数呼び出し、重複スロットの検査、
-ADR-0006 のモジュール分割は完了した。
+ADR-0006 のモジュール分割、struct の形の検査は完了した。
+
+`src/typecheck.rs` が保証するのは**形だけ**。ここを通ったプログラムでは、
+struct リテラルは宣言済み struct を指し、宣言フィールドを過不足なく一度ずつ
+持つ。ローカルに隠されていない裸の struct 名はフィールド0個。
+それ以外は何も分かっていない。
+
 残っている穴埋めの優先順は次の通り。
 
-1. **型検査が無い。** `struct` の宣言フィールドは照合していない。
-   ADR-0003 の whole-program 単相化はここから
+1. **型検査が形しか無い。** フィールド**値**の型、関数の引数と戻り値、演算、
+   optional、配列、メソッド候補の絞り込みはまだ見ていない。
+   ADR-0003 の whole-program 単相化はこの続き
 2. **enum が無い。** `Gold` はフィールド0個の struct を名札として使っている
 3. エラーに span が付いていない(`miette` を入れるならここ)

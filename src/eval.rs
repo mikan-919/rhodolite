@@ -256,8 +256,8 @@ pub struct Interp<'a> {
     methods: HashMap<&'a str, Vec<Method<'a>>>,
     /// 型名の集合。`Gold` のようなフィールド0個の struct を名前だけで値にするのに使う。
     ///
-    /// ponytail: 宣言されたフィールドは検査しない。struct 生成で与えたものが
-    /// そのまま入る。型検査を入れるときに突き合わせる
+    /// フィールドの過不足は `typecheck::check` が実行前に済ませているので、ここは
+    /// 名前の有無しか見ない。ponytail: フィールド**値**の型はまだ誰も見ていない
     structs: HashSet<&'a str>,
     /// スロット名 → trait 名。requirement.rs のものを再利用する
     slots: Slots,
