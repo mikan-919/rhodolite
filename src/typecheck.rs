@@ -266,10 +266,14 @@ fn check_expr(
         }
 
         ExprKind::Call(callee, args) => {
-            // 呼び出し先の名前は値として読まれない。評価器も `Ident` / `Path` の
-            // callee は関数表・型表から引くだけで、値へ落とさない
-            if !matches!(callee.kind, ExprKind::Ident(_) | ExprKind::Path(_)) {
-                check_expr(callee, decls, locals, ctx, ret, out);
+            match &callee.kind {
+                // 呼び出し先の名前は値として読まれない。評価器も `Ident` / `Path` の
+                // callee は関数表・型表から引くだけで、値へ落とさない
+                ExprKind::Ident(_) | ExprKind::Path(_) => {}
+                // `db.save(u)` の `save` はメソッド名であってフィールドの読みでは
+                // ない。値になるのはレシーバだけ
+                ExprKind::Field(recv, _) => check_expr(recv, decls, locals, ctx, ret, out),
+                _ => check_expr(callee, decls, locals, ctx, ret, out),
             }
             for a in args {
                 check_expr(a, decls, locals, ctx, ret, out);
@@ -283,7 +287,10 @@ fn check_expr(
             }
         }
 
-        ExprKind::Field(recv, _) => check_expr(recv, decls, locals, ctx, ret, out),
+        ExprKind::Field(recv, field) => {
+            check_expr(recv, decls, locals, ctx, ret, out);
+            check_field_read(recv, field, decls, locals, ctx, out);
+        }
 
         ExprKind::Assign { target, value } => {
             check_expr(value, decls, locals, ctx, ret, out);
@@ -429,11 +436,49 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             None => decls.variants.get(name).map(|e| plain(e)),
         },
         ExprKind::StructLit { name, .. } => Some(plain(name)),
+        // 素直な再帰なので `user.profile.name` の連鎖もそのまま辿れる。
+        // 診断は `check_field_read` の側にあるので、ここは事実を引くだけ
+        ExprKind::Field(recv, field) => {
+            let ty = infer(recv, decls, locals)?;
+            if ty.optional {
+                return None;
+            }
+            decls.structs.get(&ty.name)?.get(field).cloned()
+        }
         ExprKind::Call(callee, _) => match &callee.kind {
             ExprKind::Ident(name) => decls.fns.get(name)?.ret.clone(),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// 型の分かる非 optional のレシーバは、宣言済み struct の宣言フィールドしか読めない。
+///
+/// レシーバの型が分からないうちは黙る。optional の中身を取り出す規則もまだ無いので、
+/// `u?.rank` に相当する読みは今回の保証外(design.md 決定2)。
+fn check_field_read(
+    recv: &Expr,
+    field: &str,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    let Some(ty) = infer(recv, decls, locals) else {
+        return;
+    };
+    if ty.optional {
+        return;
+    }
+    let Some(declared) = decls.structs.get(&ty.name) else {
+        out.push(format!(
+            "{ctx}: `{ty}` は struct ではないので `{field}` を読めません"
+        ));
+        return;
+    };
+    if !declared.contains_key(field) {
+        out.push(format!("{ctx}: `{ty}` にフィールド `{field}` はありません"));
     }
 }
 
@@ -707,7 +752,7 @@ mod tests {
             errors(
                 "struct User { id: int }\n\
                  struct Store { users: Users }\n\
-                 impl Store { fn first(self -> User) { self.users } }\n",
+                 impl Store { fn first(self -> Users) { self.users } }\n",
             )
             .is_empty()
         );
@@ -1104,6 +1149,71 @@ mod tests {
             let e = only(src);
             assert!(e.contains("組み込み型の名前"), "{src}: {e}");
         }
+    }
+
+    // ---- 10. 普通のフィールドの読み ----
+
+    /// フィールドの読みの検査環境。連鎖が辿れることを見たいので2段にしてある
+    const NESTED: &str = "enum Rank { Bronze Gold }\n\
+                          struct Profile { rank: Rank }\n\
+                          struct User { profile: Profile\nage: int }\n";
+
+    #[test]
+    fn 宣言フィールドの読みは宣言型を持つ() {
+        assert!(errors(&format!("{NESTED}fn f(u: User -> int) {{ u.age }}\n")).is_empty());
+    }
+
+    #[test]
+    fn フィールドの連鎖も宣言型を辿る() {
+        assert!(
+            errors(&format!(
+                "{NESTED}fn f(u: User -> Rank) {{ u.profile.rank }}\n"
+            ))
+            .is_empty()
+        );
+        let e = only(&format!(
+            "{NESTED}fn f(u: User -> int) {{ u.profile.rank }}\n"
+        ));
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+    }
+
+    #[test]
+    fn 宣言に無いフィールドの読みを報告する() {
+        let e = only(&format!("{NESTED}fn f(u: User) {{ u.nope }}\n"));
+        assert!(e.contains("`User`"), "{e}");
+        assert!(e.contains("`nope`"), "{e}");
+    }
+
+    #[test]
+    fn structでない型からのフィールドの読みを報告する() {
+        let e = only(&format!("{NESTED}fn f(n: int) {{ n.age }}\n"));
+        assert!(e.contains("`int` は struct ではない"), "{e}");
+    }
+
+    #[test]
+    fn 型の分からないレシーバのフィールドは診断しない() {
+        // optional のレシーバも、メソッド結果のレシーバもまだ推論の外
+        assert!(
+            errors(&format!(
+                "{NESTED}fn f(u: User?, xs: Users) {{\n\
+                 \x20 u.nope\n\
+                 \x20 for x in xs {{ x.nope }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn メソッド名はフィールドの読みとして診断しない() {
+        assert!(
+            errors(&format!(
+                "{NESTED}impl User {{ fn shout(self -> int) {{ self.age }} }}\n\
+                 fn f(u: User -> int) {{ u.shout() }}\n"
+            ))
+            .is_empty()
+        );
     }
 
     // ---- 正典 ----
