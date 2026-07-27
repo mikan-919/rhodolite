@@ -133,9 +133,25 @@ effect / fn)はこの名前を名乗れない。
 - `if` / `elif` / `while` の条件と `assert` の対象は `bool`。整数や文字列からの
   暗黙の真偽値変換は無い
 
-`nil`・`??`・配列・メソッドと関連関数の呼び出しは、まだ検査器が型を付けられない。
-これは**実装がそこまで来ていない**だけで、言語に「何でも入る型」があるわけではない
-(→ `src/typecheck.rs`)。
+## optional
+
+型名の後置 `?` は値が `nil` になりうることを表す。`nil` は単独の nominal 型ではなく、
+期待型のある位置で `T?` にだけ適合する。したがって `fn f(x: int?) { f(nil) }` は通るが、
+`fn f(x: int) { f(nil) }` は型エラーになる。裸の `let x = nil` から `T` は推論しない。
+
+fallback の型規則は1本:
+
+```text
+T? ?? T -> T
+```
+
+左辺が `nil` のときだけ右辺を評価する。右辺の直接 `return` は値を産まずに枝を終えてよい
+ので、`value ?? return fallback` と書ける。`nil == value` は value が optional のときだけ
+比較でき、結果は他の `==` と同じ `bool`。
+
+optional field access の表記と伝播規則はまだ未決定。配列・optional field access・
+メソッドと関連関数の呼び出しは、まだ検査器が型を付けられない。これは**実装がそこまで
+来ていない**だけで、言語に「何でも入る型」があるわけではない(→ `src/typecheck.rs`)。
 
 ## enum
 
@@ -193,7 +209,7 @@ trait の中の `fn` が同じ見た目で違う意味になる。宣言に出�
 
 ## まだ決めていない
 
-- `??` の正確な意味論(`Option` の unwrap-or-else? 型は?)
+- optional field access の表記と、連鎖した結果の optional 伝播規則
 - パターンマッチ(`match`)を v1 に入れるか — 正典には出てこない。
   enum が入ったので、必要になったときに限定参照(`Rank::Gold`)と一緒に決める
 - `elif`/`else` を `}` と同じ行に置くか次行かは**フォーマッタ規約**

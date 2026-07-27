@@ -15,7 +15,7 @@
 
 ## 3. Integration and Documentation
 
-- [ ] 3.1 Add CLI integration coverage for invalid contextual `nil`, invalid fallback operands, and fallback-result propagation
-- [ ] 3.2 Update `README.md`, `docs/overview.md`, `docs/grammar.md`, and `src/typecheck.rs` boundary documentation, keeping optional field access explicitly deferred
-- [ ] 3.3 Run `cargo fmt --check`, the full Rust test suite, the canonical example, and the missing-handler example
-- [ ] 3.4 Validate the OpenSpec change, review the final diff, and commit the completed implementation snapshot
+- [x] 3.1 Add CLI integration coverage for invalid contextual `nil`, invalid fallback operands, and fallback-result propagation
+- [x] 3.2 Update `README.md`, `docs/overview.md`, `docs/grammar.md`, and `src/typecheck.rs` boundary documentation, keeping optional field access explicitly deferred
+- [x] 3.3 Run `cargo fmt --check`, the full Rust test suite, the canonical example, and the missing-handler example
+- [x] 3.4 Validate the OpenSpec change, review the final diff, and commit the completed implementation snapshot

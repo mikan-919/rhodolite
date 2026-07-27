@@ -760,6 +760,35 @@ fn 型の違うフィールド値は実行前に失敗する() {
 }
 
 #[test]
+fn nilを非optionalへ渡すと実行前に失敗する() {
+    実行前に失敗する(
+        "fn take(n: int) { n }\n\
+         fn unused() { take(nil) }\n\
+         fn main() { 1 }\n",
+        "`nil`",
+    );
+}
+
+#[test]
+fn 非optionalの左辺へfallbackを使うと実行前に失敗する() {
+    実行前に失敗する(
+        "fn unused(n: int) { n ?? 0 }\nfn main() { 1 }\n",
+        "`??` の左辺",
+    );
+}
+
+#[test]
+fn fallbackの結果型は実行前の戻り値検査へ届く() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         enum Grade { Low High }\n\
+         fn unused(r: Rank? -> Grade) { r ?? Gold }\n\
+         fn main() { 1 }\n",
+        "戻り値は `main::Grade` ですが、`main::Rank`",
+    );
+}
+
+#[test]
 fn 型の違う再代入は実行前に失敗する() {
     実行前に失敗する(
         "fn f(n: int) { n = \"x\" }\nfn main() { 1 }\n",
