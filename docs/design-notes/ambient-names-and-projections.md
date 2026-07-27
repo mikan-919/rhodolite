@@ -288,19 +288,19 @@ Overloading*（Leijen, Whiting）。
 **スロット名とローカル束縛の解決先が、構文位置によって食い違う。**
 
 ```rhodolite
-trait Database { fn save(self, u: Int -> unit) }
+trait Database { fn save(self, u: int -> unit) }
 effect db: Database
-struct Slot { n: Int }
-impl Database for Slot { fn save(self, u: Int -> unit) { self.n = 1 } }
-struct Local { n: Int }
-impl Database for Local { fn save(self, u: Int -> unit) { self.n = 2 } }
+struct Slot { n: int }
+impl Database for Slot { fn save(self, u: int -> unit) { self.n = 1 } }
+struct Local { n: int }
+impl Database for Local { fn save(self, u: int -> unit) { self.n = 2 } }
 
-fn handle(db: Local -> Int) {   // 引数名が偶然スロットと同じ
+fn handle(db: Local -> int) {   // 引数名が偶然スロットと同じ
     db.save(0)                  // → スロットに行く
     db.n                        // → 引数に行く
 }
 
-fn main(-> Int) {
+fn main(-> int) {
     let s = Slot { n = 0 }
     with db(s) {
         let r = handle(Local { n = 7 })

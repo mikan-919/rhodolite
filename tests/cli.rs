@@ -73,11 +73,11 @@ fn 同名スロットを持つ二つのモジュールを別々に提供して�
     project.write(
         "sides/left.rd",
         "trait StoreApi {\n\
-           fn read(self -> Int)\n\
+           fn read(self -> int)\n\
          }\n\
          struct Store {}\n\
          impl StoreApi for Store {\n\
-           fn read(self -> Int) { 1 }\n\
+           fn read(self -> int) { 1 }\n\
          }\n\
          effect db: StoreApi\n\
          fn read() { db.read() }\n",
@@ -85,11 +85,11 @@ fn 同名スロットを持つ二つのモジュールを別々に提供して�
     project.write(
         "sides/right.rd",
         "trait StoreApi {\n\
-           fn read(self -> Int)\n\
+           fn read(self -> int)\n\
          }\n\
          struct Store {}\n\
          impl StoreApi for Store {\n\
-           fn read(self -> Int) { 2 }\n\
+           fn read(self -> int) { 2 }\n\
          }\n\
          effect db: StoreApi\n\
          fn read() { db.read() }\n",
@@ -337,7 +337,7 @@ fn 宣言位置の修飾参照から子モジュールを読み込む() {
     project.write(
         "services/users.rd",
         "trait StoreApi {\n\
-         \x20 fn read(self -> Int)\n\
+         \x20 fn read(self -> int)\n\
          }\n",
     );
 
@@ -362,7 +362,7 @@ fn useしていない宣言位置のモジュール参照を報告する() {
     project.write(
         "services/users.rd",
         "trait StoreApi {\n\
-         \x20 fn read(self -> Int)\n\
+         \x20 fn read(self -> int)\n\
          }\n",
     );
 
@@ -381,7 +381,7 @@ fn ローカル束縛は修飾参照でもモジュールimportを隠す() {
     project.write(
         "main.rd",
         "use services\n\
-         fn helper(services: Int) { services::users::run() }\n\
+         fn helper(services: int) { services::users::run() }\n\
          fn main() { 0 }\n",
     );
     project.write("services/users.rd", "this must not be read\n");
@@ -431,7 +431,7 @@ fn 呼ばれない関数の不正なstruct生成でも実行前に失敗する()
     let project = Project::new();
     project.write(
         "main.rd",
-        "struct User { id: UserId }\n\
+        "struct User { id: int }\n\
          fn unused() { User { id = 1, nope = 2 } }\n\
          fn main() { 1 }\n",
     );
@@ -451,7 +451,7 @@ fn モジュールを跨ぐstruct生成を正準名で報告する() {
         "use dep::{User}\n\
          fn main() { User { id = 1 } }\n",
     );
-    project.write("dep.rd", "struct User { id: UserId\nrank: Rank }\n");
+    project.write("dep.rd", "struct User { id: int\nrank: Rank }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -471,7 +471,7 @@ fn 宣言どおりのstruct生成はモジュールを跨いでも実行され�
            u.rank\n\
          }\n",
     );
-    project.write("dep.rd", "struct User { id: UserId\nrank: Rank }\n");
+    project.write("dep.rd", "struct User { id: int\nrank: Rank }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -637,7 +637,7 @@ fn 引数の個数が合わない呼び出しは実行前に失敗する() {
         "use dep::{add}\n\
          fn main() { add(1) }\n",
     );
-    project.write("dep.rd", "fn add(a: Int, b: Int -> Int) { a }\n");
+    project.write("dep.rd", "fn add(a: int, b: int -> int) { a }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);

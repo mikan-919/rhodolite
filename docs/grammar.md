@@ -159,7 +159,7 @@ db.save(u)                                     // 使用
 ```rhodolite
 impl Database for Postgres {
     fn save(self, u: User -> unit) { ... }   // メソッド。`pg.save(u)` で呼ぶ
-    fn new(url: Str -> Postgres) { ... }     // 関連関数。`Postgres::new(url)` で呼ぶ
+    fn new(url: str -> Postgres) { ... }     // 関連関数。`Postgres::new(url)` で呼ぶ
 }
 ```
 

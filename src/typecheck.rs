@@ -82,6 +82,16 @@ fn plain(name: &str) -> KnownType {
     }
 }
 
+/// 組み込みのスカラー型。ユーザー宣言はこの名前を名乗れない(design.md 決定1)。
+const BUILTINS: [&str; 4] = ["bool", "int", "str", "unit"];
+
+/// 宣言名が組み込み型と衝突するなら、その綴り。正準名は修飾されているので
+/// 末尾だけを見る(`main::int` も `int` の宣言)。
+fn reserved(name: &str) -> Option<&str> {
+    let short = name.rsplit_once("::").map_or(name, |(_, s)| s);
+    BUILTINS.contains(&short).then_some(short)
+}
+
 /// 診断を全件返す。空なら struct の形と分かる enum 型は正しい。
 pub fn check(program: &Program) -> Vec<String> {
     let mut out = Vec::new();
@@ -134,6 +144,13 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut others = BTreeSet::new();
 
     for item in &program.items {
+        // 組み込み型はどの宣言種でも名乗れない。宣言名を出す口は module.rs の
+        // 1本しかないので、そこを借りて全種を1箇所で見る
+        for name in crate::module::item_names(item) {
+            if let Some(short) = reserved(name) {
+                out.push(format!("`{short}` は組み込み型の名前なので宣言できません"));
+            }
+        }
         match item {
             Item::Struct { name, fields, .. } => {
                 let mut declared: BTreeMap<String, KnownType> = BTreeMap::new();
@@ -404,6 +421,9 @@ fn check_return(
 /// それらを直接束縛・参照する式だけ。
 fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
     match &e.kind {
+        ExprKind::Int(_) => Some(plain("int")),
+        ExprKind::Bool(_) => Some(plain("bool")),
+        ExprKind::Str(_) => Some(plain("str")),
         ExprKind::Ident(name) => match locals.get(name) {
             Some(known) => known.clone(),
             None => decls.variants.get(name).map(|e| plain(e)),
@@ -557,7 +577,7 @@ mod tests {
 
     #[test]
     fn 相異なる宣言フィールドは診断を出さない() {
-        assert!(errors("struct User { id: UserId\nrank: Rank }\n").is_empty());
+        assert!(errors("struct User { id: int\nrank: Rank }\n").is_empty());
     }
 
     // ---- 2. リテラル ----
@@ -566,7 +586,7 @@ mod tests {
     fn 宣言どおりのリテラルは通る() {
         assert!(
             errors(
-                "struct User { id: UserId\nrank: Rank }\n\
+                "struct User { id: int\nrank: Rank }\n\
                  fn main() { User { id = 1, rank = 2 } }\n",
             )
             .is_empty()
@@ -577,7 +597,7 @@ mod tests {
     fn 宣言と順序が違っても通る() {
         assert!(
             errors(
-                "struct User { id: UserId\nrank: Rank }\n\
+                "struct User { id: int\nrank: Rank }\n\
                  fn main() { User { rank = 2, id = 1 } }\n",
             )
             .is_empty()
@@ -606,7 +626,7 @@ mod tests {
     #[test]
     fn 不足フィールドを報告する() {
         let e = only(
-            "struct User { id: UserId\nrank: Rank }\n\
+            "struct User { id: int\nrank: Rank }\n\
              fn main() { User { id = 1 } }\n",
         );
         assert!(e.contains("`rank`"), "{e}");
@@ -616,7 +636,7 @@ mod tests {
     #[test]
     fn 余分なフィールドを報告する() {
         let e = only(
-            "struct User { id: UserId }\n\
+            "struct User { id: int }\n\
              fn main() { User { id = 1, nope = 2 } }\n",
         );
         assert!(e.contains("`nope`"), "{e}");
@@ -625,7 +645,7 @@ mod tests {
     #[test]
     fn 重複したリテラルフィールドを報告する() {
         let errors = errors(
-            "struct User { id: UserId }\n\
+            "struct User { id: int }\n\
              fn main() { User { id = 1, id = 2 } }\n",
         );
         assert!(errors.iter().any(|e| e.contains("二度指定")), "{errors:?}");
@@ -634,7 +654,7 @@ mod tests {
     #[test]
     fn implとtestの本体も検査する() {
         let errors = errors(
-            "struct User { id: UserId }\n\
+            "struct User { id: int }\n\
              struct Store {}\n\
              impl Store {\n\
              \x20 fn make(-> User) { User {} }\n\
@@ -655,26 +675,26 @@ mod tests {
 
     #[test]
     fn フィールドを持つstructの裸の名前を報告する() {
-        let e = only("struct User { id: UserId }\nfn main() { User }\n");
+        let e = only("struct User { id: int }\nfn main() { User }\n");
         assert!(e.contains("`User` はフィールドを 1 個持ちます"), "{e}");
     }
 
     #[test]
     fn 同名の引数はstruct名を隠す() {
-        assert!(errors("struct User { id: UserId }\nfn f(User: Int) { User }\n").is_empty());
+        assert!(errors("struct User { id: int }\nfn f(User: int) { User }\n").is_empty());
     }
 
     #[test]
     fn letはstruct名を隠す() {
         assert!(
-            errors("struct User { id: UserId }\nfn f(n: Int) { let User = n\nUser }\n").is_empty()
+            errors("struct User { id: int }\nfn f(n: int) { let User = n\nUser }\n").is_empty()
         );
     }
 
     #[test]
     fn forの束縛はstruct名を隠す() {
         assert!(
-            errors("struct User { id: UserId }\nfn f(xs: Users) { for User in xs { User } }\n")
+            errors("struct User { id: int }\nfn f(xs: Users) { for User in xs { User } }\n")
                 .is_empty()
         );
     }
@@ -685,7 +705,7 @@ mod tests {
         // 「メソッド本体のレシーバが裸の名前として診断されない」ことだけ
         assert!(
             errors(
-                "struct User { id: UserId }\n\
+                "struct User { id: int }\n\
                  struct Store { users: Users }\n\
                  impl Store { fn first(self -> User) { self.users } }\n",
             )
@@ -696,8 +716,8 @@ mod tests {
     #[test]
     fn 実行されない枝のletは後続のstruct名を隠さない() {
         let e = only(
-            "struct User { id: UserId }\n\
-             fn f(n: Int) {\n\
+            "struct User { id: int }\n\
+             fn f(n: int) {\n\
              \x20 if false { let User = n }\n\
              \x20 User\n\
              }\n",
@@ -709,7 +729,7 @@ mod tests {
     fn 呼び出し先の名前は裸のstructとして読まない() {
         // `User(1)` は関数呼び出しであって struct 値の読みではない。
         // 未定義関数の検査は requirement の仕事
-        assert!(errors("struct User { id: UserId }\nfn main() { User(1) }\n").is_empty());
+        assert!(errors("struct User { id: int }\nfn main() { User(1) }\n").is_empty());
     }
 
     // ---- 4. 分かる enum 型 ----
@@ -781,7 +801,7 @@ mod tests {
         // 引数の型注釈も struct リテラルも通っていない値
         assert!(
             errors(&format!(
-                "{RANKS}fn main(n: Int) {{ User {{ rank = n }} }}\n"
+                "{RANKS}fn main(n: int) {{ User {{ rank = n }} }}\n"
             ))
             .is_empty()
         );
@@ -797,7 +817,7 @@ mod tests {
         // レシーバ付きの呼び出しは候補の絞り込みが要るので型が分からない
         assert!(
             errors(&format!(
-                "{RANKS}struct Store {{ id: UserId }}\n\
+                "{RANKS}struct Store {{ id: int }}\n\
                  impl Store {{ fn get(self -> User) {{ User {{ rank = Gold }} }} }}\n\
                  fn main(s: Store) {{ s.get().rank = Low }}\n"
             ))
@@ -845,7 +865,7 @@ mod tests {
         assert!(
             errors(
                 "enum Grade { Low High }\n\
-                 struct User { id: UserId }\n\
+                 struct User { id: int }\n\
                  fn main() { User { id = Low } }\n",
             )
             .is_empty()
@@ -856,12 +876,12 @@ mod tests {
 
     #[test]
     fn 宣言どおりの引数の個数は診断を出さない() {
-        assert!(errors("fn f(a: Int, b: Int) { a }\nfn main(n: Int) { f(n, n) }\n").is_empty());
+        assert!(errors("fn f(a: int, b: int) { a }\nfn main(n: int) { f(n, n) }\n").is_empty());
     }
 
     #[test]
     fn 引数が足りない呼び出しを報告する() {
-        let e = only("fn f(a: Int, b: Int) { a }\nfn main(n: Int) { f(n) }\n");
+        let e = only("fn f(a: int, b: int) { a }\nfn main(n: int) { f(n) }\n");
         assert!(e.starts_with("main: "), "{e}");
         assert!(e.contains("`f`"), "{e}");
         assert!(e.contains("2 個取ります"), "{e}");
@@ -870,7 +890,7 @@ mod tests {
 
     #[test]
     fn 引数が多すぎる呼び出しを報告する() {
-        let e = only("fn f(a: Int) { a }\nfn main(n: Int) { f(n, n) }\n");
+        let e = only("fn f(a: int) { a }\nfn main(n: int) { f(n, n) }\n");
         assert!(e.contains("1 個取ります"), "{e}");
         assert!(e.contains("2 個渡しています"), "{e}");
     }
@@ -878,8 +898,8 @@ mod tests {
     #[test]
     fn 前方参照と再帰の呼び出しも検査する() {
         let errors = errors(
-            "fn main(n: Int) { later(n, n) }\n\
-             fn later(a: Int) { later(a, a) }\n",
+            "fn main(n: int) { later(n, n) }\n\
+             fn later(a: int) { later(a, a) }\n",
         );
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].starts_with("main: "), "{errors:?}");
@@ -919,7 +939,7 @@ mod tests {
         // 演算・配列・nil・メソッド結果はまだ推論の外
         assert!(
             errors(&format!(
-                "{RANKS}fn f(r: Rank) {{ r }}\nfn main(n: Int) {{ f(n + 1) }}\n"
+                "{RANKS}fn f(r: Rank) {{ r }}\nfn main(n: int) {{ f(n + 1) }}\n"
             ))
             .is_empty()
         );
@@ -931,8 +951,8 @@ mod tests {
             errors(
                 "struct Store {}\n\
                  impl Store {\n\
-                 \x20 fn make(a: Int -> Store) { Store {} }\n\
-                 \x20 fn take(self, a: Int) { a }\n\
+                 \x20 fn make(a: int -> Store) { Store {} }\n\
+                 \x20 fn take(self, a: int) { a }\n\
                  }\n\
                  fn main(s: Store) {\n\
                  \x20 s.take()\n\
@@ -1000,7 +1020,7 @@ mod tests {
     #[test]
     fn 入れ子の明示returnの型違いを報告する() {
         let e = only(&format!(
-            "{RANKS}fn pick(b: Bool -> Grade) {{\n\
+            "{RANKS}fn pick(b: bool -> Grade) {{\n\
              \x20 if b {{ return Gold }}\n\
              \x20 Low\n\
              }}\n"
@@ -1032,7 +1052,7 @@ mod tests {
     fn 値の無いreturnは診断しない() {
         assert!(
             errors(&format!(
-                "{RANKS}fn pick(b: Bool -> Grade) {{\n if b {{ return }}\n Low\n}}\n"
+                "{RANKS}fn pick(b: bool -> Grade) {{\n if b {{ return }}\n Low\n}}\n"
             ))
             .is_empty()
         );
@@ -1040,7 +1060,50 @@ mod tests {
 
     #[test]
     fn 型の分からない戻り値は診断しない() {
-        assert!(errors(&format!("{RANKS}fn pick(n: Int -> Grade) {{ n + 1 }}\n")).is_empty());
+        assert!(errors(&format!("{RANKS}fn pick(n: int -> Grade) {{ n + 1 }}\n")).is_empty());
+    }
+
+    // ---- 9. 組み込みのスカラー型 ----
+
+    #[test]
+    fn リテラルは組み込み型を持つ() {
+        assert!(
+            errors(
+                "fn f(a: int, b: bool, c: str) { a }\n\
+                 fn main() { f(1, true, \"x\") }\n",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の違うリテラル引数を報告する() {
+        let e = only("fn f(a: int) { a }\nfn main() { f(\"x\") }\n");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+    }
+
+    #[test]
+    fn 型の違うリテラルの戻り値を報告する() {
+        let e = only("fn f(-> int) { true }\n");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`bool`"), "{e}");
+    }
+
+    #[test]
+    fn 組み込み型名を名乗る宣言を報告する() {
+        // 宣言種ごとに1本ずつ。どれか一つでも抜けるとリテラルの意味が変わる
+        for src in [
+            "struct int {}\n",
+            "enum bool { Yes No }\n",
+            "enum E { str Other }\n",
+            "trait unit { fn f(self) }\n",
+            "effect int: Clock\n",
+            "fn bool() { 1 }\n",
+        ] {
+            let e = only(src);
+            assert!(e.contains("組み込み型の名前"), "{src}: {e}");
+        }
     }
 
     // ---- 正典 ----

@@ -439,7 +439,7 @@ fn resolve(
 /// enum だけが複数出す。enum 名と各 variant 名が同じ表に並ぶので、
 /// `Gold` は struct や fn と同じ規則で解決・衝突・import される(design.md 決定2)。
 /// 同じ variant の重複は呼び出し側が別に報告するため、ここでは畳んでおく。
-fn item_names(item: &Item) -> Vec<&str> {
+pub fn item_names(item: &Item) -> Vec<&str> {
     match item {
         Item::Trait { name, .. } | Item::Struct { name, .. } => vec![name],
         Item::Enum { name, variants, .. } => {

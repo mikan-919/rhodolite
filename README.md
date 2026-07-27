@@ -13,7 +13,7 @@ fn stamp(u: User) {                       // 使用
     db.save(u)
 }
 
-fn promote(id: UserId -> bool) {          // 経由するだけ = 無記述
+fn promote(id: int -> bool) {             // 経由するだけ = 無記述
     let u = db.find(id) ?? return false
     stamp(u)
     true

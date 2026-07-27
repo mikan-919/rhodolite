@@ -369,8 +369,8 @@ impl<'a> Parser<'a> {
         Ok(parts.join("::"))
     }
 
-    /// `fn find(id: UserId -> User?)` — 戻り値の `->` は括弧の内側にある。
-    /// `fn now(-> Time)` のように引数ゼロで戻り値だけ、も書ける。
+    /// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある。
+    /// `fn now(-> int)` のように引数ゼロで戻り値だけ、も書ける。
     fn sig(&mut self) -> PResult<Sig> {
         let start = self.span();
         let name = self.expect_ident("関数名")?;
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     fn 契約とスロット宣言() {
-        let p = ok("trait Database {\n  fn find(id: UserId -> User?)\n}\neffect db: Database\n");
+        let p = ok("trait Database {\n  fn find(id: int -> User?)\n}\neffect db: Database\n");
         assert!(matches!(&p.items[0], Item::Trait { methods, .. } if methods.len() == 1));
         assert!(matches!(&p.items[1], Item::Effect { slot, trait_name, .. }
                      if slot == "db" && trait_name == "Database"));
@@ -1050,7 +1050,7 @@ mod tests {
                     \x20 fn save(self, u: User -> unit) {\n\
                     \x20   1\n\
                     \x20 }\n\
-                    \x20 fn new(url: Str -> Postgres) {\n\
+                    \x20 fn new(url: str -> Postgres) {\n\
                     \x20   2\n\
                     \x20 }\n\
                     }\n");
@@ -1074,12 +1074,12 @@ mod tests {
 
     #[test]
     fn 戻り値の矢印は括弧の内側() {
-        let p = ok("fn now(-> Time) {\n  1\n}\n");
+        let p = ok("fn now(-> int) {\n  1\n}\n");
         let Item::Fn { sig, .. } = &p.items[0] else {
             panic!()
         };
         assert!(sig.params.is_empty());
-        assert_eq!(sig.ret.as_ref().unwrap().name, "Time");
+        assert_eq!(sig.ret.as_ref().unwrap().name, "int");
     }
 
     #[test]

@@ -1044,9 +1044,9 @@ mod tests {
 
     #[test]
     fn パス呼び出しでimplの関数を呼ぶ() {
-        let src = "struct Frozen { t: Time }\n\
+        let src = "struct Frozen { t: int }\n\
                    impl Frozen {\n\
-                   \x20 fn at(t: Time -> Frozen) {\n\
+                   \x20 fn at(t: int -> Frozen) {\n\
                    \x20   Frozen { t = t }\n\
                    \x20 }\n\
                    }\n\
@@ -1090,12 +1090,12 @@ mod tests {
     fn 同名メソッドが二つのtraitにあると曖昧() {
         let src = "struct X {}\n\
                    impl A for X {\n\
-                   \x20 fn get(-> Int) {\n\
+                   \x20 fn get(-> int) {\n\
                    \x20   1\n\
                    \x20 }\n\
                    }\n\
                    impl B for X {\n\
-                   \x20 fn get(-> Int) {\n\
+                   \x20 fn get(-> int) {\n\
                    \x20   2\n\
                    \x20 }\n\
                    }\n\
@@ -1116,9 +1116,9 @@ mod tests {
     /// ハンドラの本体が自分の保存先に手が届くこと。これが無いと差し替えが書けない
     #[test]
     fn メソッドはselfでレシーバに触れる() {
-        let src = "struct Frozen { t: Time }\n\
+        let src = "struct Frozen { t: int }\n\
                    impl Clock for Frozen {\n\
-                   \x20 fn now(self -> Time) {\n\
+                   \x20 fn now(self -> int) {\n\
                    \x20   self.t\n\
                    \x20 }\n\
                    }\n\
@@ -1139,10 +1139,10 @@ mod tests {
                    \x20 }\n\
                    }\n\
                    impl Db for Store {\n\
-                   \x20 fn save(self, x: Int -> unit) {\n\
+                   \x20 fn save(self, x: int -> unit) {\n\
                    \x20   self.xs = [x]\n\
                    \x20 }\n\
-                   \x20 fn count(self -> Int) {\n\
+                   \x20 fn count(self -> int) {\n\
                    \x20   let n = 0\n\
                    \x20   for y in self.xs: n = n + 1\n\
                    \x20   n\n\
@@ -1160,7 +1160,7 @@ mod tests {
     fn selfを取らないメソッドはドットで呼べない() {
         let src = "struct S {}\n\
                    impl S {\n\
-                   \x20 fn go(-> Int) {\n\
+                   \x20 fn go(-> int) {\n\
                    \x20   1\n\
                    \x20 }\n\
                    }\n\
@@ -1174,9 +1174,9 @@ mod tests {
 
     #[test]
     fn selfを取るメソッドはパスで呼べない() {
-        let src = "struct S { n: Int }\n\
+        let src = "struct S { n: int }\n\
                    impl S {\n\
-                   \x20 fn get(self -> Int) {\n\
+                   \x20 fn get(self -> int) {\n\
                    \x20   self.n\n\
                    \x20 }\n\
                    }\n\
@@ -1190,12 +1190,12 @@ mod tests {
     /// `self` は ambient と違って普通の束縛。呼び出しで切れる
     #[test]
     fn selfは呼び出し先に届かない() {
-        let src = "struct S { n: Int }\n\
-                   fn helper(-> Int) {\n\
+        let src = "struct S { n: int }\n\
+                   fn helper(-> int) {\n\
                    \x20 self.n\n\
                    }\n\
                    impl S {\n\
-                   \x20 fn get(self -> Int) {\n\
+                   \x20 fn get(self -> int) {\n\
                    \x20   helper()\n\
                    \x20 }\n\
                    }\n\
@@ -1252,14 +1252,14 @@ mod tests {
 
     /// 土台。`Frozen` を `clock` に提供して `clock.now()` が届く
     const CLOCK: &str = "effect clock: Clock\n\
-                         struct Frozen { t: Time }\n\
+                         struct Frozen { t: int }\n\
                          impl Frozen {\n\
-                         \x20 fn at(t: Time -> Frozen) {\n\
+                         \x20 fn at(t: int -> Frozen) {\n\
                          \x20   Frozen { t = t }\n\
                          \x20 }\n\
                          }\n\
                          impl Clock for Frozen {\n\
-                         \x20 fn now(self -> Time) {\n\
+                         \x20 fn now(self -> int) {\n\
                          \x20   self.t\n\
                          \x20 }\n\
                          }\n";
@@ -1283,13 +1283,13 @@ mod tests {
     fn ambientは関数呼び出しで切れない() {
         let src = format!(
             "{CLOCK}\
-             fn stamp(-> Time) {{\n\
+             fn stamp(-> int) {{\n\
              \x20 clock.now()\n\
              }}\n\
-             fn promote(-> Time) {{\n\
+             fn promote(-> int) {{\n\
              \x20 stamp()\n\
              }}\n\
-             fn handle(-> Time) {{\n\
+             fn handle(-> int) {{\n\
              \x20 promote()\n\
              }}\n\
              fn main() {{\n\
@@ -1304,7 +1304,7 @@ mod tests {
     /// 対になる確認。`let` はどれだけ近くても呼び出し先に届かない
     #[test]
     fn 通常の束縛は呼び出しで切れる() {
-        let src = "fn callee(-> Int) {\n\
+        let src = "fn callee(-> int) {\n\
                    \x20 c\n\
                    }\n\
                    fn main() {\n\
@@ -1319,10 +1319,10 @@ mod tests {
     fn 同じ関数が提供を変えると別の答えを返す() {
         let src = format!(
             "{CLOCK}\
-             fn stamp(-> Time) {{\n\
+             fn stamp(-> int) {{\n\
              \x20 clock.now()\n\
              }}\n\
-             fn main(-> Int) {{\n\
+             fn main(-> int) {{\n\
              \x20 let a = with clock(Frozen::at(1)) {{ stamp() }}\n\
              \x20 let b = with clock(Frozen::at(2)) {{ stamp() }}\n\
              \x20 b - a\n\
@@ -1390,12 +1390,12 @@ mod tests {
         let src = "effect clock: Clock\n\
                    struct Both {}\n\
                    impl Clock for Both {\n\
-                   \x20 fn now(self -> Int) {\n\
+                   \x20 fn now(self -> int) {\n\
                    \x20   1\n\
                    \x20 }\n\
                    }\n\
                    impl Other for Both {\n\
-                   \x20 fn now(self -> Int) {\n\
+                   \x20 fn now(self -> int) {\n\
                    \x20   2\n\
                    \x20 }\n\
                    }\n\
@@ -1411,15 +1411,15 @@ mod tests {
     fn 型提供から内側で実体を初期化できる() {
         let src = "trait Database {\n\
                    \x20 fn new(-> Postgres)\n\
-                   \x20 fn value(self -> Int)\n\
+                   \x20 fn value(self -> int)\n\
                    }\n\
                    effect db: Database\n\
                    struct Postgres {}\n\
                    impl Database for Postgres {\n\
                    \x20 fn new(-> Postgres) { Postgres {} }\n\
-                   \x20 fn value(self -> Int) { 7 }\n\
+                   \x20 fn value(self -> int) { 7 }\n\
                    }\n\
-                   fn main(-> Int) {\n\
+                   fn main(-> int) {\n\
                    \x20 with db<Postgres> {\n\
                    \x20   let db = db::new()\n\
                    \x20   with db(db) { db.value() }\n\
@@ -1430,13 +1430,13 @@ mod tests {
 
     #[test]
     fn 型だけの提供では値射影を使えない() {
-        let src = "trait Database { fn value(self -> Int) }\n\
+        let src = "trait Database { fn value(self -> int) }\n\
                    effect db: Database\n\
                    struct Postgres {}\n\
                    impl Database for Postgres {\n\
-                   \x20 fn value(self -> Int) { 7 }\n\
+                   \x20 fn value(self -> int) { 7 }\n\
                    }\n\
-                   fn main(-> Int) {\n\
+                   fn main(-> int) {\n\
                    \x20 with db<Postgres> { db.value() }\n\
                    }\n";
         let error = run(src, "main").unwrap_err();
@@ -1448,14 +1448,14 @@ mod tests {
         let src = "trait Database { fn new(-> Both) }\n\
                    trait Other { fn new(-> Both) }\n\
                    effect db: Database\n\
-                   struct Both { n: Int }\n\
+                   struct Both { n: int }\n\
                    impl Database for Both {\n\
                    \x20 fn new(-> Both) { Both { n = 1 } }\n\
                    }\n\
                    impl Other for Both {\n\
                    \x20 fn new(-> Both) { Both { n = 2 } }\n\
                    }\n\
-                   fn main(-> Int) {\n\
+                   fn main(-> int) {\n\
                    \x20 with db<Both> { db::new().n }\n\
                    }\n";
         assert_eq!(run(src, "main").unwrap().show(), "1");
@@ -1504,21 +1504,21 @@ mod tests {
 
     #[test]
     fn 同名の引数はスロットを一貫して隠す() {
-        let src = "trait Database { fn save(self, u: Int -> unit) }\n\
+        let src = "trait Database { fn save(self, u: int -> unit) }\n\
                    effect db: Database\n\
-                   struct Slot { n: Int }\n\
+                   struct Slot { n: int }\n\
                    impl Database for Slot {\n\
-                   \x20 fn save(self, u: Int -> unit) { self.n = 1 }\n\
+                   \x20 fn save(self, u: int -> unit) { self.n = 1 }\n\
                    }\n\
-                   struct Local { n: Int }\n\
+                   struct Local { n: int }\n\
                    impl Database for Local {\n\
-                   \x20 fn save(self, u: Int -> unit) { self.n = 2 }\n\
+                   \x20 fn save(self, u: int -> unit) { self.n = 2 }\n\
                    }\n\
-                   fn handle(db: Local -> Int) {\n\
+                   fn handle(db: Local -> int) {\n\
                    \x20 db.save(0)\n\
                    \x20 db.n\n\
                    }\n\
-                   fn main(-> Int) {\n\
+                   fn main(-> int) {\n\
                    \x20 let slot = Slot { n = 0 }\n\
                    \x20 with db(slot) {\n\
                    \x20   let result = handle(Local { n = 7 })\n\
@@ -1530,13 +1530,13 @@ mod tests {
 
     #[test]
     fn withの右辺は外側で本体はスロットとして解決する() {
-        let src = "trait Database { fn save(self, u: Int -> unit) }\n\
+        let src = "trait Database { fn save(self, u: int -> unit) }\n\
                    effect db: Database\n\
-                   struct Store { n: Int }\n\
+                   struct Store { n: int }\n\
                    impl Database for Store {\n\
-                   \x20 fn save(self, u: Int -> unit) { self.n = u }\n\
+                   \x20 fn save(self, u: int -> unit) { self.n = u }\n\
                    }\n\
-                   fn main(-> Int) {\n\
+                   fn main(-> int) {\n\
                    \x20 let db = Store { n = 0 }\n\
                    \x20 with db(db) { db.save(9) }\n\
                    \x20 db.n\n\

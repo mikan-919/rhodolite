@@ -9,12 +9,12 @@
 // ---- 契約 ----
 
 trait Database {
-    fn find(self, id: UserId -> User?)
+    fn find(self, id: int -> User?)
     fn save(self, u: User -> unit)
 }
 
 trait Clock {
-    fn now(self -> Time)
+    fn now(self -> int)
 }
 
 // ---- データ ----
@@ -27,9 +27,9 @@ enum Rank {
 }
 
 struct User {
-    id: UserId
+    id: int
     rank: Rank
-    promoted_at: Time
+    promoted_at: int
 }
 
 // ---- スロット宣言: 役割に名前を与える ----
@@ -46,25 +46,25 @@ fn stamp(u: User) {
 
 // ---- 経由するだけ: 無記述 ----
 
-fn promote(id: UserId -> bool) {
+fn promote(id: int -> bool) {
     let u = db.find(id) ?? return false
     u.rank = Gold
     stamp(u)
     true
 }
 
-fn handle(id: UserId -> bool) {
+fn handle(id: int -> bool) {
     promote(id)
 }
 
 // ---- 本番のハンドラ。専用構文は無い、ただの impl ----
 
 struct Postgres {
-    url: Str
+    url: str
 }
 
 impl Postgres {
-    fn new(url: Str -> Postgres) {
+    fn new(url: str -> Postgres) {
         Postgres { url = url }
     }
 }
@@ -72,7 +72,7 @@ impl Postgres {
 impl Database for Postgres {
     // v1 に本物の接続は無いので空の DB として振る舞う。
     // 差し替えが動くことの検証は下の test が InMemoryDb でやる
-    fn find(self, id: UserId -> User?) {
+    fn find(self, id: int -> User?) {
         nil
     }
     fn save(self, u: User -> unit) {
@@ -84,7 +84,7 @@ struct SystemClock {}
 
 impl Clock for SystemClock {
     // v1 に本物の時計は無い
-    fn now(self -> Time) {
+    fn now(self -> int) {
         0
     }
 }
@@ -109,13 +109,13 @@ impl InMemoryDb {
         InMemoryDb { users = users }
     }
     // テストから中を覗くための関連関数。self を取らないので `::` で呼ぶ
-    fn get(store: InMemoryDb, id: UserId -> User?) {
+    fn get(store: InMemoryDb, id: int -> User?) {
         store.find(id)
     }
 }
 
 impl Database for InMemoryDb {
-    fn find(self, id: UserId -> User?) {
+    fn find(self, id: int -> User?) {
         for u in self.users {
             if u.id == id: return u
         }
@@ -128,17 +128,17 @@ impl Database for InMemoryDb {
 }
 
 struct Frozen {
-    t: Time
+    t: int
 }
 
 impl Frozen {
-    fn at(t: Time -> Frozen) {
+    fn at(t: int -> Frozen) {
         Frozen { t = t }
     }
 }
 
 impl Clock for Frozen {
-    fn now(self -> Time) {
+    fn now(self -> int) {
         self.t
     }
 }

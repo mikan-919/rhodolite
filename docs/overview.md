@@ -17,7 +17,7 @@ effect clock: Clock            // ← 宣言
 fn stamp(u: User) {
     u.at = clock.now()         // ← 使用
 }
-fn promote(id: UserId) {
+fn promote(id: int) {
     stamp(id)                  // ← 何も書いていない
 }
 

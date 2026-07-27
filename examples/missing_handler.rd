@@ -4,10 +4,14 @@
 // エラーが到達経路を持たないと直せない、という実例。
 
 trait Clock {
-    fn now(-> Time)
+    fn now(-> int)
 }
 
 effect clock: Clock
+
+struct User {
+    at: int
+}
 
 fn stamp(u: User) {
     u.at = clock.now()
@@ -22,5 +26,5 @@ fn handle(u: User) {
 }
 
 fn main() {
-    handle(1)
+    handle(User { at = 0 })
 }

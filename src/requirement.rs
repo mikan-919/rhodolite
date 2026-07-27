@@ -756,7 +756,7 @@ mod tests {
             "fn stamp(u: User) {\n\
              \x20 1\n\
              }\n\
-             fn promote(id: UserId -> bool) {\n\
+             fn promote(id: int -> bool) {\n\
              \x20 stamp(u)\n\
              \x20 audit(u)\n\
              \x20 true\n\
@@ -769,7 +769,7 @@ mod tests {
     fn 手順3_メソッド呼び出しもimplへの辺になる() {
         let p = program(
             "effect db: Database\n\
-             fn f(id: UserId) {\n\
+             fn f(id: int) {\n\
              \x20 db.save(id)\n\
              \x20 let x = Postgres::new(id)\n\
              \x20 stamp(x)\n\
@@ -896,10 +896,10 @@ mod tests {
              fn stamp(u: User) {\n\
              \x20 clock.now()\n\
              }\n\
-             fn promote(id: UserId) {\n\
+             fn promote(id: int) {\n\
              \x20 stamp(id)\n\
              }\n\
-             fn handle(id: UserId) {\n\
+             fn handle(id: int) {\n\
              \x20 promote(id)\n\
              }\n",
         );
@@ -920,7 +920,7 @@ mod tests {
              fn stamp(u: User) {\n\
              \x20 clock.now()\n\
              }\n\
-             fn promote(id: UserId) {\n\
+             fn promote(id: int) {\n\
              \x20 stamp(id)\n\
              }\n\
              fn main() {\n\
@@ -948,11 +948,11 @@ mod tests {
     fn 手順5_相互再帰でも止まる() {
         let p = program(
             "effect clock: Clock\n\
-             fn ping(n: Int) {\n\
+             fn ping(n: int) {\n\
              \x20 clock.now()\n\
              \x20 pong(n)\n\
              }\n\
-             fn pong(n: Int) {\n\
+             fn pong(n: int) {\n\
              \x20 ping(n)\n\
              }\n",
         );
@@ -970,7 +970,7 @@ mod tests {
              fn stamp(u: User) {\n\
              \x20 clock.now()\n\
              }\n\
-             fn promote(id: UserId -> bool) {\n\
+             fn promote(id: int -> bool) {\n\
              \x20 let u = db.find(id)\n\
              \x20 stamp(u)\n\
              \x20 true\n\
@@ -1060,7 +1060,7 @@ mod tests {
     fn impl本体の要求はスロット呼び出し元へ伝わる() {
         let p = program(
             "trait Database { fn save(self) }\n\
-             trait Clock { fn now(self -> Int) }\n\
+             trait Clock { fn now(self -> int) }\n\
              effect db: Database\n\
              effect clock: Clock\n\
              struct Store {}\n\
@@ -1077,7 +1077,7 @@ mod tests {
     #[test]
     fn impl本体の要求は型パス呼び出し元へ伝わる() {
         let p = program(
-            "trait Clock { fn now(self -> Int) }\n\
+            "trait Clock { fn now(self -> int) }\n\
              effect clock: Clock\n\
              struct Store {}\n\
              impl Store {\n\
