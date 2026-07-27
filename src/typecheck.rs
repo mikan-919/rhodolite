@@ -20,7 +20,7 @@
 //! 走査は `requirement::scan` と同じ字句スコープ規則を持つが、運ぶ状態が
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
-use crate::ast::{Expr, ExprKind, Head, Item, Program, Provision, Type};
+use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Type, UnOp};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 宣言の索引。正準名でそのまま引く。
@@ -324,6 +324,7 @@ fn check_expr(
                 }
                 Head::If(c) | Head::Elif(c) | Head::While(c) => {
                     check_expr(c, decls, locals, ctx, ret, out);
+                    require(c, &plain("bool"), "条件", decls, locals, ctx, out);
                     check_expr(body, decls, &mut locals.clone(), ctx, ret, out);
                 }
                 Head::For { var, iter } => {
@@ -346,16 +347,75 @@ fn check_expr(
             }
         }
         ExprKind::Block(body) => check_exprs(body, decls, locals, ctx, ret, out),
-        ExprKind::Binary { lhs, rhs, .. } => {
+        ExprKind::Binary { op, lhs, rhs } => {
             check_expr(lhs, decls, locals, ctx, ret, out);
             check_expr(rhs, decls, locals, ctx, ret, out);
+            match op {
+                // 評価器の整数演算をそのまま静的にする。暗黙変換も文字列連結も無い
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    let int = plain("int");
+                    let sym = symbol(*op);
+                    require(
+                        lhs,
+                        &int,
+                        &format!("`{sym}` の左辺"),
+                        decls,
+                        locals,
+                        ctx,
+                        out,
+                    );
+                    require(
+                        rhs,
+                        &int,
+                        &format!("`{sym}` の右辺"),
+                        decls,
+                        locals,
+                        ctx,
+                        out,
+                    );
+                }
+                // 片側が分からないうちは比べない。結果はどちらにせよ `bool`
+                BinOp::Eq => {
+                    if let (Some(l), Some(r)) =
+                        (infer(lhs, decls, locals), infer(rhs, decls, locals))
+                        && l != r
+                    {
+                        out.push(format!(
+                            "{ctx}: `==` の両辺は同じ型である必要がありますが、`{l}` と `{r}` です"
+                        ));
+                    }
+                }
+                // `??` は optional の規則が要るので今回の保証外
+                BinOp::Coalesce => {}
+            }
         }
         ExprKind::Return(Some(inner)) => {
             check_expr(inner, decls, locals, ctx, ret, out);
             check_return(inner, decls, locals, ctx, ret, out);
         }
-        ExprKind::Unary(_, inner) | ExprKind::Assert(inner) => {
-            check_expr(inner, decls, locals, ctx, ret, out)
+        ExprKind::Unary(UnOp::Neg, inner) => {
+            check_expr(inner, decls, locals, ctx, ret, out);
+            require(
+                inner,
+                &plain("int"),
+                "単項 `-` の被演算子",
+                decls,
+                locals,
+                ctx,
+                out,
+            );
+        }
+        ExprKind::Assert(inner) => {
+            check_expr(inner, decls, locals, ctx, ret, out);
+            require(
+                inner,
+                &plain("bool"),
+                "`assert` の対象",
+                decls,
+                locals,
+                ctx,
+                out,
+            );
         }
 
         ExprKind::Int(_)
@@ -449,7 +509,46 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             ExprKind::Ident(name) => decls.fns.get(name)?.ret.clone(),
             _ => None,
         },
+        // 演算子の結果型は被演算子に依らず決まる。被演算子の診断は
+        // `check_expr` の側にある(design.md 決定3)
+        ExprKind::Unary(UnOp::Neg, _) => Some(plain("int")),
+        ExprKind::Binary { op, .. } => match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Some(plain("int")),
+            BinOp::Eq => Some(plain("bool")),
+            BinOp::Coalesce => None,
+        },
         _ => None,
+    }
+}
+
+/// 使用位置が要求する型と照合する。**型が分かるときだけ**見る(design.md 決定3)。
+fn require(
+    e: &Expr,
+    expected: &KnownType,
+    what: &str,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    let Some(actual) = infer(e, decls, locals) else {
+        return;
+    };
+    if actual != *expected {
+        out.push(format!(
+            "{ctx}: {what}は `{expected}` ですが、`{actual}` です"
+        ));
+    }
+}
+
+fn symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Eq => "==",
+        BinOp::Coalesce => "??",
     }
 }
 
@@ -981,10 +1080,10 @@ mod tests {
 
     #[test]
     fn 型の分からない引数は診断しない() {
-        // 演算・配列・nil・メソッド結果はまだ推論の外
+        // `nil`・`??`・配列・メソッド結果はまだ推論の外
         assert!(
             errors(&format!(
-                "{RANKS}fn f(r: Rank) {{ r }}\nfn main(n: int) {{ f(n + 1) }}\n"
+                "{RANKS}fn f(r: Rank) {{ r }}\nfn main() {{ f(nil) }}\n"
             ))
             .is_empty()
         );
@@ -1105,7 +1204,7 @@ mod tests {
 
     #[test]
     fn 型の分からない戻り値は診断しない() {
-        assert!(errors(&format!("{RANKS}fn pick(n: int -> Grade) {{ n + 1 }}\n")).is_empty());
+        assert!(errors(&format!("{RANKS}fn pick(-> Grade) {{ nil }}\n")).is_empty());
     }
 
     // ---- 9. 組み込みのスカラー型 ----
@@ -1214,6 +1313,104 @@ mod tests {
             ))
             .is_empty()
         );
+    }
+
+    // ---- 11. 演算子と bool の文脈 ----
+
+    #[test]
+    fn 整数の演算と符号反転は診断を出さない() {
+        assert!(
+            errors(
+                "fn f(a: int, b: int -> int) { a + b * -a / (a - b) }\n\
+                 fn main() { f(1, 2) }\n",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 整数でない演算の被演算子を報告する() {
+        for (src, actual) in [
+            ("fn f(b: bool -> int) { b + 1 }\n", "bool"),
+            ("fn f(s: str -> int) { 1 + s }\n", "str"),
+            // `+` は文字列連結ではない
+            ("fn f(s: str -> int) { s + s }\n", "str"),
+            ("fn f(b: bool -> int) { -b }\n", "bool"),
+        ] {
+            let errors = errors(src);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains(&format!("`{actual}` です"))),
+                "{src}: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 演算の結果は整数として届く() {
+        let e = only("fn f(r: str) { r }\nfn main(n: int) { f(n + 1) }\n");
+        assert!(e.contains("`str`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+    }
+
+    #[test]
+    fn 同じ型どうしの比較は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(a: Rank, b: Rank -> bool) {{ a == b }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の違う比較を両辺付きで報告する() {
+        let e = only(&format!(
+            "{RANKS}fn f(a: Rank, b: Grade -> bool) {{ a == b }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 片側の型が分からない比較の結果もboolになる() {
+        assert!(errors(&format!("{RANKS}fn f(a: Rank -> bool) {{ a == nil }}\n")).is_empty());
+        let e = only(&format!("{RANKS}fn f(a: Rank -> Rank) {{ a == nil }}\n"));
+        assert!(e.contains("`bool`"), "{e}");
+    }
+
+    #[test]
+    fn boolの条件と表明は診断を出さない() {
+        assert!(
+            errors(
+                "fn f(b: bool) {\n\
+                 \x20 if b { 1 } else { 2 }\n\
+                 \x20 while b { 1 }\n\
+                 \x20 assert b\n\
+                 }\n",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn boolでない条件と表明を報告する() {
+        for src in [
+            "fn f(n: int) { if n { 1 } }\n",
+            "fn f(n: int) { if false { 1 } elif n { 2 } }\n",
+            "fn f(n: int) { while n { 1 } }\n",
+            "fn f(n: int) { assert n }\n",
+        ] {
+            let e = only(src);
+            assert!(e.contains("`bool`"), "{src}: {e}");
+            assert!(e.contains("`int`"), "{src}: {e}");
+        }
+    }
+
+    #[test]
+    fn 型の分からない条件と表明は診断しない() {
+        assert!(errors("fn f(u: Users) { for x in u { if x { assert x } } }\n").is_empty());
     }
 
     // ---- 正典 ----
