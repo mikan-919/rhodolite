@@ -10,6 +10,7 @@ Optional core typing can now construct, compare, and unwrap `T?`, but there is n
 - Type `S?.?field` as the declared field type with one optional bit, flattening an already optional field from `T?` to `T?`.
 - Reject ordinary `receiver.field` when the receiver has known optional type instead of silently deferring it.
 - Support chained reads such as `user.?profile.?name`.
+- Allow a known non-optional `T` to satisfy an expected `T?` at typed destinations such as arguments, returns, struct fields, and assignments. Keep expression inference unchanged and keep `T` and `T?` unequal for equality.
 - Keep optional field assignment and optional method calls outside this change.
 
 ## Capabilities
@@ -20,8 +21,10 @@ Optional core typing can now construct, compare, and unwrap `T?`, but there is n
 
 ### Modified Capabilities
 
-- `basic-expression-type-checking`: Remove optional field access from the expression forms that this checker explicitly defers, and reject ordinary field access on known optional receivers.
+- `basic-expression-type-checking`: Remove optional field access from the expression forms that this checker explicitly defers, reject ordinary field access on known optional receivers, and allow `T` values at `T?` assignment destinations.
+- `function-signature-type-checking`: Allow `T` values at `T?` parameter and return destinations while continuing to reject the reverse direction.
+- `optional-core-type-checking`: Define contextual `T -> T?` injection without changing inferred expression types or exact equality.
 
 ## Impact
 
-The change affects tokenization and parsing, the expression AST, module and requirement traversals, evaluation, type checking, CLI integration tests, and language documentation. It adds no dependency and does not change storage, method resolution, assignment semantics, or the existing `T? ?? T -> T` rule.
+The change affects tokenization and parsing, the expression AST, module and requirement traversals, evaluation, destination compatibility checks, CLI integration tests, and language documentation. It adds no dependency and does not change storage, method resolution, runtime values, equality semantics, or the existing `T? ?? T -> T` rule.

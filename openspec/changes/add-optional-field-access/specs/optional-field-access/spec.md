@@ -54,7 +54,7 @@ For a receiver with known type `S?`, the checker SHALL require `S` to name a loa
 - **THEN** checking defers field validation and does not infer a result type
 
 ### Requirement: Optional field results chain and reach existing checks
-The optional result of `.?` SHALL be available to subsequent optional projections and all existing exact compatibility checks.
+The optional result of `.?` SHALL be available to subsequent optional projections and all existing destination compatibility checks.
 
 #### Scenario: Chained optional fields
 - **WHEN** `user: User?`, `User.profile: Profile`, and `Profile.name: str`
@@ -66,7 +66,7 @@ The optional result of `.?` SHALL be available to subsequent optional projection
 
 #### Scenario: Result reaches a destination
 - **WHEN** an optional field result is passed, assigned, compared, or returned in a context with an established type
-- **THEN** the existing exact compatibility rules compare its inferred optional type
+- **THEN** the destination or equality rule compares its inferred optional type without silently removing optionality
 
 ### Requirement: Ordinary access rejects known optional receivers
 Ordinary `receiver.field` SHALL reject a receiver with known optional type and SHALL direct the user to explicit optional access or prior fallback.

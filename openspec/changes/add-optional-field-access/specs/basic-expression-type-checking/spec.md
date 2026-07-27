@@ -36,4 +36,47 @@ This capability SHALL leave arrays, method calls, and associated-function calls 
 
 #### Scenario: No implicit wildcard compatibility
 - **WHEN** a later capability adds a type for a previously unsupported expression form
-- **THEN** the expression participates in the same exact compatibility rules without a wildcard exception
+- **THEN** the expression participates in the same destination compatibility rules without a wildcard exception
+
+### Requirement: Known assignments preserve exact types
+The checker SHALL compare inferable struct-literal field values, field-assignment values, and ordinary-binding reassignments with their established destination types using directional compatibility. Exact nominal identity and optionality SHALL be compatible. A non-optional `T` value SHALL also be compatible with a destination of the same nominal type `T?`. An optional `T?` value SHALL NOT be compatible with a non-optional `T` destination.
+
+#### Scenario: Matching struct-literal field value
+- **WHEN** a struct literal supplies an inferable value whose type exactly matches the declared field type
+- **THEN** the checker produces no field-type diagnostic
+
+#### Scenario: Present value initializes an optional field
+- **WHEN** a struct field is declared as `T?` and its inferable initializer has type `T`
+- **THEN** checking succeeds without changing the initializer's inferred type
+
+#### Scenario: Mismatched struct-literal field value
+- **WHEN** a struct literal supplies an inferable value incompatible with the declared field type
+- **THEN** checking fails with a diagnostic identifying the struct, field, expected type, and actual type
+
+#### Scenario: Matching field assignment
+- **WHEN** a known struct field receives an inferable value compatible with its declaration
+- **THEN** the checker produces no assignment-type diagnostic
+
+#### Scenario: Mismatched field assignment
+- **WHEN** a known struct field receives an inferable value incompatible with its declaration
+- **THEN** checking fails with a diagnostic identifying the field, expected type, and actual type
+
+#### Scenario: Matching local reassignment
+- **WHEN** an ordinary binding with an established type is reassigned an inferable compatible value
+- **THEN** the checker produces no reassignment-type diagnostic
+
+#### Scenario: Mismatched local reassignment
+- **WHEN** an ordinary binding with an established type is reassigned an inferable incompatible value
+- **THEN** checking fails with a diagnostic identifying the binding, expected type, and actual type
+
+#### Scenario: Optional value does not flow into a required destination
+- **WHEN** a field or established local has type `T` and receives an inferable value of type `T?`
+- **THEN** checking fails with the ordinary assignment mismatch diagnostic
+
+#### Scenario: Assignment source is temporarily unknown
+- **WHEN** an assignment source is outside this capability's inference boundary
+- **THEN** this capability defers compatibility checking
+
+#### Scenario: Binding initializer is temporarily unknown
+- **WHEN** a binding's initializer is outside this capability's inference boundary
+- **THEN** later assignments do not establish a flow-sensitive type for that binding

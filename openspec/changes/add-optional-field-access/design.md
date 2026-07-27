@@ -4,6 +4,8 @@ Rhodolite already parses ordinary postfix field access into `ExprKind::Field`, e
 
 The agreed surface form is `receiver.?field`. It is a read-only, short-circuiting projection: an optional receiver containing a struct yields the selected field, while `nil` yields `nil`. Optional assignment and optional method calls are deliberately not part of this change.
 
+Integration exposed a gap in the existing optional core: a function can declare `T?`, but a present `T` cannot currently be passed or returned as that type. The approved correction is a contextual injection at typed destinations. It changes compatibility only when the expected type is `T?`; the expression itself still infers as `T`, and equality still compares exact types.
+
 ADR-0004 requires explicit approval before adding structure. The approved structural addition is exactly one AST variant, `ExprKind::OptionalField(Box<Expr>, String)`. No token kind, runtime value kind, environment, or type representation is added.
 
 ## Goals / Non-Goals
@@ -16,6 +18,8 @@ ADR-0004 requires explicit approval before adding structure. The approved struct
 - Infer the declared field type with its optional bit set, flattening `T?` to `T?`.
 - Support repeated chains such as `user.?profile.?name`.
 - Reject ordinary field access on known optional receivers.
+- Allow present `T` values at destinations expecting `T?`, while rejecting `T?` at destinations expecting `T`.
+- Preserve exact optionality for equality and preserve each expression's inferred type.
 - Preserve module rewriting and ambient-requirement traversal through the new expression.
 
 **Non-Goals:**
@@ -23,7 +27,7 @@ ADR-0004 requires explicit approval before adding structure. The approved struct
 - Optional field assignment.
 - Optional method invocation.
 - Backward contextual inference for `nil.?field` or another receiver whose type is unknown.
-- New optional constructors, nested optional representation, or changes to `??`.
+- Explicit optional constructors, nested optional representation, or changes to `??`.
 - Method or associated-function signature resolution.
 
 ## Decisions
@@ -58,6 +62,14 @@ An unknown receiver remains deferred and yields no inferred type. This preserves
 
 Module canonicalization recursively rewrites the receiver. Requirement analysis scans the receiver and records any slot use it contains, but the field name itself creates no call edge or ambient requirement. No new requirement-analysis structure or algorithm is needed.
 
+### 6. Inject present values only at optional destinations
+
+Centralize destination compatibility so an actual known `T` satisfies an expected `T?` when the nominal name matches. This relation applies to direct-call arguments, declared returns, struct-literal fields, field assignments, and established local reassignments. Exact matches remain valid, and an actual `T?` never satisfies an expected non-optional `T`.
+
+Inference is unchanged: a `T` expression remains `T`; the checker does not rewrite its AST or type. Equality continues to require exact nominal type and optionality, so `T == T?` remains an error. Fallback keeps its existing stricter shape `T? ?? T -> T`.
+
+An explicit constructor such as `some(value)` would make presence visible in source, but it would add syntax or a distinguished runtime operation merely to populate already-representable non-`nil` optional values. Contextual injection is the smaller rule and matches the existing contextual treatment of `nil`.
+
 ## Risks / Trade-offs
 
 - **[Risk] `.?\n` token joining could differ from ordinary dotted chains.** → Add lexer/parser coverage for same-line and continued postfix forms using the existing `Dot` and `Question` rules.
@@ -65,13 +77,15 @@ Module canonicalization recursively rewrites the receiver. Requirement analysis 
 - **[Risk] Optional method syntax could accidentally parse as field-then-call.** → Reject a call suffix whose callee expression is `OptionalField`.
 - **[Risk] Runtime field errors and static diagnostics could drift.** → Reuse ordinary struct lookup behavior in evaluation and mirror existing type-checker field tests.
 - **[Risk] Flattening loses whether both receiver and field were absent.** → This is intentional: the language has one optional bit and neither runtime nor type system distinguishes absence provenance.
+- **[Risk] Contextual injection could accidentally weaken operators or equality.** → Apply it only through typed-destination compatibility; keep equality and fallback checks explicit and add reverse-direction and equality regressions.
 
 ## Migration Plan
 
 1. Add the AST variant, postfix parser, read-only parse guards, evaluator behavior, and traversal arms with focused tests.
 2. Add static receiver/field validation, flattened result inference, chaining, and ordinary-access diagnostics.
-3. Add CLI integration tests and update the grammar, overview, README, and checker boundary documentation.
-4. Run formatting, the full Rust suite, both maintained examples, and OpenSpec validation.
+3. Add contextual `T -> T?` destination compatibility with tests for arguments, returns, struct fields, and assignments, while preserving exact equality.
+4. Add CLI integration tests and update the grammar, overview, README, and checker boundary documentation.
+5. Run formatting, the full Rust suite, both maintained examples, and OpenSpec validation.
 
 Rollback is a normal change revert; no persisted data or external interface migration is involved.
 

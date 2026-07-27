@@ -14,9 +14,15 @@
 - [x] 2.4 Verify chained optional fields and propagation into fallback, arguments, assignments, equality, and returns
 - [x] 2.5 Run focused and full tests and commit the stable type-checking snapshot
 
-## 3. Integration and Documentation
+## 3. Contextual Optional Injection
 
-- [ ] 3.1 Add CLI coverage for successful optional reads, nil propagation, invalid receiver forms, and inferred-result mismatches
-- [ ] 3.2 Update `README.md`, `docs/overview.md`, `docs/grammar.md`, and checker boundary documentation with `.?` and the remaining unknown forms
-- [ ] 3.3 Run `cargo fmt --check`, the full Rust suite, the canonical example, and the missing-handler example
-- [ ] 3.4 Validate the OpenSpec change, review the final diff, and commit the completed implementation snapshot
+- [x] 3.1 Add tests for `T` satisfying expected `T?` in arguments, returns, struct fields, field assignments, and local reassignments
+- [x] 3.2 Implement contextual destination compatibility while continuing to reject `T? -> T` and keeping equality exact
+- [x] 3.3 Run focused and full tests and commit the stable optional-injection snapshot
+
+## 4. Integration and Documentation
+
+- [ ] 4.1 Add CLI coverage for successful optional reads, nil propagation, invalid receiver forms, and inferred-result mismatches
+- [ ] 4.2 Update `README.md`, `docs/overview.md`, `docs/grammar.md`, and checker boundary documentation with `.?`, contextual optional injection, and the remaining unknown forms
+- [ ] 4.3 Run `cargo fmt --check`, the full Rust suite, the canonical example, and the missing-handler example
+- [ ] 4.4 Validate the OpenSpec change, review the final diff, and commit the completed implementation snapshot

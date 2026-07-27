@@ -13,15 +13,17 @@
 //!     分かる**比較は同じ型、`if` / `elif` / `while` の条件と `assert` の
 //!     **型の分かる**対象は `bool`
 //!   - struct リテラルのフィールド値・フィールドへの代入・ローカルへの再代入は、
-//!     **両辺の型が分かる限り**宛先の型と一致する
+//!     **両辺の型が分かる限り**宛先の型と適合する
 //!   - トップレベル関数の直接呼び出しは宣言どおりの引数の個数を持ち、
-//!     **型の分かる**引数は宣言された引数型と一致する
+//!     **型の分かる**引数は宣言された引数型と適合する
 //!   - 戻り値型を宣言した関数の、**型の分かる**明示 `return` と最後の式は
-//!     その型と一致する
+//!     その型と適合する
 //!
-//! 型の同一性は名前と後置 `?` の一致だけ(nominal)。`nil` は期待される `T?`
-//! の文脈でだけ適合し、`T? ?? T` は `T` を返す。配列、optional field access、
-//! メソッドと関連関数の呼び出しはまだ型を持たない(design.md の Non-Goals)。
+//! 型の同一性は名前と後置 `?` の一致だけ(nominal)。期待型のある宛先では
+//! `T` を同名の `T?` へ注入できるが、式の推論型と等価比較は変えない。
+//! `nil` は期待される `T?` の文脈でだけ適合し、`T? ?? T` は `T` を返す。
+//! `S?.?field` は宣言 field の型に optional を付けて返す。配列、メソッドと
+//! 関連関数の呼び出しはまだ型を持たない(design.md の Non-Goals)。
 //! これは**実装が未着手なだけ**で、言語の側にワイルドカード型は無い。
 //! 型の分からない式には診断を出さず、後続の change が一つずつ潰していく。
 //!
@@ -445,13 +447,16 @@ fn check_expr(
 /// 期待型のある位置で値を照合し、不一致なら診断用の実型名を返す。
 ///
 /// `nil` は自分だけでは nominal 型を持たず、文脈が optional のときだけ適合する。
-/// それ以外の型不明式は後続 change のために従来どおり保留する。
+/// 同名の非 optional 値は optional の期待型へ一方向に注入できる。式の推論型は
+/// 変えない。それ以外の型不明式は後続 change のために従来どおり保留する。
 fn mismatch(value: &Expr, expected: &KnownType, decls: &Decls, locals: &Locals) -> Option<String> {
     if matches!(value.kind, ExprKind::Nil) {
         return (!expected.optional).then(|| "nil".to_string());
     }
     let actual = infer(value, decls, locals)?;
-    (actual != *expected).then(|| actual.to_string())
+    let compatible = actual == *expected
+        || (actual.name == expected.name && !actual.optional && expected.optional);
+    (!compatible).then(|| actual.to_string())
 }
 
 /// 直接呼び出しの検査。引数の個数は常に、型は文脈と照合できるときだけ見る。
@@ -1187,10 +1192,21 @@ mod tests {
     }
 
     #[test]
-    fn optionalの有無が違う引数を報告する() {
+    fn 非optional引数は同名のoptional引数型へ注入できる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank?) {{ r }}\nfn main(r: Rank) {{ f(r) }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn optional引数は非optional引数型へ注入できない() {
         let e = only(&format!(
-            "{RANKS}fn f(r: Rank?) {{ r }}\nfn main(r: Rank) {{ f(r) }}\n"
+            "{RANKS}fn f(r: Rank) {{ r }}\nfn main(r: Rank?) {{ f(r) }}\n"
         ));
+        assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Rank?`"), "{e}");
     }
 
@@ -1328,6 +1344,17 @@ mod tests {
         let e = only(&format!("{RANKS}fn pick(-> Grade) {{ nil }}\n"));
         assert!(e.contains("`Grade`"), "{e}");
         assert!(e.contains("`nil`"), "{e}");
+    }
+
+    #[test]
+    fn 非optional戻り値は同名のoptional戻り値型へ注入できる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn final_value(-> Rank?) {{ Gold }}\n\
+                 fn explicit_value(-> Rank?) {{ return Bronze }}\n"
+            ))
+            .is_empty()
+        );
     }
 
     // ---- 9. 組み込みのスカラー型 ----
@@ -1577,6 +1604,15 @@ mod tests {
     }
 
     #[test]
+    fn 等価比較では非optionalからoptionalへ注入しない() {
+        let e = only(&format!(
+            "{RANKS}fn f(a: Rank, b: Rank? -> bool) {{ a == b }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Rank?`"), "{e}");
+    }
+
+    #[test]
     fn nilとの比較は相手のoptional性を使う() {
         for expr in ["a == nil", "nil == a"] {
             assert!(
@@ -1734,6 +1770,7 @@ mod tests {
                 "{FIELDS}fn f(o: Rank? -> Card) {{\n\
                  Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = nil }}\n\
                  Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = o }}\n\
+                 Card {{ n = 1, tag = Tag {{}}, rank = Gold, note = Gold }}\n\
                  }}\n"
             ))
             .is_empty()
@@ -1747,8 +1784,6 @@ mod tests {
             ("n = 1, tag = 1, rank = Gold, note = nil", "int"),
             ("n = 1, tag = Tag {}, rank = Low, note = nil", "Grade"),
             ("n = 1, tag = Tag {}, rank = nil, note = nil", "nil"),
-            // optional の有無も型の違い
-            ("n = 1, tag = Tag {}, rank = Gold, note = Gold", "Rank"),
         ] {
             let e = only(&format!(
                 "{FIELDS}fn f(-> Card) {{ Card {{ {fields} }} }}\n"
@@ -1761,7 +1796,7 @@ mod tests {
     fn 型の合うフィールド代入は診断を出さない() {
         assert!(
             errors(&format!(
-                "{FIELDS}fn f(c: Card) {{ c.n = 2\nc.rank = Bronze\nc.note = nil }}\n"
+                "{FIELDS}fn f(c: Card) {{ c.n = 2\nc.rank = Bronze\nc.note = nil\nc.note = Gold }}\n"
             ))
             .is_empty()
         );
@@ -1780,7 +1815,7 @@ mod tests {
         assert!(
             errors(&format!(
                 "{FIELDS}fn f(n: int, note: Rank?) {{\n\
-                 let r = Gold\n r = Bronze\n n = 2\n note = nil\n}}\n"
+                 let r = Gold\n r = Bronze\n n = 2\n note = nil\n note = Gold\n}}\n"
             ))
             .is_empty()
         );
