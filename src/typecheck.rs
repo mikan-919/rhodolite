@@ -294,9 +294,9 @@ fn check_expr(
             check_expr(recv, decls, locals, ctx, ret, out);
             check_field_read(recv, field, decls, locals, ctx, out);
         }
-        // 型規則と診断は optional field change の次の安定点で足す。
-        ExprKind::OptionalField(recv, _) => {
+        ExprKind::OptionalField(recv, field) => {
             check_expr(recv, decls, locals, ctx, ret, out);
+            check_optional_field_read(recv, field, decls, locals, ctx, out);
         }
 
         ExprKind::Assign { target, value } => {
@@ -528,6 +528,16 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             }
             decls.structs.get(&ty.name)?.get(field).cloned()
         }
+        ExprKind::OptionalField(recv, field) => {
+            let ty = infer(recv, decls, locals)?;
+            if !ty.optional {
+                return None;
+            }
+            let mut field_ty = decls.structs.get(&ty.name)?.get(field).cloned()?;
+            // optional は1 bit。宣言型が既に T? でも結果は T? のまま。
+            field_ty.optional = true;
+            Some(field_ty)
+        }
         ExprKind::Call(callee, _) => match &callee.kind {
             ExprKind::Ident(name) => decls.fns.get(name)?.ret.clone(),
             _ => None,
@@ -668,9 +678,7 @@ fn symbol(op: BinOp) -> &'static str {
 }
 
 /// 型の分かる非 optional のレシーバは、宣言済み struct の宣言フィールドしか読めない。
-///
-/// レシーバの型が分からないうちは黙る。optional の中身を取り出す規則もまだ無いので、
-/// `u?.rank` に相当する読みは今回の保証外(design.md 決定2)。
+/// optional のレシーバには明示的な `.?` を要求する。
 fn check_field_read(
     recv: &Expr,
     field: &str,
@@ -683,6 +691,9 @@ fn check_field_read(
         return;
     };
     if ty.optional {
+        out.push(format!(
+            "{ctx}: optional 型 `{ty}` から `{field}` を読むには `.?{field}` を使うか、先に `??` で展開してください"
+        ));
         return;
     }
     let Some(declared) = decls.structs.get(&ty.name) else {
@@ -693,6 +704,38 @@ fn check_field_read(
     };
     if !declared.contains_key(field) {
         out.push(format!("{ctx}: `{ty}` にフィールド `{field}` はありません"));
+    }
+}
+
+/// `S?.?field` は S の宣言フィールドを読み、結果へ optional bit を立てる。
+fn check_optional_field_read(
+    recv: &Expr,
+    field: &str,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    let Some(ty) = infer(recv, decls, locals) else {
+        return;
+    };
+    if !ty.optional {
+        out.push(format!(
+            "{ctx}: `.?{field}` のレシーバは optional である必要がありますが、`{ty}` です"
+        ));
+        return;
+    }
+    let Some(declared) = decls.structs.get(&ty.name) else {
+        out.push(format!(
+            "{ctx}: `{ty}` の中身は struct ではないので `.?{field}` を読めません"
+        ));
+        return;
+    };
+    if !declared.contains_key(field) {
+        out.push(format!(
+            "{ctx}: `{}` にフィールド `{field}` はありません",
+            ty.name
+        ));
     }
 }
 
@@ -1372,15 +1415,95 @@ mod tests {
 
     #[test]
     fn 型の分からないレシーバのフィールドは診断しない() {
-        // optional のレシーバも、メソッド結果のレシーバもまだ推論の外
+        // for 束縛と、戻り値型の無い呼び出し結果はまだ推論の外
         assert!(
             errors(&format!(
-                "{NESTED}fn f(u: User?, xs: Users) {{\n\
-                 \x20 u.nope\n\
+                "{NESTED}fn unknown() {{ nil }}\n\
+                 fn f(xs: Users) {{\n\
                  \x20 for x in xs {{ x.nope }}\n\
+                 \x20 unknown().?nope\n\
                  }}\n"
             ))
             .is_empty()
+        );
+    }
+
+    // ---- 11. optional field access ----
+
+    const OPTIONAL_FIELDS: &str = "struct Profile { name: str\nalias: str? }\n\
+                                   struct User { profile: Profile\nmanager: User? }\n";
+
+    #[test]
+    fn optional_fieldは結果にoptionalを付けて既存optionalを平坦化する() {
+        assert!(
+            errors(&format!(
+                "{OPTIONAL_FIELDS}fn name(u: User? -> str?) {{ u.?profile.?name }}\n\
+                 fn manager(u: User? -> User?) {{ u.?manager }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn optional_fieldの不正なレシーバとフィールドを報告する() {
+        let e = only(&format!("{OPTIONAL_FIELDS}fn f(u: User?) {{ u.?nope }}\n"));
+        assert!(e.contains("`User`"), "{e}");
+        assert!(e.contains("`nope`"), "{e}");
+
+        let e = only("fn f(n: int?) { n.?value }\n");
+        assert!(e.contains("`int?`"), "{e}");
+        assert!(e.contains("struct ではない"), "{e}");
+
+        let e = only(&format!(
+            "{OPTIONAL_FIELDS}fn f(u: User) {{ u.?profile }}\n"
+        ));
+        assert!(e.contains("optional である必要"), "{e}");
+        assert!(e.contains("`User`"), "{e}");
+    }
+
+    #[test]
+    fn 普通のfieldはoptionalレシーバを暗黙に展開しない() {
+        let e = only(&format!(
+            "{OPTIONAL_FIELDS}fn f(u: User?) {{ u.profile }}\n"
+        ));
+        assert!(e.contains("`.?profile`"), "{e}");
+
+        let e = only(&format!(
+            "{OPTIONAL_FIELDS}fn f(u: User?) {{ u.?profile.name }}\n"
+        ));
+        assert!(e.contains("`.?name`"), "{e}");
+    }
+
+    #[test]
+    fn optional_fieldの結果はfallbackと既存照合へ届く() {
+        assert!(
+            errors(&format!(
+                "{OPTIONAL_FIELDS}fn take(s: str?) {{ s }}\n\
+                 fn valid(u: User?, s: str? -> str) {{\n\
+                 \x20 s = u.?profile.?name\n\
+                 \x20 take(u.?profile.?name)\n\
+                 \x20 assert u.?profile.?name == s\n\
+                 \x20 u.?profile.?name ?? \"unknown\"\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+
+        let errors = errors(&format!(
+            "{OPTIONAL_FIELDS}fn take(n: int?) {{ n }}\n\
+             fn invalid(u: User?, n: int? -> int?) {{\n\
+             \x20 n = u.?profile.?name\n\
+             \x20 take(u.?profile.?name)\n\
+             \x20 assert u.?profile.?name == n\n\
+             \x20 u.?profile.?name\n\
+             }}\n"
+        ));
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.contains("`str?`") && e.contains("`int?`")),
+            "{errors:?}"
         );
     }
 

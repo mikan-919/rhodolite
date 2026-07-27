@@ -8,11 +8,11 @@
 
 ## 2. Static Optional Field Typing
 
-- [ ] 2.1 Add type-checker tests for valid `S?.?field`, flattened optional fields, missing fields, non-struct and non-optional receivers, and unknown receivers
-- [ ] 2.2 Validate known optional receivers and infer the declared field type with one optional bit
-- [ ] 2.3 Reject ordinary field access on known optional receivers, including after an optional projection
-- [ ] 2.4 Verify chained optional fields and propagation into fallback, arguments, assignments, equality, and returns
-- [ ] 2.5 Run focused and full tests and commit the stable type-checking snapshot
+- [x] 2.1 Add type-checker tests for valid `S?.?field`, flattened optional fields, missing fields, non-struct and non-optional receivers, and unknown receivers
+- [x] 2.2 Validate known optional receivers and infer the declared field type with one optional bit
+- [x] 2.3 Reject ordinary field access on known optional receivers, including after an optional projection
+- [x] 2.4 Verify chained optional fields and propagation into fallback, arguments, assignments, equality, and returns
+- [x] 2.5 Run focused and full tests and commit the stable type-checking snapshot
 
 ## 3. Integration and Documentation
 
