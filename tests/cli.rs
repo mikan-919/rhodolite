@@ -707,3 +707,62 @@ fn 宣言どおりの呼び出しと戻り値はモジュールを跨いでも�
     assert!(output.status.success(), "{text}");
     assert!(text.contains("main -> true"), "{text}");
 }
+
+// ---- 基本の式の型の検査 (src/typecheck.rs) ----
+
+/// 検査を通らないプログラムは1行も走らない、を各規則で1本ずつ固定する。
+/// 診断の文面そのものは typecheck.rs の単体テストが見ている
+fn 実行前に失敗する(source: &str, expected: &str) {
+    let project = Project::new();
+    project.write("main.rd", source);
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains(expected), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 組み込み型名の宣言は実行前に失敗する() {
+    実行前に失敗する(
+        "struct int {}\nfn main() { 1 }\n",
+        "`int` は組み込み型の名前なので宣言できません",
+    );
+}
+
+#[test]
+fn 宣言に無いフィールドの読みは実行前に失敗する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         fn f(u: User -> int) { u.nope }\n\
+         fn main() { 1 }\n",
+        "`nope`",
+    );
+}
+
+#[test]
+fn 整数でない被演算子は実行前に失敗する() {
+    実行前に失敗する("fn main() { \"a\" + 1 }\n", "`+` の左辺");
+}
+
+#[test]
+fn boolでない条件は実行前に失敗する() {
+    実行前に失敗する("fn main() { if 1 { 2 } }\n", "条件は `bool`");
+}
+
+#[test]
+fn 型の違うフィールド値は実行前に失敗する() {
+    実行前に失敗する(
+        "struct Card { n: int }\nfn main() { Card { n = \"x\" } }\n",
+        "`str` を与えています",
+    );
+}
+
+#[test]
+fn 型の違う再代入は実行前に失敗する() {
+    実行前に失敗する(
+        "fn f(n: int) { n = \"x\" }\nfn main() { 1 }\n",
+        "`n` への代入",
+    );
+}

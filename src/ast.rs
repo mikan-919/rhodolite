@@ -73,7 +73,7 @@ pub enum Item {
     },
 }
 
-/// `fn find(id: UserId -> User?)` — 戻り値の `->` は括弧の内側にある
+/// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある
 #[derive(Debug)]
 pub struct Sig {
     pub name: String,
