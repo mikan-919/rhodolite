@@ -1,16 +1,21 @@
-//! struct の形と、分かる範囲の enum 型の検査(docs/overview.md「次の一歩」1)。
+//! struct の形と、分かる範囲の型の検査(docs/overview.md「次の一歩」1)。
 //!
-//! モジュール解決済みの `Program` を受け取り、宣言と生成のフィールド集合を
-//! 突き合わせる。ここを通ったプログラムでは
+//! モジュール解決済みの `Program` を受け取り、宣言と使用を突き合わせる。
+//! ここを通ったプログラムでは
 //!
 //!   - 全ての struct リテラルが宣言済み struct を指し、宣言フィールドを
 //!     過不足なく一度ずつ持つ
 //!   - ローカルに隠されていない bare struct 値はフィールド0個
 //!   - 非 optional の enum 型フィールドには、**両辺の型が分かる限り**
 //!     別の enum の値が入らない
+//!   - トップレベル関数の直接呼び出しは宣言どおりの引数の個数を持ち、
+//!     **型の分かる**引数は宣言された引数型と一致する
+//!   - 戻り値型を宣言した関数の、**型の分かる**明示 `return` と最後の式は
+//!     その型と一致する
 //!
-//! フィールド**値**の型は enum の1種類だけ見る。引数、戻り値、演算、optional、
-//! 配列、呼び出し結果はまだ見ない(design.md の Non-Goals)。
+//! 型の同一性は名前と後置 `?` の一致だけ(nominal)。演算、`nil`、`??`、配列の
+//! 要素、フィールドの読み、メソッドと関連関数の呼び出しはまだ見ない
+//! (design.md の Non-Goals)。型の分からない式には診断を出さない。
 //!
 //! 走査は `requirement::scan` と同じ字句スコープ規則を持つが、運ぶ状態が
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
@@ -21,35 +26,59 @@ use std::collections::{BTreeMap, BTreeSet};
 /// 宣言の索引。正準名でそのまま引く。
 struct Decls {
     /// struct 名 → フィールド名 → 宣言された型
-    structs: BTreeMap<String, BTreeMap<String, FieldType>>,
+    structs: BTreeMap<String, BTreeMap<String, KnownType>>,
     /// enum 名
     enums: BTreeSet<String>,
     /// variant の正準名 → 所属 enum の正準名
     variants: BTreeMap<String, String>,
+    /// トップレベル関数の正準名 → 署名。本体を見る前に全部集めるので、
+    /// 前方参照と再帰も引ける(design.md 決定2)
+    fns: BTreeMap<String, FnSig>,
     /// struct ではない宣言名(trait / effect / fn / enum / variant)。
     /// 「未知」と「struct ではない」を言い分けるためだけに持つ
     others: BTreeSet<String>,
 }
 
-/// 宣言されたフィールドの型。後置 `?` は「今回は見ない」の印として残す。
-struct FieldType {
+/// 分かっている型。同一性は名前と後置 `?` の一致(nominal, design.md 決定1)。
+#[derive(Clone, PartialEq, Eq)]
+struct KnownType {
     name: String,
     optional: bool,
 }
 
-/// ローカル束縛。**型が分かっているものだけ**型名を持つ。
+impl std::fmt::Display for KnownType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.name, if self.optional { "?" } else { "" })
+    }
+}
+
+/// トップレベル関数の署名のうち、呼び出し側の検査に要る分だけ。
+struct FnSig {
+    params: Vec<KnownType>,
+    ret: Option<KnownType>,
+}
+
+/// ローカル束縛。**型が分かっているものだけ**型を持つ。
 ///
 /// 名前の集合ではなく表にしているのは、`u.rank = Gold` のレシーバ型を
-/// 引くため。入口は型注釈付き引数・`self`・struct リテラル・enum variant と、
-/// それらを直接束縛・参照する式に限る(design.md 決定4)。
-type Locals = BTreeMap<String, Option<String>>;
+/// 引くため。入口は型注釈付き引数・`self`・struct リテラル・enum variant・
+/// 直接呼び出しの宣言戻り値と、それらを直接束縛・参照する式に限る。
+type Locals = BTreeMap<String, Option<KnownType>>;
 
-/// 型注釈から「分かっている型」を取り出す。optional は今回の保証外なので落とす。
-fn known(ty: &Type) -> Option<String> {
-    if ty.optional {
-        None
-    } else {
-        Some(ty.name.clone())
+/// 型注釈をそのまま型の事実にする。`None` は「推論できない」の意味で使うので、
+/// 注釈のある所は optional でも `Some` になる(design.md 決定1)。
+fn known(ty: &Type) -> KnownType {
+    KnownType {
+        name: ty.name.clone(),
+        optional: ty.optional,
+    }
+}
+
+/// 後置 `?` の付かない型。variant / struct リテラル / self に使う。
+fn plain(name: &str) -> KnownType {
+    KnownType {
+        name: name.to_string(),
+        optional: false,
     }
 }
 
@@ -64,13 +93,14 @@ pub fn check(program: &Program) -> Vec<String> {
                 let locals = sig
                     .params
                     .iter()
-                    .map(|p| (p.name.clone(), known(&p.ty)))
+                    .map(|p| (p.name.clone(), Some(known(&p.ty))))
                     .collect();
-                check_body(body, &decls, locals, &sig.name, &mut out);
+                let ret = sig.ret.as_ref().map(known);
+                check_body(body, &decls, locals, &sig.name, ret.as_ref(), &mut out);
             }
             Item::Test { name, body, .. } => {
                 let ctx = format!("test \"{name}\"");
-                check_body(body, &decls, Locals::new(), &ctx, &mut out);
+                check_body(body, &decls, Locals::new(), &ctx, None, &mut out);
             }
             Item::Impl {
                 type_name, methods, ..
@@ -79,13 +109,14 @@ pub fn check(program: &Program) -> Vec<String> {
                     let mut locals: Locals = sig
                         .params
                         .iter()
-                        .map(|p| (p.name.clone(), known(&p.ty)))
+                        .map(|p| (p.name.clone(), Some(known(&p.ty))))
                         .collect();
                     if sig.has_self {
-                        locals.insert("self".to_string(), Some(type_name.clone()));
+                        locals.insert("self".to_string(), Some(plain(type_name)));
                     }
                     let ctx = format!("impl {type_name}::{}", sig.name);
-                    check_body(body, &decls, locals, &ctx, &mut out);
+                    let ret = sig.ret.as_ref().map(known);
+                    check_body(body, &decls, locals, &ctx, ret.as_ref(), &mut out);
                 }
             }
             _ => {}
@@ -99,21 +130,16 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut structs = BTreeMap::new();
     let mut enums = BTreeSet::new();
     let mut variants = BTreeMap::new();
+    let mut fns = BTreeMap::new();
     let mut others = BTreeSet::new();
 
     for item in &program.items {
         match item {
             Item::Struct { name, fields, .. } => {
-                let mut declared: BTreeMap<String, FieldType> = BTreeMap::new();
+                let mut declared: BTreeMap<String, KnownType> = BTreeMap::new();
                 let mut duplicates = BTreeSet::new();
                 for (field, ty) in fields {
-                    let previous = declared.insert(
-                        field.clone(),
-                        FieldType {
-                            name: ty.name.clone(),
-                            optional: ty.optional,
-                        },
-                    );
+                    let previous = declared.insert(field.clone(), known(ty));
                     if previous.is_some() {
                         duplicates.insert(field.clone());
                     }
@@ -145,6 +171,13 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
             }
             Item::Fn { sig, .. } => {
                 others.insert(sig.name.clone());
+                fns.insert(
+                    sig.name.clone(),
+                    FnSig {
+                        params: sig.params.iter().map(|p| known(&p.ty)).collect(),
+                        ret: sig.ret.as_ref().map(known),
+                    },
+                );
             }
             Item::Impl { .. } | Item::Test { .. } => {}
         }
@@ -154,12 +187,25 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
         structs,
         enums,
         variants,
+        fns,
         others,
     }
 }
 
-fn check_body(body: &[Expr], decls: &Decls, mut locals: Locals, ctx: &str, out: &mut Vec<String>) {
-    check_exprs(body, decls, &mut locals, ctx, out);
+fn check_body(
+    body: &[Expr],
+    decls: &Decls,
+    mut locals: Locals,
+    ctx: &str,
+    ret: Option<&KnownType>,
+    out: &mut Vec<String>,
+) {
+    check_exprs(body, decls, &mut locals, ctx, ret, out);
+    // ブロックは値ベースなので最後の式も戻り値。明示 `return` は走査側が見る。
+    // 最後の式を見る場所をここ一箇所にして、入れ子で二重に出るのを防ぐ
+    if let Some(last) = body.last() {
+        check_return(last, decls, &locals, ctx, ret, out);
+    }
 }
 
 fn check_exprs(
@@ -167,29 +213,37 @@ fn check_exprs(
     decls: &Decls,
     locals: &mut Locals,
     ctx: &str,
+    ret: Option<&KnownType>,
     out: &mut Vec<String>,
 ) {
     for e in body {
-        check_expr(e, decls, locals, ctx, out);
+        check_expr(e, decls, locals, ctx, ret, out);
     }
 }
 
 /// `requirement::scan` と同じく、ブロックから戻れば内側の束縛は消える。
 /// 枝へ入るときだけ `locals` を複製する。
-fn check_expr(e: &Expr, decls: &Decls, locals: &mut Locals, ctx: &str, out: &mut Vec<String>) {
+fn check_expr(
+    e: &Expr,
+    decls: &Decls,
+    locals: &mut Locals,
+    ctx: &str,
+    ret: Option<&KnownType>,
+    out: &mut Vec<String>,
+) {
     match &e.kind {
         ExprKind::Ident(name) => check_bare(name, decls, locals, ctx, out),
 
         ExprKind::StructLit { name, fields } => {
             check_literal(name, fields, decls, ctx, out);
             for (field, v) in fields {
-                check_expr(v, decls, locals, ctx, out);
+                check_expr(v, decls, locals, ctx, ret, out);
                 check_enum_field(name, field, v, decls, locals, ctx, out);
             }
         }
 
         ExprKind::Let { name, value } => {
-            check_expr(value, decls, locals, ctx, out);
+            check_expr(value, decls, locals, ctx, ret, out);
             let ty = infer(value, decls, locals);
             locals.insert(name.clone(), ty);
         }
@@ -198,22 +252,33 @@ fn check_expr(e: &Expr, decls: &Decls, locals: &mut Locals, ctx: &str, out: &mut
             // 呼び出し先の名前は値として読まれない。評価器も `Ident` / `Path` の
             // callee は関数表・型表から引くだけで、値へ落とさない
             if !matches!(callee.kind, ExprKind::Ident(_) | ExprKind::Path(_)) {
-                check_expr(callee, decls, locals, ctx, out);
+                check_expr(callee, decls, locals, ctx, ret, out);
             }
             for a in args {
-                check_expr(a, decls, locals, ctx, out);
+                check_expr(a, decls, locals, ctx, ret, out);
+            }
+            // メソッド (`Field`) と関連関数 (`Path`) は候補の絞り込みが要るので
+            // 今回は見ない(design.md 決定3)
+            if let ExprKind::Ident(name) = &callee.kind
+                && let Some(sig) = decls.fns.get(name)
+            {
+                check_call(name, sig, args, decls, locals, ctx, out);
             }
         }
 
-        ExprKind::Field(recv, _) => check_expr(recv, decls, locals, ctx, out),
+        ExprKind::Field(recv, _) => check_expr(recv, decls, locals, ctx, ret, out),
 
         ExprKind::Assign { target, value } => {
-            check_expr(value, decls, locals, ctx, out);
+            check_expr(value, decls, locals, ctx, ret, out);
             // 代入先の裸の名前は書き込み先であって値の読みではない
             if let ExprKind::Field(recv, field) = &target.kind {
-                check_expr(recv, decls, locals, ctx, out);
-                if let Some(type_name) = infer(recv, decls, locals) {
-                    check_enum_field(&type_name, field, value, decls, locals, ctx, out);
+                check_expr(recv, decls, locals, ctx, ret, out);
+                // optional の中身を取り出す規則はまだ無いので、レシーバは
+                // 非 optional と分かるときだけ見る
+                if let Some(ty) = infer(recv, decls, locals)
+                    && !ty.optional
+                {
+                    check_enum_field(&ty.name, field, value, decls, locals, ctx, out);
                 }
             }
         }
@@ -224,45 +289,49 @@ fn check_expr(e: &Expr, decls: &Decls, locals: &mut Locals, ctx: &str, out: &mut
                     // 提供値は外側で評価される
                     for b in binders {
                         if let Provision::Value { value, .. } = b {
-                            check_expr(value, decls, locals, ctx, out);
+                            check_expr(value, decls, locals, ctx, ret, out);
                         }
                     }
                     let mut inner = locals.clone();
                     for b in binders {
                         inner.insert(b.slot().to_string(), None);
                     }
-                    check_expr(body, decls, &mut inner, ctx, out);
+                    check_expr(body, decls, &mut inner, ctx, ret, out);
                 }
                 Head::If(c) | Head::Elif(c) | Head::While(c) => {
-                    check_expr(c, decls, locals, ctx, out);
-                    check_expr(body, decls, &mut locals.clone(), ctx, out);
+                    check_expr(c, decls, locals, ctx, ret, out);
+                    check_expr(body, decls, &mut locals.clone(), ctx, ret, out);
                 }
                 Head::For { var, iter } => {
-                    check_expr(iter, decls, locals, ctx, out);
+                    check_expr(iter, decls, locals, ctx, ret, out);
                     let mut inner = locals.clone();
                     // 配列の要素型は今回の保証外
                     inner.insert(var.clone(), None);
-                    check_expr(body, decls, &mut inner, ctx, out);
+                    check_expr(body, decls, &mut inner, ctx, ret, out);
                 }
-                Head::Else => check_expr(body, decls, &mut locals.clone(), ctx, out),
+                Head::Else => check_expr(body, decls, &mut locals.clone(), ctx, ret, out),
             }
             if let Some(o) = orelse {
-                check_expr(o, decls, &mut locals.clone(), ctx, out);
+                check_expr(o, decls, &mut locals.clone(), ctx, ret, out);
             }
         }
 
         ExprKind::Array(items) => {
             for i in items {
-                check_expr(i, decls, locals, ctx, out);
+                check_expr(i, decls, locals, ctx, ret, out);
             }
         }
-        ExprKind::Block(body) => check_exprs(body, decls, locals, ctx, out),
+        ExprKind::Block(body) => check_exprs(body, decls, locals, ctx, ret, out),
         ExprKind::Binary { lhs, rhs, .. } => {
-            check_expr(lhs, decls, locals, ctx, out);
-            check_expr(rhs, decls, locals, ctx, out);
+            check_expr(lhs, decls, locals, ctx, ret, out);
+            check_expr(rhs, decls, locals, ctx, ret, out);
         }
-        ExprKind::Unary(_, inner) | ExprKind::Assert(inner) | ExprKind::Return(Some(inner)) => {
-            check_expr(inner, decls, locals, ctx, out)
+        ExprKind::Return(Some(inner)) => {
+            check_expr(inner, decls, locals, ctx, ret, out);
+            check_return(inner, decls, locals, ctx, ret, out);
+        }
+        ExprKind::Unary(_, inner) | ExprKind::Assert(inner) => {
+            check_expr(inner, decls, locals, ctx, ret, out)
         }
 
         ExprKind::Int(_)
@@ -274,17 +343,76 @@ fn check_expr(e: &Expr, decls: &Decls, locals: &mut Locals, ctx: &str, out: &mut
     }
 }
 
-/// 式の型が分かるならその名前。分からないなら `None`。
+/// 直接呼び出しの検査。引数の個数は常に、型は**分かるときだけ**見る。
+fn check_call(
+    name: &str,
+    sig: &FnSig,
+    args: &[Expr],
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    if args.len() != sig.params.len() {
+        out.push(format!(
+            "{ctx}: `{name}` は引数を {} 個取りますが、{} 個渡しています",
+            sig.params.len(),
+            args.len()
+        ));
+        return;
+    }
+    for (i, (arg, expected)) in args.iter().zip(&sig.params).enumerate() {
+        let Some(actual) = infer(arg, decls, locals) else {
+            continue;
+        };
+        if actual != *expected {
+            out.push(format!(
+                "{ctx}: `{name}` の第 {} 引数は `{expected}` ですが、`{actual}` を渡しています",
+                i + 1
+            ));
+        }
+    }
+}
+
+/// 宣言された戻り値型と、**型の分かる**戻り値だけを照合する。
+/// 全ての経路が値を返すかは見ない(design.md 決定4)。
+fn check_return(
+    value: &Expr,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    ret: Option<&KnownType>,
+    out: &mut Vec<String>,
+) {
+    let Some(expected) = ret else {
+        return;
+    };
+    let Some(actual) = infer(value, decls, locals) else {
+        return;
+    };
+    if actual != *expected {
+        out.push(format!(
+            "{ctx}: 戻り値は `{expected}` ですが、`{actual}` を返しています"
+        ));
+    }
+}
+
+/// 式の型が分かるならそれ。分からないなら `None`。
 ///
-/// 入口を増やすとその分だけ検査が効くが、保証範囲も広がる。今回は
-/// design.md 決定4 の4つ(ローカル・variant・struct リテラル・それらの参照)だけ。
-fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<String> {
+/// 入口を増やすとその分だけ検査が効くが、保証範囲も広がる。今回の入口は
+/// ローカル・variant・struct リテラル・**宣言戻り値のある直接呼び出し**と、
+/// それらを直接束縛・参照する式だけ。
+fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
     match &e.kind {
         ExprKind::Ident(name) => match locals.get(name) {
             Some(known) => known.clone(),
-            None => decls.variants.get(name).cloned(),
+            None => decls.variants.get(name).map(|e| plain(e)),
         },
-        ExprKind::StructLit { name, .. } => Some(name.clone()),
+        ExprKind::StructLit { name, .. } => Some(plain(name)),
+        ExprKind::Call(callee, _) => match &callee.kind {
+            ExprKind::Ident(name) => decls.fns.get(name)?.ret.clone(),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -308,12 +436,12 @@ fn check_enum_field(
     let Some(actual) = infer(value, decls, locals) else {
         return;
     };
-    if !decls.enums.contains(&actual) || actual == declared.name {
+    if actual.optional || !decls.enums.contains(&actual.name) || actual.name == declared.name {
         return;
     }
     out.push(format!(
-        "{ctx}: `{type_name}` のフィールド `{field}` は enum `{}` ですが、enum `{actual}` の値を与えています",
-        declared.name
+        "{ctx}: `{type_name}` のフィールド `{field}` は enum `{}` ですが、enum `{}` の値を与えています",
+        declared.name, actual.name
     ));
 }
 
@@ -650,14 +778,10 @@ mod tests {
 
     #[test]
     fn 型の分からない値は診断しない() {
-        // 引数の型注釈も struct リテラルも通っていない値。呼び出し結果も同じ
+        // 引数の型注釈も struct リテラルも通っていない値
         assert!(
             errors(&format!(
-                "{RANKS}fn pick(-> Grade) {{ Low }}\n\
-                 fn main(n: Int) {{\n\
-                 \x20 User {{ rank = n }}\n\
-                 \x20 User {{ rank = pick() }}\n\
-                 }}\n"
+                "{RANKS}fn main(n: Int) {{ User {{ rank = n }} }}\n"
             ))
             .is_empty()
         );
@@ -669,11 +793,25 @@ mod tests {
     }
 
     #[test]
-    fn 呼び出し結果への代入は診断しない() {
+    fn メソッド呼び出しの結果は診断しない() {
+        // レシーバ付きの呼び出しは候補の絞り込みが要るので型が分からない
         assert!(
             errors(&format!(
-                "{RANKS}fn get(-> User) {{ User {{ rank = Gold }} }}\n\
-                 fn main() {{ get().rank = Low }}\n"
+                "{RANKS}struct Store {{ id: UserId }}\n\
+                 impl Store {{ fn get(self -> User) {{ User {{ rank = Gold }} }} }}\n\
+                 fn main(s: Store) {{ s.get().rank = Low }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 関連関数呼び出しの結果は診断しない() {
+        assert!(
+            errors(&format!(
+                "{RANKS}struct Store {{}}\n\
+                 impl Store {{ fn make(-> User) {{ User {{ rank = Gold }} }} }}\n\
+                 fn main() {{ Store::make().rank = Low }}\n"
             ))
             .is_empty()
         );
@@ -712,6 +850,197 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    // ---- 6. 直接呼び出しの引数 ----
+
+    #[test]
+    fn 宣言どおりの引数の個数は診断を出さない() {
+        assert!(errors("fn f(a: Int, b: Int) { a }\nfn main(n: Int) { f(n, n) }\n").is_empty());
+    }
+
+    #[test]
+    fn 引数が足りない呼び出しを報告する() {
+        let e = only("fn f(a: Int, b: Int) { a }\nfn main(n: Int) { f(n) }\n");
+        assert!(e.starts_with("main: "), "{e}");
+        assert!(e.contains("`f`"), "{e}");
+        assert!(e.contains("2 個取ります"), "{e}");
+        assert!(e.contains("1 個渡しています"), "{e}");
+    }
+
+    #[test]
+    fn 引数が多すぎる呼び出しを報告する() {
+        let e = only("fn f(a: Int) { a }\nfn main(n: Int) { f(n, n) }\n");
+        assert!(e.contains("1 個取ります"), "{e}");
+        assert!(e.contains("2 個渡しています"), "{e}");
+    }
+
+    #[test]
+    fn 前方参照と再帰の呼び出しも検査する() {
+        let errors = errors(
+            "fn main(n: Int) { later(n, n) }\n\
+             fn later(a: Int) { later(a, a) }\n",
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].starts_with("main: "), "{errors:?}");
+        assert!(errors[1].starts_with("later: "), "{errors:?}");
+    }
+
+    #[test]
+    fn 型の合う引数は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank) {{ r }}\nfn main() {{ f(Gold) }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の違う引数を位置付きで報告する() {
+        let e = only(&format!(
+            "{RANKS}fn f(a: Rank, b: Rank) {{ a }}\nfn main() {{ f(Gold, High) }}\n"
+        ));
+        assert!(e.contains("`f` の第 2 引数"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    #[test]
+    fn optionalの有無が違う引数を報告する() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank?) {{ r }}\nfn main(r: Rank) {{ f(r) }}\n"
+        ));
+        assert!(e.contains("`Rank?`"), "{e}");
+    }
+
+    #[test]
+    fn 型の分からない引数は診断しない() {
+        // 演算・配列・nil・メソッド結果はまだ推論の外
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank) {{ r }}\nfn main(n: Int) {{ f(n + 1) }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn メソッドと関連関数の呼び出しは引数を検査しない() {
+        assert!(
+            errors(
+                "struct Store {}\n\
+                 impl Store {\n\
+                 \x20 fn make(a: Int -> Store) { Store {} }\n\
+                 \x20 fn take(self, a: Int) { a }\n\
+                 }\n\
+                 fn main(s: Store) {\n\
+                 \x20 s.take()\n\
+                 \x20 Store::make()\n\
+                 }\n",
+            )
+            .is_empty()
+        );
+    }
+
+    // ---- 7. 直接呼び出しの戻り値型 ----
+
+    #[test]
+    fn 呼び出し結果を束縛したローカルは型が分かる() {
+        let e = only(&format!(
+            "{RANKS}fn pick(-> Grade) {{ Low }}\n\
+             fn main() {{\n let g = pick()\n User {{ rank = g }}\n}}\n"
+        ));
+        assert!(e.contains("enum `Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 呼び出し結果はそのままフィールド検査に届く() {
+        let e = only(&format!(
+            "{RANKS}fn pick(-> Grade) {{ Low }}\nfn main() {{ User {{ rank = pick() }} }}\n"
+        ));
+        assert!(e.contains("enum `Rank`"), "{e}");
+        assert!(e.contains("enum `Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 呼び出し結果への代入もレシーバ型が分かる() {
+        let e = only(&format!(
+            "{RANKS}fn get(-> User) {{ User {{ rank = Gold }} }}\n\
+             fn main() {{ get().rank = Low }}\n"
+        ));
+        assert!(e.contains("enum `Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 戻り値型の無い関数の結果は分からないまま() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn pick() {{ Low }}\nfn main() {{ User {{ rank = pick() }} }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    // ---- 8. 宣言された戻り値の検査 ----
+
+    #[test]
+    fn 型の合う最後の式は診断を出さない() {
+        assert!(errors(&format!("{RANKS}fn pick(-> Grade) {{ Low }}\n")).is_empty());
+    }
+
+    #[test]
+    fn 型の違う最後の式を報告する() {
+        let e = only(&format!("{RANKS}fn pick(-> Grade) {{ Gold }}\n"));
+        assert!(e.starts_with("pick: "), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+    }
+
+    #[test]
+    fn 入れ子の明示returnの型違いを報告する() {
+        let e = only(&format!(
+            "{RANKS}fn pick(b: Bool -> Grade) {{\n\
+             \x20 if b {{ return Gold }}\n\
+             \x20 Low\n\
+             }}\n"
+        ));
+        assert!(e.contains("`Grade`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+    }
+
+    #[test]
+    fn implメソッドの戻り値も検査する() {
+        let e = only(&format!(
+            "{RANKS}impl User {{ fn grade(self -> Grade) {{ Gold }} }}\n"
+        ));
+        assert!(e.starts_with("impl User::grade: "), "{e}");
+    }
+
+    #[test]
+    fn 最後の式が明示returnでも二重に報告しない() {
+        let e = only(&format!("{RANKS}fn pick(-> Grade) {{ return Gold }}\n"));
+        assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 戻り値型を宣言しない関数は診断しない() {
+        assert!(errors(&format!("{RANKS}fn pick() {{ Gold }}\n")).is_empty());
+    }
+
+    #[test]
+    fn 値の無いreturnは診断しない() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn pick(b: Bool -> Grade) {{\n if b {{ return }}\n Low\n}}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の分からない戻り値は診断しない() {
+        assert!(errors(&format!("{RANKS}fn pick(n: Int -> Grade) {{ n + 1 }}\n")).is_empty());
     }
 
     // ---- 正典 ----

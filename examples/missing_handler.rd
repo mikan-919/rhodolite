@@ -13,12 +13,12 @@ fn stamp(u: User) {
     u.at = clock.now()
 }
 
-fn promote(id: UserId) {
-    stamp(id)
+fn promote(u: User) {
+    stamp(u)
 }
 
-fn handle(id: UserId) {
-    promote(id)
+fn handle(u: User) {
+    promote(u)
 }
 
 fn main() {

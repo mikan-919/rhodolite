@@ -626,3 +626,84 @@ fn 別のenumのvariantをenum型フィールドへ与えると実行前に失�
     assert!(text.contains("enum `dep::Grade`"), "{text}");
     assert!(!text.contains("main ->"), "{text}");
 }
+
+// ---- 関数の署名の検査 (src/typecheck.rs) ----
+
+#[test]
+fn 引数の個数が合わない呼び出しは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{add}\n\
+         fn main() { add(1) }\n",
+    );
+    project.write("dep.rd", "fn add(a: Int, b: Int -> Int) { a }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("`dep::add`"), "{text}");
+    assert!(text.contains("2 個取ります"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 型の違う引数を渡す呼び出しは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Grade, Low}\n\
+         enum Rank { Bronze Gold }\n\
+         fn rank(r: Rank -> Rank) { r }\n\
+         fn main() { rank(Low) }\n",
+    );
+    project.write("dep.rd", "enum Grade { Low High }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("第 1 引数"), "{text}");
+    assert!(text.contains("`dep::Grade`"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 宣言と違う型を返す関数は実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Grade}\n\
+         enum Rank { Bronze Gold }\n\
+         fn pick(-> Grade) { Gold }\n\
+         fn main() { pick() }\n",
+    );
+    project.write("dep.rd", "enum Grade { Low High }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("main::pick: 戻り値"), "{text}");
+    assert!(text.contains("`dep::Grade`"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 宣言どおりの呼び出しと戻り値はモジュールを跨いでも実行される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Rank, Gold, pick}\n\
+         fn keep(r: Rank -> Rank) { r }\n\
+         fn main() { keep(pick()) == Gold }\n",
+    );
+    project.write(
+        "dep.rd",
+        "enum Rank { Bronze Gold }\n\
+         fn pick(-> Rank) { Gold }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> true"), "{text}");
+}
