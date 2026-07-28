@@ -618,6 +618,45 @@ impl<'a> Parser<'a> {
         }
         self.stmt()
     }
+
+    /// `match` の arm 列。区切りはブロックと同じ改行で、カンマは無い。
+    /// 本体は既存 Head と同じ `: 単純式` か `{ ... }`(design.md 決定1)。
+    fn match_arms(&mut self) -> PResult<Vec<MatchArm>> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.eat(&Tok::RBrace) {
+                break;
+            }
+            if self.at(&Tok::Eof) {
+                return Err(self.err("`}` が見つからないままファイルが終わりました"));
+            }
+
+            let start = self.span();
+            let path = self.name_path("arm の `Enum::Variant`")?;
+            let Some((enum_name, variant)) = path.rsplit_once("::") else {
+                return Err(self.err(&format!(
+                    "arm には `Enum::Variant` の形が必要です (実際は `{path}`)"
+                )));
+            };
+            let body = self.head_body()?;
+            arms.push(MatchArm {
+                enum_name: enum_name.to_string(),
+                variant: variant.to_string(),
+                body,
+                span: self.to(start),
+            });
+
+            if !self.at(&Tok::Newline) && !self.at(&Tok::RBrace) {
+                return Err(self.err(&format!(
+                    "1行に2つの arm は書けません (次は {:?})",
+                    self.peek()
+                )));
+            }
+        }
+        Ok(arms)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -952,6 +991,18 @@ impl<'a> Parser<'a> {
                 ExprKind::Block(body)
             }
 
+            // `match rank { Rank::Gold: "gold" }` — 選ばれた arm の値を産む式。
+            // 文位置専用にしないのは、値ベースで引数にも渡せる必要があるため
+            Tok::Match => {
+                self.bump();
+                let subject = self.cond()?;
+                let arms = self.match_arms()?;
+                ExprKind::Match {
+                    subject: Box::new(subject),
+                    arms,
+                }
+            }
+
             other => {
                 return Err(self.err(&format!("式が必要です (実際は {:?})", other)));
             }
@@ -1034,6 +1085,79 @@ mod tests {
     fn enumのvariantは値を持てない() {
         let e = parse_src("enum Rank { Bronze = 1 }\n").unwrap_err();
         assert!(e.msg.contains("variant 名"), "{}", e.msg);
+    }
+
+    // ---- match ----
+
+    fn arms(src: &str) -> Vec<(String, String)> {
+        let p = ok(src);
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!()
+        };
+        let ExprKind::Let { value, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        let ExprKind::Match { arms, .. } = &value.kind else {
+            panic!("match ではない: {:?}", value.kind)
+        };
+        arms.iter()
+            .map(|a| (a.enum_name.clone(), a.variant.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn matchは限定variantのarmを改行で並べる() {
+        // 一行形とブロック形が混ざっても、arm の並びは同じ
+        let expected = vec![
+            ("Rank".to_string(), "Bronze".to_string()),
+            ("Rank".to_string(), "Gold".to_string()),
+        ];
+        assert_eq!(
+            arms(
+                "fn f(r: Rank) {\n\
+                  \x20 let label = match r {\n\
+                  \x20   Rank::Bronze: \"bronze\"\n\
+                  \x20   Rank::Gold {\n\
+                  \x20     audit()\n\
+                  \x20     \"gold\"\n\
+                  \x20   }\n\
+                  \x20 }\n\
+                  }\n"
+            ),
+            expected
+        );
+        // 修飾された enum パスも1つの名前として保つ
+        assert_eq!(
+            arms("fn f(r: Rank) {\n let x = match r { dep::Rank::Gold: 1 }\n}\n"),
+            vec![("dep::Rank".to_string(), "Gold".to_string())]
+        );
+    }
+
+    #[test]
+    fn 空のmatchも書ける() {
+        assert!(arms("fn f(n: Never) {\n let x = match n { }\n}\n").is_empty());
+    }
+
+    #[test]
+    fn matchの対象の直後のbraceはarm列になる() {
+        // `match c { }` の `{ }` を `c` の struct リテラルにはしない
+        ok("fn f(r: Rank) {\n match r { Rank::Gold: 1 }\n}\n");
+    }
+
+    #[test]
+    fn 裸のarmパスを受けない() {
+        let e = parse_src("fn f(r: Rank) {\n match r { Gold: 1 }\n}\n").unwrap_err();
+        assert!(e.msg.contains("`Enum::Variant`"), "{}", e.msg);
+    }
+
+    #[test]
+    fn armの本体にもコロンと改行の規則が効く() {
+        let e = parse_src("fn f(r: Rank) {\n match r {\n Rank::Gold:\n 1\n }\n}\n").unwrap_err();
+        assert!(e.msg.contains("改行"), "{}", e.msg);
+
+        let e = parse_src("fn f(r: Rank) {\n match r { Rank::Gold: 1 Rank::Bronze: 2 }\n}\n")
+            .unwrap_err();
+        assert!(e.msg.contains("1行に2つ"), "{}", e.msg);
     }
 
     #[test]

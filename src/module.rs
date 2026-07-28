@@ -458,6 +458,15 @@ pub fn item_names(item: &Item) -> Vec<&str> {
     }
 }
 
+/// 正準名の末尾。`main::Gold` → `Gold`。
+///
+/// variant は所属 enum と同じモジュールで宣言されるので、enum の正準名と短い
+/// variant 名の組だけで variant を一意に指せる。限定参照 `Rank::Gold` の照合は
+/// この形で行い、所属の表を別に持たない(下のテストが不変条件を固定している)。
+pub fn short_name(name: &str) -> &str {
+    name.rsplit_once("::").map_or(name, |(_, short)| short)
+}
+
 fn resolve_item(
     item: &mut Item,
     local: &BTreeMap<String, String>,
@@ -838,6 +847,44 @@ fn resolve_expr(
             declarations,
             diagnostics,
         ),
+        // arm は束縛を導入しないが、本体の `let` を他の arm や後続へ漏らさない
+        // ために、それぞれ外側 locals の複製で解決する(design.md 決定4)
+        ExprKind::Match { subject, arms } => {
+            resolve_expr(
+                subject,
+                locals,
+                local,
+                imported_declarations,
+                imported_modules,
+                declarations,
+                diagnostics,
+            );
+            for arm in arms {
+                if !arm
+                    .enum_name
+                    .split("::")
+                    .next()
+                    .is_some_and(|first| locals.contains(first))
+                {
+                    arm.enum_name = resolve_name(
+                        &arm.enum_name,
+                        local,
+                        imported_declarations,
+                        imported_modules,
+                        declarations,
+                    );
+                }
+                resolve_expr(
+                    &mut arm.body,
+                    &mut locals.clone(),
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                    diagnostics,
+                );
+            }
+        }
         ExprKind::Head { head, body, orelse } => {
             match head {
                 Head::Ambient(provisions) => {
@@ -1181,6 +1228,20 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             ExprKind::Return(Some(value)) => {
                 collect_expr_paths(std::slice::from_ref(value), locals, paths);
             }
+            ExprKind::Match { subject, arms } => {
+                collect_expr_paths(std::slice::from_ref(subject), locals, paths);
+                for arm in arms {
+                    if !arm
+                        .enum_name
+                        .split("::")
+                        .next()
+                        .is_some_and(|first| locals.contains(first))
+                    {
+                        collect_name_path(&arm.enum_name, paths);
+                    }
+                    collect_expr_paths(std::slice::from_ref(&arm.body), &mut locals.clone(), paths);
+                }
+            }
             ExprKind::Head { head, body, orelse } => {
                 match head {
                     Head::If(condition) | Head::Elif(condition) | Head::While(condition) => {
@@ -1302,6 +1363,71 @@ mod tests {
         assert!(matches!(&callee.kind, ExprKind::Ident(name) if name == "dep::make"));
         assert_eq!(field, "value");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// match の arm の enum も、他の名前と同じ規則で正準名になる。
+    /// variant は短いままで、`short_name` と組で宣言を一意に指す
+    #[test]
+    fn matchのarmと本体を正準名へ解決する() {
+        let mut program = parse::parse(&join(
+            lex("fn main(r: Rank) {\n\
+                 \x20 match r {\n\
+                 \x20   Rank::Bronze: local()\n\
+                 \x20   dep::Grade::Low { let shadowed = 1\nshadowed }\n\
+                 \x20 }\n\
+                 \x20 shadowed\n\
+                 }\n")
+            .unwrap(),
+        ))
+        .unwrap();
+        let Item::Fn { body, .. } = &mut program.items[0] else {
+            panic!()
+        };
+
+        let module = ModulePath(vec!["dep".to_string()]);
+        let local = BTreeMap::from([
+            ("Rank".to_string(), "main::Rank".to_string()),
+            ("local".to_string(), "main::local".to_string()),
+        ]);
+        let imported_modules = BTreeMap::from([("dep".to_string(), module.clone())]);
+        let declarations = BTreeMap::from([(
+            module,
+            BTreeMap::from([("Grade".to_string(), "dep::Grade".to_string())]),
+        )]);
+        let mut diagnostics = Vec::new();
+        let mut locals = BTreeSet::from(["r".to_string()]);
+        resolve_exprs(
+            body,
+            &mut locals,
+            &local,
+            &BTreeMap::new(),
+            &imported_modules,
+            &declarations,
+            &mut diagnostics,
+        );
+
+        let ExprKind::Match { subject, arms } = &body[0].kind else {
+            panic!("match ではない: {:?}", body[0].kind)
+        };
+        assert!(matches!(&subject.kind, ExprKind::Ident(name) if name == "r"));
+        assert_eq!(arms[0].enum_name, "main::Rank");
+        assert_eq!(arms[0].variant, "Bronze");
+        assert_eq!(arms[1].enum_name, "dep::Grade");
+        assert_eq!(arms[1].variant, "Low");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let ExprKind::Call(callee, _) = &arms[0].body.kind else {
+            panic!("arm 本体が呼び出しではない: {:?}", arms[0].body.kind)
+        };
+        assert!(matches!(&callee.kind, ExprKind::Ident(name) if name == "main::local"));
+
+        // arm 内の束縛は後続へ漏れないので、`shadowed` は宣言として解決を試みる
+        assert!(
+            matches!(&body[1].kind, ExprKind::Ident(name) if name == "shadowed"),
+            "{:?}",
+            body[1].kind
+        );
+        assert!(!locals.contains("shadowed"));
     }
 
     /// 角括弧の内側の名前も、裸の名前と同じ規則で正準名になる

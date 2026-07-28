@@ -31,6 +31,7 @@ pub enum Tok {
     In,
     While,
     With,
+    Match,
     Trait,
     Struct,
     Enum,
@@ -236,6 +237,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "in" => Tok::In,
         "while" => Tok::While,
         "with" => Tok::With,
+        "match" => Tok::Match,
         "trait" => Tok::Trait,
         "struct" => Tok::Struct,
         "enum" => Tok::Enum,
@@ -353,6 +355,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::For
             | Tok::While
             | Tok::With
+            | Tok::Match
             | Tok::Trait
             | Tok::Struct
             | Tok::Enum
@@ -422,6 +425,32 @@ mod tests {
         );
         // 行頭に立てる = 直前の改行が文の区切りとして残る
         assert_eq!(newlines("a()\nenum Rank {}\n"), 2);
+    }
+
+    #[test]
+    fn matchはキーワードで行頭に立てる() {
+        assert_eq!(
+            toks("match r { Rank::Gold: 1 }"),
+            vec![
+                Tok::Match,
+                Tok::Ident("r".into()),
+                Tok::LBrace,
+                Tok::Ident("Rank".into()),
+                Tok::ColonColon,
+                Tok::Ident("Gold".into()),
+                Tok::Colon,
+                Tok::Int(1),
+                Tok::RBrace,
+                Tok::Eof
+            ]
+        );
+        // 行頭に立てる = 直前の改行が文の区切りとして残る
+        assert_eq!(newlines("a()\nmatch r { }\n"), 2);
+        // arm どうしは改行で切れる
+        assert_eq!(
+            newlines("match r {\nRank::Bronze: 1\nRank::Gold: 2\n}\n"),
+            3
+        );
     }
 
     #[test]

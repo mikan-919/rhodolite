@@ -166,6 +166,12 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     /// `{ ... }` — 第二級。値は最後の式
     Block(Vec<Expr>),
+    /// `match rank { Rank::Gold: "gold" }` — fieldless enum の variant ごとの分岐。
+    /// 選ばれた arm の値がこの式の値になる(design.md 決定1)
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     /// `Head block` または `Head ':' 単純式`
     Head {
         head: Head,
@@ -177,6 +183,18 @@ pub enum ExprKind {
         /// 「`elif`/`else` は文の先頭に来られない」という整形式規則で扱う。
         orelse: Option<Box<Expr>>,
     },
+}
+
+/// `Rank::Gold: "gold"` / `Rank::Gold { ... }` — 限定 variant と、既存 Head と
+/// 同じ形の本体。限定を必須にすることで arm 単体から所属 enum が分かる。
+#[derive(Debug)]
+pub struct MatchArm {
+    /// 書かれたままの enum パス。module loader が正準名へ書き換える
+    pub enum_name: String,
+    /// その enum に属する短い variant 名
+    pub variant: String,
+    pub body: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug)]

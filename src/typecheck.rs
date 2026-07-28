@@ -42,8 +42,9 @@
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
 use crate::ast::{
-    BinOp, Expr, ExprKind, Head, Item, Program, Provision, Sig, Type, TypeKind, UnOp,
+    BinOp, Expr, ExprKind, Head, Item, MatchArm, Program, Provision, Sig, Type, TypeKind, UnOp,
 };
+use crate::module::short_name;
 use crate::requirement::{Slots, collect_slots};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +54,9 @@ struct Decls {
     structs: BTreeMap<String, BTreeMap<String, KnownType>>,
     /// variant の正準名 → 所属 enum の正準名
     variants: BTreeMap<String, String>,
+    /// enum の正準名 → 宣言順の variant の正準名。網羅性の検査と、限定参照
+    /// `Rank::Gold` の所属の照合に使う
+    enums: BTreeMap<String, Vec<String>>,
     /// トップレベル関数の正準名 → 署名。本体を見る前に全部集めるので、
     /// 前方参照と再帰も引ける(design.md 決定2)
     fns: BTreeMap<String, FnSig>,
@@ -187,7 +191,7 @@ const BUILTINS: [&str; 4] = ["bool", "int", "str", "unit"];
 /// 宣言名が組み込み型と衝突するなら、その綴り。正準名は修飾されているので
 /// 末尾だけを見る(`main::int` も `int` の宣言)。
 fn reserved(name: &str) -> Option<&str> {
-    let short = name.rsplit_once("::").map_or(name, |(_, s)| s);
+    let short = short_name(name);
     BUILTINS.contains(&short).then_some(short)
 }
 
@@ -238,6 +242,7 @@ pub fn check(program: &Program) -> Vec<String> {
 fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut structs = BTreeMap::new();
     let mut variants = BTreeMap::new();
+    let mut enums = BTreeMap::new();
     let mut fns = BTreeMap::new();
     let mut traits: BTreeMap<String, BTreeMap<String, FnSig>> = BTreeMap::new();
     let mut impls: BTreeMap<String, Vec<(String, FnSig)>> = BTreeMap::new();
@@ -279,6 +284,7 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
                     variants.insert(variant.clone(), name.clone());
                     others.insert(variant.clone());
                 }
+                enums.insert(name.clone(), vs.clone());
             }
             // trait のメンバー名の重複は宣言の誤りだが、契約としては一意に保つ。
             // 実装側の過不足は `check_impl` が契約と突き合わせて報告する
@@ -320,6 +326,7 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let decls = Decls {
         structs,
         variants,
+        enums,
         fns,
         traits,
         impls,
@@ -639,6 +646,36 @@ fn check_expr_at(
             }
         }
         ExprKind::Block(body) => check_exprs(body, decls, locals, ctx, ret, out),
+
+        // 対象は既知の非 optional な enum で、arm はその全 variant を一度ずつ。
+        // 結果型は期待型、無ければ最初に型の分かる arm を基準にする
+        // (design.md 決定3・5)。arm は束縛を導入しないが、本体の `let` を
+        // 他の arm や後続へ漏らさないよう `locals` を複製して入る
+        ExprKind::Match { subject, arms } => {
+            check_expr(subject, decls, locals, ctx, ret, out);
+            let matched = matched_enum(subject, decls, locals, ctx, out);
+            check_arms(arms, matched.as_deref(), decls, ctx, out);
+
+            let result = match expected {
+                Some(expected) => Some(expected.clone()),
+                None => arms.iter().find_map(|arm| infer(&arm.body, decls, locals)),
+            };
+            for arm in arms {
+                check_expr_at(
+                    &arm.body,
+                    result.as_ref(),
+                    decls,
+                    &mut locals.clone(),
+                    ctx,
+                    ret,
+                    out,
+                );
+                if let Some(result) = &result {
+                    let what = format!("arm `{}::{}` の値", arm.enum_name, arm.variant);
+                    require(&arm.body, result, &what, decls, locals, ctx, out);
+                }
+            }
+        }
         ExprKind::Binary { op, lhs, rhs } => {
             check_expr(lhs, decls, locals, ctx, ret, out);
             check_expr(rhs, decls, locals, ctx, ret, out);
@@ -701,12 +738,99 @@ fn check_expr_at(
             );
         }
 
+        // 宣言済み enum を修飾した path は variant 値。それ以外の path は
+        // 関連関数や ambient の型射影なので、従来どおり何も言わない
+        ExprKind::Path(parts) => {
+            if let [enum_name, variant] = parts.as_slice()
+                && let Some(declared) = decls.enums.get(enum_name)
+                && !declared.iter().any(|v| short_name(v) == variant)
+            {
+                out.push(format!(
+                    "{ctx}: `{enum_name}::{variant}` は `{enum_name}` の variant ではありません"
+                ));
+            }
+        }
+
         ExprKind::Int(_)
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
         | ExprKind::Nil
-        | ExprKind::Path(_)
         | ExprKind::Return(None) => {}
+    }
+}
+
+/// `match` の対象の enum。既知の非 optional な enum のときだけ返す。
+///
+/// 型不明の対象を実行時へ委ねると arm の所属・網羅性・結果型の基準を決められない
+/// ので、ここで診断する(design.md 決定3)。
+fn matched_enum(
+    subject: &Expr,
+    decls: &Decls,
+    locals: &Locals,
+    ctx: &str,
+    out: &mut Vec<String>,
+) -> Option<String> {
+    let Some(ty) = infer(subject, decls, locals) else {
+        out.push(format!("{ctx}: `match` の対象の型が決まりません"));
+        return None;
+    };
+    match ty.name() {
+        Some(name) if !ty.optional && decls.enums.contains_key(name) => Some(name.to_string()),
+        _ => {
+            out.push(format!(
+                "{ctx}: `match` の対象は非 optional な enum である必要がありますが、`{ty}` です"
+            ));
+            None
+        }
+    }
+}
+
+/// arm の集合が対象 enum の宣言 variant と完全に一致するか見る。
+/// 対象の enum が分からないときは、arm 自身の整合だけを見る。
+fn check_arms(
+    arms: &[MatchArm],
+    matched: Option<&str>,
+    decls: &Decls,
+    ctx: &str,
+    out: &mut Vec<String>,
+) {
+    let mut covered: BTreeSet<&str> = BTreeSet::new();
+    for arm in arms {
+        let arm_name = format!("{}::{}", arm.enum_name, arm.variant);
+        let Some(declared) = decls.enums.get(&arm.enum_name) else {
+            out.push(format!("{ctx}: `{}` は enum ではありません", arm.enum_name));
+            continue;
+        };
+        if !declared.iter().any(|v| short_name(v) == arm.variant) {
+            out.push(format!(
+                "{ctx}: `{arm_name}` は `{}` の variant ではありません",
+                arm.enum_name
+            ));
+            continue;
+        }
+        let Some(matched) = matched else { continue };
+        if arm.enum_name != matched {
+            out.push(format!(
+                "{ctx}: arm `{arm_name}` は `{matched}` の variant ではありません"
+            ));
+            continue;
+        }
+        if !covered.insert(arm.variant.as_str()) {
+            out.push(format!("{ctx}: arm `{arm_name}` が重複しています"));
+        }
+    }
+
+    let Some(matched) = matched else { return };
+    let missing: Vec<&str> = decls.enums[matched]
+        .iter()
+        .map(|variant| short_name(variant))
+        .filter(|variant| !covered.contains(variant))
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!(
+            "{ctx}: `{matched}` の variant {} を扱っていません",
+            quoted(&missing)
+        ));
     }
 }
 
@@ -723,6 +847,11 @@ fn mismatch(value: &Expr, expected: &KnownType, decls: &Decls, locals: &Locals) 
     // `check_expr` が期待要素型で照合済みなので、ここでは配列全体を
     // 適合として扱う(design.md 決定4)
     if matches!(value.kind, ExprKind::Array(_)) && expected.element().is_some() {
+        return None;
+    }
+    // 期待型のある位置の match も同じ。期待型は各 arm へそのまま配られ、
+    // `check_expr` が arm ごとに照合済みなので、式全体では二度言わない
+    if matches!(value.kind, ExprKind::Match { .. }) {
         return None;
     }
     let actual = infer(value, decls, locals)?;
@@ -990,6 +1119,19 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             Some(Binding::Slot(_)) => None,
             None => decls.variants.get(name).map(|e| plain(e)),
         },
+        // `Rank::Gold` — 宣言済み enum の variant を限定した path は、裸の
+        // `Gold` と同じ enum 値。ローカルは限定参照を隠さない(design.md 決定2)
+        ExprKind::Path(parts) => {
+            let [enum_name, variant] = parts.as_slice() else {
+                return None;
+            };
+            decls
+                .enums
+                .get(enum_name)?
+                .iter()
+                .any(|v| short_name(v) == variant)
+                .then(|| plain(enum_name))
+        }
         ExprKind::StructLit { name, .. } => Some(plain(name)),
         // 素直な再帰なので `user.profile.name` の連鎖もそのまま辿れる。
         // 診断は `check_field_read` の側にあるので、ここは事実を引くだけ
@@ -1031,6 +1173,9 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             }
             Some(array_of(element?))
         }
+        // 期待型の無い `match` は最初に型の分かる arm を結果型にする。
+        // 残りの arm との照合は `check_expr` の側にある(design.md 決定5)
+        ExprKind::Match { arms, .. } => arms.iter().find_map(|arm| infer(&arm.body, decls, locals)),
         // 演算子の結果型は被演算子に依らず決まる。被演算子の診断は
         // `check_expr` の側にある(design.md 決定3)
         ExprKind::Unary(UnOp::Neg, _) => Some(plain("int")),
@@ -1577,6 +1722,269 @@ mod tests {
             "{RANKS}fn main() {{\n let u = User {{ rank = Gold }}\n u.rank = Low\n}}\n"
         ));
         assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    // ---- 4b. 限定した variant ----
+
+    #[test]
+    fn 限定したvariantは裸の参照と同じ値になる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn take(r: Rank) {{ r }}\n\
+                 fn f(-> bool) {{\n\
+                 \x20 take(Rank::Gold)\n\
+                 \x20 User {{ rank = Rank::Bronze }}\n\
+                 \x20 let g = Rank::Gold\n\
+                 \x20 g == Gold\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 限定したvariantはローカルに隠されない() {
+        // 裸の `Gold` はローカルを指すが、`Rank::Gold` は宣言を通り続ける
+        let e = only(&format!(
+            "{RANKS}fn f(Gold: int -> bool) {{ Rank::Gold == Gold }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+    }
+
+    #[test]
+    fn 別のenumの限定variantを報告する() {
+        let e = only(&format!("{RANKS}fn f(-> Rank) {{ Grade::Low }}\n"));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 宣言に無い限定variantを報告する() {
+        let e = only(&format!("{RANKS}fn f() {{ Rank::Silver }}\n"));
+        assert!(e.contains("`Rank::Silver`"), "{e}");
+        assert!(e.contains("variant ではありません"), "{e}");
+    }
+
+    #[test]
+    fn enumでない修飾は限定variantにならない() {
+        // 関連関数の path はこれまでどおり値にならず、診断も増えない
+        assert!(
+            errors(&format!(
+                "{RANKS}struct Store {{}}\n\
+                 impl Store {{ fn make(-> User) {{ User {{ rank = Gold }} }} }}\n\
+                 fn f(-> User) {{ Store::make() }}\n"
+            ))
+            .is_empty()
+        );
+        assert!(errors(&format!("{RANKS}fn f() {{ User::nope }}\n")).is_empty());
+    }
+
+    // ---- 4c. match ----
+
+    #[test]
+    fn 網羅的なmatchは診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn label(r: Rank -> str) {{\n\
+                 \x20 match r {{\n\
+                 \x20   Rank::Bronze: \"bronze\"\n\
+                 \x20   Rank::Gold: \"gold\"\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn matchの対象は既知の非optionalなenumに限る() {
+        for (subject, expected) in [
+            ("n: int", "`int` です"),
+            ("r: Rank?", "`Rank?` です"),
+            ("u: User", "`User` です"),
+            ("xs: [Rank]", "`[Rank]` です"),
+        ] {
+            let e = only(&format!(
+                "{RANKS}fn f({subject}) {{ match {} {{ Rank::Bronze: 1\nRank::Gold: 2 }} }}\n",
+                subject.split(':').next().unwrap()
+            ));
+            assert!(e.contains("非 optional な enum"), "{subject}: {e}");
+            assert!(e.contains(expected), "{subject}: {e}");
+        }
+
+        let e = only(&format!(
+            "{RANKS}fn unknown() {{ nil }}\n\
+             fn f() {{ match unknown() {{ Rank::Bronze: 1\nRank::Gold: 2 }} }}\n"
+        ));
+        assert!(e.contains("`match` の対象の型が決まりません"), "{e}");
+    }
+
+    #[test]
+    fn 欠けているarmを列挙して報告する() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank -> int) {{ match r {{ Rank::Gold: 1 }} }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Bronze`"), "{e}");
+        assert!(!e.contains("`Gold`"), "{e}");
+    }
+
+    #[test]
+    fn 重複したarmを報告する() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank -> int) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Bronze: 1\n\
+             \x20   Rank::Gold: 2\n\
+             \x20   Rank::Gold: 3\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("arm `Rank::Gold` が重複"), "{e}");
+    }
+
+    #[test]
+    fn 別のenumのarmと宣言に無いarmを報告する() {
+        let errors = errors(&format!(
+            "{RANKS}fn f(r: Rank -> int) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Bronze: 1\n\
+             \x20   Rank::Gold: 2\n\
+             \x20   Grade::Low: 3\n\
+             \x20   Rank::Silver: 4\n\
+             \x20   User::Nope: 5\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(
+            errors[0].contains("arm `Grade::Low` は `Rank` の variant ではありません"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].contains("`Rank::Silver` は `Rank` の variant ではありません"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[2].contains("`User` は enum ではありません"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn 空のenumはarmゼロで網羅的() {
+        assert!(
+            errors("enum Never {}\nfn f(n: Never -> int) { match n { } }\n")
+                .iter()
+                .all(|e| !e.contains("variant")),
+            "空の enum に扱い漏れは無い"
+        );
+    }
+
+    #[test]
+    fn 期待型のあるmatchは全armをその型で照合する() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn take(s: str) {{ s }}\n\
+                 fn f(r: Rank) {{ take(match r {{ Rank::Bronze: \"b\"\nRank::Gold: \"g\" }}) }}\n"
+            ))
+            .is_empty()
+        );
+
+        let e = only(&format!(
+            "{RANKS}fn take(s: str) {{ s }}\n\
+             fn f(r: Rank) {{ take(match r {{ Rank::Bronze: \"b\"\nRank::Gold: 1 }}) }}\n"
+        ));
+        assert!(e.contains("arm `Rank::Gold` の値"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+    }
+
+    #[test]
+    fn 期待型が無いmatchは最初に型の分かるarmを基準にする() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank) {{\n\
+             \x20 let label = match r {{ Rank::Bronze: \"b\"\nRank::Gold: 1 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("arm `Rank::Gold` の値"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+    }
+
+    #[test]
+    fn matchの結果型は後続の検査へ届く() {
+        // 束縛を経由しても推論した結果型が残る
+        let e = only(&format!(
+            "{RANKS}fn take(n: int) {{ n }}\n\
+             fn f(r: Rank) {{\n\
+             \x20 let label = match r {{ Rank::Bronze: \"b\"\nRank::Gold: \"g\" }}\n\
+             \x20 take(label)\n\
+             }}\n"
+        ));
+        assert!(e.contains("`take` の第 1 引数"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+    }
+
+    #[test]
+    fn 宣言戻り値は各armへ配られ二度は報告しない() {
+        let errors = errors(&format!(
+            "{RANKS}fn f(r: Rank -> str) {{ match r {{ Rank::Bronze: 1\nRank::Gold: 2 }} }}\n"
+        ));
+        assert_eq!(errors.len(), 2, "arm ごとに一度ずつ: {errors:?}");
+        assert!(errors[0].contains("arm `Rank::Bronze` の値"), "{errors:?}");
+        assert!(errors[1].contains("arm `Rank::Gold` の値"), "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.contains("`str`") && e.contains("`int`")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn 非optionalなarmはoptionalな期待型へ注入できる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank -> Rank?) {{ match r {{ Rank::Bronze: Gold\nRank::Gold: nil }} }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の分からないarmだけのmatchは結果型を持たない() {
+        // ブロック形の arm と `return` は推論の外。存在しない型を作らない
+        assert!(
+            errors(&format!(
+                "{RANKS}fn take(n: int) {{ n }}\n\
+                 fn f(r: Rank -> int) {{\n\
+                 \x20 take(match r {{\n\
+                 \x20   Rank::Bronze {{ \"b\" }}\n\
+                 \x20   Rank::Gold: return 0\n\
+                 \x20 }})\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn armの束縛は他のarmと後続へ漏れない() {
+        let errors = errors(&format!(
+            "{RANKS}fn f(r: Rank) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Bronze {{ let u = User {{ rank = Gold }}\nu }}\n\
+             \x20   Rank::Gold {{ u.rank = Low }}\n\
+             \x20 }}\n\
+             \x20 u.rank = Low\n\
+             }}\n"
+        ));
+        assert!(
+            errors.is_empty(),
+            "隣の arm と後続では `u` の型が分からないので照合しない: {errors:?}"
+        );
     }
 
     // ---- 5. 今回の保証外 ----

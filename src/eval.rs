@@ -11,6 +11,7 @@
 //! **この差1行が言語の全部**(CONTEXT.md「ambient」)。
 
 use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Sig, UnOp};
+use crate::module::short_name;
 use crate::requirement::{Slots, collect_slots};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -282,6 +283,9 @@ pub struct Interp<'a> {
     structs: HashSet<&'a str>,
     /// variant の正準名 → 所属 enum の正準名。裸の `Gold` を値へ落とすのに使う
     variants: HashMap<&'a str, &'a str>,
+    /// enum の正準名 → その variant の正準名。限定した `Rank::Gold` と
+    /// match の arm はこちらから引く
+    enums: HashMap<&'a str, &'a [String]>,
     /// スロット名 → trait 名。requirement.rs のものを再利用する
     slots: Slots,
 }
@@ -292,6 +296,7 @@ impl<'a> Interp<'a> {
         let mut methods: HashMap<_, Vec<_>> = HashMap::new();
         let mut structs = HashSet::new();
         let mut variants = HashMap::new();
+        let mut enums = HashMap::new();
         for item in &program.items {
             match item {
                 Item::Fn { sig, body, .. } => {
@@ -306,6 +311,7 @@ impl<'a> Interp<'a> {
                     for variant in vs {
                         variants.insert(variant.as_str(), name.as_str());
                     }
+                    enums.insert(name.as_str(), vs.as_slice());
                 }
                 Item::Impl {
                     trait_name,
@@ -330,8 +336,21 @@ impl<'a> Interp<'a> {
             methods,
             structs,
             variants,
+            enums,
             slots: collect_slots(program),
         }
+    }
+
+    /// `Rank::Gold` が指す variant の正準名。宣言済み enum の variant のときだけ。
+    ///
+    /// variant は所属 enum と同じモジュールで宣言されるので、enum の正準名と
+    /// 短い variant 名の組で一意に決まる(module.rs `short_name`)。
+    fn variant_of(&self, enum_name: &str, variant: &str) -> Option<&'a str> {
+        self.enums
+            .get(enum_name)?
+            .iter()
+            .map(String::as_str)
+            .find(|declared| short_name(declared) == variant)
     }
 
     /// 型名とメソッド名から本体を引く。
@@ -707,7 +726,36 @@ impl<'a> Interp<'a> {
                 Ok(Value::Array(Rc::new(RefCell::new(xs))))
             }
 
-            ExprKind::Path(parts) => fail(format!("`{}` は値ではありません", parts.join("::"))),
+            // `Rank::Gold` — 限定した variant は裸の `Gold` と同じ enum 値。
+            // それ以外の path は関連関数や型射影なので値にならない
+            ExprKind::Path(parts) => match parts.as_slice() {
+                [enum_name, variant] => match self.variant_of(enum_name, variant) {
+                    Some(declared) => Ok(Value::Enum {
+                        enum_name: enum_name.clone(),
+                        variant: declared.to_string(),
+                    }),
+                    None => fail(format!("`{enum_name}::{variant}` は値ではありません")),
+                },
+                _ => fail(format!("`{}` は値ではありません", parts.join("::"))),
+            },
+
+            // 対象は一度だけ評価し、一致した arm の本体だけを走らせる。
+            // 静的検査を通っていれば下の2つの失敗は起きない(design.md 決定4)
+            ExprKind::Match { subject, arms } => {
+                let value = self.eval(subject, env, ambient)?;
+                let Value::Enum { enum_name, variant } = &value else {
+                    return fail(format!("`match` の対象は enum だけです ({})", value.show()));
+                };
+                let arm = arms
+                    .iter()
+                    .find(|arm| arm.enum_name == *enum_name && arm.variant == short_name(variant));
+                match arm {
+                    Some(arm) => self.eval(&arm.body, env, ambient),
+                    None => fail(format!(
+                        "`{enum_name}.{variant}` に一致する arm がありません"
+                    )),
+                }
+            }
         }
     }
 
@@ -1046,6 +1094,100 @@ mod tests {
     fn ローカルはvariantを隠す() {
         let src = format!("{RANKS}fn main() {{\n let Gold = 7\n Gold\n}}\n");
         assert_eq!(int(&src), 7);
+    }
+
+    #[test]
+    fn 限定したvariantは裸の参照と同じ値になる() {
+        let src = format!(
+            "{RANKS}fn main() {{\n\
+             \x20 assert Rank::Gold == Gold\n\
+             \x20 assert Rank::Gold == Rank::Gold\n\
+             \x20 assert (Rank::Gold == Rank::Bronze) == false\n\
+             \x20 Rank::Gold\n\
+             }}\n"
+        );
+        assert_eq!(run(&src, "main").unwrap().show(), "Rank.Gold");
+    }
+
+    #[test]
+    fn 限定したvariantはローカルに隠されない() {
+        let src = format!("{RANKS}fn main() {{\n let Gold = 7\n Rank::Gold == Gold\n}}\n");
+        assert!(matches!(run(&src, "main"), Ok(Value::Bool(false))));
+    }
+
+    #[test]
+    fn 宣言に無い限定variantと非enumの修飾は値にならない() {
+        for path in ["Rank::Silver", "Grade::Gold", "Missing::Gold"] {
+            let src = format!("{RANKS}fn main() {{\n {path}\n}}\n");
+            let e = run(&src, "main").expect_err(path);
+            assert!(e.contains("値ではありません"), "{path}: {e}");
+        }
+    }
+
+    // ---- match ----
+
+    #[test]
+    fn matchは一致したarmの値を産む() {
+        let src = format!(
+            "{RANKS}fn label(r: Rank -> str) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Bronze: \"bronze\"\n\
+             \x20   Rank::Gold {{ \"gold\" }}\n\
+             \x20 }}\n\
+             }}\n\
+             fn main() {{\n label(Gold)\n}}\n"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Str(s)) if s == "gold"));
+    }
+
+    #[test]
+    fn matchは対象を一度だけ評価する() {
+        let src = format!(
+            "{RANKS}struct Counter {{ n: int }}\n\
+             fn next(c: Counter -> Rank) {{\n\
+             \x20 c.n = c.n + 1\n\
+             \x20 Gold\n\
+             }}\n\
+             fn main() {{\n\
+             \x20 let c = Counter {{ n = 0 }}\n\
+             \x20 let picked = match next(c) {{ Rank::Bronze: 0\nRank::Gold: 1 }}\n\
+             \x20 c.n * 10 + picked\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 11);
+    }
+
+    #[test]
+    fn 選ばれなかったarmは走らない() {
+        let src = format!(
+            "{RANKS}fn boom(-> int) {{ 1 / 0 }}\n\
+             fn main() {{\n match Bronze {{ Rank::Bronze: 7\nRank::Gold: boom() }}\n}}\n"
+        );
+        assert_eq!(int(&src), 7);
+    }
+
+    #[test]
+    fn armのreturnは関数を抜ける() {
+        let src = format!(
+            "{RANKS}fn pick(r: Rank -> int) {{\n\
+             \x20 match r {{ Rank::Bronze: return 1\nRank::Gold: return 2 }}\n\
+             \x20 999\n\
+             }}\n\
+             fn main() {{\n pick(Gold)\n}}\n"
+        );
+        assert_eq!(int(&src), 2);
+    }
+
+    /// 静的検査を通さず評価器を直接使う経路の防御。型検査を通れば起きない
+    #[test]
+    fn 対象がenumでないかarmが無ければ実行時エラー() {
+        let src = format!("{RANKS}fn main() {{\n match 1 {{ Rank::Gold: 1 }}\n}}\n");
+        let e = run(&src, "main").expect_err("enum ではない");
+        assert!(e.contains("`match` の対象は enum だけです"), "{e}");
+
+        let src = format!("{RANKS}fn main() {{\n match Bronze {{ Rank::Gold: 1 }}\n}}\n");
+        let e = run(&src, "main").expect_err("一致する arm が無い");
+        assert!(e.contains("一致する arm がありません"), "{e}");
     }
 
     #[test]

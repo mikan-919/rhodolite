@@ -298,6 +298,16 @@ fn scan(
         ExprKind::Return(None) => {}
         ExprKind::Assert(inner) => scan(inner, slots, provided, locals, out),
         ExprKind::Block(body) => scan_exprs(body, slots, provided, locals, out),
+
+        // どの arm も実行されうるので、全 arm の要求と呼び出し辺を合流する。
+        // arm は束縛を導入しないが、本体の `let` は他の arm へ漏らさない
+        ExprKind::Match { subject, arms } => {
+            scan(subject, slots, provided, locals, out);
+            for arm in arms {
+                let mut inner_locals = locals.clone();
+                scan(&arm.body, slots, provided, &mut inner_locals, out);
+            }
+        }
     }
 }
 
@@ -887,6 +897,68 @@ mod tests {
         assert_eq!(facts.calls.len(), 2);
         assert!(facts.calls[0].provided.is_empty());
         assert_eq!(facts.calls[1].provided.get("db"), Some(&SlotLevel::Value));
+    }
+
+    /// どの arm も実行されうるので、全 arm の直接使用と呼び出し辺が合流する。
+    /// 対象自身の使用も落とさない(design.md 決定4)
+    #[test]
+    fn 全てのarmの要求と呼び出し辺が合流する() {
+        let p = program(
+            "effect db: Database\n\
+             effect clock: Clock\n\
+             fn f(r: Rank) {\n\
+             \x20 match pick(r) {\n\
+             \x20   Rank::Bronze: clock.now()\n\
+             \x20   Rank::Gold {\n\
+             \x20     stamp(r)\n\
+             \x20   }\n\
+             \x20 }\n\
+             }\n\
+             fn pick(r: Rank) { db.find(r) }\n\
+             fn stamp(r: Rank) { 1 }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["clock"]));
+        assert_eq!(callees(&p, "f"), set(&["impl Clock::now", "pick", "stamp"]));
+
+        // 経路も既存の `if` と同じ形で伝わる
+        let reqs = &analyze(&p).reqs["f"];
+        assert_eq!(reqs["db"].path, vec!["pick".to_string()]);
+        assert!(reqs["clock"].path.is_empty());
+    }
+
+    #[test]
+    fn armの中の提供はその本体だけを覆う() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(r: Rank) {\n\
+             \x20 match r {\n\
+             \x20   Rank::Bronze {\n\
+             \x20     with db(pg) { db.save(u) }\n\
+             \x20   }\n\
+             \x20   Rank::Gold: db.find(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db"]));
+    }
+
+    /// arm は束縛を導入しないが、本体の `let` は隣の arm へ漏らさない。
+    /// 漏れるとスロットを隠してしまい、要求が消える
+    #[test]
+    fn armの束縛は隣のarmへ漏れない() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(r: Rank) {\n\
+             \x20 match r {\n\
+             \x20   Rank::Bronze {\n\
+             \x20     let db = 1\n\
+             \x20     db\n\
+             \x20   }\n\
+             \x20   Rank::Gold: db.find(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db"]));
     }
 
     // ---- 手順5 + 6 ----
