@@ -4,7 +4,7 @@
 // エラーが到達経路を持たないと直せない、という実例。
 
 trait Clock {
-    fn now(-> int)
+    fn now(self -> int)
 }
 
 effect clock: Clock

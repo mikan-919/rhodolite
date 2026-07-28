@@ -62,7 +62,7 @@ test が緑になる。
 ```
 $ cargo run examples/missing_handler.rd
 main: `clock` が提供されていません
-  clock が要る ← handle ← promote ← stamp
+  clock が要る ← stamp ← promote ← handle ← main
 ```
 
 ```

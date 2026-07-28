@@ -354,8 +354,9 @@ fn merge_facts(into: &mut BodyFacts, from: BodyFacts) {
 ///
 /// 経路は呼び出しの連なりで、**末尾が実際に使っている関数**。
 /// 空なら「この関数自身が使っている」。
-/// `{"clock": ["handle", "promote", "stamp"]}` は
-/// 「clock が要る ← handle ← promote ← stamp」と読む。
+/// `handle` が持つ `{"clock": ["promote", "stamp"]}` は
+/// 「clock が要る ← stamp ← promote ← handle」と表示される
+/// (`←` は「その要求元」なので、実際の使用者から呼び出し元へさかのぼる向き)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
     pub level: SlotLevel,
@@ -613,10 +614,13 @@ impl Analysis {
                         format!("{name}: `{slot}` が提供されていません\n")
                     }
                 };
+                // 使っている関数を `slot` の隣に置いて、呼び出し元へさかのぼる。
+                // 経路は entry から降る順に持っているので、逆に読んで entry で閉じる
                 line.push_str(&format!("  {slot} が要る"));
-                for step in &requirement.path {
+                for step in requirement.path.iter().rev() {
                     line.push_str(&format!(" ← {step}"));
                 }
+                line.push_str(&format!(" ← {name}"));
                 errors.push(line);
             }
         }
@@ -943,7 +947,7 @@ mod tests {
 
         assert_eq!(errors.len(), 1);
         assert!(
-            errors[0].contains("clock が要る ← promote ← stamp"),
+            errors[0].contains("clock が要る ← stamp ← promote ← main"),
             "{}",
             errors[0]
         );

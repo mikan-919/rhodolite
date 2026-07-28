@@ -835,6 +835,30 @@ fn optional_fieldの結果型は実行前の引数検査へ届く() {
     );
 }
 
+/// `examples/` は誰も走らせないと腐る(実際 `missing_handler.rd` は
+/// メソッド呼び出しの検査が入った時点で型検査に落ちていた)。
+#[test]
+fn 提供忘れの例は到達経路付きで失敗する() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rhodolite"))
+        .arg("examples/missing_handler.rd")
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+
+    assert!(!output.status.success(), "{text}");
+    // 使っている関数から呼び出し元へさかのぼる向き(README と同じ形)
+    assert!(
+        text.contains(
+            "missing_handler::clock が要る \
+             ← missing_handler::stamp \
+             ← missing_handler::promote \
+             ← missing_handler::handle \
+             ← missing_handler::main"
+        ),
+        "{text}"
+    );
+}
+
 #[test]
 fn 契約を満たさない提供は実行前に失敗する() {
     let contract = "trait Clock { fn now(self -> int) }\n\

@@ -47,7 +47,7 @@ v1 の到達目標は [examples/canonical.rd](./examples/canonical.rd)。
 
 1. **差し替え** — 本番実装と in-memory 実装を、呼ばれる側を変更せずに入れ替えられる
 2. **可視化** — 各関数が要求する trait を推論して表示できる
-3. **経路エラー** — 提供忘れを到達経路付きで報告できる(`Clock ← stamp ← promote ← main`)
+3. **経路エラー** — 提供忘れを到達経路付きで報告できる(`clock ← stamp ← promote ← main`)
 
 3つとも、呼び出しグラフを SCC 縮約して逆位相順に1パス舐める処理の副産物になる。
 
