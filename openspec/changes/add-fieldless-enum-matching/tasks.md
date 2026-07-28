@@ -17,6 +17,6 @@
 
 ## 4. Integration and documentation
 
-- [ ] 4.1 Add CLI integration programs covering a successful value-producing match and representative parse, subject-type, exhaustiveness, arm-type, and unsatisfied-ambient diagnostics.
-- [ ] 4.2 Update `docs/grammar.md`, `docs/overview.md`, and `README.md` to document qualified variants, value-producing exhaustive match, its deliberate fieldless boundary, and the resulting next roadmap gap.
-- [ ] 4.3 Run formatting, the complete Rust test suite, canonical and missing-handler examples, and strict OpenSpec validation; fix all regressions before marking the change complete.
+- [x] 4.1 Add CLI integration programs covering a successful value-producing match and representative parse, subject-type, exhaustiveness, arm-type, and unsatisfied-ambient diagnostics.
+- [x] 4.2 Update `docs/grammar.md`, `docs/overview.md`, and `README.md` to document qualified variants, value-producing exhaustive match, its deliberate fieldless boundary, and the resulting next roadmap gap.
+- [x] 4.3 Run formatting, the complete Rust test suite, canonical and missing-handler examples, and strict OpenSpec validation; fix all regressions before marking the change complete.

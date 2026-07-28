@@ -585,6 +585,127 @@ fn ローカル束縛はvariantを隠す() {
     assert!(text.contains("main -> 7"), "{text}");
 }
 
+// ---- 限定した variant と match (src/parse.rs, src/typecheck.rs, src/eval.rs) ----
+
+#[test]
+fn 限定したvariantのmatchはarmの値を産んで実行される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Grade, High}\n\
+         enum Rank { Bronze Gold }\n\
+         fn label(r: Rank -> str) {\n\
+         \x20 match r {\n\
+         \x20   Rank::Bronze: \"bronze\"\n\
+         \x20   Rank::Gold {\n\
+         \x20     \"gold\"\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         fn score(g: Grade -> int) {\n\
+         \x20 match g {\n\
+         \x20   Grade::Low: 1\n\
+         \x20   Grade::High: 2\n\
+         \x20 }\n\
+         }\n\
+         fn main(-> str) {\n\
+         \x20 assert score(High) == 2\n\
+         \x20 label(Rank::Gold)\n\
+         }\n",
+    );
+    project.write("dep.rd", "enum Grade { Low High }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> \"gold\""), "{text}");
+}
+
+#[test]
+fn 裸のarmパスは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn main(r: Rank -> int) { match r { Bronze: 1\nGold: 2 } }\n",
+        "`Enum::Variant`",
+    );
+}
+
+#[test]
+fn enumでない対象のmatchは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(n: int) { match n { Rank::Bronze: 1\nRank::Gold: 2 } }\n\
+         fn main() { 1 }\n",
+        "`match` の対象は非 optional な enum",
+    );
+}
+
+#[test]
+fn 網羅していないmatchは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank -> int) { match r { Rank::Gold: 2 } }\n\
+         fn main() { 1 }\n",
+        "`main::Rank` の variant `Bronze` を扱っていません",
+    );
+}
+
+#[test]
+fn 別のenumのarmは正準名で報告される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Low}\n\
+         enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank -> int) {\n\
+         \x20 match r {\n\
+         \x20   Rank::Bronze: 1\n\
+         \x20   Rank::Gold: 2\n\
+         \x20   dep::Grade::Low: 3\n\
+         \x20 }\n\
+         }\n\
+         fn main() { 1 }\n",
+    );
+    project.write("dep.rd", "enum Grade { Low High }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("arm `dep::Grade::Low` は `main::Rank` の variant ではありません"),
+        "{text}"
+    );
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 型の違うarmの値は実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank -> str) { match r { Rank::Bronze: \"b\"\nRank::Gold: 2 } }\n\
+         fn main() { 1 }\n",
+        "arm `main::Rank::Gold` の値は `str` ですが、`int` です",
+    );
+}
+
+/// arm の中の ambient 使用も、他の枝と同じく到達経路付きで届く
+#[test]
+fn armの中の提供忘れは到達経路付きで失敗する() {
+    実行前に失敗する(
+        "trait Clock { fn now(self -> int) }\n\
+         effect clock: Clock\n\
+         enum Rank { Bronze Gold }\n\
+         fn stamp(-> int) { clock.now() }\n\
+         fn main(r: Rank -> int) {\n\
+         \x20 match r {\n\
+         \x20   Rank::Bronze: 0\n\
+         \x20   Rank::Gold: stamp()\n\
+         \x20 }\n\
+         }\n",
+        "main::clock が要る ← main::stamp ← main::main",
+    );
+}
+
 // ---- enum 型の検査 (src/typecheck.rs) ----
 
 #[test]
