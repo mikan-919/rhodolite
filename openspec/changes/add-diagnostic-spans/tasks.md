@@ -1,13 +1,13 @@
 ## 1. Spans identify their source
 
-- [ ] 1.1 Add a source identifier to `lex::Span`, take it as a parameter of `lex::lex`, and stamp it on every token; keep a zero-id entry point so existing lexer and parser tests read unchanged.
-- [ ] 1.2 Retain each module's path and text during loading, assign distinct source identifiers, expose them from `LoadedProgram`, and test that spans from a merged multi-module program resolve to the file they were lexed from.
+- [x] 1.1 Add a source identifier to `lex::Span`, take it as a parameter of `lex::lex`, and stamp it on every token; keep a zero-id entry point so existing lexer and parser tests read unchanged.
+- [x] 1.2 Retain each module's path and text during loading, assign distinct source identifiers, expose them from `LoadedProgram`, and test that spans from a merged multi-module program resolve to the file they were lexed from.
 
 ## 2. Diagnostic value
 
-- [ ] 2.1 Introduce the diagnostic struct carrying message, optional span, optional label, optional help, and related diagnostics, with a constructor for the span-less case.
-- [ ] 2.2 Move lexer and parser errors onto it with the byte position they already know, replacing `ParseError`'s line-only rendering while keeping its message text.
-- [ ] 2.3 Move module-loading diagnostics onto it, spanning the `use` declaration for unresolvable modules and omitting the span for entry-path and read failures; cover both cases with tests.
+- [x] 2.1 Introduce the diagnostic struct carrying message, optional span, optional label, optional help, and related diagnostics, with a constructor for the span-less case.
+- [x] 2.2 Move lexer and parser errors onto it with the byte position they already know, replacing `ParseError`'s line-only rendering while keeping its message text.
+- [x] 2.3 Move module-loading diagnostics onto it, spanning the `use` declaration for unresolvable modules and omitting the span for entry-path and read failures; cover both cases with tests.
 
 ## 3. Rendering
 

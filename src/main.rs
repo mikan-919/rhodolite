@@ -1,6 +1,7 @@
 // 構文木のフィールドは次の段(要求推論)で読む。それまでは未使用になる。
 #[allow(dead_code)]
 mod ast;
+mod diag;
 mod eval;
 mod lex;
 mod module;

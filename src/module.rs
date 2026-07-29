@@ -4,6 +4,8 @@
 //! 書き換えてから、既存の要求推論と評価器へ渡す。
 
 use crate::ast::*;
+use crate::diag::Diag;
+use crate::lex::Span;
 use crate::{lex, parse};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -44,17 +46,26 @@ struct ParsedModule {
     items: Vec<Item>,
 }
 
+/// 読み込んだモジュール1つ分のソース。診断の描画まで本文を保つために持つ。
+/// `lex::SourceId` はこの表の添字。
+#[derive(Debug)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub text: String,
+}
+
 #[derive(Debug)]
 pub struct LoadedProgram {
     pub program: Program,
     pub entry: String,
+    pub sources: Vec<SourceFile>,
 }
 
-pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<String>> {
+pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<Diag>> {
     let Some(root) = entry_file.parent() else {
-        return Err(vec![
-            "エントリーファイルの親ディレクトリがありません".to_string(),
-        ]);
+        return Err(vec![Diag::msg(
+            "エントリーファイルの親ディレクトリがありません",
+        )]);
     };
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
@@ -62,203 +73,252 @@ pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<String>> {
         root
     };
     let Some(stem) = entry_file.file_stem().and_then(|s| s.to_str()) else {
-        return Err(vec![
-            "エントリーファイル名を UTF-8 として読めません".to_string(),
-        ]);
+        return Err(vec![Diag::msg(
+            "エントリーファイル名を UTF-8 として読めません",
+        )]);
     };
     if entry_file.extension().and_then(|s| s.to_str()) != Some("rd") {
-        return Err(vec![
-            "エントリーファイルは `.rd` でなければなりません".to_string(),
-        ]);
+        return Err(vec![Diag::msg(
+            "エントリーファイルは `.rd` でなければなりません",
+        )]);
     }
     if !valid_ident(stem) {
-        return Err(vec![format!(
+        return Err(vec![Diag::msg(format!(
             "モジュール名 `{stem}` は有効な識別子ではありません"
-        )]);
+        ))]);
     }
 
     let entry_path = ModulePath(vec![stem.to_string()]);
-    let mut modules = BTreeMap::new();
-    let mut directories = BTreeSet::new();
-    let mut diagnostics = Vec::new();
-    load_module(
+    let mut loader = Loader {
         root,
-        &mut modules,
-        &mut directories,
-        &mut diagnostics,
-        &entry_path,
-    );
-    if !diagnostics.is_empty() {
-        return Err(diagnostics);
+        modules: BTreeMap::new(),
+        directories: BTreeSet::new(),
+        diagnostics: Vec::new(),
+        sources: Vec::new(),
+    };
+    loader.load_module(&entry_path, None);
+    if !loader.diagnostics.is_empty() {
+        return Err(loader.diagnostics);
     }
-    resolve(modules, directories, &entry_path)
+    resolve(
+        loader.modules,
+        loader.directories,
+        loader.sources,
+        &entry_path,
+    )
 }
 
-fn load_module(
-    root: &Path,
-    modules: &mut BTreeMap<ModulePath, ParsedModule>,
-    directories: &mut BTreeSet<ModulePath>,
-    diagnostics: &mut Vec<String>,
-    path: &ModulePath,
-) {
-    if modules.contains_key(path) || directories.contains(path) {
-        return;
-    }
-    for part in &path.0 {
-        if !valid_ident(part) {
-            diagnostics.push(format!(
-                "モジュールパス `{path}` の `{part}` は有効な識別子ではありません"
-            ));
+/// 読み込み中の状態。再帰の引数を増やさずに、読んだソースと診断を溜める。
+struct Loader<'a> {
+    root: &'a Path,
+    modules: BTreeMap<ModulePath, ParsedModule>,
+    directories: BTreeSet<ModulePath>,
+    diagnostics: Vec<Diag>,
+    sources: Vec<SourceFile>,
+}
+
+impl Loader<'_> {
+    /// `origin` は、このモジュールの読み込みを要求した `use` 宣言の位置。
+    /// 見つからない・読めないといった診断はそこを指す。エントリーだけ `None`。
+    fn load_module(&mut self, path: &ModulePath, origin: Option<Span>) {
+        let root = self.root;
+        if self.modules.contains_key(path) || self.directories.contains(path) {
             return;
         }
-    }
+        for part in &path.0 {
+            if !valid_ident(part) {
+                self.diagnostics.push(Diag::from_span(
+                    origin,
+                    format!("モジュールパス `{path}` の `{part}` は有効な識別子ではありません"),
+                ));
+                return;
+            }
+        }
 
-    for length in 1..=path.0.len() {
-        let prefix = ModulePath(path.0[..length].to_vec());
-        let relative = prefix
+        for length in 1..=path.0.len() {
+            let prefix = ModulePath(path.0[..length].to_vec());
+            let relative = prefix
+                .0
+                .iter()
+                .fold(PathBuf::new(), |built, part| built.join(part));
+            let leaf = root.join(&relative).with_extension("rd");
+            let directory = root.join(&relative);
+            let has_leaf = leaf.is_file();
+            let has_directory = directory.is_dir();
+
+            if (has_leaf && !exact_spelling(&leaf))
+                || (has_directory && !exact_spelling(&directory))
+            {
+                self.diagnostics.push(Diag::from_span(
+                    origin,
+                    format!(
+                        "モジュール `{prefix}` のパスはファイルシステム上の綴りと完全一致しません"
+                    ),
+                ));
+                return;
+            }
+            if has_leaf && has_directory {
+                self.diagnostics.push(Diag::from_span(
+                    origin,
+                    format!(
+                        "モジュール `{prefix}` に `{}` と `{}` の両方があります",
+                        leaf.display(),
+                        directory.display()
+                    ),
+                ));
+                return;
+            }
+            if length < path.0.len() && has_leaf {
+                self.diagnostics.push(Diag::from_span(
+                    origin,
+                    format!("リーフモジュール `{prefix}` は子モジュールを持てません"),
+                ));
+                return;
+            }
+            if length < path.0.len() && !has_directory {
+                self.diagnostics.push(Diag::from_span(
+                    origin,
+                    format!("モジュール `{prefix}` が見つかりません"),
+                ));
+                return;
+            }
+        }
+
+        let relative = path
             .0
             .iter()
             .fold(PathBuf::new(), |built, part| built.join(part));
         let leaf = root.join(&relative).with_extension("rd");
-        let directory = root.join(&relative);
+        let directory = root.join(relative);
         let has_leaf = leaf.is_file();
         let has_directory = directory.is_dir();
-
-        if (has_leaf && !exact_spelling(&leaf)) || (has_directory && !exact_spelling(&directory)) {
-            diagnostics.push(format!(
-                "モジュール `{prefix}` のパスはファイルシステム上の綴りと完全一致しません"
+        if !has_leaf && !has_directory {
+            self.diagnostics.push(Diag::from_span(
+                origin,
+                format!("モジュール `{path}` が見つかりません"),
             ));
             return;
         }
-        if has_leaf && has_directory {
-            diagnostics.push(format!(
-                "モジュール `{prefix}` に `{}` と `{}` の両方があります",
-                leaf.display(),
-                directory.display()
-            ));
+        if has_directory {
+            self.directories.insert(path.clone());
             return;
         }
-        if length < path.0.len() && has_leaf {
-            diagnostics.push(format!(
-                "リーフモジュール `{prefix}` は子モジュールを持てません"
-            ));
-            return;
-        }
-        if length < path.0.len() && !has_directory {
-            diagnostics.push(format!("モジュール `{prefix}` が見つかりません"));
-            return;
-        }
-    }
 
-    let relative = path
-        .0
-        .iter()
-        .fold(PathBuf::new(), |built, part| built.join(part));
-    let leaf = root.join(&relative).with_extension("rd");
-    let directory = root.join(relative);
-    let has_leaf = leaf.is_file();
-    let has_directory = directory.is_dir();
-    if !has_leaf && !has_directory {
-        diagnostics.push(format!("モジュール `{path}` が見つかりません"));
-        return;
-    }
-    if has_directory {
-        directories.insert(path.clone());
-        return;
-    }
-
-    let source = match std::fs::read_to_string(&leaf) {
-        Ok(source) => source,
-        Err(error) => {
-            diagnostics.push(format!("{} を読めません: {error}", leaf.display()));
-            return;
-        }
-    };
-    let tokens = match lex::lex(&source) {
-        Ok(tokens) => lex::join(tokens),
-        Err(error) => {
-            diagnostics.push(format!("{}: 字句解析エラー: {error}", leaf.display()));
-            return;
-        }
-    };
-    let program = match parse::parse(&tokens) {
-        Ok(program) => program,
-        Err(error) => {
-            diagnostics.push(format!("{}: {error}", leaf.display()));
-            return;
-        }
-    };
-    let uses = program.uses.clone();
-    modules.insert(
-        path.clone(),
-        ParsedModule {
-            path: path.clone(),
-            uses: program.uses,
-            items: program.items,
-        },
-    );
-
-    // 先に現在のモジュールを登録するため、循環 use はここで自然に止まる。
-    for use_decl in uses {
-        let target = ModulePath::from_parts(&use_decl.path);
-        load_module(root, modules, directories, diagnostics, &target);
-        if use_decl.members.is_some() && directories.contains(&target) {
-            for member in use_decl.members.unwrap_or_default() {
-                let child = target.child(&member.name);
-                if module_exists(root, &child) {
-                    load_module(root, modules, directories, diagnostics, &child);
-                }
+        let text = match std::fs::read_to_string(&leaf) {
+            Ok(text) => text,
+            Err(error) => {
+                self.diagnostics.push(Diag::msg(format!(
+                    "{} を読めません: {error}",
+                    leaf.display()
+                )));
+                return;
             }
-        }
-    }
-
-    // ディレクトリモジュールは、修飾参照に現れた子だけを辿る。
-    // ディレクトリ全体を走査しないため、未参照ファイルは読まれない。
-    let Some(module) = modules.get(path) else {
-        return;
-    };
-    let references = module_references(&module.items);
-    let mut directory_imports = Vec::new();
-    for use_decl in &module.uses {
-        let target = ModulePath::from_parts(&use_decl.path);
-        if let Some(members) = &use_decl.members {
-            for member in members {
-                let child = target.child(&member.name);
-                if directories.contains(&child) {
-                    directory_imports.push((
-                        member.alias.clone().unwrap_or_else(|| member.name.clone()),
-                        child,
-                    ));
-                }
-            }
-        } else if directories.contains(&target) {
-            directory_imports.push((
-                use_decl
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| target.name().to_string()),
-                target,
-            ));
-        }
-    }
-
-    for reference in references {
-        let Some((_, mut current)) = directory_imports
-            .iter()
-            .find(|(alias, _)| reference.first() == Some(alias))
-            .cloned()
-        else {
-            continue;
         };
-        for part in reference.iter().skip(1) {
-            let child = current.child(part);
-            if !module_exists(root, &child) {
-                break;
+        // 診断の描画まで本文を保つ。span はこの添字で自分のファイルを引く
+        let id = self.sources.len() as lex::SourceId;
+        self.sources.push(SourceFile {
+            path: leaf.clone(),
+            text,
+        });
+        let source = &self.sources[id as usize].text;
+        let tokens = match lex::lex_source(source, id) {
+            Ok(tokens) => lex::join(tokens),
+            Err(error) => {
+                self.diagnostics.push(Diag {
+                    msg: format!("字句解析エラー: {error}"),
+                    ..error
+                });
+                return;
             }
-            load_module(root, modules, directories, diagnostics, &child);
-            current = child;
+        };
+        let program = match parse::parse(&tokens) {
+            Ok(program) => program,
+            Err(error) => {
+                self.diagnostics.push(error);
+                return;
+            }
+        };
+        let uses = program.uses.clone();
+        self.modules.insert(
+            path.clone(),
+            ParsedModule {
+                path: path.clone(),
+                uses: program.uses,
+                items: program.items,
+            },
+        );
+
+        // 先に現在のモジュールを登録するため、循環 use はここで自然に止まる。
+        for use_decl in uses {
+            let target = ModulePath::from_parts(&use_decl.path);
+            self.load_module(&target, Some(use_decl.span));
+            if use_decl.members.is_some() && self.directories.contains(&target) {
+                for member in use_decl.members.unwrap_or_default() {
+                    let child = target.child(&member.name);
+                    if module_exists(root, &child) {
+                        self.load_module(&child, Some(use_decl.span));
+                    }
+                }
+            }
+        }
+
+        // ディレクトリモジュールは、修飾参照に現れた子だけを辿る。
+        // ディレクトリ全体を走査しないため、未参照ファイルは読まれない。
+        let Some(module) = self.modules.get(path) else {
+            return;
+        };
+        let references = module_references(&module.items);
+        let mut directory_imports = Vec::new();
+        for use_decl in &module.uses {
+            let target = ModulePath::from_parts(&use_decl.path);
+            if let Some(members) = &use_decl.members {
+                for member in members {
+                    let child = target.child(&member.name);
+                    if self.directories.contains(&child) {
+                        directory_imports.push((
+                            member.alias.clone().unwrap_or_else(|| member.name.clone()),
+                            child,
+                            use_decl.span,
+                        ));
+                    }
+                }
+            } else if self.directories.contains(&target) {
+                directory_imports.push((
+                    use_decl
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| target.name().to_string()),
+                    target,
+                    use_decl.span,
+                ));
+            }
+        }
+
+        for reference in references {
+            let Some((_, mut current, origin)) = directory_imports
+                .iter()
+                .find(|(alias, _, _)| reference.first() == Some(alias))
+                .cloned()
+            else {
+                continue;
+            };
+            for part in reference.iter().skip(1) {
+                let child = current.child(part);
+                if !module_exists(root, &child) {
+                    break;
+                }
+                self.load_module(&child, Some(origin));
+                current = child;
+            }
         }
     }
+}
+
+/// 文言で整列して重複を畳む(span が入る前と同じ集合・同じ順序)。
+/// 同じ文言が両方出たときは、位置を持つ方を残す。
+fn sort_diagnostics(diagnostics: &mut Vec<Diag>) {
+    diagnostics.sort_by(|a, b| (&a.msg, a.span.is_none()).cmp(&(&b.msg, b.span.is_none())));
+    diagnostics.dedup_by(|a, b| a.msg == b.msg);
 }
 
 fn module_exists(root: &Path, path: &ModulePath) -> bool {
@@ -286,8 +346,9 @@ fn exact_spelling(path: &Path) -> bool {
 fn resolve(
     modules: BTreeMap<ModulePath, ParsedModule>,
     directories: BTreeSet<ModulePath>,
+    sources: Vec<SourceFile>,
     entry_path: &ModulePath,
-) -> Result<LoadedProgram, Vec<String>> {
+) -> Result<LoadedProgram, Vec<Diag>> {
     let mut diagnostics = Vec::new();
     let mut declarations: BTreeMap<ModulePath, BTreeMap<String, String>> = BTreeMap::new();
     for directory in directories {
@@ -303,8 +364,11 @@ fn resolve(
                 let mut seen = BTreeSet::new();
                 for variant in variants {
                     if !seen.insert(variant.as_str()) {
-                        diagnostics.push(format!(
-                            "enum `{name}`: variant `{variant}` が重複して宣言されています"
+                        diagnostics.push(Diag::at(
+                            item.span(),
+                            format!(
+                                "enum `{name}`: variant `{variant}` が重複して宣言されています"
+                            ),
                         ));
                     }
                 }
@@ -314,9 +378,12 @@ fn resolve(
                     .insert(name.to_string(), module.path.qualified(name))
                     .is_some()
                 {
-                    diagnostics.push(format!(
-                        "モジュール `{}` で名前 `{name}` が重複しています",
-                        module.path
+                    diagnostics.push(Diag::at(
+                        item.span(),
+                        format!(
+                            "モジュール `{}` で名前 `{name}` が重複しています",
+                            module.path
+                        ),
                     ));
                 }
             }
@@ -337,12 +404,17 @@ fn resolve(
                     let alias = member.alias.as_deref().unwrap_or(&member.name);
                     let child = target.child(&member.name);
                     if local.contains_key(alias) {
-                        diagnostics
-                            .push(format!("import名 `{alias}` がローカル宣言と衝突しています"));
+                        diagnostics.push(Diag::at(
+                            use_decl.span,
+                            format!("import名 `{alias}` がローカル宣言と衝突しています"),
+                        ));
                     } else if imported_declarations.contains_key(alias)
                         || imported_modules.contains_key(alias)
                     {
-                        diagnostics.push(format!("import名 `{alias}` が衝突しています"));
+                        diagnostics.push(Diag::at(
+                            use_decl.span,
+                            format!("import名 `{alias}` が衝突しています"),
+                        ));
                     } else if declarations.contains_key(&child) {
                         imported_modules.insert(alias.to_string(), child);
                     } else if let Some(name) = declarations
@@ -351,20 +423,29 @@ fn resolve(
                     {
                         imported_declarations.insert(alias.to_string(), name.clone());
                     } else {
-                        diagnostics.push(format!(
-                            "モジュール `{target}` にメンバー `{}` がありません",
-                            member.name
+                        diagnostics.push(Diag::at(
+                            use_decl.span,
+                            format!(
+                                "モジュール `{target}` にメンバー `{}` がありません",
+                                member.name
+                            ),
                         ));
                     }
                 }
             } else if declarations.contains_key(&target) {
                 let alias = use_decl.alias.as_deref().unwrap_or_else(|| target.name());
                 if local.contains_key(alias) {
-                    diagnostics.push(format!("import名 `{alias}` がローカル宣言と衝突しています"));
+                    diagnostics.push(Diag::at(
+                        use_decl.span,
+                        format!("import名 `{alias}` がローカル宣言と衝突しています"),
+                    ));
                 } else if imported_declarations.contains_key(alias)
                     || imported_modules.contains_key(alias)
                 {
-                    diagnostics.push(format!("import名 `{alias}` が衝突しています"));
+                    diagnostics.push(Diag::at(
+                        use_decl.span,
+                        format!("import名 `{alias}` が衝突しています"),
+                    ));
                 } else {
                     imported_modules.insert(alias.to_string(), target);
                 }
@@ -387,14 +468,17 @@ fn resolve(
                 && !imported_declarations.contains_key(first)
                 && !imported_modules.contains_key(first)
             {
-                diagnostics.push(format!("モジュール名 `{first}` は `use` されていません"));
+                // 型注釈の参照には span が無い。同じ文言を式側が span 付きで
+                // 出したときは、下の整列がそちらを残す
+                diagnostics.push(Diag::msg(format!(
+                    "モジュール名 `{first}` は `use` されていません"
+                )));
             }
         }
     }
 
     if !diagnostics.is_empty() {
-        diagnostics.sort();
-        diagnostics.dedup();
+        sort_diagnostics(&mut diagnostics);
         return Err(diagnostics);
     }
 
@@ -419,8 +503,7 @@ fn resolve(
         }
     }
 
-    diagnostics.sort();
-    diagnostics.dedup();
+    sort_diagnostics(&mut diagnostics);
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
@@ -431,6 +514,7 @@ fn resolve(
             items,
         },
         entry: entry_path.qualified("main"),
+        sources,
     })
 }
 
@@ -473,7 +557,7 @@ fn resolve_item(
     imported_declarations: &BTreeMap<String, String>,
     imported_modules: &BTreeMap<String, ModulePath>,
     declarations: &BTreeMap<ModulePath, BTreeMap<String, String>>,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<Diag>,
 ) {
     match item {
         Item::Trait { name, methods, .. } => {
@@ -663,7 +747,7 @@ fn resolve_exprs(
     imported_declarations: &BTreeMap<String, String>,
     imported_modules: &BTreeMap<String, ModulePath>,
     declarations: &BTreeMap<ModulePath, BTreeMap<String, String>>,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<Diag>,
 ) {
     for expr in body {
         resolve_expr(
@@ -686,7 +770,7 @@ fn resolve_expr(
     imported_declarations: &BTreeMap<String, String>,
     imported_modules: &BTreeMap<String, ModulePath>,
     declarations: &BTreeMap<ModulePath, BTreeMap<String, String>>,
-    diagnostics: &mut Vec<String>,
+    diagnostics: &mut Vec<Diag>,
 ) {
     match &mut expr.kind {
         ExprKind::Ident(name) if !locals.contains(name) => {
@@ -717,9 +801,9 @@ fn resolve_expr(
                 && !imported_declarations.contains_key(&original[0])
                 && !imported_modules.contains_key(&original[0])
             {
-                diagnostics.push(format!(
-                    "モジュール名 `{}` は `use` されていません",
-                    original[0]
+                diagnostics.push(Diag::at(
+                    expr.span,
+                    format!("モジュール名 `{}` は `use` されていません", original[0]),
                 ));
             }
             expr.kind = if resolved.len() == 1 {
@@ -1327,6 +1411,76 @@ mod tests {
             }
         }
         assert_eq!(checked, 2, "正典の `Rank` は variant を2つ持つ");
+    }
+
+    /// 一時ディレクトリに書いて `main.rd` を読み込み、後片付けまでやる。
+    fn load_files(files: &[(&str, &str)]) -> Result<LoadedProgram, Vec<Diag>> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "rhodolite-module-unit-{}-{number}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, source) in files {
+            std::fs::write(root.join(name), source).unwrap();
+        }
+        let loaded = load(&root.join("main.rd"));
+        std::fs::remove_dir_all(&root).unwrap();
+        loaded
+    }
+
+    /// 畳んだ後の span 単体から元のファイルへ戻れること(design.md 決定1・2)。
+    /// バイト範囲は他のファイルとぶつかるので、`src` が無いと引けない。
+    #[test]
+    fn 畳んだ後もspanは元のファイルへ解決する() {
+        let loaded = load_files(&[
+            ("main.rd", "use dep\nfn main() { dep::value() }\n"),
+            ("dep.rd", "fn value() { 1 }\n"),
+        ])
+        .expect("ロードできる");
+
+        let mut seen = BTreeMap::new();
+        for item in &loaded.program.items {
+            let span = item.span();
+            let source = &loaded.sources[span.src as usize];
+            let text = &source.text[span.start as usize..span.end as usize];
+            seen.insert(
+                source
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                text.to_string(),
+            );
+        }
+        assert_eq!(seen["main.rd"], "fn main() { dep::value() }");
+        assert_eq!(seen["dep.rd"], "fn value() { 1 }");
+    }
+
+    #[test]
+    fn 見つからないモジュールはuse宣言を指す() {
+        let source = "use missing\nfn main() { 1 }\n";
+        let diagnostics = load_files(&[("main.rd", source)]).expect_err("`missing` は見つからない");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.msg, "モジュール `missing` が見つかりません");
+        let span = diagnostic.span.expect("use 宣言を指す");
+        assert_eq!(
+            &source[span.start as usize..span.end as usize],
+            "use missing"
+        );
+    }
+
+    /// ソースへ届く前に失敗した読み込みは指すものが無い。
+    #[test]
+    fn エントリーが読めないときはspanを持たない() {
+        let diagnostics = load(Path::new("no-such-directory/main.rd")).expect_err("読めない");
+        assert!(
+            diagnostics.iter().all(|d| d.span.is_none()),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

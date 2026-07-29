@@ -8,8 +8,16 @@
 //! 構文木を知る必要がないため。パーサに混ぜると全産出に「ここで改行は許すか」が
 //! 滲み出すが、独立パスなら規則が `can_end_expr` / `can_start_expr` の2関数に閉じる。
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+use crate::diag::Diag;
+
+/// 読み込み済みソースの識別子。`module::LoadedProgram::sources` の添字。
+pub type SourceId = u32;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Span {
+    /// このバイト範囲がどのソースのものか。複数モジュールを1つの `Program` に
+    /// 畳んだ後でも、span 単体から元のファイルを引けるようにするために持つ
+    pub src: SourceId,
     pub start: u32,
     pub end: u32,
 }
@@ -83,8 +91,23 @@ pub struct Token {
     pub line: u32,
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+/// ソース識別子を持たない呼び出しの入口。識別子 0 を刻む。
+pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
+    lex_source(src, 0)
+}
+
+pub fn lex_source(src: &str, source: SourceId) -> Result<Vec<Token>, Diag> {
     let b = src.as_bytes();
+    let span = |start: usize, end: usize| Span {
+        src: source,
+        start: start as u32,
+        end: end as u32,
+    };
+    let tok = |t, start: usize, end: usize| Token {
+        tok: t,
+        span: span(start, end),
+        line: 1,
+    };
     let mut i = 0usize;
     let mut out: Vec<Token> = Vec::new();
 
@@ -127,9 +150,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             while i < b.len() && b[i].is_ascii_digit() {
                 i += 1;
             }
-            let n: i64 = src[start..i]
-                .parse()
-                .map_err(|_| format!("整数が大きすぎます: {}", &src[start..i]))?;
+            let n: i64 = src[start..i].parse().map_err(|_| {
+                Diag::at(
+                    span(start, i),
+                    format!("整数が大きすぎます: {}", &src[start..i]),
+                )
+            })?;
             out.push(tok(Tok::Int(n), start, i));
             continue;
         }
@@ -140,12 +166,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let text_start = i;
             while i < b.len() && b[i] != b'"' {
                 if b[i] == b'\n' {
-                    return Err("文字列が閉じられていません".to_string());
+                    return Err(Diag::at(span(start, i), "文字列が閉じられていません"));
                 }
                 i += 1;
             }
             if i >= b.len() {
-                return Err("文字列が閉じられていません".to_string());
+                return Err(Diag::at(span(start, i), "文字列が閉じられていません"));
             }
             let text = src[text_start..i].to_string();
             i += 1; // 閉じ引用符
@@ -190,7 +216,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             b'-' => Tok::Minus,
             b'*' => Tok::Star,
             b'/' => Tok::Slash,
-            _ => return Err(format!("読めない文字です: {:?}", c as char)),
+            _ => {
+                return Err(Diag::at(
+                    span(start, i + 1),
+                    format!("読めない文字です: {:?}", c as char),
+                ));
+            }
         };
         i += 1;
         out.push(tok(t, start, i));
@@ -213,17 +244,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     }
 
     Ok(out)
-}
-
-fn tok(t: Tok, start: usize, end: usize) -> Token {
-    Token {
-        tok: t,
-        span: Span {
-            start: start as u32,
-            end: end as u32,
-        },
-        line: 1,
-    }
 }
 
 fn keyword_or_ident(w: &str) -> Tok {

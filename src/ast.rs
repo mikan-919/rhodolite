@@ -73,6 +73,21 @@ pub enum Item {
     },
 }
 
+impl Item {
+    /// 宣言全体の範囲。宣言そのものを指す診断はここを使う。
+    pub fn span(&self) -> Span {
+        match self {
+            Item::Trait { span, .. }
+            | Item::Struct { span, .. }
+            | Item::Enum { span, .. }
+            | Item::Impl { span, .. }
+            | Item::Effect { span, .. }
+            | Item::Fn { span, .. }
+            | Item::Test { span, .. } => *span,
+        }
+    }
+}
+
 /// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある
 #[derive(Debug)]
 pub struct Sig {

@@ -8,21 +8,10 @@
 //! ブロック形はそのまま `{}`、一行形だけ `:` で本体を区切る。
 
 use crate::ast::*;
+use crate::diag::Diag;
 use crate::lex::{Span, Tok, Token};
 
-#[derive(Debug)]
-pub struct ParseError {
-    pub msg: String,
-    pub line: u32,
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}行目: {}", self.line, self.msg)
-    }
-}
-
-type PResult<T> = Result<T, ParseError>;
+type PResult<T> = Result<T, Diag>;
 
 pub fn parse(tokens: &[Token]) -> PResult<Program> {
     let mut p = Parser {
@@ -107,11 +96,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn err(&self, msg: &str) -> ParseError {
-        ParseError {
-            msg: msg.to_string(),
-            line: self.line(),
-        }
+    /// 現在のトークンを主 span に取る。読み進めた位置がそのまま原因の位置になる。
+    fn err(&self, msg: &str) -> Diag {
+        Diag::at(self.span(), msg)
     }
 
     fn skip_newlines(&mut self) {
@@ -123,6 +110,7 @@ impl<'a> Parser<'a> {
     fn to(&self, start: Span) -> Span {
         let end = self.toks[self.pos.saturating_sub(1)].span.end;
         Span {
+            src: start.src,
             start: start.start,
             end,
         }
