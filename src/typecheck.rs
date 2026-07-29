@@ -211,6 +211,12 @@ impl Out {
     fn push(&mut self, msg: String) {
         self.diagnostics.push(Diag::from_span(self.span, msg));
     }
+
+    /// 検査中の式より内側の部分式について報告するとき。引数や戻り値のように、
+    /// 責めるべき式が実引数として渡ってきている場合に使う。
+    fn push_at(&mut self, span: Span, msg: String) {
+        self.diagnostics.push(Diag::at(span, msg));
+    }
 }
 
 /// 診断を全件返す。空なら struct の形と分かる enum 型は正しい。
@@ -1112,10 +1118,13 @@ fn check_call(
         let Some(actual) = mismatch(arg, expected, decls, locals) else {
             continue;
         };
-        out.push(format!(
-            "{ctx}: `{name}` の第 {} 引数は `{expected}` ですが、`{actual}` を渡しています",
-            i + 1
-        ));
+        out.push_at(
+            arg.span,
+            format!(
+                "{ctx}: `{name}` の第 {} 引数は `{expected}` ですが、`{actual}` を渡しています",
+                i + 1
+            ),
+        );
     }
 }
 
@@ -1135,9 +1144,10 @@ fn check_return(
     let Some(actual) = mismatch(value, expected, decls, locals) else {
         return;
     };
-    out.push(format!(
-        "{ctx}: 戻り値は `{expected}` ですが、`{actual}` を返しています"
-    ));
+    out.push_at(
+        value.span,
+        format!("{ctx}: 戻り値は `{expected}` ですが、`{actual}` を返しています"),
+    );
 }
 
 /// 式の型が分かるならそれ。分からないなら `None`。
@@ -1238,9 +1248,10 @@ fn require(
     let Some(actual) = mismatch(e, expected, decls, locals) else {
         return;
     };
-    out.push(format!(
-        "{ctx}: {what}は `{expected}` ですが、`{actual}` です"
-    ));
+    out.push_at(
+        e.span,
+        format!("{ctx}: {what}は `{expected}` ですが、`{actual}` です"),
+    );
 }
 
 /// `T? ?? T` の被演算子を検査する。右辺の直接 `return` は値を産まずに
@@ -1427,9 +1438,12 @@ fn check_field_value(
     let Some(actual) = mismatch(value, declared, decls, locals) else {
         return;
     };
-    out.push(format!(
-        "{ctx}: `{type_name}` のフィールド `{field}` は `{declared}` ですが、`{actual}` を与えています"
-    ));
+    out.push_at(
+        value.span,
+        format!(
+            "{ctx}: `{type_name}` のフィールド `{field}` は `{declared}` ですが、`{actual}` を与えています"
+        ),
+    );
 }
 
 /// 裸の名前が値になれるのは、隠されていないフィールド0個の struct か
@@ -1529,6 +1543,63 @@ mod tests {
         let errors = errors(src);
         assert_eq!(errors.len(), 1, "{errors:?}");
         errors.into_iter().next().unwrap()
+    }
+
+    /// 診断が指す範囲をソースから切り出す。span が無ければ失敗させる。
+    fn spanned(src: &str, expected_msg_part: &str) -> String {
+        let diagnostics = diagnostics(src);
+        let found = diagnostics
+            .iter()
+            .find(|d| d.msg.contains(expected_msg_part))
+            .unwrap_or_else(|| panic!("`{expected_msg_part}` を含む診断がない: {diagnostics:?}"));
+        let span = found.span.expect("実行前の診断は位置を持つ");
+        src[span.start as usize..span.end as usize].to_string()
+    }
+
+    // ---- 診断の位置 ----
+
+    /// 4つの形(式・宣言・arm・match 式)それぞれで、指すものを固定する。
+    #[test]
+    fn 式の診断はその式を指す() {
+        assert_eq!(
+            spanned(
+                "struct Card { n: int }
+fn main() { Card { n = \"x\" } }
+",
+                "フィールド `n`"
+            ),
+            "\"x\""
+        );
+    }
+
+    #[test]
+    fn 宣言の診断はその宣言を指す() {
+        assert_eq!(
+            spanned(
+                "struct User { rank: Rank
+rank: Rank }
+",
+                "struct `User`"
+            ),
+            "struct User { rank: Rank\nrank: Rank }"
+        );
+    }
+
+    #[test]
+    fn armの診断はそのarmを指す() {
+        let src = "enum Rank { Bronze Gold }
+                   fn main(r: Rank) {
+                   \x20 match r {\n\x20   Rank::Bronze: 1\n\x20   Rank::Bronze: 2\n\x20 }\n                   }\n";
+        assert_eq!(spanned(src, "が重複しています"), "Rank::Bronze: 2");
+    }
+
+    #[test]
+    fn 欠落variantの診断はmatch式を指す() {
+        let src = "enum Rank { Bronze Gold }\n                   fn main(r: Rank) { match r { Rank::Bronze: 1 } }\n";
+        assert_eq!(
+            spanned(src, "を扱っていません"),
+            "match r { Rank::Bronze: 1 }"
+        );
     }
 
     // ---- 1. 宣言 ----

@@ -12,20 +12,20 @@
 ## 3. Rendering
 
 - [x] 3.1 Add the `miette` dependency and a CLI-side conversion that pairs a diagnostic with its module's source, rendering path, line, column, excerpt, and span extent, with related entries rendered against their own file.
-- [ ] 3.2 Keep span-less diagnostics, evaluation errors, the requirement listing, and the exit codes rendering as they do today, and pin this with CLI tests.
+- [x] 3.2 Keep span-less diagnostics, evaluation errors, the requirement listing, and the exit codes rendering as they do today, and pin this with CLI tests.
 
 ## 4. Checker diagnostics
 
 - [x] 4.1 Move every `typecheck` diagnostic onto the diagnostic value with the span of the expression or declaration it reports, leaving the message text unchanged.
 - [x] 4.2 Span the match exhaustiveness diagnostics at the offending arm, and the missing-variant diagnostic at the match expression.
 - [x] 4.3 Move the declaration and duplicate-slot diagnostics of `requirement` onto the diagnostic value with their declaration spans.
-- [ ] 4.4 Add checker tests asserting the reported span for a representative diagnostic of each shape: expression, declaration, arm, and match expression.
+- [x] 4.4 Add checker tests asserting the reported span for a representative diagnostic of each shape: expression, declaration, arm, and match expression.
 
 ## 5. Reachability path by position
 
 - [x] 5.1 Record the call span on requirement call sites and carry per-hop spans through requirement propagation, keeping the inferred-requirement listing byte-identical.
 - [x] 5.2 Report an unsatisfied requirement with its use site as the primary span, one related entry per hop, and the existing arrow-separated chain as the help note.
-- [ ] 5.3 Test a direct unsatisfied use, a transitive one, and a path whose hops are declared in different modules.
+- [x] 5.3 Test a direct unsatisfied use, a transitive one, and a path whose hops are declared in different modules.
 
 ## 6. Documentation
 

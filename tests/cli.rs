@@ -1009,3 +1009,98 @@ fn 型の違う再代入は実行前に失敗する() {
         "`n` への代入",
     );
 }
+
+// ---- 診断の描画 (src/render.rs) ----
+
+/// span を持つ診断は、ファイル・行・桁と原因行の抜粋を伴って出る。
+#[test]
+fn 位置を持つ診断はソース抜粋付きで出る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "struct Card { n: int }\nfn main() { Card { n = \"x\" } }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("main.rd:2:24"), "{text}");
+    assert!(text.contains("fn main() { Card { n = \"x\" } }"), "{text}");
+}
+
+/// ソースへ届く前に失った診断は、抜粋を持たない素のテキストのまま出る。
+#[test]
+fn 位置を持たない診断は抜粋なしで出る() {
+    let project = Project::new();
+    project.write("main.txt", "fn main() { 1 }\n");
+
+    let output = project.run("main.txt");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        text.trim(),
+        "エントリーファイルは `.rd` でなければなりません"
+    );
+}
+
+/// 実行時エラーは span を持たない。従来どおりの1行のまま。
+#[test]
+fn 実行時エラーは従来どおりの見た目で出る() {
+    let project = Project::new();
+    project.write("main.rd", "fn main(-> int) { 1 / 0 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("  main で失敗: "), "{text}");
+    assert!(!text.contains("╭─"), "{text}");
+}
+
+/// 推論された要求の一覧は診断ではない。span が入っても書式は変わらない。
+#[test]
+fn 推論された要求の一覧は従来どおり出る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Clock { fn now(self -> int) }\n\
+         effect clock: Clock\n\
+         struct SystemClock {}\n\
+         impl Clock for SystemClock { fn now(self -> int) { 7 } }\n\
+         fn main(-> int) { with clock(SystemClock {}) { clock.now() } }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("\n推論された要求:\n"), "{text}");
+    assert!(text.contains("  main::main / (要求なし)\n"), "{text}");
+}
+
+/// 到達経路がモジュールを跨いでも、各ホップは自分のファイルの上に描かれる。
+#[test]
+fn 到達経路のホップは宣言元のファイルで描かれる() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep\n\
+         trait Clock { fn now(self -> int) }\n\
+         effect clock: Clock\n\
+         fn main(-> int) { dep::relay() }\n",
+    );
+    project.write(
+        "dep.rd",
+        "use main\n\
+         fn relay(-> int) { main::clock.now() }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    // 使用地点は dep.rd、要求を運ぶ呼び出しは main.rd にある
+    assert!(text.contains("dep.rd:2:20"), "{text}");
+    assert!(text.contains("main.rd:4:19"), "{text}");
+    assert!(
+        text.contains("main::clock が要る ← dep::relay ← main::main"),
+        "{text}"
+    );
+}

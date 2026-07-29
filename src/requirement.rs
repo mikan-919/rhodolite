@@ -1099,6 +1099,40 @@ mod tests {
         );
     }
 
+    /// 診断が指す範囲をソースから切り出す。テストの `program` は識別子 0 の
+    /// 単一ソースなので、span はそのまま `src` の添字になる。
+    fn slice(src: &str, span: Span) -> &str {
+        &src[span.start as usize..span.end as usize]
+    }
+
+    #[test]
+    fn 手順6_直接の提供忘れは使用地点を指しホップを持たない() {
+        let src = "effect clock: Clock\nfn main() { clock.now() }\n";
+        let errors = analyze(&program(src)).unsatisfied();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(slice(src, errors[0].span.unwrap()), "clock.now");
+        assert!(errors[0].related.is_empty(), "{:?}", errors[0].related);
+        assert_eq!(errors[0].help.as_deref(), Some("clock が要る ← main"));
+    }
+
+    /// 経路の各ホップは、その要求を運ぶ**呼び出し**を指す。使用地点は
+    /// 一番下の関数の中にあり、ホップはそれを呼んだ側の位置になる。
+    #[test]
+    fn 手順6_経由した提供忘れはホップごとに呼び出しを指す() {
+        let src = "effect clock: Clock\n                   fn stamp() { clock.now() }\n                   fn promote() { stamp() }\n                   fn main() { promote() }\n";
+        let errors = analyze(&program(src)).unsatisfied();
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(slice(src, errors[0].span.unwrap()), "clock.now");
+        let hops: Vec<&str> = errors[0]
+            .related
+            .iter()
+            .map(|hop| slice(src, hop.span.unwrap()))
+            .collect();
+        assert_eq!(hops, vec!["stamp()", "promote()"]);
+    }
+
     #[test]
     fn 手順6_正典には提供忘れがない() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
