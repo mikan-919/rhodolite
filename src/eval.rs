@@ -10,7 +10,9 @@
 //! `Env` は `invoke` で作り直し、`Ambient` はそのまま渡す。
 //! **この差1行が言語の全部**(CONTEXT.md「ambient」)。
 
-use crate::ast::{BinOp, Expr, ExprKind, Head, Item, Program, Provision, Sig, UnOp};
+use crate::ast::{
+    BinOp, EnumVariant, Expr, ExprKind, Head, Item, PatternBinding, Program, Provision, Sig, UnOp,
+};
 use crate::module::short_name;
 use crate::requirement::{Slots, collect_slots};
 use std::cell::RefCell;
@@ -35,13 +37,15 @@ pub enum Value {
     /// `User?` の無い方
     Nil,
     Struct(Rc<RefCell<Obj>>),
-    /// `Gold`。所属 enum と variant の名前だけを持つ**不変**な値。
+    /// `Gold` / `Lookup.Found(user)`。所属 enum と variant の名前、宣言順の
+    /// payload を持つ**不変**な値。fieldless は payload が空。
     ///
     /// struct を流用しないのは、フィールドアクセス・メソッド解決・表示が
     /// enum と struct を取り違えない不変条件を作るため(design.md 決定3)
     Enum {
         enum_name: String,
         variant: String,
+        payload: Vec<Value>,
     },
     /// `[alice]`。struct と同じく**参照**。`let a = b` は別物にならない。
     /// 「複合値は参照」の規則1本で済ませるため(型によって代入の意味が変わらない)
@@ -85,17 +89,30 @@ impl Value {
             (Str(a), Str(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Unit, Unit) | (Nil, Nil) => true,
-            // 同じ enum の同じ variant だけが等しい
+            // 同じ enum の同じ variant で、payload が対応ごとに等しいときだけ
+            // 等しい(design.md 決定6)
             (
                 Enum {
                     enum_name: ea,
                     variant: va,
+                    payload: pa,
                 },
                 Enum {
                     enum_name: eb,
                     variant: vb,
+                    payload: pb,
                 },
-            ) => ea == eb && va == vb,
+            ) => {
+                if ea != eb || va != vb || pa.len() != pb.len() {
+                    return Ok(false);
+                }
+                for (x, y) in pa.iter().zip(pb.iter()) {
+                    if !x.eq_at(y, depth + 1)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
             (Struct(a), Struct(b)) => {
                 // 同じ実体なら中身を見ない。循環していても答えが出る
                 if Rc::ptr_eq(a, b) {
@@ -139,7 +156,19 @@ impl Value {
             Value::Unit => "unit".to_string(),
             Value::Nil => "nil".to_string(),
             Value::Struct(o) => o.borrow().type_name.clone(),
-            Value::Enum { enum_name, variant } => format!("{enum_name}.{variant}"),
+            Value::Enum {
+                enum_name,
+                variant,
+                payload,
+            } if payload.is_empty() => format!("{enum_name}.{variant}"),
+            Value::Enum {
+                enum_name,
+                variant,
+                payload,
+            } => {
+                let shown: Vec<String> = payload.iter().map(Value::show).collect();
+                format!("{enum_name}.{variant}({})", shown.join(", "))
+            }
             Value::Array(xs) => format!("[{} 要素]", xs.borrow().len()),
         }
     }
@@ -223,6 +252,16 @@ impl Env {
         Ok(())
     }
 
+    /// 局所束縛だけの1段。match arm の payload を本体の間だけ見せるのに使う
+    /// (ブロックはスコープを作らないので、ここが arm の唯一の境界)。
+    fn push_scope(&mut self, binds: impl Iterator<Item = (String, Value)>) {
+        self.scopes.push(
+            binds
+                .map(|(name, value)| (name, Binding::Local(value)))
+                .collect(),
+        );
+    }
+
     fn push_slots<'s>(&mut self, slots: impl Iterator<Item = &'s str>) {
         let mut scope = HashMap::new();
         for slot in slots {
@@ -283,9 +322,9 @@ pub struct Interp<'a> {
     structs: HashSet<&'a str>,
     /// variant の正準名 → 所属 enum の正準名。裸の `Gold` を値へ落とすのに使う
     variants: HashMap<&'a str, &'a str>,
-    /// enum の正準名 → その variant の正準名。限定した `Rank::Gold` と
-    /// match の arm はこちらから引く
-    enums: HashMap<&'a str, &'a [String]>,
+    /// enum の正準名 → その宣言 variant。限定した `Rank::Gold`、payload の
+    /// constructor、match の arm はこちらから引く
+    enums: HashMap<&'a str, &'a [EnumVariant]>,
     /// スロット名 → trait 名。requirement.rs のものを再利用する
     slots: Slots,
 }
@@ -309,7 +348,7 @@ impl<'a> Interp<'a> {
                     name, variants: vs, ..
                 } => {
                     for variant in vs {
-                        variants.insert(variant.as_str(), name.as_str());
+                        variants.insert(variant.name.as_str(), name.as_str());
                     }
                     enums.insert(name.as_str(), vs.as_slice());
                 }
@@ -341,16 +380,15 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// `Rank::Gold` が指す variant の正準名。宣言済み enum の variant のときだけ。
+    /// `Rank::Gold` が指す宣言。宣言済み enum の variant のときだけ。
     ///
     /// variant は所属 enum と同じモジュールで宣言されるので、enum の正準名と
     /// 短い variant 名の組で一意に決まる(module.rs `short_name`)。
-    fn variant_of(&self, enum_name: &str, variant: &str) -> Option<&'a str> {
+    fn variant_of(&self, enum_name: &str, variant: &str) -> Option<&'a EnumVariant> {
         self.enums
             .get(enum_name)?
             .iter()
-            .map(String::as_str)
-            .find(|declared| short_name(declared) == variant)
+            .find(|declared| short_name(&declared.name) == variant)
     }
 
     /// 型名とメソッド名から本体を引く。
@@ -551,11 +589,22 @@ impl<'a> Interp<'a> {
             ExprKind::Ident(name) => match env.binding(name) {
                 Some(Binding::Local(v)) => Ok(v.clone()),
                 Some(Binding::Slot) => fail(format!("スロット `{name}` は値として取り出せません")),
-                // `Gold` — 隠されていない variant は名前だけで値になる
-                None if self.variants.contains_key(name.as_str()) => Ok(Value::Enum {
-                    enum_name: self.variants[name.as_str()].to_string(),
-                    variant: name.clone(),
-                }),
+                // `Gold` — 隠されていない fieldless variant は名前だけで値になる。
+                // payload を持つ variant は限定 path の呼び出しでしか作れない
+                None if self.variants.contains_key(name.as_str()) => {
+                    let enum_name = self.variants[name.as_str()];
+                    match self.variant_of(enum_name, short_name(name)) {
+                        Some(declared) if declared.payload.is_empty() => Ok(Value::Enum {
+                            enum_name: enum_name.to_string(),
+                            variant: name.clone(),
+                            payload: Vec::new(),
+                        }),
+                        _ => fail(format!(
+                            "`{name}` は payload を取ります。`{enum_name}::{}(...)` で生成してください",
+                            short_name(name)
+                        )),
+                    }
+                }
                 // フィールド0個の struct も名前だけで値になる
                 None if self.structs.contains(name.as_str()) => Ok(new_obj(name, BTreeMap::new())),
                 None => fail(format!("`{name}` が束縛されていません")),
@@ -676,6 +725,29 @@ impl<'a> Interp<'a> {
                 match (&callee.kind, recv) {
                     (ExprKind::Ident(name), _) => self.call(name, vals, ambient),
                     (ExprKind::Path(parts), _) => match parts.as_slice() {
+                        // 宣言済み enum の variant なら constructor。引数は上で
+                        // 左から一度ずつ評価済み。関連関数より先に見る
+                        // (design.md 決定4)
+                        [enum_name, variant]
+                            if self.variant_of(enum_name, variant).is_some() =>
+                        {
+                            let declared = self
+                                .variant_of(enum_name, variant)
+                                .expect("直前のガードで宣言済みと分かっている");
+                            // 静的検査を通っていればここは起きない(design.md 決定2)
+                            if declared.payload.len() != vals.len() {
+                                return fail(format!(
+                                    "`{enum_name}::{variant}` は payload {} 個ですが {} 個渡されました",
+                                    declared.payload.len(),
+                                    vals.len()
+                                ));
+                            }
+                            Ok(Value::Enum {
+                                enum_name: enum_name.clone(),
+                                variant: declared.name.clone(),
+                                payload: vals,
+                            })
+                        }
                         [name, method] if self.name_is_slot(name, env) => {
                             let Some(binding) = ambient.get(name) else {
                                 return fail(format!(
@@ -726,35 +798,60 @@ impl<'a> Interp<'a> {
                 Ok(Value::Array(Rc::new(RefCell::new(xs))))
             }
 
-            // `Rank::Gold` — 限定した variant は裸の `Gold` と同じ enum 値。
-            // それ以外の path は関連関数や型射影なので値にならない
+            // `Rank::Gold` — 限定した fieldless variant は裸の `Gold` と同じ
+            // enum 値。payload を持つ variant とそれ以外の path は値にならない
             ExprKind::Path(parts) => match parts.as_slice() {
                 [enum_name, variant] => match self.variant_of(enum_name, variant) {
-                    Some(declared) => Ok(Value::Enum {
+                    Some(declared) if declared.payload.is_empty() => Ok(Value::Enum {
                         enum_name: enum_name.clone(),
-                        variant: declared.to_string(),
+                        variant: declared.name.clone(),
+                        payload: Vec::new(),
                     }),
+                    Some(declared) => fail(format!(
+                        "`{enum_name}::{variant}` は payload を {} 個取ります。`{enum_name}::{variant}(...)` で生成してください",
+                        declared.payload.len()
+                    )),
                     None => fail(format!("`{enum_name}::{variant}` は値ではありません")),
                 },
                 _ => fail(format!("`{}` は値ではありません", parts.join("::"))),
             },
 
-            // 対象は一度だけ評価し、一致した arm の本体だけを走らせる。
-            // 静的検査を通っていれば下の2つの失敗は起きない(design.md 決定4)
+            // 対象は一度だけ評価し、一致した arm の本体だけを走らせる。payload は
+            // その arm だけのスコープへ束縛し、`_` は捨てる(design.md 決定5)。
+            // 静的検査を通っていれば下の3つの失敗は起きない(design.md 決定4)
             ExprKind::Match { subject, arms } => {
                 let value = self.eval(subject, env, ambient)?;
-                let Value::Enum { enum_name, variant } = &value else {
+                let Value::Enum {
+                    enum_name,
+                    variant,
+                    payload,
+                } = &value
+                else {
                     return fail(format!("`match` の対象は enum だけです ({})", value.show()));
                 };
                 let arm = arms
                     .iter()
                     .find(|arm| arm.enum_name == *enum_name && arm.variant == short_name(variant));
-                match arm {
-                    Some(arm) => self.eval(&arm.body, env, ambient),
-                    None => fail(format!(
+                let Some(arm) = arm else {
+                    return fail(format!(
                         "`{enum_name}.{variant}` に一致する arm がありません"
-                    )),
+                    ));
+                };
+                if arm.bindings.len() != payload.len() {
+                    return fail(format!(
+                        "arm `{enum_name}::{}` は payload {} 個を束縛しますが、値の payload は {} 個です",
+                        arm.variant,
+                        arm.bindings.len(),
+                        payload.len()
+                    ));
                 }
+                env.push_scope(arm.bindings.iter().zip(payload).filter_map(|(b, v)| match b {
+                    PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
+                    PatternBinding::Discard => None,
+                }));
+                let result = self.eval(&arm.body, env, ambient);
+                env.pop_scope();
+                result
             }
         }
     }
@@ -1081,10 +1178,12 @@ mod tests {
         let same_in_a = Value::Enum {
             enum_name: "a::Rank".into(),
             variant: "a::Same".into(),
+            payload: Vec::new(),
         };
         let same_in_b = Value::Enum {
             enum_name: "b::Grade".into(),
             variant: "b::Same".into(),
+            payload: Vec::new(),
         };
         assert!(!same_in_a.eq(&same_in_b).unwrap());
         assert!(same_in_a.eq(&same_in_a.clone()).unwrap());

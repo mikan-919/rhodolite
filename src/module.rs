@@ -383,11 +383,12 @@ fn resolve(
             if let Item::Enum { name, variants, .. } = item {
                 let mut seen = BTreeSet::new();
                 for variant in variants {
-                    if !seen.insert(variant.as_str()) {
+                    if !seen.insert(variant.name.as_str()) {
                         diagnostics.push(Diag::at(
                             item.span(),
                             format!(
-                                "enum `{name}`: variant `{variant}` が重複して宣言されています"
+                                "enum `{name}`: variant `{}` が重複して宣言されています",
+                                variant.name
                             ),
                         ));
                     }
@@ -556,8 +557,8 @@ pub fn item_names(item: &Item) -> Vec<&str> {
             let mut names = vec![name.as_str()];
             let mut seen = BTreeSet::new();
             for variant in variants {
-                if seen.insert(variant.as_str()) {
-                    names.push(variant);
+                if seen.insert(variant.name.as_str()) {
+                    names.push(variant.name.as_str());
                 }
             }
             names
@@ -565,6 +566,16 @@ pub fn item_names(item: &Item) -> Vec<&str> {
         Item::Effect { slot, .. } => vec![slot],
         Item::Fn { sig, .. } => vec![&sig.name],
         Item::Impl { .. } | Item::Test { .. } => Vec::new(),
+    }
+}
+
+/// arm pattern が本体へ導入する名前。`_` は名前を作らないので何も足さない。
+/// 名前を locals へ入れることで、同名の宣言を隠す規則が既存の走査に乗る。
+fn bind_pattern(bindings: &[PatternBinding], locals: &mut BTreeSet<String>) {
+    for binding in bindings {
+        if let PatternBinding::Bind(name) = binding {
+            locals.insert(name.clone());
+        }
     }
 }
 
@@ -610,10 +621,21 @@ fn resolve_item(
                 );
             }
         }
+        // payload の型は struct フィールドや関数引数と同じ正準化を通す
+        // (design.md 決定4)
         Item::Enum { name, variants, .. } => {
             *name = local[name].clone();
             for variant in variants {
-                *variant = local[variant].clone();
+                variant.name = local[&variant.name].clone();
+                for ty in &mut variant.payload {
+                    resolve_type(
+                        ty,
+                        local,
+                        imported_declarations,
+                        imported_modules,
+                        declarations,
+                    );
+                }
             }
         }
         Item::Impl {
@@ -957,8 +979,8 @@ fn resolve_expr(
             declarations,
             diagnostics,
         ),
-        // arm は束縛を導入しないが、本体の `let` を他の arm や後続へ漏らさない
-        // ために、それぞれ外側 locals の複製で解決する(design.md 決定4)
+        // payload の束縛も本体の `let` も他の arm や後続へ漏らさないために、
+        // それぞれ外側 locals の複製で解決する(design.md 決定4・5)
         ExprKind::Match { subject, arms } => {
             resolve_expr(
                 subject,
@@ -984,9 +1006,11 @@ fn resolve_expr(
                         declarations,
                     );
                 }
+                let mut arm_locals = locals.clone();
+                bind_pattern(&arm.bindings, &mut arm_locals);
                 resolve_expr(
                     &mut arm.body,
-                    &mut locals.clone(),
+                    &mut arm_locals,
                     local,
                     imported_declarations,
                     imported_modules,
@@ -1260,8 +1284,15 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
             }
             Item::Effect { trait_name, .. } => collect_name_path(trait_name, &mut paths),
             Item::Fn { sig, .. } => collect_sig_paths(sig, &mut paths),
-            // enum は型も値も参照しない
-            Item::Enum { .. } | Item::Test { .. } => {}
+            // enum が参照するのは variant payload の型だけ
+            Item::Enum { variants, .. } => {
+                for variant in variants {
+                    for ty in &variant.payload {
+                        collect_type_paths(ty, &mut paths);
+                    }
+                }
+            }
+            Item::Test { .. } => {}
         }
     }
     paths
@@ -1349,7 +1380,9 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
                     {
                         collect_name_path(&arm.enum_name, paths);
                     }
-                    collect_expr_paths(std::slice::from_ref(&arm.body), &mut locals.clone(), paths);
+                    let mut arm_locals = locals.clone();
+                    bind_pattern(&arm.bindings, &mut arm_locals);
+                    collect_expr_paths(std::slice::from_ref(&arm.body), &mut arm_locals, paths);
                 }
             }
             ExprKind::Head { head, body, orelse } => {
@@ -1430,8 +1463,10 @@ mod tests {
             };
             let (_, enum_short) = name.rsplit_once("::").expect("enum は正準名を持つ");
             for variant in variants {
-                let (variant_module, _) =
-                    variant.rsplit_once("::").expect("variant は正準名を持つ");
+                let (variant_module, _) = variant
+                    .name
+                    .rsplit_once("::")
+                    .expect("variant は正準名を持つ");
                 assert_eq!(&format!("{variant_module}::{enum_short}"), name);
                 checked += 1;
             }

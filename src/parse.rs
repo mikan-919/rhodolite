@@ -246,7 +246,8 @@ impl<'a> Parser<'a> {
                 })
             }
 
-            // `enum Rank { Bronze Gold }`。`enum Never {}` のように variant 0個も書ける
+            // `enum Lookup { Found(User) Skipped }`。payload は関数引数と同じ
+            // positional な型の並び。`enum Never {}` のように variant 0個も書ける
             Tok::Enum => {
                 self.bump();
                 let name = self.expect_ident("enum 名")?;
@@ -257,7 +258,21 @@ impl<'a> Parser<'a> {
                     if self.eat(&Tok::RBrace) {
                         break;
                     }
-                    variants.push(self.expect_ident("variant 名")?);
+                    let vname = self.expect_ident("variant 名")?;
+                    let mut payload = Vec::new();
+                    if self.eat(&Tok::LParen) {
+                        while !self.at(&Tok::RParen) {
+                            payload.push(self.ty()?);
+                            if !self.eat(&Tok::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&Tok::RParen, "`)` または payload の型")?;
+                    }
+                    variants.push(EnumVariant {
+                        name: vname,
+                        payload,
+                    });
                     self.eat(&Tok::Comma);
                 }
                 Ok(Item::Enum {
@@ -628,10 +643,28 @@ impl<'a> Parser<'a> {
                     "arm には `Enum::Variant` の形が必要です (実際は `{path}`)"
                 )));
             };
+            // `Lookup::Found(user, _)` — 宣言 payload と同じ個数の平坦な要素。
+            // 個数と型の照合は宣言表を持つ型検査の側にある(design.md 決定3)
+            let mut bindings = Vec::new();
+            if self.eat(&Tok::LParen) {
+                while !self.at(&Tok::RParen) {
+                    let name = self.expect_ident("payload の束縛名または `_`")?;
+                    bindings.push(if name == "_" {
+                        PatternBinding::Discard
+                    } else {
+                        PatternBinding::Bind(name)
+                    });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RParen, "`)` または payload の束縛名")?;
+            }
             let body = self.head_body()?;
             arms.push(MatchArm {
                 enum_name: enum_name.to_string(),
                 variant: variant.to_string(),
+                bindings,
                 body,
                 span: self.to(start),
             });
@@ -1046,8 +1079,35 @@ mod tests {
         );
     }
 
+    /// 宣言 variant を (名前, payload 型の綴り) で取り出す
+    fn variants(src: &str) -> Vec<(String, Vec<String>)> {
+        let p = ok(src);
+        let Item::Enum { variants, .. } = &p.items[0] else {
+            panic!("enum ではない: {:?}", p.items[0])
+        };
+        variants
+            .iter()
+            .map(|v| {
+                let payload = v.payload.iter().map(show_type).collect();
+                (v.name.clone(), payload)
+            })
+            .collect()
+    }
+
+    fn show_type(ty: &Type) -> String {
+        let base = match &ty.kind {
+            TypeKind::Named(name) => name.clone(),
+            TypeKind::Array(element) => format!("[{}]", show_type(element)),
+        };
+        if ty.optional {
+            format!("{base}?")
+        } else {
+            base
+        }
+    }
+
     #[test]
-    fn enum宣言はデータを持たないvariantを並べる() {
+    fn enum宣言はpayloadを持たないvariantを並べる() {
         // 改行区切りでも1行でも同じ形に読める
         for src in [
             "enum Rank {\n  Bronze\n  Gold\n}\n",
@@ -1055,12 +1115,61 @@ mod tests {
             "enum Rank { Bronze, Gold }\n",
         ] {
             let p = ok(src);
-            let Item::Enum { name, variants, .. } = &p.items[0] else {
+            let Item::Enum { name, .. } = &p.items[0] else {
                 panic!("enum ではない: {:?}", p.items[0])
             };
             assert_eq!(name, "Rank");
-            assert_eq!(variants, &["Bronze", "Gold"]);
+            assert_eq!(
+                variants(src),
+                vec![
+                    ("Bronze".to_string(), Vec::<String>::new()),
+                    ("Gold".to_string(), Vec::new()),
+                ]
+            );
         }
+    }
+
+    #[test]
+    fn variantはpayload型を宣言順に並べる() {
+        assert_eq!(
+            variants("enum Lookup {\n  Found(User)\n  Missing(str, int)\n  Skipped\n}\n"),
+            vec![
+                ("Found".to_string(), vec!["User".to_string()]),
+                (
+                    "Missing".to_string(),
+                    vec!["str".to_string(), "int".to_string()]
+                ),
+                ("Skipped".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn payloadは型注釈の形をそのまま取る() {
+        assert_eq!(
+            variants("enum Box { One([User?]?) }\n"),
+            vec![("One".to_string(), vec!["[User?]?".to_string()])]
+        );
+    }
+
+    #[test]
+    fn 空のpayload括弧はfieldlessと同じ形になる() {
+        assert_eq!(
+            variants("enum Lookup { Skipped() }\n"),
+            vec![("Skipped".to_string(), Vec::<String>::new())]
+        );
+    }
+
+    #[test]
+    fn payloadの閉じ括弧が無いと落ちる() {
+        let e = parse_src("enum Lookup { Found(User }\n").unwrap_err();
+        assert!(e.msg.contains("`)`"), "{}", e.msg);
+    }
+
+    #[test]
+    fn payloadに型でないものは書けない() {
+        let e = parse_src("enum Lookup { Found(1) }\n").unwrap_err();
+        assert!(e.msg.contains("型名"), "{}", e.msg);
     }
 
     #[test]
@@ -1130,6 +1239,65 @@ mod tests {
     fn matchの対象の直後のbraceはarm列になる() {
         // `match c { }` の `{ }` を `c` の struct リテラルにはしない
         ok("fn f(r: Rank) {\n match r { Rank::Gold: 1 }\n}\n");
+    }
+
+    /// arm を (`Enum::Variant`, pattern 要素の綴り) で取り出す。`_` は `"_"`
+    fn arm_patterns(src: &str) -> Vec<(String, Vec<String>)> {
+        let p = ok(src);
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!()
+        };
+        let ExprKind::Let { value, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        let ExprKind::Match { arms, .. } = &value.kind else {
+            panic!("match ではない: {:?}", value.kind)
+        };
+        arms.iter()
+            .map(|a| {
+                let bindings = a
+                    .bindings
+                    .iter()
+                    .map(|b| match b {
+                        PatternBinding::Bind(name) => name.clone(),
+                        PatternBinding::Discard => "_".to_string(),
+                    })
+                    .collect();
+                (format!("{}::{}", a.enum_name, a.variant), bindings)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn armのpatternは識別子とアンダースコアを並べる() {
+        assert_eq!(
+            arm_patterns(
+                "fn f(l: Lookup) {\n\
+                  \x20 let x = match l {\n\
+                  \x20   Lookup::Found(user): 1\n\
+                  \x20   Lookup::Missing(reason, _): 2\n\
+                  \x20   Lookup::Skipped: 3\n\
+                  \x20 }\n\
+                  }\n"
+            ),
+            vec![
+                (
+                    "Lookup::Found".to_string(),
+                    vec!["user".to_string()]
+                ),
+                (
+                    "Lookup::Missing".to_string(),
+                    vec!["reason".to_string(), "_".to_string()]
+                ),
+                ("Lookup::Skipped".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn armのpatternの閉じ括弧が無いと落ちる() {
+        let e = parse_src("fn f(l: Lookup) {\n match l { Lookup::Found(user: 1 }\n}\n").unwrap_err();
+        assert!(e.msg.contains("`)`"), "{}", e.msg);
     }
 
     #[test]

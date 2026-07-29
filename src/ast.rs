@@ -40,11 +40,11 @@ pub enum Item {
         fields: Vec<(String, Type)>,
         span: Span,
     },
-    /// `enum Rank { Bronze Gold }` — データを持たない有限個の値。
-    /// variant は payload も明示値も持たない(design.md 決定1)
+    /// `enum Lookup { Found(User) Skipped }` — variant ごとに0個以上の
+    /// positional payload を持つ有限個の値。明示値は持たない(design.md 決定1)
     Enum {
         name: String,
-        variants: Vec<String>,
+        variants: Vec<EnumVariant>,
         span: Span,
     },
     /// `impl Database for Postgres { ... }` — ハンドラの正体。専用構文は持たない。
@@ -71,6 +71,17 @@ pub enum Item {
         body: Vec<Expr>,
         span: Span,
     },
+}
+
+/// `Found(User, str)` / `Skipped` — 宣言された variant。
+///
+/// payload 無しは長さ0の `payload` として同じ形に載せる。fieldless を別の変種に
+/// しないのは、どの層でも0要素と1要素以上を同じ走査で扱うため(design.md 決定2)
+#[derive(Debug)]
+pub struct EnumVariant {
+    pub name: String,
+    /// 宣言順の payload 型
+    pub payload: Vec<Type>,
 }
 
 impl Item {
@@ -200,16 +211,28 @@ pub enum ExprKind {
     },
 }
 
-/// `Rank::Gold: "gold"` / `Rank::Gold { ... }` — 限定 variant と、既存 Head と
-/// 同じ形の本体。限定を必須にすることで arm 単体から所属 enum が分かる。
+/// `Rank::Gold: "gold"` / `Lookup::Found(user) { ... }` — 限定 variant と、
+/// 既存 Head と同じ形の本体。限定を必須にすることで arm 単体から所属 enum が分かる。
 #[derive(Debug)]
 pub struct MatchArm {
     /// 書かれたままの enum パス。module loader が正準名へ書き換える
     pub enum_name: String,
     /// その enum に属する短い variant 名
     pub variant: String,
+    /// 宣言 payload と同じ個数の平坦な pattern 要素。fieldless なら空
+    /// (design.md 決定3)
+    pub bindings: Vec<PatternBinding>,
     pub body: Expr,
     pub span: Span,
+}
+
+/// arm pattern の1要素。入れ子も literal も無く、名前か `_` だけ。
+#[derive(Debug)]
+pub enum PatternBinding {
+    /// 識別子。対応する宣言 payload 型を持ち、その arm 本体だけで見える
+    Bind(String),
+    /// `_`。値を捨て、ローカル名を導入しない
+    Discard,
 }
 
 #[derive(Debug)]

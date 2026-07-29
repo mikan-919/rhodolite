@@ -20,7 +20,7 @@
 //! 「いま提供されているスロットの集合」を持ち回る必要が出た時点で、
 //! 同じ走査に畳んだ。`scan` の1回の再帰が2・3・4を兼ねている。
 
-use crate::ast::{Expr, ExprKind, Head, Item, Program, Provision};
+use crate::ast::{Expr, ExprKind, Head, Item, PatternBinding, Program, Provision};
 use crate::diag::Diag;
 use crate::lex::Span;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -315,11 +315,17 @@ fn scan(
         ExprKind::Block(body) => scan_exprs(body, slots, provided, locals, out),
 
         // どの arm も実行されうるので、全 arm の要求と呼び出し辺を合流する。
-        // arm は束縛を導入しないが、本体の `let` は他の arm へ漏らさない
+        // payload の束縛は同名スロットをその arm の間だけ隠し、本体の `let` と
+        // ともに他の arm へは漏らさない
         ExprKind::Match { subject, arms } => {
             scan(subject, slots, provided, locals, out);
             for arm in arms {
                 let mut inner_locals = locals.clone();
+                for binding in &arm.bindings {
+                    if let PatternBinding::Bind(name) = binding {
+                        inner_locals.insert(name.clone());
+                    }
+                }
                 scan(&arm.body, slots, provided, &mut inner_locals, out);
             }
         }

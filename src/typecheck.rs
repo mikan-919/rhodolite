@@ -43,7 +43,8 @@
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
 use crate::ast::{
-    BinOp, Expr, ExprKind, Head, Item, MatchArm, Program, Provision, Sig, Type, TypeKind, UnOp,
+    BinOp, Expr, ExprKind, Head, Item, MatchArm, PatternBinding, Program, Provision, Sig, Type,
+    TypeKind, UnOp,
 };
 use crate::diag::Diag;
 use crate::lex::Span;
@@ -60,6 +61,10 @@ struct Decls {
     /// enum の正準名 → 宣言順の variant の正準名。網羅性の検査と、限定参照
     /// `Rank::Gold` の所属の照合に使う
     enums: BTreeMap<String, Vec<String>>,
+    /// variant の正準名 → その variant を作る constructor の署名。payload 型を
+    /// そのまま引数、所属 enum を戻り値にしてあるので、個数・引数型・結果型の
+    /// 検査が既存の呼び出し1本に乗る(design.md 決定4)。fieldless は引数0個
+    ctors: BTreeMap<String, FnSig>,
     /// トップレベル関数の正準名 → 署名。本体を見る前に全部集めるので、
     /// 前方参照と再帰も引ける(design.md 決定2)
     fns: BTreeMap<String, FnSig>,
@@ -273,6 +278,7 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
     let mut structs = BTreeMap::new();
     let mut variants = BTreeMap::new();
     let mut enums = BTreeMap::new();
+    let mut ctors = BTreeMap::new();
     let mut fns = BTreeMap::new();
     let mut traits: BTreeMap<String, BTreeMap<String, FnSig>> = BTreeMap::new();
     let mut impls: BTreeMap<String, Vec<(String, FnSig)>> = BTreeMap::new();
@@ -312,10 +318,18 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
             } => {
                 others.insert(name.clone());
                 for variant in vs {
-                    variants.insert(variant.clone(), name.clone());
-                    others.insert(variant.clone());
+                    variants.insert(variant.name.clone(), name.clone());
+                    others.insert(variant.name.clone());
+                    ctors.insert(
+                        variant.name.clone(),
+                        FnSig {
+                            has_self: false,
+                            params: variant.payload.iter().map(known).collect(),
+                            ret: Some(plain(name)),
+                        },
+                    );
                 }
-                enums.insert(name.clone(), vs.clone());
+                enums.insert(name.clone(), vs.iter().map(|v| v.name.clone()).collect());
             }
             // trait のメンバー名の重複は宣言の誤りだが、契約としては一意に保つ。
             // 実装側の過不足は `check_impl` が契約と突き合わせて報告する
@@ -358,6 +372,7 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
         structs,
         variants,
         enums,
+        ctors,
         fns,
         traits,
         impls,
@@ -698,8 +713,8 @@ fn check_expr_kind(
 
         // 対象は既知の非 optional な enum で、arm はその全 variant を一度ずつ。
         // 結果型は期待型、無ければ最初に型の分かる arm を基準にする
-        // (design.md 決定3・5)。arm は束縛を導入しないが、本体の `let` を
-        // 他の arm や後続へ漏らさないよう `locals` を複製して入る
+        // (design.md 決定3・5)。payload の束縛も本体の `let` も他の arm や
+        // 後続へ漏らさないよう、arm ごとに `locals` を複製して入る
         ExprKind::Match { subject, arms } => {
             check_expr(subject, decls, locals, ctx, ret, out);
             let matched = matched_enum(subject, decls, locals, ctx, out);
@@ -707,21 +722,16 @@ fn check_expr_kind(
 
             let result = match expected {
                 Some(expected) => Some(expected.clone()),
-                None => arms.iter().find_map(|arm| infer(&arm.body, decls, locals)),
+                None => arms
+                    .iter()
+                    .find_map(|arm| infer(&arm.body, decls, &arm_locals(arm, decls, locals))),
             };
             for arm in arms {
-                check_expr_at(
-                    &arm.body,
-                    result.as_ref(),
-                    decls,
-                    &mut locals.clone(),
-                    ctx,
-                    ret,
-                    out,
-                );
+                let mut inner = arm_locals(arm, decls, locals);
+                check_expr_at(&arm.body, result.as_ref(), decls, &mut inner, ctx, ret, out);
                 if let Some(result) = &result {
                     let what = format!("arm `{}::{}` の値", arm.enum_name, arm.variant);
-                    require(&arm.body, result, &what, decls, locals, ctx, out);
+                    require(&arm.body, result, &what, decls, &inner, ctx, out);
                 }
             }
         }
@@ -787,16 +797,24 @@ fn check_expr_kind(
             );
         }
 
-        // 宣言済み enum を修飾した path は variant 値。それ以外の path は
+        // 宣言済み enum を修飾した path は fieldless variant の値。payload を持つ
+        // variant は限定 path の呼び出しでしか作れず、裸の path は値でも
+        // first-class constructor でもない(design.md 決定1)。それ以外の path は
         // 関連関数や ambient の型射影なので、従来どおり何も言わない
         ExprKind::Path(parts) => {
             if let [enum_name, variant] = parts.as_slice()
-                && let Some(declared) = decls.enums.get(enum_name)
-                && !declared.iter().any(|v| short_name(v) == variant)
+                && decls.enums.contains_key(enum_name)
             {
-                out.push(format!(
-                    "{ctx}: `{enum_name}::{variant}` は `{enum_name}` の variant ではありません"
-                ));
+                match payload_of(enum_name, variant, decls) {
+                    None => out.push(format!(
+                        "{ctx}: `{enum_name}::{variant}` は `{enum_name}` の variant ではありません"
+                    )),
+                    Some(payload) if !payload.is_empty() => out.push(format!(
+                        "{ctx}: `{enum_name}::{variant}` は payload を {} 個取ります。`{enum_name}::{variant}(...)` で生成してください",
+                        payload.len()
+                    )),
+                    Some(_) => {}
+                }
             }
         }
 
@@ -834,6 +852,21 @@ fn matched_enum(
     }
 }
 
+/// arm 本体から見えるローカル。pattern の名前は対応する宣言 payload 型を持ち、
+/// 同名の外側束縛をこの arm の間だけ隠す。`_` は名前を作らない
+/// (design.md 決定5)。
+fn arm_locals(arm: &MatchArm, decls: &Decls, locals: &Locals) -> Locals {
+    let mut inner = locals.clone();
+    let payload = payload_of(&arm.enum_name, &arm.variant, decls).unwrap_or(&[]);
+    for (n, binding) in arm.bindings.iter().enumerate() {
+        if let PatternBinding::Bind(name) = binding {
+            // 個数が合わないときは `check_arms` が診断済み。型は付けずに束縛だけ作る
+            inner.insert(name.clone(), Binding::Value(payload.get(n).cloned()));
+        }
+    }
+    inner
+}
+
 /// arm の集合が対象 enum の宣言 variant と完全に一致するか見る。
 /// 対象の enum が分からないときは、arm 自身の整合だけを見る。
 fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str, out: &mut Out) {
@@ -843,17 +876,18 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
     for arm in arms {
         out.span = Some(arm.span);
         let arm_name = format!("{}::{}", arm.enum_name, arm.variant);
-        let Some(declared) = decls.enums.get(&arm.enum_name) else {
+        if !decls.enums.contains_key(&arm.enum_name) {
             out.push(format!("{ctx}: `{}` は enum ではありません", arm.enum_name));
             continue;
-        };
-        if !declared.iter().any(|v| short_name(v) == arm.variant) {
+        }
+        let Some(payload) = payload_of(&arm.enum_name, &arm.variant, decls) else {
             out.push(format!(
                 "{ctx}: `{arm_name}` は `{}` の variant ではありません",
                 arm.enum_name
             ));
             continue;
-        }
+        };
+        check_pattern(&arm_name, payload, &arm.bindings, ctx, out);
         let Some(matched) = matched else { continue };
         if arm.enum_name != matched {
             out.push(format!(
@@ -880,6 +914,35 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
             "{ctx}: `{matched}` の variant {} を扱っていません",
             quoted(&missing)
         ));
+    }
+}
+
+/// pattern の要素が宣言 payload と1対1に並ぶか見る。同じ名前を二度束縛すると
+/// 先の payload が黙って消えるので、それも診断する(design.md 決定3)。
+fn check_pattern(
+    arm_name: &str,
+    payload: &[KnownType],
+    bindings: &[PatternBinding],
+    ctx: &str,
+    out: &mut Out,
+) {
+    if bindings.len() != payload.len() {
+        out.push(format!(
+            "{ctx}: arm `{arm_name}` は payload を {} 個束縛しますが、`{arm_name}` の payload は {} 個です",
+            bindings.len(),
+            payload.len()
+        ));
+        return;
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for binding in bindings {
+        if let PatternBinding::Bind(name) = binding
+            && !seen.insert(name)
+        {
+            out.push(format!(
+                "{ctx}: arm `{arm_name}` の pattern が `{name}` を二度束縛しています"
+            ));
+        }
     }
 }
 
@@ -972,6 +1035,11 @@ fn resolve_call<'d>(
             let [first, name] = parts.as_slice() else {
                 return Ok(None);
             };
+            // 宣言済み enum の variant なら constructor。関連関数や ambient の
+            // 型射影より先に見る(design.md 決定4)
+            if let Some(ctor) = variant_ctor(first, name, decls) {
+                return Ok(Some(ctor));
+            }
             match slot_trait(first, decls, locals) {
                 Some(trait_name) => from_trait(&trait_name, name, false, decls),
                 None => from_type(first, name, false, decls),
@@ -979,6 +1047,25 @@ fn resolve_call<'d>(
         }
         _ => Ok(None),
     }
+}
+
+/// `Enum::Variant` が指す宣言済み variant の正準名。
+fn declared_variant<'d>(enum_name: &str, variant: &str, decls: &'d Decls) -> Option<&'d String> {
+    decls
+        .enums
+        .get(enum_name)?
+        .iter()
+        .find(|declared| short_name(declared) == variant)
+}
+
+/// 限定 variant の constructor 署名。
+fn variant_ctor<'d>(enum_name: &str, variant: &str, decls: &'d Decls) -> Option<&'d FnSig> {
+    decls.ctors.get(declared_variant(enum_name, variant, decls)?)
+}
+
+/// 宣言された payload 型の並び。宣言に無い variant なら `None`。
+fn payload_of<'d>(enum_name: &str, variant: &str, decls: &'d Decls) -> Option<&'d [KnownType]> {
+    Some(variant_ctor(enum_name, variant, decls)?.params.as_slice())
 }
 
 /// 名前がこの位置で ambient スロットなら、その宣言 trait 名。最も内側の束縛が
@@ -1164,20 +1251,22 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             Some(Binding::Value(known)) => known.clone(),
             // スロットは値ではない。読みの診断は requirement / eval の側にある
             Some(Binding::Slot(_)) => None,
-            None => decls.variants.get(name).map(|e| plain(e)),
+            // payload を持つ variant は裸の名前では値にならない
+            None => decls
+                .variants
+                .get(name)
+                .filter(|_| decls.ctors[name].params.is_empty())
+                .map(|e| plain(e)),
         },
-        // `Rank::Gold` — 宣言済み enum の variant を限定した path は、裸の
-        // `Gold` と同じ enum 値。ローカルは限定参照を隠さない(design.md 決定2)
+        // `Rank::Gold` — 宣言済み enum の fieldless variant を限定した path は、
+        // 裸の `Gold` と同じ enum 値。ローカルは限定参照を隠さない(design.md 決定2)
         ExprKind::Path(parts) => {
             let [enum_name, variant] = parts.as_slice() else {
                 return None;
             };
-            decls
-                .enums
-                .get(enum_name)?
-                .iter()
-                .any(|v| short_name(v) == variant)
-                .then(|| plain(enum_name))
+            payload_of(enum_name, variant, decls)
+                .filter(|payload| payload.is_empty())
+                .map(|_| plain(enum_name))
         }
         ExprKind::StructLit { name, .. } => Some(plain(name)),
         // 素直な再帰なので `user.profile.name` の連鎖もそのまま辿れる。
@@ -1447,9 +1536,22 @@ fn check_field_value(
 }
 
 /// 裸の名前が値になれるのは、隠されていないフィールド0個の struct か
-/// enum variant のときだけ。
+/// payload 0個の enum variant のときだけ。
 fn check_bare(name: &str, decls: &Decls, locals: &Locals, ctx: &str, out: &mut Out) {
     if locals.contains_key(name) {
+        return;
+    }
+    // 裸の payload variant は構築にならない。限定 path の呼び出しを要求する
+    // (design.md 決定1)
+    if let Some(enum_name) = decls.variants.get(name)
+        && let payload = &decls.ctors[name].params
+        && !payload.is_empty()
+    {
+        out.push(format!(
+            "{ctx}: `{name}` は payload を {} 個取ります。`{enum_name}::{}(...)` で生成してください",
+            payload.len(),
+            short_name(name)
+        ));
         return;
     }
     let Some(declared) = decls.structs.get(name) else {
