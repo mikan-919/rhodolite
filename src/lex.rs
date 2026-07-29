@@ -91,7 +91,9 @@ pub struct Token {
     pub line: u32,
 }
 
-/// ソース識別子を持たない呼び出しの入口。識別子 0 を刻む。
+/// ソース識別子を持たない入口。識別子 0 を刻む。実際に読み込むのは
+/// `module` だけなので、これを使うのは字句解析器とパーサのテストに限る。
+#[cfg(test)]
 pub fn lex(src: &str) -> Result<Vec<Token>, Diag> {
     lex_source(src, 0)
 }

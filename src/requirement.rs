@@ -21,6 +21,8 @@
 //! 同じ走査に畳んだ。`scan` の1回の再帰が2・3・4を兼ねている。
 
 use crate::ast::{Expr, ExprKind, Head, Item, Program, Provision};
+use crate::diag::Diag;
+use crate::lex::Span;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,8 @@ pub struct CallSite {
     pub callee: String,
     pub provided: BTreeMap<String, SlotLevel>,
     pub kind: CallKind,
+    /// 呼び出しそのものの位置。提供忘れの到達経路は、このホップをここで指す
+    pub span: Span,
 }
 
 /// 名前解決で検査する必要があるのは、`stamp()` のような直接呼び出しだけ。
@@ -123,8 +127,16 @@ pub enum SlotLevel {
 #[derive(Debug, Default, Clone)]
 pub struct BodyFacts {
     /// 提供されないまま漏れた直接使用
-    pub escaping: BTreeMap<String, SlotLevel>,
+    pub escaping: BTreeMap<String, SlotUse>,
     pub calls: Vec<CallSite>,
+}
+
+/// 漏れたスロットの使用。`span` は最初に見つけた使用地点で、提供忘れの
+/// 診断はここを主 span に取る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotUse {
+    pub level: SlotLevel,
+    pub span: Span,
 }
 
 /// 本体を1回歩いて `BodyFacts` を作る。
@@ -213,7 +225,7 @@ fn scan(
 
         ExprKind::Field(recv, _) | ExprKind::OptionalField(recv, _) => {
             if let ExprKind::Ident(name) = &recv.kind {
-                record_access(name, SlotLevel::Value, slots, provided, locals, out);
+                record_access(name, SlotLevel::Value, e.span, slots, provided, locals, out);
             }
             scan(recv, slots, provided, locals, out);
         }
@@ -225,6 +237,7 @@ fn scan(
                         callee: name.clone(),
                         provided: provided.clone(),
                         kind: CallKind::Direct,
+                        span: e.span,
                     });
                 }
                 ExprKind::Field(recv, method) => {
@@ -236,6 +249,7 @@ fn scan(
                             callee: trait_method_key(trait_name, method),
                             provided: provided.clone(),
                             kind: CallKind::Method,
+                            span: e.span,
                         });
                     }
                 }
@@ -253,6 +267,7 @@ fn scan(
                             callee,
                             provided: provided.clone(),
                             kind: CallKind::Method,
+                            span: e.span,
                         });
                     }
                 }
@@ -268,7 +283,7 @@ fn scan(
         ExprKind::Ident(_) => {}
         ExprKind::Path(parts) => {
             if let Some(name) = parts.first() {
-                record_access(name, SlotLevel::Type, slots, provided, locals, out);
+                record_access(name, SlotLevel::Type, e.span, slots, provided, locals, out);
             }
         }
         ExprKind::Array(items) => {
@@ -311,9 +326,11 @@ fn scan(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_access(
     name: &str,
     level: SlotLevel,
+    span: Span,
     slots: &Slots,
     provided: &BTreeMap<String, SlotLevel>,
     locals: &BTreeSet<String>,
@@ -327,10 +344,11 @@ fn record_access(
     }
 
     match out.escaping.get_mut(name) {
-        Some(existing) if *existing < level => *existing = level,
+        Some(existing) if existing.level < level => *existing = SlotUse { level, span },
         Some(_) => {}
         None => {
-            out.escaping.insert(name.to_string(), level);
+            out.escaping
+                .insert(name.to_string(), SlotUse { level, span });
         }
     }
 }
@@ -344,12 +362,12 @@ fn type_method_key(type_name: &str, method: &str) -> String {
 }
 
 fn merge_facts(into: &mut BodyFacts, from: BodyFacts) {
-    for (slot, level) in from.escaping {
+    for (slot, used) in from.escaping {
         match into.escaping.get_mut(&slot) {
-            Some(existing) if *existing < level => *existing = level,
+            Some(existing) if existing.level < used.level => *existing = used,
             Some(_) => {}
             None => {
-                into.escaping.insert(slot, level);
+                into.escaping.insert(slot, used);
             }
         }
     }
@@ -370,7 +388,25 @@ fn merge_facts(into: &mut BodyFacts, from: BodyFacts) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requirement {
     pub level: SlotLevel,
-    pub path: Vec<String>,
+    /// スロットを実際に使っている地点。提供忘れの主 span
+    pub span: Span,
+    pub path: Vec<Hop>,
+}
+
+/// 到達経路の1ホップ。名前だけを読む用途(一覧・1行表現)は従来どおり、
+/// 位置を読む用途(診断の従属エントリ)はこの span を使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hop {
+    pub name: String,
+    /// 要求を運ぶ呼び出しそのものの位置。呼び出し**元**のファイルにある
+    pub span: Span,
+}
+
+impl Requirement {
+    /// 経路の関数名だけ。1行表現と既存の一覧はこれで足りる。
+    pub fn path_names(&self) -> Vec<&str> {
+        self.path.iter().map(|hop| hop.name.as_str()).collect()
+    }
 }
 
 pub type Reqs = BTreeMap<String, Requirement>;
@@ -382,7 +418,7 @@ pub struct Analysis {
     pub reqs: BTreeMap<String, Reqs>,
     /// 出力の並び順(宣言順)。BTreeMap の辞書順だと読みにくいため
     pub order: Vec<String>,
-    diagnostics: Vec<String>,
+    diagnostics: Vec<Diag>,
 }
 
 /// テストの本体も関数と同じ扱いにする。名前がぶつからないよう印を付ける。
@@ -451,9 +487,9 @@ pub fn analyze(program: &Program) -> Analysis {
     for (caller, body) in &facts {
         for site in &body.calls {
             if site.kind == CallKind::Direct && !facts.contains_key(&site.callee) {
-                diagnostics.push(format!(
-                    "{caller}: 関数 `{}` が定義されていません",
-                    site.callee
+                diagnostics.push(Diag::at(
+                    site.span,
+                    format!("{caller}: 関数 `{}` が定義されていません", site.callee),
                 ));
             }
         }
@@ -480,8 +516,8 @@ pub fn analyze(program: &Program) -> Analysis {
             let mut next = reqs[name].clone();
 
             // (1) この関数自身が使っていて、提供されていないもの。経路は空
-            for (slot, level) in &f.escaping {
-                changed |= merge_requirement(&mut next, slot, *level, Vec::new());
+            for (slot, used) in &f.escaping {
+                changed |= merge_requirement(&mut next, slot, used.level, used.span, Vec::new());
             }
 
             // (2) 呼び出し先から上がってくるもの
@@ -502,12 +538,20 @@ pub fn analyze(program: &Program) -> Analysis {
                         continue;
                     }
 
-                    let mut path = Vec::new();
-                    path.push(site.callee.clone());
-                    for step in &requirement.path {
-                        path.push(step.clone());
-                    }
-                    changed |= merge_requirement(&mut next, slot, requirement.level, path);
+                    // このホップは「呼び出し元のどの呼び出しが要求を運んだか」なので、
+                    // 名前は呼び先、位置は呼び出し地点になる
+                    let mut path = vec![Hop {
+                        name: site.callee.clone(),
+                        span: site.span,
+                    }];
+                    path.extend(requirement.path.iter().cloned());
+                    changed |= merge_requirement(
+                        &mut next,
+                        slot,
+                        requirement.level,
+                        requirement.span,
+                        path,
+                    );
                 }
             }
 
@@ -528,7 +572,7 @@ pub fn analyze(program: &Program) -> Analysis {
     }
 }
 
-fn duplicate_slot_diagnostics(program: &Program) -> Vec<String> {
+fn duplicate_slot_diagnostics(program: &Program) -> Vec<Diag> {
     let mut declared: HashMap<&str, &str> = HashMap::new();
     let mut diagnostics = Vec::new();
 
@@ -538,8 +582,9 @@ fn duplicate_slot_diagnostics(program: &Program) -> Vec<String> {
         } = item
             && let Some(previous_trait) = declared.insert(slot, trait_name)
         {
-            diagnostics.push(format!(
-                "effect `{slot}` が重複しています (`{previous_trait}` と `{trait_name}`)"
+            diagnostics.push(Diag::at(
+                item.span(),
+                format!("effect `{slot}` が重複しています (`{previous_trait}` と `{trait_name}`)"),
             ));
         }
     }
@@ -547,16 +592,23 @@ fn duplicate_slot_diagnostics(program: &Program) -> Vec<String> {
     diagnostics
 }
 
-fn merge_requirement(reqs: &mut Reqs, slot: &str, level: SlotLevel, path: Vec<String>) -> bool {
+fn merge_requirement(
+    reqs: &mut Reqs,
+    slot: &str,
+    level: SlotLevel,
+    span: Span,
+    path: Vec<Hop>,
+) -> bool {
     match reqs.get_mut(slot) {
         Some(existing) if existing.level < level => {
             existing.level = level;
+            existing.span = span;
             existing.path = path;
             true
         }
         Some(_) => false,
         None => {
-            reqs.insert(slot.to_string(), Requirement { level, path });
+            reqs.insert(slot.to_string(), Requirement { level, span, path });
             true
         }
     }
@@ -565,13 +617,13 @@ fn merge_requirement(reqs: &mut Reqs, slot: &str, level: SlotLevel, path: Vec<St
 impl Analysis {
     /// 要求解析より前に見つかる宣言・名前解決エラーと、提供忘れをまとめて返す。
     #[cfg(test)]
-    pub fn errors(&self) -> Vec<String> {
+    pub fn errors(&self) -> Vec<Diag> {
         let mut errors = self.diagnostics.clone();
         errors.extend(self.unsatisfied());
         errors
     }
 
-    pub fn errors_for(&self, entry: &str) -> Vec<String> {
+    pub fn errors_for(&self, entry: &str) -> Vec<Diag> {
         let mut errors = self.diagnostics.clone();
         errors.extend(self.unsatisfied_for(entry));
         errors
@@ -602,11 +654,11 @@ impl Analysis {
     ///
     /// 到達経路を添えて返す。原因は数階層下にあるので、経路がないと直せない。
     #[cfg(test)]
-    pub fn unsatisfied(&self) -> Vec<String> {
+    pub fn unsatisfied(&self) -> Vec<Diag> {
         self.unsatisfied_for("main")
     }
 
-    pub fn unsatisfied_for(&self, entry: &str) -> Vec<String> {
+    pub fn unsatisfied_for(&self, entry: &str) -> Vec<Diag> {
         let mut errors = Vec::new();
 
         for name in &self.order {
@@ -616,22 +668,39 @@ impl Analysis {
             }
 
             for (slot, requirement) in &self.reqs[name] {
-                let mut line = match requirement.level {
+                let msg = match requirement.level {
                     SlotLevel::Type => {
-                        format!("{name}: `{slot}` の実装型が提供されていません\n")
+                        format!("{name}: `{slot}` の実装型が提供されていません")
                     }
                     SlotLevel::Value => {
-                        format!("{name}: `{slot}` が提供されていません\n")
+                        format!("{name}: `{slot}` が提供されていません")
                     }
                 };
                 // 使っている関数を `slot` の隣に置いて、呼び出し元へさかのぼる。
-                // 経路は entry から降る順に持っているので、逆に読んで entry で閉じる
-                line.push_str(&format!("  {slot} が要る"));
-                for step in requirement.path.iter().rev() {
-                    line.push_str(&format!(" ← {step}"));
+                // 経路は entry から降る順に持っているので、逆に読んで entry で閉じる。
+                // 位置の要らない読み方(README・テストの部分一致)はこの1行で足りる
+                let mut chain = format!("{slot} が要る");
+                for name in requirement.path_names().iter().rev() {
+                    chain.push_str(&format!(" ← {name}"));
                 }
-                line.push_str(&format!(" ← {name}"));
-                errors.push(line);
+                chain.push_str(&format!(" ← {name}"));
+
+                // 経路はモジュールを跨ぐので、ホップごとに自分のファイルを持たせる
+                let hops = requirement
+                    .path
+                    .iter()
+                    .rev()
+                    .map(|hop| {
+                        Diag::at(hop.span, format!("`{}` を呼んでいます", hop.name))
+                            .label("ここが要求を運ぶ")
+                    })
+                    .collect();
+                errors.push(
+                    Diag::at(requirement.span, msg)
+                        .label(format!("`{slot}` がここで要る"))
+                        .help(chain)
+                        .related(hops),
+                );
             }
         }
         errors
@@ -650,6 +719,11 @@ mod tests {
 
     fn program(src: &str) -> Program {
         parse::parse(&join(lex(src).unwrap())).expect("パースできるはず")
+    }
+
+    /// 文言だけを見る検査のための取り出し。
+    fn messages(diagnostics: &[Diag]) -> Vec<String> {
+        diagnostics.iter().map(|d| d.msg.clone()).collect()
     }
 
     fn set(names: &[&str]) -> BTreeSet<String> {
@@ -707,10 +781,11 @@ mod tests {
         let errors = analyze(&p).errors();
 
         assert_eq!(errors.len(), 1);
-        assert!(
-            errors[0].contains("effect `service` が重複しています (`Clock` と `Database`)"),
-            "{errors:?}"
+        assert_eq!(
+            errors[0].msg,
+            "effect `service` が重複しています (`Clock` と `Database`)"
         );
+        assert!(errors[0].span.is_some(), "重複した effect 宣言を指す");
     }
 
     #[test]
@@ -719,7 +794,7 @@ mod tests {
         let errors = analyze(&p).errors();
 
         assert_eq!(
-            errors,
+            messages(&errors),
             vec!["main: 関数 `stanp` が定義されていません".to_string()]
         );
     }
@@ -922,7 +997,7 @@ mod tests {
 
         // 経路も既存の `if` と同じ形で伝わる
         let reqs = &analyze(&p).reqs["f"];
-        assert_eq!(reqs["db"].path, vec!["pick".to_string()]);
+        assert_eq!(reqs["db"].path_names(), vec!["pick"]);
         assert!(reqs["clock"].path.is_empty());
     }
 
@@ -993,11 +1068,11 @@ mod tests {
         );
         let a = analyze(&p);
 
-        assert_eq!(a.reqs["stamp"]["clock"].path, Vec::<String>::new());
-        assert_eq!(a.reqs["promote"]["clock"].path, vec!["stamp".to_string()]);
+        assert!(a.reqs["stamp"]["clock"].path_names().is_empty());
+        assert_eq!(a.reqs["promote"]["clock"].path_names(), vec!["stamp"]);
         assert_eq!(
-            a.reqs["handle"]["clock"].path,
-            vec!["promote".to_string(), "stamp".to_string()]
+            a.reqs["handle"]["clock"].path_names(),
+            vec!["promote", "stamp"]
         );
     }
 
@@ -1018,10 +1093,9 @@ mod tests {
         let errors = analyze(&p).unsatisfied();
 
         assert_eq!(errors.len(), 1);
-        assert!(
-            errors[0].contains("clock が要る ← stamp ← promote ← main"),
-            "{}",
-            errors[0]
+        assert_eq!(
+            errors[0].help.as_deref(),
+            Some("clock が要る ← stamp ← promote ← main")
         );
     }
 

@@ -45,6 +45,8 @@
 use crate::ast::{
     BinOp, Expr, ExprKind, Head, Item, MatchArm, Program, Provision, Sig, Type, TypeKind, UnOp,
 };
+use crate::diag::Diag;
+use crate::lex::Span;
 use crate::module::short_name;
 use crate::requirement::{Slots, collect_slots};
 use std::collections::{BTreeMap, BTreeSet};
@@ -196,12 +198,32 @@ fn reserved(name: &str) -> Option<&str> {
     BUILTINS.contains(&short).then_some(short)
 }
 
+/// 診断の受け皿。「いま検査している式か宣言」の span を持ち、押し込まれた文言に
+/// それを刻む。42 箇所の `push` は文言だけを渡すままでよく、位置の管理は
+/// 走査側の1本(`check_expr_at` が式ごとに差し替える)に閉じる。
+struct Out {
+    diagnostics: Vec<Diag>,
+    /// 走査に入る前だけ `None`。以降は必ず何かを指している
+    span: Option<Span>,
+}
+
+impl Out {
+    fn push(&mut self, msg: String) {
+        self.diagnostics.push(Diag::from_span(self.span, msg));
+    }
+}
+
 /// 診断を全件返す。空なら struct の形と分かる enum 型は正しい。
-pub fn check(program: &Program) -> Vec<String> {
-    let mut out = Vec::new();
+pub fn check(program: &Program) -> Vec<Diag> {
+    let mut out = Out {
+        diagnostics: Vec::new(),
+        span: None,
+    };
     let decls = collect(program, &mut out);
+    let out = &mut out;
 
     for item in &program.items {
+        out.span = Some(item.span());
         match item {
             Item::Fn { sig, body, .. } => {
                 let locals = sig
@@ -210,11 +232,11 @@ pub fn check(program: &Program) -> Vec<String> {
                     .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
                     .collect();
                 let ret = sig.ret.as_ref().map(known);
-                check_body(body, &decls, locals, &sig.name, ret.as_ref(), &mut out);
+                check_body(body, &decls, locals, &sig.name, ret.as_ref(), out);
             }
             Item::Test { name, body, .. } => {
                 let ctx = format!("test \"{name}\"");
-                check_body(body, &decls, Locals::new(), &ctx, None, &mut out);
+                check_body(body, &decls, Locals::new(), &ctx, None, out);
             }
             Item::Impl {
                 type_name, methods, ..
@@ -230,17 +252,18 @@ pub fn check(program: &Program) -> Vec<String> {
                     }
                     let ctx = format!("impl {type_name}::{}", sig.name);
                     let ret = sig.ret.as_ref().map(known);
-                    check_body(body, &decls, locals, &ctx, ret.as_ref(), &mut out);
+                    out.span = Some(sig.span);
+                    check_body(body, &decls, locals, &ctx, ret.as_ref(), out);
                 }
             }
             _ => {}
         }
     }
 
-    out
+    std::mem::take(&mut out.diagnostics)
 }
 
-fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
+fn collect(program: &Program, out: &mut Out) -> Decls {
     let mut structs = BTreeMap::new();
     let mut variants = BTreeMap::new();
     let mut enums = BTreeMap::new();
@@ -251,6 +274,7 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
     let mut others = BTreeSet::new();
 
     for item in &program.items {
+        out.span = Some(item.span());
         // 組み込み型はどの宣言種でも名乗れない。宣言名を出す口は module.rs の
         // 1本しかないので、そこを借りて全種を1箇所で見る
         for name in crate::module::item_names(item) {
@@ -345,6 +369,7 @@ fn collect(program: &Program, out: &mut Vec<String>) -> Decls {
             ..
         } = item
         {
+            out.span = Some(item.span());
             check_impl(trait_name, type_name, methods, &decls, out);
         }
     }
@@ -359,7 +384,7 @@ fn check_impl(
     type_name: &str,
     methods: &[(Sig, Vec<Expr>)],
     decls: &Decls,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let ctx = format!("impl {trait_name} for {type_name}");
     let Some(contract) = decls.traits.get(trait_name) else {
@@ -440,7 +465,7 @@ fn check_body(
     mut locals: Locals,
     ctx: &str,
     ret: Option<&KnownType>,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     // ブロックは値ベースなので最後の式も戻り値。明示 `return` は走査側が見る。
     // 最後の式を見る場所をここ一箇所にして、入れ子で二重に出るのを防ぐ
@@ -458,7 +483,7 @@ fn check_exprs(
     locals: &mut Locals,
     ctx: &str,
     ret: Option<&KnownType>,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     for e in body {
         check_expr(e, decls, locals, ctx, ret, out);
@@ -472,7 +497,7 @@ fn check_expr(
     locals: &mut Locals,
     ctx: &str,
     ret: Option<&KnownType>,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     check_expr_at(e, None, decls, locals, ctx, ret, out);
 }
@@ -482,6 +507,8 @@ fn check_expr(
 ///
 /// `expected` は宛先の宣言型。配列リテラルだけが要素へ配るために使い、
 /// それ以外の式は自分の型を推論するだけなので見ない。
+/// 検査中の式を診断の位置にする。部分木から戻ったら外側の式へ戻す
+/// (戻さないと、子を見た後の親の診断が子の位置を指してしまう)。
 #[allow(clippy::too_many_arguments)]
 fn check_expr_at(
     e: &Expr,
@@ -490,7 +517,22 @@ fn check_expr_at(
     locals: &mut Locals,
     ctx: &str,
     ret: Option<&KnownType>,
-    out: &mut Vec<String>,
+    out: &mut Out,
+) {
+    let outer = out.span.replace(e.span);
+    check_expr_kind(e, expected, decls, locals, ctx, ret, out);
+    out.span = outer;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_expr_kind(
+    e: &Expr,
+    expected: Option<&KnownType>,
+    decls: &Decls,
+    locals: &mut Locals,
+    ctx: &str,
+    ret: Option<&KnownType>,
+    out: &mut Out,
 ) {
     match &e.kind {
         ExprKind::Ident(name) => check_bare(name, decls, locals, ctx, out),
@@ -769,7 +811,7 @@ fn matched_enum(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) -> Option<String> {
     let Some(ty) = infer(subject, decls, locals) else {
         out.push(format!("{ctx}: `match` の対象の型が決まりません"));
@@ -788,15 +830,12 @@ fn matched_enum(
 
 /// arm の集合が対象 enum の宣言 variant と完全に一致するか見る。
 /// 対象の enum が分からないときは、arm 自身の整合だけを見る。
-fn check_arms(
-    arms: &[MatchArm],
-    matched: Option<&str>,
-    decls: &Decls,
-    ctx: &str,
-    out: &mut Vec<String>,
-) {
+fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str, out: &mut Out) {
     let mut covered: BTreeSet<&str> = BTreeSet::new();
+    // 呼び出し時点の span は `match` 式全体。arm を指す診断の間だけ差し替える
+    let whole = out.span;
     for arm in arms {
+        out.span = Some(arm.span);
         let arm_name = format!("{}::{}", arm.enum_name, arm.variant);
         let Some(declared) = decls.enums.get(&arm.enum_name) else {
             out.push(format!("{ctx}: `{}` は enum ではありません", arm.enum_name));
@@ -821,6 +860,9 @@ fn check_arms(
         }
     }
 
+    out.span = whole;
+
+    // 欠落は「無いもの」なので指すべき arm が無い。式全体が唯一正しい位置
     let Some(matched) = matched else { return };
     let missing: Vec<&str> = decls.enums[matched]
         .iter()
@@ -874,7 +916,7 @@ fn iterated(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) -> Option<KnownType> {
     let ty = infer(iter, decls, locals)?;
     let Some(element) = ty.element() else {
@@ -1021,13 +1063,7 @@ fn member(callee: &Expr) -> String {
 /// (design.md 決定3)。スロットでない名前は requirement / eval 側が報告する。
 ///
 /// eval.rs にも同じ判定がある。あちらは型の分からない提供を実行時に止める網。
-fn check_provision(
-    b: &Provision,
-    decls: &Decls,
-    locals: &Locals,
-    ctx: &str,
-    out: &mut Vec<String>,
-) {
+fn check_provision(b: &Provision, decls: &Decls, locals: &Locals, ctx: &str, out: &mut Out) {
     let Some(want) = decls.slots.trait_of(b.slot()) else {
         return;
     };
@@ -1062,7 +1098,7 @@ fn check_call(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     if args.len() != sig.params.len() {
         out.push(format!(
@@ -1091,7 +1127,7 @@ fn check_return(
     locals: &Locals,
     ctx: &str,
     ret: Option<&KnownType>,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let Some(expected) = ret else {
         return;
@@ -1197,7 +1233,7 @@ fn require(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let Some(actual) = mismatch(e, expected, decls, locals) else {
         return;
@@ -1215,7 +1251,7 @@ fn check_coalesce(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     if matches!(lhs.kind, ExprKind::Nil) {
         if let Some(actual) = infer(rhs, decls, locals)
@@ -1279,7 +1315,7 @@ fn check_equality(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let pair = match (&lhs.kind, &rhs.kind) {
         (ExprKind::Nil, ExprKind::Nil) => return,
@@ -1320,7 +1356,7 @@ fn check_field_read(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let Some(ty) = infer(recv, decls, locals) else {
         return;
@@ -1349,7 +1385,7 @@ fn check_optional_field_read(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let Some(ty) = infer(recv, decls, locals) else {
         return;
@@ -1383,7 +1419,7 @@ fn check_field_value(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    out: &mut Vec<String>,
+    out: &mut Out,
 ) {
     let Some(declared) = decls.structs.get(type_name).and_then(|f| f.get(field)) else {
         return;
@@ -1398,7 +1434,7 @@ fn check_field_value(
 
 /// 裸の名前が値になれるのは、隠されていないフィールド0個の struct か
 /// enum variant のときだけ。
-fn check_bare(name: &str, decls: &Decls, locals: &Locals, ctx: &str, out: &mut Vec<String>) {
+fn check_bare(name: &str, decls: &Decls, locals: &Locals, ctx: &str, out: &mut Out) {
     if locals.contains_key(name) {
         return;
     }
@@ -1414,13 +1450,7 @@ fn check_bare(name: &str, decls: &Decls, locals: &Locals, ctx: &str, out: &mut V
     ));
 }
 
-fn check_literal(
-    name: &str,
-    fields: &[(String, Expr)],
-    decls: &Decls,
-    ctx: &str,
-    out: &mut Vec<String>,
-) {
+fn check_literal(name: &str, fields: &[(String, Expr)], decls: &Decls, ctx: &str, out: &mut Out) {
     let Some(declared) = decls.structs.get(name) else {
         if decls.others.contains(name) {
             out.push(format!("{ctx}: `{name}` は struct ではありません"));
@@ -1487,6 +1517,10 @@ mod tests {
     use crate::parse;
 
     fn errors(src: &str) -> Vec<String> {
+        diagnostics(src).into_iter().map(|d| d.msg).collect()
+    }
+
+    fn diagnostics(src: &str) -> Vec<Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
         check(&program)
     }

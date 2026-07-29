@@ -6,6 +6,7 @@ mod eval;
 mod lex;
 mod module;
 mod parse;
+mod render;
 mod requirement;
 mod typecheck;
 
@@ -19,15 +20,14 @@ fn main() -> ExitCode {
 
     let loaded = match module::load(Path::new(&path)) {
         Ok(program) => program,
-        Err(errors) => {
-            for error in errors {
-                eprintln!("{error}");
-            }
+        Err(failure) => {
+            render::report(&failure.diagnostics, &failure.sources);
             return ExitCode::FAILURE;
         }
     };
     let program = loaded.program;
     let entry = loaded.entry;
+    let sources = loaded.sources;
 
     println!("{path}: {} 個の宣言", program.items.len());
     for item in &program.items {
@@ -39,9 +39,7 @@ fn main() -> ExitCode {
     let shape_errors = typecheck::check(&program);
     if !shape_errors.is_empty() {
         eprintln!();
-        for e in &shape_errors {
-            eprintln!("{e}");
-        }
+        render::report(&shape_errors, &sources);
         return ExitCode::FAILURE;
     }
 
@@ -60,9 +58,7 @@ fn main() -> ExitCode {
     let errors = analysis.errors_for(&entry);
     if !errors.is_empty() {
         eprintln!();
-        for e in &errors {
-            eprintln!("{e}");
-        }
+        render::report(&errors, &sources);
         return ExitCode::FAILURE;
     }
 

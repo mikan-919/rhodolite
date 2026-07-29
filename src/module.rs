@@ -54,6 +54,14 @@ pub struct SourceFile {
     pub text: String,
 }
 
+/// 読み込みが失敗したときの診断と、そこまでに読めたソース。
+/// span 付きの診断を描くには本文が要るので、失敗時も一緒に返す。
+#[derive(Debug)]
+pub struct LoadError {
+    pub diagnostics: Vec<Diag>,
+    pub sources: Vec<SourceFile>,
+}
+
 #[derive(Debug)]
 pub struct LoadedProgram {
     pub program: Program,
@@ -61,11 +69,11 @@ pub struct LoadedProgram {
     pub sources: Vec<SourceFile>,
 }
 
-pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<Diag>> {
+pub fn load(entry_file: &Path) -> Result<LoadedProgram, LoadError> {
     let Some(root) = entry_file.parent() else {
-        return Err(vec![Diag::msg(
+        return Err(LoadError::single(Diag::msg(
             "エントリーファイルの親ディレクトリがありません",
-        )]);
+        )));
     };
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
@@ -73,19 +81,19 @@ pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<Diag>> {
         root
     };
     let Some(stem) = entry_file.file_stem().and_then(|s| s.to_str()) else {
-        return Err(vec![Diag::msg(
+        return Err(LoadError::single(Diag::msg(
             "エントリーファイル名を UTF-8 として読めません",
-        )]);
+        )));
     };
     if entry_file.extension().and_then(|s| s.to_str()) != Some("rd") {
-        return Err(vec![Diag::msg(
+        return Err(LoadError::single(Diag::msg(
             "エントリーファイルは `.rd` でなければなりません",
-        )]);
+        )));
     }
     if !valid_ident(stem) {
-        return Err(vec![Diag::msg(format!(
+        return Err(LoadError::single(Diag::msg(format!(
             "モジュール名 `{stem}` は有効な識別子ではありません"
-        ))]);
+        ))));
     }
 
     let entry_path = ModulePath(vec![stem.to_string()]);
@@ -98,7 +106,10 @@ pub fn load(entry_file: &Path) -> Result<LoadedProgram, Vec<Diag>> {
     };
     loader.load_module(&entry_path, None);
     if !loader.diagnostics.is_empty() {
-        return Err(loader.diagnostics);
+        return Err(LoadError {
+            diagnostics: loader.diagnostics,
+            sources: loader.sources,
+        });
     }
     resolve(
         loader.modules,
@@ -314,6 +325,15 @@ impl Loader<'_> {
     }
 }
 
+impl LoadError {
+    fn single(diagnostic: Diag) -> Self {
+        Self {
+            diagnostics: vec![diagnostic],
+            sources: Vec::new(),
+        }
+    }
+}
+
 /// 文言で整列して重複を畳む(span が入る前と同じ集合・同じ順序)。
 /// 同じ文言が両方出たときは、位置を持つ方を残す。
 fn sort_diagnostics(diagnostics: &mut Vec<Diag>) {
@@ -348,7 +368,7 @@ fn resolve(
     directories: BTreeSet<ModulePath>,
     sources: Vec<SourceFile>,
     entry_path: &ModulePath,
-) -> Result<LoadedProgram, Vec<Diag>> {
+) -> Result<LoadedProgram, LoadError> {
     let mut diagnostics = Vec::new();
     let mut declarations: BTreeMap<ModulePath, BTreeMap<String, String>> = BTreeMap::new();
     for directory in directories {
@@ -479,7 +499,10 @@ fn resolve(
 
     if !diagnostics.is_empty() {
         sort_diagnostics(&mut diagnostics);
-        return Err(diagnostics);
+        return Err(LoadError {
+            diagnostics,
+            sources,
+        });
     }
 
     let mut items = Vec::new();
@@ -505,7 +528,10 @@ fn resolve(
 
     sort_diagnostics(&mut diagnostics);
     if !diagnostics.is_empty() {
-        return Err(diagnostics);
+        return Err(LoadError {
+            diagnostics,
+            sources,
+        });
     }
 
     Ok(LoadedProgram {
@@ -1414,7 +1440,7 @@ mod tests {
     }
 
     /// 一時ディレクトリに書いて `main.rd` を読み込み、後片付けまでやる。
-    fn load_files(files: &[(&str, &str)]) -> Result<LoadedProgram, Vec<Diag>> {
+    fn load_files(files: &[(&str, &str)]) -> Result<LoadedProgram, LoadError> {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -1463,8 +1489,8 @@ mod tests {
     #[test]
     fn 見つからないモジュールはuse宣言を指す() {
         let source = "use missing\nfn main() { 1 }\n";
-        let diagnostics = load_files(&[("main.rd", source)]).expect_err("`missing` は見つからない");
-        let diagnostic = &diagnostics[0];
+        let failure = load_files(&[("main.rd", source)]).expect_err("`missing` は見つからない");
+        let diagnostic = &failure.diagnostics[0];
         assert_eq!(diagnostic.msg, "モジュール `missing` が見つかりません");
         let span = diagnostic.span.expect("use 宣言を指す");
         assert_eq!(
@@ -1476,10 +1502,10 @@ mod tests {
     /// ソースへ届く前に失敗した読み込みは指すものが無い。
     #[test]
     fn エントリーが読めないときはspanを持たない() {
-        let diagnostics = load(Path::new("no-such-directory/main.rd")).expect_err("読めない");
+        let failure = load(Path::new("no-such-directory/main.rd")).expect_err("読めない");
         assert!(
-            diagnostics.iter().all(|d| d.span.is_none()),
-            "{diagnostics:?}"
+            failure.diagnostics.iter().all(|d| d.span.is_none()),
+            "{failure:?}"
         );
     }
 
