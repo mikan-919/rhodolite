@@ -13,6 +13,7 @@
 use crate::ast::{
     BinOp, EnumVariant, Expr, ExprKind, Head, Item, PatternBinding, Program, Provision, Sig, UnOp,
 };
+use crate::diag::Diag;
 use crate::module::short_name;
 use crate::requirement::{Slots, collect_slots};
 use std::cell::RefCell;
@@ -181,16 +182,17 @@ impl Value {
 /// 式の評価を途中で終わらせるもの。`Result` の `Err` 側に載せて `?` で運ぶ。
 #[derive(Debug)]
 pub enum Flow {
-    /// `return` — 関数の境界で受け止める
+    /// `return` — 関数の境界で受け止める。エラーではないので診断にしない
     Return(Value),
-    /// 実行時エラー。ponytail: 文字列。span を付けるのは miette を入れるときに
-    Error(String),
+    /// 実行時エラー。実行前の段と同じ `Diag` に載せる。span は式の境界
+    /// (`Interp::eval`) で内側から1回だけ埋まる
+    Error(Diag),
 }
 
 impl std::fmt::Display for Flow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Flow::Error(m) => write!(f, "{m}"),
+            Flow::Error(d) => write!(f, "{d}"),
             Flow::Return(_) => write!(f, "`return` が関数の外に出ました"),
         }
     }
@@ -198,8 +200,9 @@ impl std::fmt::Display for Flow {
 
 pub type Eval = Result<Value, Flow>;
 
+/// 位置なしで失敗する。span は評価中の式が `eval` の境界で付ける。
 fn fail<T>(msg: impl Into<String>) -> Result<T, Flow> {
-    Err(Flow::Error(msg.into()))
+    Err(Flow::Error(Diag::msg(msg)))
 }
 
 #[derive(Clone)]
@@ -579,7 +582,24 @@ impl<'a> Interp<'a> {
         Ok(last)
     }
 
+    /// 式の評価。**位置を持つのはここだけ。**
+    ///
+    /// 失敗がまだ位置を持っていなければ、いま評価している式の span を入れる。
+    /// 再帰も呼び出し先の本体もこの境界を通るので、最初に失敗を見た内側の式が
+    /// 埋め、外側(ブロック・呼び出し元・別モジュール)は上書きしない。
+    /// `fail(...)` の各所に span を配らずに済む(design.md 決定2)。
     fn eval(&self, e: &Expr, env: &mut Env, ambient: &Ambient) -> Eval {
+        self.eval_kind(e, env, ambient).map_err(|flow| match flow {
+            Flow::Error(mut d) if d.span.is_none() => {
+                d.span = Some(e.span);
+                d.label = Some("ここで失敗しました".to_string());
+                Flow::Error(d)
+            }
+            other => other,
+        })
+    }
+
+    fn eval_kind(&self, e: &Expr, env: &mut Env, ambient: &Ambient) -> Eval {
         match &e.kind {
             ExprKind::Int(n) => Ok(Value::Int(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
@@ -1013,13 +1033,20 @@ mod tests {
     use crate::lex::{join, lex};
     use crate::parse;
 
-    /// ソースを評価して、指定した関数を引数なしで呼ぶ
-    fn run(src: &str, entry: &str) -> Result<Value, String> {
+    /// ソースを評価して、指定した関数を引数なしで呼ぶ。
+    /// 失敗は診断のまま返すので、文言も span も見られる(`Display` は文言だけ)。
+    fn run(src: &str, entry: &str) -> Result<Value, Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
         Interp::new(&program).run(entry).map_err(|f| match f {
-            Flow::Error(m) => m,
+            Flow::Error(d) => d,
             Flow::Return(v) => panic!("return が関数境界を越えた: {}", v.show()),
         })
+    }
+
+    /// 失敗した式のソース上の位置。
+    fn failing_source(src: &str, entry: &str) -> String {
+        let span = run(src, entry).unwrap_err().span.expect("span を持つはず");
+        src[span.start as usize..span.end as usize].to_string()
     }
 
     fn int(src: &str) -> i64 {
@@ -1043,6 +1070,44 @@ mod tests {
     #[test]
     fn ゼロ除算はエラーになる() {
         assert!(run("fn main() {\n 1 / 0\n}\n", "main").is_err());
+    }
+
+    /// 直接失敗した式そのものを指す。
+    #[test]
+    fn 実行時エラーは失敗した式を指す() {
+        assert_eq!(
+            failing_source("fn main() {\n assert false\n}\n", "main"),
+            "assert false"
+        );
+    }
+
+    /// 内側が先に位置を埋めるので、囲む式(`+` や `if`)には上書きされない。
+    #[test]
+    fn 入れ子の失敗は外側ではなく内側の式を指す() {
+        assert_eq!(
+            failing_source("fn main() {\n 1 + (2 / 0)\n}\n", "main"),
+            "2 / 0"
+        );
+    }
+
+    /// 呼び出しは境界を越えても位置を保つ。指すのは呼び出し元ではなく callee の式。
+    #[test]
+    fn 呼び出し先の失敗は呼び出し元ではなくcalleeの式を指す() {
+        let src = "fn boom() {\n assert false\n}\n\
+                   fn main() {\n boom()\n}\n";
+        assert_eq!(failing_source(src, "main"), "assert false");
+    }
+
+    /// 式を1つも評価する前の失敗は位置を持てない。文言だけは残る。
+    #[test]
+    fn 式の前で失敗するエントリ名の診断は位置を持たない() {
+        let program =
+            parse::parse(&join(lex("fn main() { 1 }\n").unwrap())).expect("パースできるはず");
+        let Err(Flow::Error(diag)) = Interp::new(&program).run("nope") else {
+            panic!("未知のエントリは失敗するはず");
+        };
+        assert_eq!(diag.span, None);
+        assert!(diag.msg.contains("関数 `nope` がありません"), "{diag}");
     }
 
     #[test]
@@ -1222,7 +1287,7 @@ mod tests {
         for path in ["Rank::Silver", "Grade::Gold", "Missing::Gold"] {
             let src = format!("{RANKS}fn main() {{\n {path}\n}}\n");
             let e = run(&src, "main").expect_err(path);
-            assert!(e.contains("値ではありません"), "{path}: {e}");
+            assert!(e.msg.contains("値ではありません"), "{path}: {e}");
         }
     }
 
@@ -1285,11 +1350,11 @@ mod tests {
     fn 対象がenumでないかarmが無ければ実行時エラー() {
         let src = format!("{RANKS}fn main() {{\n match 1 {{ Rank::Gold: 1 }}\n}}\n");
         let e = run(&src, "main").expect_err("enum ではない");
-        assert!(e.contains("`match` の対象は enum だけです"), "{e}");
+        assert!(e.msg.contains("`match` の対象は enum だけです"), "{e}");
 
         let src = format!("{RANKS}fn main() {{\n match Bronze {{ Rank::Gold: 1 }}\n}}\n");
         let e = run(&src, "main").expect_err("一致する arm が無い");
-        assert!(e.contains("一致する arm がありません"), "{e}");
+        assert!(e.msg.contains("一致する arm がありません"), "{e}");
     }
 
     // ---- payload を持つ variant ----
@@ -1405,7 +1470,7 @@ mod tests {
              }}\n"
         );
         let e = run(&src, "main").expect_err("arm の外に `reason` は無い");
-        assert!(e.contains("`reason` が束縛されていません"), "{e}");
+        assert!(e.msg.contains("`reason` が束縛されていません"), "{e}");
     }
 
     #[test]
@@ -1431,7 +1496,7 @@ mod tests {
         let src =
             format!("{LOOKUP}fn main() {{\n let u = User {{ id = 1 }}\n Lookup::Found(u)\n}}\n");
         let e = run(&src, "main").expect_err("constructor の個数違い");
-        assert!(e.contains("payload 2 個ですが 1 個渡されました"), "{e}");
+        assert!(e.msg.contains("payload 2 個ですが 1 個渡されました"), "{e}");
 
         let src = format!(
             "{LOOKUP}fn main() {{\n\
@@ -1439,7 +1504,7 @@ mod tests {
              }}\n"
         );
         let e = run(&src, "main").expect_err("arm の個数違い");
-        assert!(e.contains("payload 2 個を束縛します"), "{e}");
+        assert!(e.msg.contains("payload 2 個を束縛します"), "{e}");
     }
 
     #[test]
@@ -1447,7 +1512,7 @@ mod tests {
         for expr in ["Lookup::Found", "Found"] {
             let src = format!("{LOOKUP}fn main() {{\n {expr}\n}}\n");
             let e = run(&src, "main").expect_err(expr);
-            assert!(e.contains("payload"), "{expr}: {e}");
+            assert!(e.msg.contains("payload"), "{expr}: {e}");
         }
     }
 
@@ -1455,7 +1520,7 @@ mod tests {
     fn enumはstructではないのでフィールドを読めない() {
         let src = format!("{RANKS}fn main() {{\n Gold.name\n}}\n");
         let e = run(&src, "main").expect_err("enum にフィールドは無い");
-        assert!(e.contains("struct ではありません"), "{e}");
+        assert!(e.msg.contains("struct ではありません"), "{e}");
     }
 
     #[test]
@@ -1564,7 +1629,7 @@ mod tests {
                    \x20 X::get()\n\
                    }\n";
         let e = run(src, "main").expect_err("曖昧なのでエラー");
-        assert!(e.contains("どの trait"), "{e}");
+        assert!(e.msg.contains("どの trait"), "{e}");
     }
 
     #[test]
@@ -1630,7 +1695,7 @@ mod tests {
                    \x20 s.go()\n\
                    }\n";
         let e = run(src, "main").expect_err("self が無いのでエラー");
-        assert!(e.contains("self を取りません"), "{e}");
+        assert!(e.msg.contains("self を取りません"), "{e}");
     }
 
     #[test]
@@ -1645,7 +1710,7 @@ mod tests {
                    \x20 S::get()\n\
                    }\n";
         let e = run(src, "main").expect_err("レシーバが無いのでエラー");
-        assert!(e.contains("レシーバ"), "{e}");
+        assert!(e.msg.contains("レシーバ"), "{e}");
     }
 
     /// `self` は ambient と違って普通の束縛。呼び出しで切れる
@@ -1802,7 +1867,7 @@ mod tests {
              }}\n"
         );
         let e = run(&src, "main").expect_err("外では提供されていない");
-        assert!(e.contains("提供されていません"), "{e}");
+        assert!(e.msg.contains("提供されていません"), "{e}");
     }
 
     #[test]
@@ -1830,7 +1895,7 @@ mod tests {
              }}\n"
         );
         let e = run(&src, "main").expect_err("clock はまだ立っていない");
-        assert!(e.contains("提供されていません"), "{e}");
+        assert!(e.msg.contains("提供されていません"), "{e}");
     }
 
     /// トレイトを実装していない値はスロットに入らない
@@ -1842,7 +1907,7 @@ mod tests {
                    \x20 with clock(Nope {}) { 1 }\n\
                    }\n";
         let e = run(src, "main").expect_err("Clock を実装していない");
-        assert!(e.contains("実装していない"), "{e}");
+        assert!(e.msg.contains("実装していない"), "{e}");
     }
 
     /// 同じ型が2つの trait に同名メソッドを持っていても、スロット経由なら決まる
@@ -1901,7 +1966,7 @@ mod tests {
                    \x20 with db<Postgres> { db.value() }\n\
                    }\n";
         let error = run(src, "main").unwrap_err();
-        assert!(error.contains("型だけ"), "{error}");
+        assert!(error.msg.contains("型だけ"), "{error}");
     }
 
     #[test]
@@ -1931,7 +1996,7 @@ mod tests {
                    fn main() { db = Store }\n";
         let error = run(src, "main").unwrap_err();
         assert!(
-            error.contains("スロット `db` には代入できません"),
+            error.msg.contains("スロット `db` には代入できません"),
             "{error}"
         );
     }

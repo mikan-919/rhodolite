@@ -63,11 +63,11 @@ fn main() -> ExitCode {
     }
 
     // 検査を通ったので走らせる
-    run(&program, &entry)
+    run(&program, &entry, &sources)
 }
 
 /// `test` があれば全部走らせる。無ければ `main` を走らせる。
-fn run(program: &ast::Program, entry: &str) -> ExitCode {
+fn run(program: &ast::Program, entry: &str, sources: &[module::SourceFile]) -> ExitCode {
     let interp = eval::Interp::new(program);
 
     let tests: Vec<(&str, &[ast::Expr])> = program
@@ -87,7 +87,8 @@ fn run(program: &ast::Program, entry: &str) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("  main で失敗: {e}");
+                println!("  main で失敗:");
+                report_runtime(&e, sources);
                 ExitCode::FAILURE
             }
         };
@@ -101,7 +102,7 @@ fn run(program: &ast::Program, entry: &str) -> ExitCode {
             Err(e) => {
                 failed += 1;
                 println!("  FAIL {name}");
-                println!("       {e}");
+                report_runtime(&e, sources);
             }
         }
     }
@@ -111,6 +112,20 @@ fn run(program: &ast::Program, entry: &str) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// 実行時の失敗を、実行前の診断と同じ描画で出す。
+///
+/// 見出しは stdout、描画は stderr なので、パイプで別々に溜まると順が入れ替わる。
+/// 描く前に stdout を流して見出しを先に出す。
+fn report_runtime(flow: &eval::Flow, sources: &[module::SourceFile]) {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    match flow {
+        eval::Flow::Error(diagnostic) => render::report(std::slice::from_ref(diagnostic), sources),
+        // `return` は関数の境界で受け止まるので、ここへ来るのは評価器の不具合
+        other => eprintln!("       {other}"),
     }
 }
 

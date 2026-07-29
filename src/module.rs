@@ -1521,6 +1521,30 @@ mod tests {
         assert_eq!(seen["dep.rd"], "fn value() { 1 }");
     }
 
+    /// 実行時の失敗も同じ表で引ける。呼び出し元は `main.rd` にいるが、指すのは
+    /// 失敗した式を持つ `dep.rd` のほう。
+    #[test]
+    fn 呼び出し先の実行時エラーは失敗した式のモジュールを指す() {
+        let loaded = load_files(&[
+            ("main.rd", "use dep\nfn main() { dep::boom() }\n"),
+            ("dep.rd", "fn boom() { assert false }\n"),
+        ])
+        .expect("ロードできる");
+
+        let Err(crate::eval::Flow::Error(diagnostic)) =
+            crate::eval::Interp::new(&loaded.program).run(&loaded.entry)
+        else {
+            panic!("`assert false` は失敗するはず");
+        };
+        let span = diagnostic.span.expect("失敗した式を指す");
+        let source = &loaded.sources[span.src as usize];
+        assert_eq!(source.path.file_name().unwrap(), "dep.rd");
+        assert_eq!(
+            &source.text[span.start as usize..span.end as usize],
+            "assert false"
+        );
+    }
+
     #[test]
     fn 見つからないモジュールはuse宣言を指す() {
         let source = "use missing\nfn main() { 1 }\n";

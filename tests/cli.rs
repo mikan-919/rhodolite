@@ -1198,16 +1198,52 @@ fn 位置を持たない診断は抜粋なしで出る() {
     );
 }
 
-/// 実行時エラーは span を持たない。従来どおりの1行のまま。
+/// 実行時エラーも実行前の診断と同じく、失敗した式の抜粋の上に描かれる。
 #[test]
-fn 実行時エラーは従来どおりの見た目で出る() {
+fn mainの実行時エラーは抜粋つきで出る() {
     let project = Project::new();
     project.write("main.rd", "fn main(-> int) { 1 / 0 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
     assert!(!output.status.success(), "{text}");
-    assert!(text.contains("  main で失敗: "), "{text}");
+    assert!(text.contains("  main で失敗:"), "{text}");
+    assert!(text.contains("0 で割れません"), "{text}");
+    assert!(text.contains("fn main(-> int) { 1 / 0 }"), "{text}");
+    assert!(text.contains("╭─"), "{text}");
+}
+
+/// 失敗したテストは名前を残したまま抜粋つきで出て、残りのテストは走り続ける。
+#[test]
+fn テストの実行時エラーはテスト名と抜粋つきで出る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn main() { 1 }\n\
+         test \"落ちる\" { assert false }\n\
+         test \"通る\" { assert true }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("  FAIL 落ちる"), "{text}");
+    assert!(text.contains("assert が偽になりました"), "{text}");
+    assert!(text.contains("╭─"), "{text}");
+    assert!(text.contains("  ok   通る"), "{text}");
+    assert!(text.contains("2 件中 1 件成功"), "{text}");
+}
+
+/// 失敗しなければ出力は従来どおり。診断は1件も出ない。
+#[test]
+fn 実行時エラーが無ければ出力は変わらない() {
+    let project = Project::new();
+    project.write("main.rd", "fn main(-> int) { 1 + 2 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("  main -> 3"), "{text}");
     assert!(!text.contains("╭─"), "{text}");
 }
 
