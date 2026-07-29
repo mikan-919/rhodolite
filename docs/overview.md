@@ -45,6 +45,8 @@ fn main() {
       ├─ analyze  構文木 → 要求と経路        src/requirement.rs
       └─ eval     構文木を走らせる            src/eval.rs
                                             ↑ 全部つながっている
+
+  診断は全段が `Diag` を返し、CLI が抜粋付きで描く  src/diag.rs / src/render.rs
 ```
 
 **v1 の到達目標は達成済み。**`cargo run` で `examples/canonical.rd` の
@@ -61,8 +63,23 @@ test が緑になる。
 
 ```
 $ cargo run examples/missing_handler.rd
-main: `clock` が提供されていません
-  clock が要る ← stamp ← promote ← handle ← main
+
+  × missing_handler::main: `missing_handler::clock` が提供されていません
+    ╭─[examples/missing_handler.rd:17:12]
+ 16 │ fn stamp(u: User) {
+ 17 │     u.at = clock.now()
+    ·            ────┬────
+    ·                ╰── `missing_handler::clock` がここで要る
+ 18 │ }
+    ╰────
+  help: missing_handler::clock が要る ← missing_handler::stamp ← ... ← missing_handler::main
+  ├─▶   × `missing_handler::stamp` を呼んでいます
+  │       ╭─[examples/missing_handler.rd:21:5]
+  │    21 │     stamp(u)
+  │       ·     ────┬───
+  │       ·         ╰── ここが要求を運ぶ
+  │       ╰────
+  ╰─▶ (以下、経路のホップごとに1件)
 ```
 
 ```
@@ -76,14 +93,16 @@ main: `clock` が提供されていません
 
 | ファイル | 役割 | 行 |
 |---|---|---|
-| `src/lex.rs` | 字句解析 + 行継続 | 477 |
-| `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 244 |
-| `src/parse.rs` | 再帰下降パーサ | 1436 |
-| `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 1465 |
-| `src/typecheck.rs` | struct の形と、分かる範囲の型・呼び出しの検査 | 3139 |
-| `src/requirement.rs` | **要求推論(中核)** | 1185 |
+| `src/lex.rs` | 字句解析 + 行継続 | 499 |
+| `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 259 |
+| `src/parse.rs` | 再帰下降パーサ | 1424 |
+| `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 1645 |
+| `src/typecheck.rs` | struct の形と、分かる範囲の型・呼び出しの検査 | 3245 |
+| `src/requirement.rs` | **要求推論(中核)** | 1293 |
 | `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 1746 |
-| `src/main.rs` | 繋ぐだけ | 147 |
+| `src/diag.rs` | 実行前の診断の値。位置・ラベル・help・従属診断 | 75 |
+| `src/render.rs` | 診断をソース抜粋付きで描く。miette を知る唯一の場所 | 107 |
+| `src/main.rs` | 繋ぐだけ | 144 |
 
 `requirement.rs` の中は6段。手順1〜3が mikan の手書き、4〜6は代筆。
 
@@ -106,17 +125,18 @@ main: `clock` が提供されていません
 | 0004 | 構造の追加は mikan が決める(申告制)。それ以外は代筆 |
 | 0005 | ブロック形から `:` を外し、ambient 提供を `with` で書く |
 | 0006 | ファイル/ディレクトリをモジュールとし、読み込みを `use` に一本化 |
+| 0007 | 診断の描画に `miette` を1つだけ依存に足す |
 
 文法は `docs/grammar.md`、用語は `CONTEXT.md`、プロジェクトの目的は `README.md`。
 **まだ決まっていない設計は `docs/design-notes/`**（測った結果・却下案・未決の問い）。
 
-## 6. 次の一歩
+## 6. 検査がいま保証すること
 
 v1 完了線は越えた。未定義の直接関数呼び出し、重複スロットの検査、
 ADR-0006 のモジュール分割、struct の形の検査、データを持たない enum、
 関数の署名の検査、基本式の型検査、配列の型検査、メソッドと関連関数の
 呼び出しの型検査、fieldless enum の限定参照と `match`、`with` の提供の
-契約検査は完了した。
+契約検査、実行前の診断への span の付与は完了した。
 
 `src/typecheck.rs` が保証するのは**形**と、**分かる範囲の型**だけ。
 ここを通ったプログラムでは、struct リテラルは宣言済み struct を指し、宣言
@@ -174,12 +194,57 @@ fieldless enum の variant は、裸の名前に加えて `Rank::Gold` と限定
 型の同一性は形と後置 `?` の一致だけで、部分型も暗黙の optional 展開も無い。
 上記の期待型境界に限り、present な値を optional 宛先へ注入する。
 
+## 7. 診断の形
+
+実行前の段(`lex` / `parse` / `load` / `check` / `analyze`)は、すべて
+`diag::Diag` を返す。
+
+```rust
+struct Diag {
+    msg: String,          // 文言。span の有無に関わらず必ず出る
+    span: Option<Span>,   // 主原因の位置
+    label: Option<String>,// span に添える短い語
+    help: Option<String>, // 直し方 / 到達経路の1行表現
+    related: Vec<Diag>,   // 別の位置(別ファイルもありうる)を指す従属診断
+}
+```
+
+`Span` は `{ src, start, end }` で、`src` は読み込んだソースの識別子。
+`module::LoadedProgram.sources` の添字になっているので、複数モジュールを
+1つの `Program` に畳んだ後でも、span 単体から元のファイルとバイト範囲を引ける。
+読み込みに失敗したときも、そこまでに読めたソースは診断と一緒に返る。
+
+**span が保証されるもの**:
+
+| 診断 | 指す場所 |
+|---|---|
+| 字句解析・構文解析 | 読めなかったトークンの位置 |
+| `use` が指すモジュールを解決できない | その `use` 宣言 |
+| import 名の衝突・メンバー不在 | その `use` 宣言 |
+| 宣言名の重複・組み込み型名の宣言 | その宣言 |
+| 型検査の式に関する診断 | その式(引数・戻り値・フィールド値は部分式そのもの) |
+| `match` の重複・別 enum・未知 variant | その arm |
+| `match` の variant 欠落 | `match` 式全体 |
+| `effect` の重複 | その `effect` 宣言 |
+| 未定義の直接呼び出し | その呼び出し |
+| 提供忘れ | スロットの使用地点。経路の各ホップは `related` |
+
+**span を持たないもの**は、ソースへ届く前に失敗した読み込みだけ:
+エントリーが `.rd` でない、親ディレクトリが無い、ファイル名が UTF-8 でない、
+ファイルを読めない。これらは素のテキストのまま出る。
+
+実行時エラー(`eval`)は `String` のままで、span を持たない。
+
+描画は `src/render.rs` の1ファイルに閉じている。`Diag` は miette を知らない
+素の構造体で、CLI 境界でだけ `miette::Report` へ変換する。依存を外すか
+差し替える判断がこの1ファイルで済む(ADR-0007)。
+
+## 8. 次の一歩
+
 残っている穴埋めの優先順は次の通り。
 
-1. **エラーに span が付いていない。** 診断が全部ただの `String` で、位置も
-   ソースの抜粋も出せない(`miette` を入れるならここ)。網羅性の診断も enum と
-   variant の名前で示すだけで、arm の位置は指せない。売りが「到達経路付きの
-   報告」なので、見え方の質はここで決まる
-2. **enum は fieldless のまま。** 限定参照と網羅的な `match` は入ったが、
+1. **enum は fieldless のまま。** 限定参照と網羅的な `match` は入ったが、
    データ付き variant と、それに伴う pattern 束縛・ワイルドカード・guard は無い
+2. **実行時エラーに span が無い。** 評価器の呼び出し規約に span の受け渡しが
+   要るので、実行前の診断とは別の段として残っている
 3. 配列の可変性・所有権と、ADR-0003 の whole-program 単相化

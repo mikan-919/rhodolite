@@ -29,5 +29,5 @@
 
 ## 6. Documentation
 
-- [ ] 6.1 Describe the diagnostic shape and what spans are guaranteed in `docs/overview.md`, and update the reachability-path rendering in `docs/requirement-map.md`.
-- [ ] 6.2 Record the `miette` dependency decision as an ADR, since adding a dependency is a structural decision under ADR-0004.
+- [x] 6.1 Describe the diagnostic shape and what spans are guaranteed in `docs/overview.md`, and update the reachability-path rendering in `docs/requirement-map.md`.
+- [x] 6.2 Record the `miette` dependency decision as an ADR, since adding a dependency is a structural decision under ADR-0004.

@@ -11,7 +11,7 @@ flowchart TD
     subgraph entry["入口"]
         analyze["analyze(&Program) -> Analysis"]
         render["Analysis::render(&self) -> String"]
-        unsat["Analysis::unsatisfied(&self) -> Vec&lt;String&gt;"]
+        unsat["Analysis::unsatisfied(&self) -> Vec&lt;Diag&gt;"]
     end
 
     subgraph body["本体の走査"]
@@ -19,8 +19,8 @@ flowchart TD
         scan_body["scan_body(&[Expr], &Slots) -> BodyFacts"]
         scan_exprs["scan_exprs(&[Expr], &Slots, provided, locals, out)"]
         scan["scan(&Expr, &Slots, provided, locals, out)"]
-        access["record_access(slot, SlotLevel, provided, locals, out)"]
-        merge["merge_requirement(&mut Reqs, slot, SlotLevel, path)"]
+        access["record_access(slot, SlotLevel, Span, provided, locals, out)"]
+        merge["merge_requirement(&mut Reqs, slot, SlotLevel, Span, path)"]
         test_key["test_key(&str) -> String"]
     end
 
@@ -58,11 +58,11 @@ flowchart TD
 flowchart LR
     P["Program (AST)"]
     S["Slots<br/>slot -> trait 名"]
-    BF["BodyFacts<br/>escaping: slot -> SlotLevel<br/>calls: Vec&lt;CallSite&gt;"]
-    CS["CallSite<br/>callee: String<br/>provided: slot -> SlotLevel<br/>kind: Direct | Method"]
-    R["Reqs<br/>slot -> Requirement<br/>(SlotLevel + 到達経路)"]
+    BF["BodyFacts<br/>escaping: slot -> SlotUse (SlotLevel + 使用地点)<br/>calls: Vec&lt;CallSite&gt;"]
+    CS["CallSite<br/>callee: String<br/>provided: slot -> SlotLevel<br/>kind: Direct | Method<br/>span: 呼び出しの位置"]
+    R["Reqs<br/>slot -> Requirement<br/>(SlotLevel + 使用地点 + 到達経路 Vec&lt;Hop&gt;)"]
     A["Analysis<br/>slots / reqs / order / diagnostics"]
-    OUT["文字列出力"]
+    OUT["render: 文字列 / unsatisfied: Diag"]
 
     P -->|collect_slots| S
     P -->|scan_body 各関数・implメソッド1回| BF
@@ -96,6 +96,26 @@ flowchart LR
 実体提供は両方を満たすが、型提供は`Value`要求を満たさない。
 スロット経由のメソッド呼び出しはtrait単位、`Type::method()`は型単位の
 `impl`呼び出し辺にもなり、メソッド本体で生じた要求を呼び出し元へ伝える。
+
+## 到達経路の描き方
+
+`Requirement.path` は `Hop { name, span }` の列で、**先頭が直近の呼び出し先、
+末尾が実際にスロットを使っている関数**。`name` は呼び先の関数名、`span` は
+その呼び出しが書かれている**呼び出し元**の位置になる。
+
+`Analysis::unsatisfied_for` はこれを1つの `Diag` に畳む。
+
+| 診断の部分 | 中身 |
+|---|---|
+| 主 span | スロットを実際に使っている地点(`clock.now()`) |
+| ラベル | `` `clock` がここで要る`` |
+| help | `clock が要る ← stamp ← promote ← main` — 名前だけの1行表現 |
+| related | ホップごとに1件。各件の span はその呼び出しの位置 |
+
+related を使うのは、ADR-0006 のモジュール分割があるかぎり経路がファイルを
+跨ぐため。miette の複数ラベルは同一ソース前提なので、跨いだ経路は描けない。
+related なら各ホップが自分のファイルの抜粋を持てる。名前だけの1行表現は help に
+残してあるので、位置の要らない読み方は従来どおり通じる。
 
 `CallKind`は要求伝播と最低限の名前解決を分ける。`Direct`な呼び出し先が
 トップレベル関数に無ければエラーにする。`Method`の存在確認にはレシーバの型が
