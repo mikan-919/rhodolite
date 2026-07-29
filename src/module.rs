@@ -1645,6 +1645,109 @@ mod tests {
         assert!(!locals.contains("shadowed"));
     }
 
+    /// payload の名前は他の名前を隠すが、その arm の本体の間だけ。
+    /// 隣の arm にも match の後にも漏らさない(design.md 決定5)
+    #[test]
+    fn armのpayload束縛はその本体の間だけ宣言を隠す() {
+        let mut program = parse::parse(&join(
+            lex("fn main(l: Lookup) {\n\
+                 \x20 match l {\n\
+                 \x20   Lookup::Found(local): local()\n\
+                 \x20   Lookup::Missing(_): local()\n\
+                 \x20 }\n\
+                 \x20 local\n\
+                 }\n")
+            .unwrap(),
+        ))
+        .unwrap();
+        let Item::Fn { body, .. } = &mut program.items[0] else {
+            panic!()
+        };
+
+        let local = BTreeMap::from([
+            ("Lookup".to_string(), "main::Lookup".to_string()),
+            ("local".to_string(), "main::local".to_string()),
+        ]);
+        let mut diagnostics = Vec::new();
+        let mut locals = BTreeSet::from(["l".to_string()]);
+        resolve_exprs(
+            body,
+            &mut locals,
+            &local,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut diagnostics,
+        );
+
+        let ExprKind::Match { arms, .. } = &body[0].kind else {
+            panic!("match ではない: {:?}", body[0].kind)
+        };
+        // 束縛した arm では payload が勝ち、`_` の arm では宣言のままになる
+        let callee = |arm: &MatchArm| match &arm.body.kind {
+            ExprKind::Call(callee, _) => match &callee.kind {
+                ExprKind::Ident(name) => name.clone(),
+                other => panic!("呼び出し先が裸の名前ではない: {other:?}"),
+            },
+            other => panic!("arm 本体が呼び出しではない: {other:?}"),
+        };
+        assert_eq!(callee(&arms[0]), "local");
+        assert_eq!(callee(&arms[1]), "main::local");
+        // match の後にも漏れない
+        assert!(matches!(&body[1].kind, ExprKind::Ident(name) if name == "main::local"));
+        assert!(!locals.contains("local"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// payload の型は struct フィールドと同じ規則で正準名になる
+    #[test]
+    fn payloadの型も正準名へ解決する() {
+        let mut program = parse::parse(&join(
+            lex("enum Lookup { Found(User, [dep::Row?]?) Skipped }\n").unwrap(),
+        ))
+        .unwrap();
+
+        let module = ModulePath(vec!["dep".to_string()]);
+        let local = BTreeMap::from([
+            ("Lookup".to_string(), "main::Lookup".to_string()),
+            ("Found".to_string(), "main::Found".to_string()),
+            ("Skipped".to_string(), "main::Skipped".to_string()),
+            ("User".to_string(), "main::User".to_string()),
+        ]);
+        let imported_modules = BTreeMap::from([("dep".to_string(), module.clone())]);
+        let declarations = BTreeMap::from([(
+            module,
+            BTreeMap::from([("Row".to_string(), "dep::Row".to_string())]),
+        )]);
+        let mut diagnostics = Vec::new();
+        resolve_item(
+            &mut program.items[0],
+            &local,
+            &BTreeMap::new(),
+            &imported_modules,
+            &declarations,
+            &mut diagnostics,
+        );
+
+        let Item::Enum { name, variants, .. } = &program.items[0] else {
+            panic!()
+        };
+        assert_eq!(name, "main::Lookup");
+        assert_eq!(variants[0].name, "main::Found");
+        // ローカル宣言・import 経由・角括弧と後置 `?` の内側まで同じ規則で通る
+        assert_eq!(variants[0].payload[0].name(), Some("main::User"));
+        let TypeKind::Array(element) = &variants[0].payload[1].kind else {
+            panic!("配列ではない: {:?}", variants[0].payload[1])
+        };
+        assert!(variants[0].payload[1].optional);
+        assert_eq!(element.name(), Some("dep::Row"));
+        assert!(element.optional);
+        // fieldless は payload 無しのまま
+        assert_eq!(variants[1].name, "main::Skipped");
+        assert!(variants[1].payload.is_empty());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
     /// 角括弧の内側の名前も、裸の名前と同じ規則で正準名になる
     #[test]
     fn 配列の要素型も正準名へ解決する() {

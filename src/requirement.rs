@@ -1023,6 +1023,57 @@ mod tests {
         assert_eq!(escaping(&p, "f"), set(&["db"]));
     }
 
+    /// payload の名前は同名スロットをその arm の間だけ隠す。隣の arm と
+    /// 後続の要求は残る(design.md 決定5)
+    #[test]
+    fn payload束縛はそのarmの中だけスロットを隠す() {
+        let p = program(
+            "effect db: Database\n\
+             effect clock: Clock\n\
+             fn f(l: Lookup) {\n\
+             \x20 match l {\n\
+             \x20   Lookup::Found(db): db.save(u)\n\
+             \x20   Lookup::Missing(_): clock.now()\n\
+             \x20   Lookup::Skipped: db.find(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        // 隠した arm は要求を作らないが、隠していない arm の分は残る
+        assert_eq!(escaping(&p, "f"), set(&["db", "clock"]));
+        assert_eq!(
+            callees(&p, "f"),
+            set(&["impl Clock::now", "impl Database::find"])
+        );
+    }
+
+    #[test]
+    fn payload束縛が全てのarmでスロットを隠せば要求は消える() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(l: Lookup) {\n\
+             \x20 match l {\n\
+             \x20   Lookup::Found(db): db.save(u)\n\
+             \x20   Lookup::Missing(db): db.find(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert!(escaping(&p, "f").is_empty());
+    }
+
+    /// `_` は名前を作らないので、何も隠さない
+    #[test]
+    fn discardはスロットを隠さない() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(l: Lookup) {\n\
+             \x20 match l {\n\
+             \x20   Lookup::Found(_): db.save(u)\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db"]));
+    }
+
     /// arm は束縛を導入しないが、本体の `let` は隣の arm へ漏らさない。
     /// 漏れるとスロットを隠してしまい、要求が消える
     #[test]

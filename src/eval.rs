@@ -728,9 +728,7 @@ impl<'a> Interp<'a> {
                         // 宣言済み enum の variant なら constructor。引数は上で
                         // 左から一度ずつ評価済み。関連関数より先に見る
                         // (design.md 決定4)
-                        [enum_name, variant]
-                            if self.variant_of(enum_name, variant).is_some() =>
-                        {
+                        [enum_name, variant] if self.variant_of(enum_name, variant).is_some() => {
                             let declared = self
                                 .variant_of(enum_name, variant)
                                 .expect("直前のガードで宣言済みと分かっている");
@@ -845,10 +843,15 @@ impl<'a> Interp<'a> {
                         payload.len()
                     ));
                 }
-                env.push_scope(arm.bindings.iter().zip(payload).filter_map(|(b, v)| match b {
-                    PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
-                    PatternBinding::Discard => None,
-                }));
+                env.push_scope(
+                    arm.bindings
+                        .iter()
+                        .zip(payload)
+                        .filter_map(|(b, v)| match b {
+                            PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
+                            PatternBinding::Discard => None,
+                        }),
+                );
                 let result = self.eval(&arm.body, env, ambient);
                 env.pop_scope();
                 result
@@ -1287,6 +1290,165 @@ mod tests {
         let src = format!("{RANKS}fn main() {{\n match Bronze {{ Rank::Gold: 1 }}\n}}\n");
         let e = run(&src, "main").expect_err("一致する arm が無い");
         assert!(e.contains("一致する arm がありません"), "{e}");
+    }
+
+    // ---- payload を持つ variant ----
+
+    const LOOKUP: &str = "struct User { id: int }\n\
+                          enum Lookup { Found(User, int) Missing(str) Skipped }\n";
+
+    #[test]
+    fn payloadは限定pathの呼び出しで構築され表示に出る() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 let u = User {{ id = 1 }}\n\
+             \x20 Lookup::Found(u, 2)\n\
+             }}\n"
+        );
+        assert_eq!(run(&src, "main").unwrap().show(), "Lookup.Found(User, 2)");
+        // fieldless の表示は従来のまま
+        let src = format!("{LOOKUP}fn main() {{\n Skipped\n}}\n");
+        assert_eq!(run(&src, "main").unwrap().show(), "Lookup.Skipped");
+    }
+
+    #[test]
+    fn payloadの引数は左から一度ずつ評価される() {
+        let src = "enum Pair { Two(int, int) }\n\
+                   struct Counter { n: int }\n\
+                   fn bump(c: Counter -> int) {\n c.n = c.n + 1\n c.n\n}\n\
+                   fn main() {\n\
+                   \x20 let c = Counter { n = 0 }\n\
+                   \x20 let p = Pair::Two(bump(c), bump(c))\n\
+                   \x20 match p { Pair::Two(a, b): a * 100 + b * 10 + c.n }\n\
+                   }\n";
+        // 左が先に1回、右が次に1回。呼び出しは合計2回
+        assert_eq!(int(src), 122);
+    }
+
+    #[test]
+    fn payloadの等値は対応ごとの構造的同値() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 assert Lookup::Missing(\"a\") == Lookup::Missing(\"a\")\n\
+             \x20 assert (Lookup::Missing(\"a\") == Lookup::Missing(\"b\")) == false\n\
+             \x20 assert (Lookup::Missing(\"a\") == Lookup::Skipped) == false\n\
+             \x20 let u = User {{ id = 1 }}\n\
+             \x20 let v = User {{ id = 1 }}\n\
+             \x20 assert Lookup::Found(u, 2) == Lookup::Found(v, 2)\n\
+             \x20 assert (Lookup::Found(u, 2) == Lookup::Found(v, 3)) == false\n\
+             \x20 v.id = 9\n\
+             \x20 Lookup::Found(u, 2) == Lookup::Found(v, 2)\n\
+             }}\n"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Bool(false))));
+    }
+
+    /// 複合 payload は既存の「複合値は参照」の規則にそのまま乗る
+    #[test]
+    fn 共有された複合payloadは同じ実体を指す() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 let u = User {{ id = 1 }}\n\
+             \x20 let l = Lookup::Found(u, 0)\n\
+             \x20 u.id = 7\n\
+             \x20 match l {{\n\
+             \x20   Lookup::Found(found, _): found.id\n\
+             \x20   Lookup::Missing(_): 0\n\
+             \x20   Lookup::Skipped: 0\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 7);
+    }
+
+    #[test]
+    fn armは宣言順のpayloadを名前へ束縛する() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 let u = User {{ id = 3 }}\n\
+             \x20 match Lookup::Found(u, 5) {{\n\
+             \x20   Lookup::Found(found, n): found.id * 10 + n\n\
+             \x20   Lookup::Missing(_): 0\n\
+             \x20   Lookup::Skipped: 0\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 35);
+    }
+
+    #[test]
+    fn discardした位置は名前にならない() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 let _ = 9\n\
+             \x20 match Lookup::Missing(\"gone\") {{\n\
+             \x20   Lookup::Found(_, _): 0\n\
+             \x20   Lookup::Missing(_): _\n\
+             \x20   Lookup::Skipped: 0\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        // `_` は arm が束縛しないので、外側の `let _` がそのまま見える
+        assert_eq!(int(&src), 9);
+    }
+
+    #[test]
+    fn payload束縛はarmの外へ漏れない() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 match Lookup::Missing(\"gone\") {{\n\
+             \x20   Lookup::Found(_, _): 0\n\
+             \x20   Lookup::Missing(reason): 0\n\
+             \x20   Lookup::Skipped: 0\n\
+             \x20 }}\n\
+             \x20 reason\n\
+             }}\n"
+        );
+        let e = run(&src, "main").expect_err("arm の外に `reason` は無い");
+        assert!(e.contains("`reason` が束縛されていません"), "{e}");
+    }
+
+    #[test]
+    fn payload束縛はarmの間だけ外側を隠す() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 let reason = 1\n\
+             \x20 let inner = match Lookup::Missing(\"gone\") {{\n\
+             \x20   Lookup::Found(_, _): \"f\"\n\
+             \x20   Lookup::Missing(reason): reason\n\
+             \x20   Lookup::Skipped: \"s\"\n\
+             \x20 }}\n\
+             \x20 assert inner == \"gone\"\n\
+             \x20 reason\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 1);
+    }
+
+    /// 静的検査を通さず評価器を直接使う経路の防御。型検査を通れば起きない
+    #[test]
+    fn payloadの個数が合わなければ実行時エラー() {
+        let src =
+            format!("{LOOKUP}fn main() {{\n let u = User {{ id = 1 }}\n Lookup::Found(u)\n}}\n");
+        let e = run(&src, "main").expect_err("constructor の個数違い");
+        assert!(e.contains("payload 2 個ですが 1 個渡されました"), "{e}");
+
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 match Lookup::Missing(\"x\") {{ Lookup::Missing(a, b): 1 }}\n\
+             }}\n"
+        );
+        let e = run(&src, "main").expect_err("arm の個数違い");
+        assert!(e.contains("payload 2 個を束縛します"), "{e}");
+    }
+
+    #[test]
+    fn payload_variantは構築しないと値にならない() {
+        for expr in ["Lookup::Found", "Found"] {
+            let src = format!("{LOOKUP}fn main() {{\n {expr}\n}}\n");
+            let e = run(&src, "main").expect_err(expr);
+            assert!(e.contains("payload"), "{expr}: {e}");
+        }
     }
 
     #[test]

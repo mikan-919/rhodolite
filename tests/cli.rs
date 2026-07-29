@@ -706,6 +706,161 @@ fn armの中の提供忘れは到達経路付きで失敗する() {
     );
 }
 
+// ---- payload を持つ variant (src/parse.rs, src/typecheck.rs, src/eval.rs) ----
+
+/// 構築と分解が往復する縦切り。payload の順序・`_`・fieldless の共存・
+/// モジュールを跨ぐ payload 型まで、1本のプログラムで通す
+#[test]
+fn payloadの構築と分解が往復して実行される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{User, make}\n\
+         enum Lookup {\n\
+         \x20 Found(User, int)\n\
+         \x20 Missing(str)\n\
+         \x20 Skipped\n\
+         }\n\
+         fn describe(l: Lookup -> str) {\n\
+         \x20 match l {\n\
+         \x20   Lookup::Found(found, _) {\n\
+         \x20     assert found.id == 7\n\
+         \x20     \"found\"\n\
+         \x20   }\n\
+         \x20   Lookup::Missing(reason): reason\n\
+         \x20   Lookup::Skipped: \"skipped\"\n\
+         \x20 }\n\
+         }\n\
+         fn rank(l: Lookup -> int) {\n\
+         \x20 match l {\n\
+         \x20   Lookup::Found(_, n): n\n\
+         \x20   Lookup::Missing(_): 0\n\
+         \x20   Lookup::Skipped: 0\n\
+         \x20 }\n\
+         }\n\
+         fn main(-> str) {\n\
+         \x20 let u = make()\n\
+         \x20 assert rank(Lookup::Found(u, 5)) == 5\n\
+         \x20 assert describe(Lookup::Missing(\"gone\")) == \"gone\"\n\
+         \x20 assert describe(Skipped) == \"skipped\"\n\
+         \x20 assert Lookup::Missing(\"a\") == Lookup::Missing(\"a\")\n\
+         \x20 assert (Lookup::Missing(\"a\") == Lookup::Missing(\"b\")) == false\n\
+         \x20 describe(Lookup::Found(u, 5))\n\
+         }\n",
+    );
+    project.write(
+        "dep.rd",
+        "struct User { id: int }\n\
+         fn make(-> User) { User { id = 7 } }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> \"found\""), "{text}");
+}
+
+/// payload の型がモジュール参照なら、他の型注釈と同じく `use` を要求する
+#[test]
+fn use_していないモジュールのpayload型を報告する() {
+    実行前に失敗する(
+        "enum Lookup { Found(dep::User) }\n\
+         fn main() { 1 }\n",
+        "モジュール名 `dep` は `use` されていません",
+    );
+}
+
+#[test]
+fn 構築の個数違いは実行前に失敗する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         enum Lookup { Found(User, int) }\n\
+         fn main() { Lookup::Found(User { id = 1 }) }\n",
+        "`main::Lookup::Found` は引数を 2 個取りますが、1 個渡しています",
+    );
+}
+
+#[test]
+fn 構築の引数の型違いは実行前に失敗する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         enum Lookup { Found(User) }\n\
+         fn main() { Lookup::Found(1) }\n",
+        "`main::Lookup::Found` の第 1 引数は `main::User` ですが、`int` を渡しています",
+    );
+}
+
+#[test]
+fn 構築しないpayload_variantは実行前に失敗する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         enum Lookup { Found(User) }\n\
+         fn main() { Lookup::Found }\n",
+        "`main::Lookup::Found` は payload を 1 個取ります",
+    );
+}
+
+#[test]
+fn patternの個数違いは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Lookup { Found(str) }\n\
+         fn unused(l: Lookup -> int) { match l { Lookup::Found(a, b): 1 } }\n\
+         fn main() { 1 }\n",
+        "arm `main::Lookup::Found` は payload を 2 個束縛しますが、\
+         `main::Lookup::Found` の payload は 1 個です",
+    );
+}
+
+#[test]
+fn 同じ名前を二度束縛するpatternは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Lookup { Found(str, str) }\n\
+         fn unused(l: Lookup -> str) { match l { Lookup::Found(x, x): x } }\n\
+         fn main() { 1 }\n",
+        "arm `main::Lookup::Found` の pattern が `x` を二度束縛しています",
+    );
+}
+
+#[test]
+fn 束縛の型は後続の検査へ流れる() {
+    実行前に失敗する(
+        "enum Lookup { Found(str) }\n\
+         fn take(n: int) { n }\n\
+         fn unused(l: Lookup -> int) { match l { Lookup::Found(reason): take(reason) } }\n\
+         fn main() { 1 }\n",
+        "`main::take` の第 1 引数は `int` ですが、`str` を渡しています",
+    );
+}
+
+/// payload の名前が ambient スロットを隠すのは、その arm の本体の間だけ。
+/// 隠した arm は要求を作らず、隠していない arm の要求は残る
+#[test]
+fn payload束縛に隠されたスロットは要求にならない() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Clock { fn now(self -> int) }\n\
+         struct SystemClock {}\n\
+         impl Clock for SystemClock { fn now(self -> int) { 42 } }\n\
+         effect clock: Clock\n\
+         enum Lookup { Found(SystemClock) Skipped }\n\
+         fn read(l: Lookup -> int) {\n\
+         \x20 match l {\n\
+         \x20   Lookup::Found(clock): clock.now()\n\
+         \x20   Lookup::Skipped: 0\n\
+         \x20 }\n\
+         }\n\
+         fn main(-> int) { read(Lookup::Found(SystemClock {})) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    // `with` が1つも無くても、要求が無いので走る
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main::read / (要求なし)"), "{text}");
+    assert!(text.contains("main -> 42"), "{text}");
+}
+
 // ---- enum 型の検査 (src/typecheck.rs) ----
 
 #[test]

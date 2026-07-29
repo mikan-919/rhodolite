@@ -79,9 +79,12 @@ v1 の到達目標は達成済み。lexer、parser、要求推論、インタプ
 `value.?field` は optional な struct から field を安全に読み、結果を optional にする。
 引数・戻り値・field・代入の期待型が `T?` なら同名の `T` を渡せるが、式自体は
 `T` のままで、`T` と `T?` の等価比較はできない。
-データを持たない enum は `Rank::Gold` と限定して参照でき、`match` で variant ごとに
+enum の variant は `Rank::Gold` と限定して参照でき、`match` で variant ごとに
 分岐できる。arm は宣言 variant を過不足なく一度ずつ持つことを実行前に要求され、
-選ばれた arm の値がそのまま式の値になる。データ付き variant と pattern 束縛は無い。
+選ばれた arm の値がそのまま式の値になる。variant は型付きの positional payload を
+宣言でき、`Lookup::Found(user)` で構築して arm の `Lookup::Found(found)` で
+取り出す。個数と型は実行前に検査され、束縛はその arm の中だけで見える。
+`_` で個々の payload を捨てられる。catch-all pattern と guard、入れ子 pattern は無い。
 メソッドと関連関数の呼び出しも静的に解決される。trait `impl` は宣言時に契約と
 突き合わされ、呼び出しはレシーバの具体型かスロットの trait から一意の宣言を選び、
 引数と戻り値がそのまま後続の検査へ流れる。`with` の提供値が本当にスロットの

@@ -133,10 +133,11 @@ $ cargo run examples/missing_handler.rd
 ## 6. 検査がいま保証すること
 
 v1 完了線は越えた。未定義の直接関数呼び出し、重複スロットの検査、
-ADR-0006 のモジュール分割、struct の形の検査、データを持たない enum、
+ADR-0006 のモジュール分割、struct の形の検査、enum の宣言、
 関数の署名の検査、基本式の型検査、配列の型検査、メソッドと関連関数の
-呼び出しの型検査、fieldless enum の限定参照と `match`、`with` の提供の
-契約検査、実行前の診断への span の付与は完了した。
+呼び出しの型検査、fieldless enum の限定参照と `match`、データを持つ variant の
+構築と pattern 束縛、`with` の提供の契約検査、実行前の診断への span の付与は
+完了した。
 
 `src/typecheck.rs` が保証するのは**形**と、**分かる範囲の型**だけ。
 ここを通ったプログラムでは、struct リテラルは宣言済み struct を指し、宣言
@@ -177,14 +178,29 @@ trait 実装をまとめて名前で絞って一意を要求し、レシーバ�
 宣言された `self` の有無と一致しなければならず、解決できた呼び出しの戻り値型は
 そのまま後続の検査へ届く。レシーバの型が分からない呼び出しは保留する。
 
-fieldless enum の variant は、裸の名前に加えて `Rank::Gold` と限定して参照できる。
+payload を持たない variant は、裸の名前に加えて `Rank::Gold` と限定して参照できる。
 限定参照は宣言を直接指すのでローカル束縛に隠されず、同名 variant を持つ enum が
 複数あっても曖昧にならない。`match` は既知の非 optional な enum の値を variant
 ごとに分岐し、選ばれた arm の値を式全体の値にする。arm は対象 enum の宣言 variant
 を過不足なく一度ずつ持たなければならず、欠落・重複・別 enum の variant は実行前に
 落ちる。arm の結果型は期待型、無ければ最初に型の分かる arm を基準にして照合し、
-その型が後続の検査へ流れる。arm は束縛を導入せず、要求推論はどの arm も
-実行されうるものとして全 arm の要求を合流する。
+その型が後続の検査へ流れる。要求推論はどの arm も実行されうるものとして
+全 arm の要求を合流する。
+
+variant は0個以上の型付き positional payload を宣言できる。payload の型は他の型
+注釈と同じ nominal 規則で正準化される。payload を持つ variant は
+`Lookup::Found(user)` という限定 path の呼び出しでだけ作れ、裸の path は値でも
+first-class な constructor でもない。構築は関数呼び出しと同じ規則で、引数の個数が
+宣言 payload と一致し、各引数が対応する payload 型と適合することを実行前に要求する
+(この照合は関連関数の解決より先に走る)。式の型は宣言した enum になる。
+
+arm は宣言 payload と同じ個数の平坦な pattern 要素を並べる。要素は識別子か `_`
+だけで、個数の不一致と同じ pattern 内の重複した名前は実行前に落ちる。識別子は
+対応する宣言 payload の型を持ち、その arm 本体の間だけ同名の外側ローカル・宣言・
+ambient スロットを隠す。その型は field の読み・呼び出しの引数・代入・戻り値という
+既存の検査へそのまま流れ、隣の arm にも match の後にも漏れない。`_` は値を捨て、
+名前を導入しないので何も隠さない。enum 値の等値は enum・variant の同一性と payload
+の対応ごとの構造的同値で、payload の比較には既存の値の等値規則が効く。
 
 `with` の提供は、スロットの契約を実装した具体型だけが置ける。`with db<Postgres>`
 は型名がそのまま分かるので常に、`with db(value)` は値の型が分かるときだけ実行前に
@@ -223,7 +239,7 @@ struct Diag {
 | import 名の衝突・メンバー不在 | その `use` 宣言 |
 | 宣言名の重複・組み込み型名の宣言 | その宣言 |
 | 型検査の式に関する診断 | その式(引数・戻り値・フィールド値は部分式そのもの) |
-| `match` の重複・別 enum・未知 variant | その arm |
+| `match` の重複・別 enum・未知 variant・pattern の個数と重複束縛 | その arm |
 | `match` の variant 欠落 | `match` 式全体 |
 | `effect` の重複 | その `effect` 宣言 |
 | 未定義の直接呼び出し | その呼び出し |
@@ -243,8 +259,10 @@ struct Diag {
 
 残っている穴埋めの優先順は次の通り。
 
-1. **enum は fieldless のまま。** 限定参照と網羅的な `match` は入ったが、
-   データ付き variant と、それに伴う pattern 束縛・ワイルドカード・guard は無い
+1. **pattern は variant ごとの平坦な束縛だけ。** payload の構築と分解は
+   往復するようになったが、variant 全体を覆う catch-all pattern と guard は
+   網羅性モデルを変えるので入れていない。入れ子 pattern、名前付き payload、
+   payload の field access、enum のメソッドも無い
 2. **実行時エラーに span が無い。** 評価器の呼び出し規約に span の受け渡しが
    要るので、実行前の診断とは別の段として残っている
 3. 配列の可変性・所有権と、ADR-0003 の whole-program 単相化

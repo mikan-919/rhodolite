@@ -25,6 +25,11 @@
 //!   - 配列リテラルの要素は、期待要素型があればそれと、無ければ互いに適合する
 //!   - `for` の反復対象は非 optional な配列で、ループ変数は要素型を持つ
 //!   - `with` の提供は、**型の分かる限り**スロットの trait を実装した具体型
+//!   - 限定 variant の呼び出しは宣言 payload と同じ個数の引数を持ち、
+//!     **型の分かる**引数は対応する payload 型と適合する。payload を持つ
+//!     variant は呼び出さない限り値にならない
+//!   - `match` の arm は宣言 payload と同じ個数の pattern 要素を持ち、
+//!     一つの pattern が同じ名前を二度束縛しない
 //!
 //! 型の同一性は形と後置 `?` の一致だけ(nominal)。配列は要素型まで含めて
 //! 一致しないと同じ型ではない。期待型のある宛先では
@@ -32,7 +37,8 @@
 //! `nil` は期待される `T?` の文脈でだけ適合し、`T? ?? T` は `T` を返す。
 //! `S?.?field` は宣言 field の型に optional を付けて返す。
 //!
-//! 呼び出しの解決は評価器と同じ順序で、スロット経由なら宣言 trait の契約だけ、
+//! 呼び出しの解決は評価器と同じ順序で、宣言済み enum の限定 variant を
+//! constructor として最初に見てから、スロット経由なら宣言 trait の契約だけ、
 //! 具体型なら inherent と trait 実装をまとめて名前で絞り一意を要求する。
 //! レシーバの型が分からない呼び出しは保留する。`with slot<T>` は型名が
 //! そのまま分かるので常に、`with slot(v)` は `v` の型が分かるときだけ契約と
@@ -1060,7 +1066,9 @@ fn declared_variant<'d>(enum_name: &str, variant: &str, decls: &'d Decls) -> Opt
 
 /// 限定 variant の constructor 署名。
 fn variant_ctor<'d>(enum_name: &str, variant: &str, decls: &'d Decls) -> Option<&'d FnSig> {
-    decls.ctors.get(declared_variant(enum_name, variant, decls)?)
+    decls
+        .ctors
+        .get(declared_variant(enum_name, variant, decls)?)
 }
 
 /// 宣言された payload 型の並び。宣言に無い variant なら `None`。
@@ -2192,6 +2200,244 @@ rank: Rank }
         assert!(
             errors.is_empty(),
             "隣の arm と後続では `u` の型が分からないので照合しない: {errors:?}"
+        );
+    }
+
+    // ---- 4d. payload を持つ variant ----
+
+    const LOOKUP: &str = "struct User { rank: Rank }\n\
+                          enum Rank { Bronze Gold }\n\
+                          enum Lookup { Found(User, int) Missing(str) Skipped }\n";
+
+    #[test]
+    fn 限定した構築と分解は診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{LOOKUP}fn take(u: User) {{ u }}\n\
+                 fn f(u: User -> str) {{\n\
+                 \x20 match Lookup::Found(u, 1) {{\n\
+                 \x20   Lookup::Found(found, n) {{ take(found)\n\"found\" }}\n\
+                 \x20   Lookup::Missing(reason): reason\n\
+                 \x20   Lookup::Skipped: \"skipped\"\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 構築の個数違いを報告する() {
+        for (call, expected) in [
+            ("Lookup::Found(u)", "1 個渡しています"),
+            ("Lookup::Found(u, 1, 2)", "3 個渡しています"),
+        ] {
+            let e = only(&format!("{LOOKUP}fn f(u: User) {{ {call} }}\n"));
+            assert!(e.contains("`Lookup::Found` は引数を 2 個取ります"), "{e}");
+            assert!(e.contains(expected), "{e}");
+        }
+    }
+
+    #[test]
+    fn 構築の引数の型違いを報告する() {
+        let e = only(&format!(
+            "{LOOKUP}fn f(u: User) {{ Lookup::Found(u, \"x\") }}\n"
+        ));
+        assert!(e.contains("`Lookup::Found` の第 2 引数"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+    }
+
+    #[test]
+    fn payload_variantは構築しないと値にならない() {
+        // 限定 path も裸の名前も、first-class な constructor にはしない
+        for (expr, named) in [("Lookup::Found", "`Lookup::Found`"), ("Found", "`Found`")] {
+            let e = only(&format!("{LOOKUP}fn f() {{ {expr} }}\n"));
+            assert!(e.contains(named), "{e}");
+            assert!(e.contains("payload を 2 個取ります"), "{e}");
+        }
+    }
+
+    #[test]
+    fn 構築した値は所属enumの型を持つ() {
+        let e = only(&format!(
+            "{LOOKUP}fn take(r: Rank) {{ r }}\n\
+             fn f(u: User) {{ take(Lookup::Skipped) }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Lookup`"), "{e}");
+
+        let e = only(&format!(
+            "{LOOKUP}fn take(r: Rank) {{ r }}\n\
+             fn f(u: User) {{ take(Lookup::Found(u, 1)) }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Lookup`"), "{e}");
+    }
+
+    #[test]
+    fn payload引数にもoptionalへの注入が効く() {
+        assert!(
+            errors(
+                "enum Box { One(int?) }\n\
+                 fn f(-> Box) {{ Box::One(1) }}\n"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn patternの個数違いを報告する() {
+        for (pattern, expected) in [
+            ("Lookup::Found(a)", "payload を 1 個束縛します"),
+            ("Lookup::Found(a, b, c)", "payload を 3 個束縛します"),
+            ("Lookup::Skipped(a)", "payload を 1 個束縛します"),
+        ] {
+            let arm_enum = pattern.split('(').next().unwrap();
+            let e = only(&format!(
+                "{LOOKUP}fn f(l: Lookup -> int) {{\n\
+                 \x20 match l {{\n\
+                 \x20   {pattern}: 1\n\
+                 \x20   Lookup::Missing(_): 2\n\
+                 \x20   {}: 3\n\
+                 \x20 }}\n\
+                 }}\n",
+                if arm_enum == "Lookup::Skipped" {
+                    "Lookup::Found(_, _)"
+                } else {
+                    "Lookup::Skipped"
+                }
+            ));
+            assert!(e.contains(expected), "{pattern}: {e}");
+        }
+    }
+
+    #[test]
+    fn 同じ名前を二度束縛するpatternを報告する() {
+        let e = only(&format!(
+            "{LOOKUP}fn f(l: Lookup -> int) {{\n\
+             \x20 match l {{\n\
+             \x20   Lookup::Found(x, x): 1\n\
+             \x20   Lookup::Missing(_): 2\n\
+             \x20   Lookup::Skipped: 3\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("`x` を二度束縛"), "{e}");
+    }
+
+    #[test]
+    fn 束縛の型は既存の検査へ流れる() {
+        // field の読み・呼び出しの引数・代入・戻り値の4つを1本の match で通す
+        let errors = errors(&format!(
+            "{LOOKUP}fn take(n: int) {{ n }}\n\
+             fn f(l: Lookup -> int) {{\n\
+             \x20 match l {{\n\
+             \x20   Lookup::Found(found, n) {{ found.rank = Gold\ntake(found) }}\n\
+             \x20   Lookup::Missing(reason): return reason\n\
+             \x20   Lookup::Skipped: 0\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("`take` の第 1 引数"), "{errors:?}");
+        assert!(errors[0].contains("`User`"), "{errors:?}");
+        assert!(errors[1].contains("戻り値は `int`"), "{errors:?}");
+        assert!(errors[1].contains("`str`"), "{errors:?}");
+    }
+
+    #[test]
+    fn 束縛はその本体の間だけ外側を隠す() {
+        // arm の中では payload の型、隣の arm と後続では外側の型
+        let errors = errors(&format!(
+            "{LOOKUP}fn f(l: Lookup, reason: int -> int) {{\n\
+             \x20 match l {{\n\
+             \x20   Lookup::Found(_, n): n\n\
+             \x20   Lookup::Missing(reason): reason\n\
+             \x20   Lookup::Skipped: reason\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].contains("arm `Lookup::Missing` の値"),
+            "{errors:?}"
+        );
+        assert!(errors[0].contains("`str`"), "{errors:?}");
+    }
+
+    #[test]
+    fn discardは外側の名前を隠さない() {
+        // 同じ位置を `reason` で束縛すると `str` になって落ちる
+        // (上の「束縛はその本体の間だけ外側を隠す」)。`_` なら外側の
+        // `reason: int` がそのまま見え続ける
+        assert!(
+            errors(&format!(
+                "{LOOKUP}fn f(l: Lookup, reason: int -> int) {{\n\
+                 \x20 match l {{\n\
+                 \x20   Lookup::Found(_, _): reason\n\
+                 \x20   Lookup::Missing(_): reason\n\
+                 \x20   Lookup::Skipped: reason\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn fieldless_enumの既存の検査は変わらない() {
+        // payload を持つ variant を1つも使わないプログラムは診断が増えない
+        assert!(
+            errors(&format!(
+                "{RANKS}fn label(r: Rank -> str) {{\n\
+                 \x20 match r {{ Rank::Bronze: \"b\"\nRank::Gold: \"g\" }}\n\
+                 }}\n\
+                 fn f(-> Rank) {{ Rank::Gold }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn variantでないpath呼び出しは従来の解決のまま() {
+        // 関連関数・ambient の型射影は constructor に横取りされない
+        assert!(
+            errors(&format!(
+                "{LOOKUP}struct Store {{}}\n\
+                 impl Store {{ fn make(-> User) {{ User {{ rank = Gold }} }} }}\n\
+                 fn f(-> User) {{ Store::make() }}\n"
+            ))
+            .is_empty()
+        );
+        // 宣言済み enum を修飾していても variant でなければ constructor に
+        // ならず、宣言を知らない型のメンバーとして従来どおり保留される
+        assert!(errors(&format!("{LOOKUP}fn f() {{ Lookup::Nope(1) }}\n")).is_empty());
+    }
+
+    #[test]
+    fn payloadの診断は責めるべき式を指す() {
+        assert_eq!(
+            spanned(
+                &format!("{LOOKUP}fn f(u: User) {{ Lookup::Found(u, \"x\") }}\n"),
+                "第 2 引数"
+            ),
+            "\"x\""
+        );
+        assert_eq!(
+            spanned(
+                &format!(
+                    "{LOOKUP}fn f(l: Lookup -> int) {{\n\
+                     \x20 match l {{\n\
+                     \x20   Lookup::Found(a): 1\n\
+                     \x20   Lookup::Missing(_): 2\n\
+                     \x20   Lookup::Skipped: 3\n\
+                     \x20 }}\n\
+                     }}\n"
+                ),
+                "payload を 1 個束縛"
+            ),
+            "Lookup::Found(a): 1"
         );
     }
 

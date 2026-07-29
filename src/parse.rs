@@ -1281,10 +1281,7 @@ mod tests {
                   }\n"
             ),
             vec![
-                (
-                    "Lookup::Found".to_string(),
-                    vec!["user".to_string()]
-                ),
+                ("Lookup::Found".to_string(), vec!["user".to_string()]),
                 (
                     "Lookup::Missing".to_string(),
                     vec!["reason".to_string(), "_".to_string()]
@@ -1296,7 +1293,8 @@ mod tests {
 
     #[test]
     fn armのpatternの閉じ括弧が無いと落ちる() {
-        let e = parse_src("fn f(l: Lookup) {\n match l { Lookup::Found(user: 1 }\n}\n").unwrap_err();
+        let e =
+            parse_src("fn f(l: Lookup) {\n match l { Lookup::Found(user: 1 }\n}\n").unwrap_err();
         assert!(e.msg.contains("`)`"), "{}", e.msg);
     }
 

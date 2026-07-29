@@ -201,10 +201,12 @@ struct Store {
 
 ## enum
 
-データを持たない有限個の値。variant に payload も明示値も書けない。
+有限個の値。variant は0個以上の**型付き positional payload** を持てる。
+明示値は書けない。
 
 ```ebnf
-enum_decl ::= 'enum' ident '{' ident* '}'
+enum_decl ::= 'enum' ident '{' enum_variant* '}'
+enum_variant ::= ident ('(' (type (',' type)*)? ')')?
 ```
 
 ```rhodolite
@@ -212,7 +214,18 @@ enum Rank {
     Bronze
     Gold
 }
+
+enum Lookup {
+    Found(User)
+    Missing(str, int)
+    Skipped
+}
 ```
+
+payload の型は関数引数や struct フィールドと同じ型注釈で、同じ nominal 規則で
+解決される(`use` した名前・角括弧・後置 `?` もそのまま効く)。payload を書かない
+variant は長さ0の payload として同じ形に載るので、`Skipped` と `Skipped()` は
+同じ宣言になる。
 
 variant は宣言モジュールの**普通の宣言**で、`Gold` という裸の名前で参照できる。
 名前の解決・衝突・`use` での導入・ローカル束縛によるシャドーイングは、struct や
@@ -228,16 +241,34 @@ let a = Gold          // 裸の参照
 let b = Rank::Gold    // 限定した参照。a == b
 ```
 
-variant は struct ではない。フィールドアクセスもメソッド解決もできず、
-等しいのは**同じ enum の同じ variant** のときだけ。
+payload を持つ variant は**限定 path の呼び出し**でだけ作る。裸の path は値でも
+first-class な constructor でもなく、引数を伴わない参照は実行前に落ちる。
+
+```rhodolite
+let result = Lookup::Found(user)   // 限定 path に引数を並べる
+let missing = Lookup::Missing("gone", 404)
+```
+
+構築は関数呼び出しと同じ positional 規則で検査する。引数の個数は宣言 payload と
+一致しなければならず、各引数は対応する payload 型と既存の適合規則(optional への
+注入を含む)で照合される。式全体の型は宣言した enum になる。宣言済み enum を
+修飾していても variant でない path は constructor にならず、従来どおり関連関数や
+ambient の型射影として解決される。
+
+variant は struct ではない。フィールドアクセスもメソッド解決もできない。
+等しいのは**同じ enum の同じ variant で、payload が対応ごとに等しい**ときだけで、
+payload の比較には既存の値の等値規則(struct と配列は中身、複合値は参照の共有を
+含む)がそのまま効く。表示は payload を含めて `Enum.Variant(値, ...)` になる。
 
 ### match
 
 enum の値を variant ごとに分岐する。選ばれた arm の値が式全体の値になる。
 
 ```ebnf
-match_expr ::= 'match' expr '{' match_arm* '}'
-match_arm  ::= module_path '::' ident (':' 単純式 | '{' expr* '}')
+match_expr    ::= 'match' expr '{' match_arm* '}'
+match_arm     ::= module_path '::' ident pattern? (':' 単純式 | '{' expr* '}')
+pattern       ::= '(' (pattern_elem (',' pattern_elem)*)? ')'
+pattern_elem  ::= ident | '_'
 ```
 
 ```rhodolite
@@ -247,6 +278,15 @@ let label = match rank {
         audit()
         "gold"
     }
+}
+
+let message = match result {
+    Lookup::Found(user): user.name
+    Lookup::Missing(reason, _) {
+        audit(reason)
+        reason
+    }
+    Lookup::Skipped: "skipped"
 }
 ```
 
@@ -262,13 +302,23 @@ arm の本体は Head と同じ2つの形だけで、区切りはブロックと
 - 期待型のある位置(引数・戻り値・field・代入)では、各 arm をその型と既存の
   適合規則で照合する。期待型が無ければ最初に型の分かる arm を結果型にして残りを
   照合し、その型が後続の検査へ流れる。全 arm が推論の外なら結果型も分からないまま
-- arm は束縛を導入しない。本体は第二級ブロックで、そこで導入した `let` は隣の
-  arm にも後続にも漏れない。`return` は既存どおり関数を抜ける
-- 対象は一度だけ評価し、一致した arm だけを走らせる。要求推論はどの arm も
-  実行されうるものとして**全 arm の要求を合流**する(`if` と同じ保守的な意味論)
+- payload を持つ variant の arm は、宣言 payload と**同じ個数**の平坦な pattern
+  要素を並べる。要素は識別子か `_` だけで、入れ子も literal も OR も無い。個数の
+  不一致と、同じ pattern 内で同じ名前を二度束縛することは実行前に落ちる
+- 識別子は対応する宣言 payload の型を持ち、**その arm 本体の間だけ**見える。
+  同名の外側ローカル・宣言・ambient スロットをその間だけ隠し、隣の arm にも
+  match の後にも漏れない。`_` は値を捨て、名前を導入しないので何も隠さない
+- 束縛の型は field の読み・呼び出しの引数・代入・戻り値という既存の検査へ
+  そのまま流れる
+- 本体は第二級ブロックで、そこで導入した `let` も隣の arm と後続へ漏れない。
+  `return` は既存どおり関数を抜ける
+- 対象は一度だけ評価し、一致した arm だけを走らせる。constructor の引数も
+  左から一度ずつ評価する。要求推論はどの arm も実行されうるものとして
+  **全 arm の要求を合流**する(`if` と同じ保守的な意味論)。payload の名前が
+  隠したスロットは、その arm の中では要求にならない
 
-データ付き variant、束縛を伴う pattern、ワイルドカード、guard、enum のメソッドは
-無い。
+variant 全体を覆う catch-all pattern、guard、入れ子 pattern、名前付き payload、
+payload の field access、enum のメソッドは無い。
 
 ## ambient は4箇所にしか現れない
 
@@ -313,8 +363,13 @@ trait の中の `fn` が同じ見た目で違う意味になる。宣言に出�
 
 ## まだ決めていない
 
-- データ付き variant と、それに伴う pattern 束縛・ワイルドカード・guard —
-  fieldless の `match` が入ったので、必要になった時点で1つずつ決める
+- variant 全体を覆う catch-all pattern と guard — どちらも「variant ごとに
+  過不足なく一つの arm」という網羅性モデルを変える。同じ variant の複数 arm、
+  guard が全て偽のときの fallback、網羅性への算入規則を同時に決める必要がある
+  ので、利用例が出た時点で1つずつ決める
+- 入れ子 pattern・literal pattern・OR pattern と、名前付き payload・payload の
+  field access — payload の構築と分解が往復するようになったので、必要になった
+  時点で決める
 - `elif`/`else` を `}` と同じ行に置くか次行かは**フォーマッタ規約**
   (行継続規則がどちらも受けるため文法の問題ではない)
 - 非局所制御フローの細則(break のラベル、ネストした Head からの early return)
