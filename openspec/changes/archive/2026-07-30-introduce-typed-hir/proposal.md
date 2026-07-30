@@ -22,7 +22,10 @@
 
 ### Modified Capabilities
 
-なし。既存main specsの観測可能な要件をすべて維持する。
+- `total-static-type-checking` — 下ろしを全域にするために、閉じた検査契約へ3つの
+  要件を足す。型注釈の名前、`effect` と inherent `impl` の対象、代入の左辺は
+  すべて宣言を指さなければならない。どれも以前は実行時に失敗するか黙って通って
+  いた形で、HIR に置き場所が無い。
 
 ## Impact
 
@@ -31,4 +34,4 @@
 - `src/requirement.rs` と `src/eval.rs` は段階的に HIR を入力とする実装へ移行する。
 - `src/main.rs` は HIR を要求解析と評価へ渡す。
 - AST、module loader、lexer、parser、診断描画、言語仕様、外部依存は原則として変更しない。
-- 利用者向け仕様変更がないため、このchangeは`skip_specs: true`としdelta specsを作らない。
+- 上記3件を除いて利用者向けの観測可能な変更はない。delta specsはその3件だけを記述する。
