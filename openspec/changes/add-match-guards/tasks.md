@@ -22,6 +22,6 @@
 
 ## 4. Documentation and final verification
 
-- [ ] 4.1 Update `docs/grammar.md`, `docs/overview.md`, `README.md` where relevant, and AST/compiler comments with guard syntax, scope, boolean checking, fallback, exhaustiveness, and remaining pattern boundaries.
-- [ ] 4.2 Run `cargo fmt --check`, the complete Rust test suite, canonical and missing-handler examples, and strict OpenSpec validation; fix all regressions.
-- [ ] 4.3 Commit the final verified implementation and documentation snapshot.
+- [x] 4.1 Update `docs/grammar.md`, `docs/overview.md`, `README.md` where relevant, and AST/compiler comments with guard syntax, scope, boolean checking, fallback, exhaustiveness, and remaining pattern boundaries.
+- [x] 4.2 Run `cargo fmt --check`, the complete Rust test suite, canonical and missing-handler examples, and strict OpenSpec validation; fix all regressions.
+- [x] 4.3 Commit the final verified implementation and documentation snapshot.

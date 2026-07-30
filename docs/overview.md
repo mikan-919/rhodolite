@@ -189,6 +189,16 @@ payload を持たない variant は、裸の名前に加えて `Rank::Gold` と�
 結果型は期待型、無ければ最初に型の分かる arm を基準にして照合し、その型が後続の
 検査へ流れる。要求推論はどの arm も実行されうるものとして全 arm の要求を合流する。
 
+限定 pattern には `if 条件` の guard を続けられる。guard は arm が選ばれるかだけを
+決め、payload の束縛を本体と同じに見る。型が分かるなら `bool` でなければならず、
+推論の外なら `if` の条件と同じく実行時に `bool` を要求する。`_` に guard は
+付けられない。guard は偽になりうるので、guard 付きの arm はその variant を網羅した
+ことにならず、偽のときの行き先として最後の `_` が要る。重複の禁止は guard の有無に
+関わらず効くので、同じ variant を条件違いで並べることはできない。実行時は限定 arm が
+一致したら payload を束縛してから guard を一度だけ評価し、真のときだけその本体を
+走らせる。偽なら本体を走らせずに `_` へ落ちる。要求推論は guard も本体と同じに
+保守的へ合流する。
+
 variant は0個以上の型付き positional payload を宣言できる。payload の型は他の型
 注釈と同じ nominal 規則で正準化される。payload を持つ variant は
 `Lookup::Found(user)` という限定 path の呼び出しでだけ作れ、裸の path は値でも
@@ -247,6 +257,7 @@ struct Diag {
 | `_` の重複 | 2つ目以降の `_` の arm |
 | `_` が最後でない | 先頭の `_` の arm |
 | `match` の variant 欠落 | `match` 式全体 |
+| arm の guard の型違い(実行前・実行時とも) | その guard 式 |
 | `effect` の重複 | その `effect` 宣言 |
 | 未定義の直接呼び出し | その呼び出し |
 | 提供忘れ | スロットの使用地点。経路の各ホップは `related` |

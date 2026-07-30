@@ -266,8 +266,10 @@ enum の値を variant ごとに分岐する。選ばれた arm の値が式全�
 
 ```ebnf
 match_expr    ::= 'match' expr '{' match_arm* '}'
-match_arm     ::= (module_path '::' ident pattern? | '_')
+match_arm     ::= module_path '::' ident pattern? guard?
                   (':' 単純式 | '{' expr* '}')
+                | '_' (':' 単純式 | '{' expr* '}')
+guard         ::= 'if' expr
 pattern       ::= '(' (pattern_elem (',' pattern_elem)*)? ')'
 pattern_elem  ::= ident | '_'
 ```
@@ -294,6 +296,11 @@ let message = match result {
     Lookup::Found(user): user.name
     _: "なし"
 }
+
+let message = match result {
+    Lookup::Found(user) if user.active: user.name
+    _: "なし"
+}
 ```
 
 arm の本体は Head と同じ2つの形だけで、区切りはブロックと同じ改行(カンマは
@@ -304,7 +311,8 @@ arm の本体は Head と同じ2つの形だけで、区切りはブロックと
   で展開する。型が分からない対象は実行時へ回さず、その場で診断する
 - arm は対象 enum の宣言 variant を**過不足なく一度ずつ**持つ。欠落・重複・
   別 enum の variant・宣言に無い variant はすべて実行前に落ちる。宣言 variant が
-  0個の enum は arm ゼロで網羅的
+  0個の enum は arm ゼロで網羅的。重複の禁止は guard の有無に関わらず効くので、
+  同じ variant を条件違いで並べることはできない
 - `_` は限定 arm が拾わなかった variant を**全部**受ける。`_` があれば網羅的
   なので、残りの variant を書かなくてよい。`_` は**一度だけ**、**最後の arm**
   として書く。重複と後続 arm は実行前に落ちる。全 variant を書いた上での `_` は
@@ -325,15 +333,23 @@ arm の本体は Head と同じ2つの形だけで、区切りはブロックと
   そのまま流れる
 - 本体は第二級ブロックで、そこで導入した `let` も隣の arm と後続へ漏れない。
   `return` は既存どおり関数を抜ける
-- 対象は一度だけ評価し、一致した限定 arm だけを走らせる。限定 arm が無ければ
-  `_` へ落ちる。constructor の引数も
+- 限定 pattern には `if 条件` の **guard** を続けられる。guard は payload の
+  束縛を本体と同じに見られて、型が分かるなら `bool` でなければならない。型が
+  推論の外なら `if` の条件と同じく実行時に `bool` を要求する。`_` に guard は
+  付けられない
+- guard 付きの arm は偽になりうるので、**その variant を網羅したことにならない**。
+  guard を書いたら、偽のときの行き先として最後の `_` が要る
+- 対象は一度だけ評価し、選ばれた arm だけを走らせる。限定 arm が一致したら
+  payload を束縛してから guard を**一度だけ**評価し、真のときだけその本体を
+  走らせる。偽なら本体を走らせずに `_` へ落ちる。限定 arm が無いときも `_` へ
+  落ちる。constructor の引数も
   左から一度ずつ評価する。要求推論はどの arm も実行されうるものとして
-  **全 arm の要求を合流**する(`if` と同じ保守的な意味論)。payload の名前が
-  隠したスロットは、その arm の中では要求にならない
+  **全 arm の guard と本体の要求を合流**する(`if` と同じ保守的な意味論)。
+  payload の名前が隠したスロットは、その arm の中では要求にならない
 
-guard、入れ子 pattern、literal や OR の pattern、名前付き payload、
-payload の field access、enum のメソッドは無い。`_` で受けた値そのものを
-名前で受け取る pattern も無い。
+同じ variant を条件違いで並べる arm、入れ子 pattern、literal や OR の pattern、
+名前付き payload、payload の field access、enum のメソッドは無い。`_` で受けた
+値そのものを名前で受け取る pattern も無い。
 
 ## ambient は4箇所にしか現れない
 
