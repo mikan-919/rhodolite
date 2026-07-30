@@ -37,16 +37,18 @@ fn main() -> ExitCode {
         println!("  {}", summary(item));
     }
 
-    // 要求解析より前に struct の形を固める。ここを通れば、評価器へ届く
-    // struct 値は宣言どおりの形をしている(src/typecheck.rs)
-    let shape_errors = typecheck::check(&program);
-    if !shape_errors.is_empty() {
-        eprintln!();
-        render::report(&shape_errors, &sources);
-        return ExitCode::FAILURE;
-    }
+    // 検査と下ろしはひとつ。ここを通れば、後段が受け取るのは型の付いた
+    // 参照解決済みの HIR で、名前を引き直す必要がない(src/hir.rs)
+    let checked = match typecheck::check_and_lower(&program) {
+        Ok(checked) => checked,
+        Err(errors) => {
+            eprintln!();
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let analysis = requirement::analyze(&program);
+    let analysis = requirement::analyze(&checked);
 
     println!("\nスロット:");
     for slot in analysis.slots.names() {

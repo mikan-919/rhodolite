@@ -337,14 +337,6 @@ impl Out {
     }
 }
 
-/// 診断を全件返す。空なら struct の形と分かる enum 型は正しい。
-///
-/// 下ろした HIR を捨てて診断だけを見る呼び出し口。既存のテストと、HIR を
-/// 要らない場所のために残す(design.md 決定7)。
-pub fn check(program: &Program) -> Vec<Diag> {
-    check_and_lower(program).err().unwrap_or_default()
-}
-
 /// 型検査と HIR の構築。**同じ1回の走査**で型と呼び出し先を決めながら下ろすので、
 /// 検査が知った事実を後から復元し直すことがない(design.md 決定7)。
 ///
@@ -615,6 +607,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 ));
                 ids.fns.insert(sig.name.clone(), id);
                 targets.push(Target::Callable(id));
+                lowered.bodies.push(hir::BodyId::Callable(id));
             }
             Item::Impl {
                 trait_name,
@@ -651,6 +644,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                     span: *span,
                 });
                 targets.push(Target::Test(id));
+                lowered.bodies.push(hir::BodyId::Test(id));
             }
         }
     }
@@ -900,6 +894,7 @@ fn lower_impl(
             });
         }
         targets.push(Target::Callable(id));
+        lowered.bodies.push(hir::BodyId::Callable(id));
     }
 }
 
@@ -1820,6 +1815,8 @@ enum CallTarget {
         slot: hir::SlotId,
         method: hir::TraitMethodId,
         receiver: hir::SlotReceiver,
+        /// スロットを名指している部分の位置。呼び出し全体より狭い
+        slot_span: Span,
     },
     Ctor(hir::VariantId),
     Unresolvable,
@@ -1878,10 +1875,12 @@ fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Ou
             slot,
             method,
             receiver,
+            slot_span,
         } => hir::ExprKind::Call(hir::Call::Slot {
             slot,
             method,
             receiver,
+            slot_span,
             args: ids,
         }),
         CallTarget::Ctor(variant) => hir::ExprKind::Call(hir::Call::Ctor { variant, args: ids }),
@@ -1931,6 +1930,7 @@ fn resolve<'d>(
                                 &trait_name,
                                 name,
                                 hir::SlotReceiver::Value,
+                                callee.span,
                                 decls,
                             ),
                         )
@@ -1989,6 +1989,7 @@ fn resolve<'d>(
                                     &trait_name,
                                     name,
                                     hir::SlotReceiver::Type,
+                                    callee.span,
                                     decls,
                                 ),
                             )
@@ -2040,6 +2041,7 @@ fn slot_target(
     trait_name: &str,
     method: &str,
     receiver: hir::SlotReceiver,
+    slot_span: Span,
     decls: &Decls,
 ) -> CallTarget {
     let contract = decls
@@ -2051,6 +2053,7 @@ fn slot_target(
             slot: *slot,
             method: *method,
             receiver,
+            slot_span,
         },
         _ => CallTarget::Unresolvable,
     }

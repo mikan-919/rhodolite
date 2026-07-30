@@ -367,6 +367,13 @@ pub struct TraitImplDecl {
     pub span: Span,
 }
 
+/// 本体の同一性。宣言順の並びと、要求解析・評価器の本体参照に使う。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum BodyId {
+    Callable(CallableId),
+    Test(TestId),
+}
+
 /// 本体の持ち主。診断と要求解析の表示名はここから決まる。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CallableOwner {
@@ -613,6 +620,9 @@ pub enum Call {
         slot: SlotId,
         method: TraitMethodId,
         receiver: SlotReceiver,
+        /// スロットを名指している部分(`db.save` / `db::make`)の位置。
+        /// 呼び出し全体より狭い。提供忘れの診断は使用地点としてここを指す
+        slot_span: Span,
         args: Vec<ExprId>,
     },
     /// `Lookup::Found(user)` — enum の構築
@@ -646,6 +656,9 @@ pub struct Program {
     pub slots: Arena<SlotId, SlotDecl>,
     pub callables: Arena<CallableId, Callable>,
     pub tests: Arena<TestId, TestDecl>,
+    /// 宣言順の本体。要求の一覧の並びは宣言順なので、arena が種類ごとに
+    /// 分かれていても元の順を復元できるようここに持つ
+    pub bodies: Vec<BodyId>,
 }
 
 impl Program {
@@ -672,18 +685,39 @@ impl Program {
         out
     }
 
-    /// 要求解析と診断が使う本体の表示名。`impl Trait::method` / `impl Type::method`
+    pub fn body(&self, id: BodyId) -> &Body {
+        match id {
+            BodyId::Callable(id) => &self.callables[id].body,
+            BodyId::Test(id) => &self.tests[id].body,
+        }
+    }
+
+    /// 要求解析と診断が使う本体の表示名。
+    ///
+    /// `impl` のメソッドは trait ではなく**実装先の型**で綴る。同じ契約の別の
+    /// 実装は別の本体なので、具体的な呼び出し先を指すときは型で言い分ける
+    /// (契約そのものを指す綴りは `show_trait_method`)。
     pub fn show_callable(&self, id: CallableId) -> String {
         let callable = &self.callables[id];
-        match callable.owner {
-            CallableOwner::Free => callable.name.clone(),
-            CallableOwner::Inherent(type_) => {
-                format!("impl {}::{}", self.structs[type_].name, callable.name)
-            }
-            CallableOwner::TraitImpl(impl_) => format!(
-                "impl {}::{}",
-                self.traits[self.trait_impls[impl_].trait_].name, callable.name
-            ),
+        let owner = match callable.owner {
+            CallableOwner::Free => return callable.name.clone(),
+            CallableOwner::Inherent(type_) => type_,
+            CallableOwner::TraitImpl(impl_) => self.trait_impls[impl_].type_,
+        };
+        format!("impl {}::{}", self.structs[owner].name, callable.name)
+    }
+
+    /// 契約メソッドの表示名。スロット経由の呼び出しはこれを指す
+    pub fn show_trait_method(&self, id: TraitMethodId) -> String {
+        let method = &self.trait_methods[id];
+        format!("impl {}::{}", self.traits[method.owner].name, method.name)
+    }
+
+    /// 本体の表示名。
+    pub fn show_body(&self, id: BodyId) -> String {
+        match id {
+            BodyId::Callable(id) => self.show_callable(id),
+            BodyId::Test(id) => format!("test {:?}", self.tests[id].name),
         }
     }
 
@@ -1078,6 +1112,7 @@ impl Program {
                     method,
                     receiver,
                     args: a,
+                    ..
                 } => format!(
                     "call slot {}{}{}({})",
                     self.slots[*slot].name,

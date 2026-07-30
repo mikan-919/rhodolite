@@ -42,14 +42,14 @@
 
 ## 5. HIR Requirement Analysis
 
-- [ ] 5.1 Add HIR body-fact scanning keyed by callable, trait-method virtual body, slot, local, and resolved call IDs
-- [ ] 5.2 Merge trait implementation method facts into both concrete callable and trait-method virtual identities without string keys
-- [ ] 5.3 Port provision masking, slot type/value levels, fixed-point propagation, and call-path construction to HIR IDs
-- [ ] 5.4 Preserve public requirement ordering, canonical display names, rendered summaries, diagnostics, and related call-site spans
-- [ ] 5.5 Add differential tests comparing complete AST and HIR analysis results for canonical, recursive, multi-module, match, and nested-provider programs
-- [ ] 5.6 Switch CLI requirement analysis to HIR after differential coverage passes
-- [ ] 5.7 Remove AST requirement scanning and temporary string body keys while retaining the existing fixed-point algorithm
-- [ ] 5.8 Run formatting, the full test suite, and strict OpenSpec validation, then commit HIR requirement analysis as a stable snapshot
+- [x] 5.1 Add HIR body-fact scanning keyed by callable, trait-method virtual body, slot, local, and resolved call IDs
+- [x] 5.2 Merge trait implementation method facts into both concrete callable and trait-method virtual identities without string keys
+- [x] 5.3 Port provision masking, slot type/value levels, fixed-point propagation, and call-path construction to HIR IDs
+- [x] 5.4 Preserve public requirement ordering, canonical display names, rendered summaries, diagnostics, and related call-site spans
+- [x] 5.5 Add differential tests comparing complete AST and HIR analysis results for canonical, recursive, multi-module, match, and nested-provider programs
+- [x] 5.6 Switch CLI requirement analysis to HIR after differential coverage passes
+- [x] 5.7 Remove AST requirement scanning and temporary string body keys while retaining the existing fixed-point algorithm
+- [x] 5.8 Run formatting, the full test suite, and strict OpenSpec validation, then commit HIR requirement analysis as a stable snapshot
 
 ## 6. HIR Reference Interpreter
 
