@@ -3,6 +3,9 @@
 mod ast;
 mod diag;
 mod eval;
+// HIR は段ごとに使われ始める。移行が終わるまでは未使用の語彙が残る
+#[allow(dead_code)]
+mod hir;
 mod lex;
 mod module;
 mod parse;

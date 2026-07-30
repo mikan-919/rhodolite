@@ -1,11 +1,11 @@
 ## 1. HIR Vocabulary and Storage
 
-- [ ] 1.1 Add `src/hir.rs` with distinct program-local ID newtypes and checked arena allocation/access helpers
-- [ ] 1.2 Define HIR builtin, struct, enum, array, optional, and divergent result types without canonical-name strings in semantic type references
-- [ ] 1.3 Define owned declaration records for structs, fields, enums, variants, traits, trait methods, slots, tests, callables, and trait implementations
-- [ ] 1.4 Define the structured expression arena, `ExprId`, `LocalId`, source spans, blocks, heads, match arms, provisions, and resolved call variants
-- [ ] 1.5 Add deterministic debug rendering and focused tests proving IDs are declaration-ordered and cannot be mixed across declaration kinds
-- [ ] 1.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the HIR vocabulary as a stable snapshot
+- [x] 1.1 Add `src/hir.rs` with distinct program-local ID newtypes and checked arena allocation/access helpers
+- [x] 1.2 Define HIR builtin, struct, enum, array, optional, and divergent result types without canonical-name strings in semantic type references
+- [x] 1.3 Define owned declaration records for structs, fields, enums, variants, traits, trait methods, slots, tests, callables, and trait implementations
+- [x] 1.4 Define the structured expression arena, `ExprId`, `LocalId`, source spans, blocks, heads, match arms, provisions, and resolved call variants
+- [x] 1.5 Add deterministic debug rendering and focused tests proving IDs are declaration-ordered and cannot be mixed across declaration kinds
+- [x] 1.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the HIR vocabulary as a stable snapshot
 
 ## 2. Declaration Lowering
 
