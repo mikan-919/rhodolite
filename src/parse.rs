@@ -623,7 +623,8 @@ impl<'a> Parser<'a> {
     }
 
     /// `match` の arm 列。区切りはブロックと同じ改行で、カンマは無い。
-    /// 本体は既存 Head と同じ `: 単純式` か `{ ... }`(design.md 決定1)。
+    /// 限定 pattern には任意の `if 条件` が続けられ、本体は既存 Head と同じ
+    /// `: 単純式` か `{ ... }`(design.md 決定1・2)。
     fn match_arms(&mut self) -> PResult<Vec<MatchArm>> {
         self.expect(&Tok::LBrace, "`{`")?;
         let mut arms = Vec::new();
@@ -638,9 +639,22 @@ impl<'a> Parser<'a> {
 
             let start = self.span();
             let pattern = self.match_pattern()?;
+            // `Enum::Variant(payload) if condition` — 本体の `{` を struct
+            // literal と読まないよう、`if`/`while` と同じ cond で読む
+            // (design.md 決定2)
+            let guard = if self.at(&Tok::If) {
+                if matches!(pattern, MatchPattern::CatchAll) {
+                    return Err(self.err("`_` に `if` は付けられません"));
+                }
+                self.bump();
+                Some(Box::new(self.cond()?))
+            } else {
+                None
+            };
             let body = self.head_body()?;
             arms.push(MatchArm {
                 pattern,
+                guard,
                 body,
                 span: self.to(start),
             });
@@ -1344,6 +1358,64 @@ mod tests {
     fn 全体patternのアンダースコアはpayloadを取れない() {
         let e = parse_src("fn f(l: Lookup) {\n match l { _(reason): 1 }\n}\n").unwrap_err();
         assert!(e.msg.contains("payload を束縛できません"), "{}", e.msg);
+    }
+
+    /// arm の guard の有無を取り出す
+    fn arm_guards(src: &str) -> Vec<bool> {
+        let p = ok(src);
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!()
+        };
+        let ExprKind::Let { value, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        let ExprKind::Match { arms, .. } = &value.kind else {
+            panic!("match ではない: {:?}", value.kind)
+        };
+        arms.iter().map(|a| a.guard.is_some()).collect()
+    }
+
+    #[test]
+    fn 限定armにifのguardを書ける() {
+        // 単純式の本体でもブロックの本体でも guard を読み終えてから本体へ進む
+        assert_eq!(
+            arm_guards(
+                "fn f(l: Lookup) {\n\
+                  \x20 let x = match l {\n\
+                  \x20   Lookup::Found(user) if user.age == 1: 1\n\
+                  \x20   Lookup::Missing(reason, _) if ready {\n\
+                  \x20     2\n\
+                  \x20   }\n\
+                  \x20   Lookup::Skipped: 3\n\
+                  \x20   _: 4\n\
+                  \x20 }\n\
+                  }\n"
+            ),
+            vec![true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn guardの直後のbraceは本体になる() {
+        // `if ready { .. }` の `{` を `ready` の struct リテラルにはしない
+        assert_eq!(
+            arm_guards(
+                "fn f(r: Rank) {\n let x = match r {\n Rank::Gold if ready { 1 }\n _: 0\n }\n}\n"
+            ),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn アンダースコアにguardは付けられない() {
+        let e = parse_src("fn f(r: Rank) {\n match r { _ if ready: 1 }\n}\n").unwrap_err();
+        assert!(e.msg.contains("`_` に `if`"), "{}", e.msg);
+    }
+
+    #[test]
+    fn guardの条件が無いと落ちる() {
+        let e = parse_src("fn f(r: Rank) {\n match r { Rank::Gold if: 1 }\n}\n").unwrap_err();
+        assert!(!e.msg.is_empty());
     }
 
     #[test]

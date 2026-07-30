@@ -1015,6 +1015,19 @@ fn resolve_expr(
                     }
                     bind_pattern(bindings, &mut arm_locals);
                 }
+                // guard も本体も同じ payload スコープで見るが、片方で増えた
+                // 束縛をもう片方へ漏らさないよう複製で入る(design.md 決定3)
+                if let Some(guard) = &mut arm.guard {
+                    resolve_expr(
+                        guard,
+                        &mut arm_locals.clone(),
+                        local,
+                        imported_declarations,
+                        imported_modules,
+                        declarations,
+                        diagnostics,
+                    );
+                }
                 resolve_expr(
                     &mut arm.body,
                     &mut arm_locals,
@@ -1395,6 +1408,13 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
                         }
                         bind_pattern(bindings, &mut arm_locals);
                     }
+                    if let Some(guard) = &arm.guard {
+                        collect_expr_paths(
+                            std::slice::from_ref(&**guard),
+                            &mut arm_locals.clone(),
+                            paths,
+                        );
+                    }
                     collect_expr_paths(std::slice::from_ref(&arm.body), &mut arm_locals, paths);
                 }
             }
@@ -1730,6 +1750,63 @@ mod tests {
         assert_eq!(callee(&arms[1]), "main::local");
         // match の後にも漏れない
         assert!(matches!(&body[1].kind, ExprKind::Ident(name) if name == "main::local"));
+        assert!(!locals.contains("local"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// guard は本体と同じ payload スコープで解決される。payload に隠されない
+    /// 名前は輸入宣言として正準名になる(design.md 決定3)
+    #[test]
+    fn armのguardも本体と同じスコープで解決する() {
+        let mut program = parse::parse(&join(
+            lex("fn main(l: Lookup) {\n\
+                 \x20 match l {\n\
+                 \x20   Lookup::Found(local) if local == ready: 1\n\
+                 \x20   Lookup::Missing(_) if local == ready: 2\n\
+                 \x20   _: 0\n\
+                 \x20 }\n\
+                 }\n")
+            .unwrap(),
+        ))
+        .unwrap();
+        let Item::Fn { body, .. } = &mut program.items[0] else {
+            panic!()
+        };
+
+        let local = BTreeMap::from([
+            ("Lookup".to_string(), "main::Lookup".to_string()),
+            ("local".to_string(), "main::local".to_string()),
+            ("ready".to_string(), "main::ready".to_string()),
+        ]);
+        let mut diagnostics = Vec::new();
+        let mut locals = BTreeSet::from(["l".to_string()]);
+        resolve_exprs(
+            body,
+            &mut locals,
+            &local,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut diagnostics,
+        );
+
+        let ExprKind::Match { arms, .. } = &body[0].kind else {
+            panic!("match ではない: {:?}", body[0].kind)
+        };
+        let lhs = |arm: &MatchArm| {
+            let ExprKind::Binary { lhs, rhs, .. } = &arm.guard.as_ref().unwrap().kind else {
+                panic!("guard が二項式ではない")
+            };
+            let (ExprKind::Ident(l), ExprKind::Ident(r)) = (&lhs.kind, &rhs.kind) else {
+                panic!("guard の両辺が裸の名前ではない")
+            };
+            // 隠されない `ready` はどちらの arm でも宣言として解決される
+            assert_eq!(r, "main::ready");
+            l.clone()
+        };
+        // payload が同名の宣言を隠すのは束縛した arm の guard の中だけ
+        assert_eq!(lhs(&arms[0]), "local");
+        assert_eq!(lhs(&arms[1]), "main::local");
         assert!(!locals.contains("local"));
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }

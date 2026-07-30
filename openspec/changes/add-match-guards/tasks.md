@@ -1,9 +1,9 @@
 ## 1. Guard representation and syntax
 
-- [ ] 1.1 Add `MatchArm::guard: Option<Box<Expr>>`, update every existing arm constructor with `None`, and keep the complete Rust test suite green.
-- [ ] 1.2 Parse `Enum::Variant(payload) if condition` with simple and block arm bodies, reject `if` after `_`, and add focused parser tests for valid and malformed forms.
-- [ ] 1.3 Resolve names and collect paths in guards under the same payload-local scope as their arm bodies, with tests for imported names and payload shadowing.
-- [ ] 1.4 Run formatting and the complete Rust test suite, then commit the verified representation, syntax, and loading snapshot.
+- [x] 1.1 Add `MatchArm::guard: Option<Box<Expr>>`, update every existing arm constructor with `None`, and keep the complete Rust test suite green.
+- [x] 1.2 Parse `Enum::Variant(payload) if condition` with simple and block arm bodies, reject `if` after `_`, and add focused parser tests for valid and malformed forms.
+- [x] 1.3 Resolve names and collect paths in guards under the same payload-local scope as their arm bodies, with tests for imported names and payload shadowing.
+- [x] 1.4 Run formatting and the complete Rust test suite, then commit the verified representation, syntax, and loading snapshot.
 
 ## 2. Static guard semantics
 

@@ -211,11 +211,15 @@ pub enum ExprKind {
     },
 }
 
-/// `Rank::Gold: "gold"` / `Lookup::Found(user) { ... }` / `_: "other"` —
-/// pattern と、既存 Head と同じ形の本体。
+/// `Rank::Gold: "gold"` / `Lookup::Found(user) if n > 0 { ... }` / `_: "other"`
+/// — pattern と、任意の boolean guard と、既存 Head と同じ形の本体。
 #[derive(Debug)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
+    /// `Enum::Variant(payload) if condition` の `condition`。arm が選ばれるかを
+    /// 決めるので pattern ではなく arm が持つ。`_` には付けられない
+    /// (design.md 決定1)。payload の束縛は本体と同じくここからも見える
+    pub guard: Option<Box<Expr>>,
     pub body: Expr,
     pub span: Span,
 }
