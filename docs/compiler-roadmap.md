@@ -5,8 +5,8 @@ C バックエンドを追加する。インタプリタは捨てず、生成コ
 参照実装として残す。
 
 この文書は**順序と完了線の地図**であり、個々の機能仕様ではない。OpenSpec change は
-各段階へ着手する直前に作り、その時点までに判明した制約を反映する。後続 change 名は
-予約名であり、まだ作成済みであることを意味しない。
+各段階へ着手する直前に作り、その時点までに判明した制約を反映する。状態が「未着手」の
+change 名は予約名であり、まだ作成済みであることを意味しない。
 
 ## 到達点
 
@@ -56,7 +56,7 @@ compiled v1
 |---|---|---|---|
 | 0 | 完了 | archived changes | AST インタプリタと v1 正典 |
 | 1 | 完了 | archived `close-static-type-checking` | Unknown のない検査成功 |
-| 2 | 未着手 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
+| 2 | 計画済み | `introduce-typed-hir` | 型付き・名前解決済み HIR |
 | 3 | 未着手 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 未着手 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |
 | 5 | 未着手 | `compile-data-values` | struct・enum・optional・配列の C 表現 |
@@ -69,7 +69,7 @@ archive してから次段の提案を作る。
 ## 1. 型検査を閉じる
 
 OpenSpec:
-[`close-static-type-checking`](../openspec/changes/close-static-type-checking/)
+[`close-static-type-checking`](../openspec/changes/archive/2026-07-30-close-static-type-checking/)
 
 目的は、検査成功後に「型が分からない」「呼び出し先が分からない」を残さないこと。
 戻り値注釈なしを `unit` とし、文脈を必要とする局所値には
@@ -85,7 +85,8 @@ OpenSpec:
 
 ## 2. 型付き HIR を導入する
 
-想定 change: `introduce-typed-hir`
+OpenSpec:
+[`introduce-typed-hir`](../openspec/changes/introduce-typed-hir/)
 
 この段階は利用者向けの新機能ではなく内部表現の置換なので、OpenSpec では
 `skip_specs: true` のリファクタ change とする。
