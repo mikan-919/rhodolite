@@ -56,8 +56,8 @@ compiled v1
 |---|---|---|---|
 | 0 | 完了 | archived changes | AST インタプリタと v1 正典 |
 | 1 | 完了 | archived `close-static-type-checking` | Unknown のない検査成功 |
-| 2 | 計画済み | `introduce-typed-hir` | 型付き・名前解決済み HIR |
-| 3 | 未着手 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
+| 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
+| 3 | 次 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 未着手 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |
 | 5 | 未着手 | `compile-data-values` | struct・enum・optional・配列の C 表現 |
 | 6 | 未着手 | `compile-traits-and-ambient` | trait・slot・`with` の C 生成 |
@@ -91,15 +91,25 @@ OpenSpec:
 この段階は利用者向けの新機能ではなく内部表現の置換なので、OpenSpec では
 `skip_specs: true` のリファクタ change とする。
 
-AST 上の文字列名を、`FnId`、`TypeId`、`FieldId`、`VariantId`、`SlotId` などの
-解決済み ID へ変換する。各 HIR 式は具体型と元ソースの span を持つ。
+AST 上の文字列名を、`CallableId`、`StructId`、`FieldId`、`EnumId`、`VariantId`、
+`TraitId`、`TraitMethodId`、`TraitImplId`、`SlotId`、`LocalId`、`ExprId` の
+解決済み ID へ変換する。各 HIR 式は具体型または制御脱出の分類と、元ソースの
+span を持つ。
 
-完了条件:
+完了条件(すべて達成):
 
 - HIR 評価中に名前探索・メソッド候補探索・型推論を行わない
 - HIR インタプリタで現在の正典プログラムが同じ結果になる
 - 既存の診断位置と要求表示が変わらない
 - AST 直接評価を正式な実行経路から外せる
+
+結果として、パイプラインは
+`load AST → check/lower HIR → analyze HIR → eval HIR` になった。
+`typecheck::check_and_lower` が唯一の境界で、診断が1件でもあれば HIR は渡らない。
+下ろしを全域にするために、型注釈・`effect` の対象・inherent `impl` の対象は
+宣言済みの名前でなければならず、代入の左辺は局所束縛か宣言フィールドで
+なければならない。どれも以前は実行時に失敗するか黙って通っていた形で、
+HIR に置き場所が無い。
 
 ## 3. ambient の低水準契約を決める
 

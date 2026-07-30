@@ -20,7 +20,6 @@
 //! 「いま提供されているスロットの集合」を持ち回る必要が出た時点で、
 //! 同じ走査に畳んだ。`scan` の1回の再帰が2・3・4を兼ねている。
 
-use crate::ast::{Item, Program};
 use crate::diag::Diag;
 use crate::hir;
 use crate::lex::Span;
@@ -36,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// ただのローカル変数なのか区別がつかない。
 #[derive(Debug, Default)]
 pub struct Slots {
-    map: HashMap<String, String>,
+    pub(crate) map: HashMap<String, String>,
 }
 
 impl Slots {
@@ -51,26 +50,6 @@ impl Slots {
     pub fn names(&self) -> BTreeSet<&str> {
         self.map.keys().map(|s| s.as_str()).collect()
     }
-}
-
-/// プログラム全体から `Item::Effect` を拾って表にする。
-///
-/// ヒント: `program.items` を回して `Item::Effect { slot, trait_name, .. }` に
-/// マッチしたものを入れるだけ。再帰も木歩きも要らない。
-pub fn collect_slots(program: &Program) -> Slots {
-    let mut map = HashMap::new();
-    for x in program.items.iter() {
-        if let Item::Effect {
-            slot,
-            trait_name,
-            span: _,
-        } = x
-        {
-            // 重複は analyze の診断で止めるため、ここでどちらが残るかは観測されない。
-            map.insert(slot.clone(), trait_name.clone());
-        }
-    }
-    Slots { map }
 }
 
 // ---------------------------------------------------------------------------
@@ -673,10 +652,11 @@ impl Analysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast;
     use crate::lex::{join, lex};
     use crate::parse;
 
-    fn program(src: &str) -> Program {
+    fn program(src: &str) -> ast::Program {
         parse::parse(&join(lex(src).unwrap())).expect("パースできるはず")
     }
 
@@ -685,7 +665,7 @@ mod tests {
         analysis_of_program(&program(src))
     }
 
-    fn analysis_of_program(p: &Program) -> Analysis {
+    fn analysis_of_program(p: &ast::Program) -> Analysis {
         let lowered = crate::typecheck::check_and_lower(p).expect("型検査を通るはず");
         analyze(&lowered)
     }
@@ -947,10 +927,11 @@ mod tests {
 
     // ---- 手順1 ----
 
+    /// スロット表は下ろした HIR から作る。名前で引くのは CLI の一覧表示だけ
     #[test]
     fn 手順1_スロット表を作る() {
-        let p = program("effect db: Database\neffect clock: Clock\n");
-        let slots = collect_slots(&p);
+        let lowered = lowered_of("fn main() { assert true }\n");
+        let slots = analyze(&lowered).slots;
 
         assert_eq!(slots.trait_of("db"), Some("Database"));
         assert_eq!(slots.trait_of("clock"), Some("Clock"));

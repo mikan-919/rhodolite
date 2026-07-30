@@ -63,7 +63,7 @@ use crate::diag::Diag;
 use crate::hir;
 use crate::lex::Span;
 use crate::module::short_name;
-use crate::requirement::{Slots, collect_slots};
+use crate::requirement::Slots;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 宣言の索引。正準名でそのまま引く。
@@ -263,6 +263,25 @@ fn array_of(element: KnownType) -> KnownType {
         kind: KnownKind::Array(Box::new(element)),
         optional: false,
     }
+}
+
+/// 構文木の `effect` 宣言から、スロット名 → trait 名の表を作る。
+///
+/// これがないと `db.save(u)` を見たとき、`db` がスロットなのかただのローカル
+/// 変数なのか区別がつかない。名前で引く必要があるのは検査の間だけなので、
+/// この表を作るのも検査器の仕事(下ろした後は `SlotId` で足りる)。
+fn collect_slots(program: &Program) -> Slots {
+    let mut map = std::collections::HashMap::new();
+    for item in &program.items {
+        if let Item::Effect {
+            slot, trait_name, ..
+        } = item
+        {
+            // 重複は要求解析の診断で止めるため、どちらが残るかは観測されない
+            map.insert(slot.clone(), trait_name.clone());
+        }
+    }
+    Slots { map }
 }
 
 /// 組み込みのスカラー型。ユーザー宣言はこの名前を名乗れない(design.md 決定1)。

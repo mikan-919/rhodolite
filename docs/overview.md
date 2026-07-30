@@ -37,14 +37,18 @@ fn main() {
 ```
   ソース (.rd)
       │
-      ├─ lex      文字 → トークン           src/lex.rs
-      ├─ join     行継続の改行を消す         src/lex.rs
-      ├─ parse    トークン → 構文木          src/parse.rs → src/ast.rs
-      ├─ load     use を辿って名前解決        src/module.rs
-      ├─ check    struct の形と分かる型を照合  src/typecheck.rs
-      ├─ analyze  構文木 → 要求と経路        src/requirement.rs
-      └─ eval     構文木を走らせる            src/eval.rs
-                                            ↑ 全部つながっている
+      ├─ lex      文字 → トークン            src/lex.rs
+      ├─ join     行継続の改行を消す          src/lex.rs
+      ├─ parse    トークン → 構文木           src/parse.rs → src/ast.rs
+      ├─ load     use を辿って名前解決         src/module.rs
+      ├─ check    構文木 → 型付き HIR         src/typecheck.rs → src/hir.rs
+      ├─ analyze  HIR → 要求と経路           src/requirement.rs
+      └─ eval     HIR を走らせる              src/eval.rs
+                                             ↑ 全部つながっている
+
+  `check` を通った後は構文木を見ない。HIR は全ての式の具体型と、
+  呼び出し先・フィールド・variant・局所束縛・提供する実装をプログラム内 ID で
+  持っているので、要求解析も評価も名前で引き直さない
 
   診断は全段が `Diag` を返し、CLI が抜粋付きで描く  src/diag.rs / src/render.rs
 ```
@@ -94,21 +98,22 @@ $ cargo run examples/missing_handler.rd
 | ファイル | 役割 | 行 |
 |---|---|---|
 | `src/lex.rs` | 字句解析 + 行継続 | 499 |
-| `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 282 |
-| `src/parse.rs` | 再帰下降パーサ | 1590 |
-| `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 1807 |
-| `src/typecheck.rs` | struct の形と、分かる範囲の型・呼び出しの検査 | 3593 |
-| `src/requirement.rs` | **要求推論(中核)** | 1350 |
-| `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 2072 |
+| `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 313 |
+| `src/parse.rs` | 再帰下降パーサ | 1774 |
+| `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 2009 |
+| `src/hir.rs` | 型付き・参照解決済みの中間表現。処理系の境界 | 1195 |
+| `src/typecheck.rs` | 型検査と HIR への下ろし(同じ1回の走査) | 5913 |
+| `src/requirement.rs` | **要求推論(中核)**。入力は HIR | 1539 |
+| `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 1932 |
 | `src/diag.rs` | 診断の値。位置・ラベル・help・従属診断。全段が返す | 75 |
 | `src/render.rs` | 診断をソース抜粋付きで描く。miette を知る唯一の場所 | 107 |
-| `src/main.rs` | 繋ぐだけ | 159 |
+| `src/main.rs` | 繋ぐだけ | 160 |
 
 `requirement.rs` の中は6段。手順1〜3が mikan の手書き、4〜6は代筆。
 
 | 手順 | 関数 | やること |
 |---|---|---|
-| 1 | `collect_slots` | `effect db: Database` を表にする |
+| 1 | `hir::Program::slots` | `effect db: Database` は下ろしの時点で `SlotId` になっている |
 | 2〜4 | `scan` | 本体を1回歩いて、直接使用・呼び出し辺・**`provided` による打ち消し**を同時に集める |
 | 5 | `analyze` | 変化がなくなるまで回して要求を伝播させる |
 | 6 | `unsatisfied` | 残った要求を到達経路付きで報告 |
@@ -239,9 +244,8 @@ enum 値の等値は enum・variant の同一性と payload
 `with` の提供は、スロットの契約を実装した具体型だけが置ける。`with db<Postgres>`
 は型名から、`with db(value)` は値の型から、どちらも実行前に契約と突き合わせる。
 提供値の型が決まらなければそこで落ちるので、型の不確かさが実行時へ回ることはない。
-`src/eval.rs` にも同じ判定が残っているが、これは評価器の単体テストと検査の欠陥に
-対する網で、検査を通ったプログラムからは到達しない。型付き HIR が解決済みの型と
-呼び出し先を持つようになった時点で外す。
+提供された実装は下ろしの時点で `TraitImplId` に確定しているので、評価器に
+同じ判定は残っていない。
 型の同一性は形と後置 `?` の一致だけで、部分型も暗黙の optional 展開も無い。
 上記の期待型境界に限り、present な値を optional 宛先へ注入する。
 

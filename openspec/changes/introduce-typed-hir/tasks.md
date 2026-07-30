@@ -69,7 +69,7 @@
 - [x] 7.1 Remove the AST interpreter, runtime source-name method lookup, and compatibility APIs superseded by HIR execution
 - [x] 7.2 Remove AST requirement scanning and declaration indexes duplicated by the HIR program
 - [x] 7.3 Rename or consolidate temporary HIR modules so the final pipeline has one type checker, one requirement analyzer, and one interpreter
-- [ ] 7.4 Verify `main` follows `load AST → check/lower HIR → analyze HIR → eval HIR` with no semantic consumer returning to AST
-- [ ] 7.5 Update `README.md`, `docs/overview.md`, file maps, and `docs/compiler-roadmap.md` to describe the HIR boundary and mark this phase complete
-- [ ] 7.6 Run canonical CLI success and failure examples, formatting, the full test suite, and strict OpenSpec validation
-- [ ] 7.7 Commit the completed HIR migration as a stable snapshot ready for the ambient runtime ABI change
+- [x] 7.4 Verify `main` follows `load AST → check/lower HIR → analyze HIR → eval HIR` with no semantic consumer returning to AST
+- [x] 7.5 Update `README.md`, `docs/overview.md`, file maps, and `docs/compiler-roadmap.md` to describe the HIR boundary and mark this phase complete
+- [x] 7.6 Run canonical CLI success and failure examples, formatting, the full test suite, and strict OpenSpec validation
+- [x] 7.7 Commit the completed HIR migration as a stable snapshot ready for the ambient runtime ABI change
