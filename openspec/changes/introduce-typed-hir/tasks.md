@@ -53,22 +53,22 @@
 
 ## 6. HIR Reference Interpreter
 
-- [ ] 6.1 Add a parallel HIR interpreter with environments keyed by `LocalId`, direct jumps by `CallableId`, and program-aware value rendering
-- [ ] 6.2 Move runtime struct and enum identity from canonical strings to `StructId` and `VariantId`
-- [ ] 6.3 Execute scalar operations, locals, assignment, blocks, return, assert, loops, and conditionals from resolved HIR expressions
-- [ ] 6.4 Execute structs, arrays, optionals, enum constructors, match payload bindings, guards, and shared mutation with existing runtime semantics
-- [ ] 6.5 Execute concrete methods and associated functions by direct `CallableId` without runtime candidate search
-- [ ] 6.6 Represent ambient type/value bindings with `TraitImplId` and dispatch slot calls through `TraitMethodId`
-- [ ] 6.7 Preserve nested provider selection, type-versus-value provision behavior, recursion, and runtime diagnostic spans
-- [ ] 6.8 Add differential tests comparing AST and HIR evaluation values, mutations, errors, output, and canonical test results
-- [ ] 6.9 Switch CLI execution and test running to the HIR interpreter after differential coverage passes
-- [ ] 6.10 Run formatting, the full test suite, and strict OpenSpec validation, then commit the HIR interpreter cutover as a stable snapshot
+- [x] 6.1 Add a parallel HIR interpreter with environments keyed by `LocalId`, direct jumps by `CallableId`, and program-aware value rendering
+- [x] 6.2 Move runtime struct and enum identity from canonical strings to `StructId` and `VariantId`
+- [x] 6.3 Execute scalar operations, locals, assignment, blocks, return, assert, loops, and conditionals from resolved HIR expressions
+- [x] 6.4 Execute structs, arrays, optionals, enum constructors, match payload bindings, guards, and shared mutation with existing runtime semantics
+- [x] 6.5 Execute concrete methods and associated functions by direct `CallableId` without runtime candidate search
+- [x] 6.6 Represent ambient type/value bindings with `TraitImplId` and dispatch slot calls through `TraitMethodId`
+- [x] 6.7 Preserve nested provider selection, type-versus-value provision behavior, recursion, and runtime diagnostic spans
+- [x] 6.8 Add differential tests comparing AST and HIR evaluation values, mutations, errors, output, and canonical test results
+- [x] 6.9 Switch CLI execution and test running to the HIR interpreter after differential coverage passes
+- [x] 6.10 Run formatting, the full test suite, and strict OpenSpec validation, then commit the HIR interpreter cutover as a stable snapshot
 
 ## 7. Remove the AST Semantic Pipeline
 
-- [ ] 7.1 Remove the AST interpreter, runtime source-name method lookup, and compatibility APIs superseded by HIR execution
-- [ ] 7.2 Remove AST requirement scanning and declaration indexes duplicated by the HIR program
-- [ ] 7.3 Rename or consolidate temporary HIR modules so the final pipeline has one type checker, one requirement analyzer, and one interpreter
+- [x] 7.1 Remove the AST interpreter, runtime source-name method lookup, and compatibility APIs superseded by HIR execution
+- [x] 7.2 Remove AST requirement scanning and declaration indexes duplicated by the HIR program
+- [x] 7.3 Rename or consolidate temporary HIR modules so the final pipeline has one type checker, one requirement analyzer, and one interpreter
 - [ ] 7.4 Verify `main` follows `load AST → check/lower HIR → analyze HIR → eval HIR` with no semantic consumer returning to AST
 - [ ] 7.5 Update `README.md`, `docs/overview.md`, file maps, and `docs/compiler-roadmap.md` to describe the HIR boundary and mark this phase complete
 - [ ] 7.6 Run canonical CLI success and failure examples, formatting, the full test suite, and strict OpenSpec validation

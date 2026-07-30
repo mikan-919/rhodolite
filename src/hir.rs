@@ -212,64 +212,6 @@ impl Type {
     pub fn unit() -> Self {
         Type::builtin(Builtin::Unit)
     }
-
-    pub fn struct_(id: StructId) -> Self {
-        Type {
-            kind: TypeKind::Struct(id),
-            optional: false,
-        }
-    }
-
-    pub fn enum_(id: EnumId) -> Self {
-        Type {
-            kind: TypeKind::Enum(id),
-            optional: false,
-        }
-    }
-
-    pub fn array(element: Type) -> Self {
-        Type {
-            kind: TypeKind::Array(Box::new(element)),
-            optional: false,
-        }
-    }
-
-    /// 後置 `?` を落とした同じ形。`T? ?? T` の結果型
-    pub fn required(&self) -> Type {
-        Type {
-            kind: self.kind.clone(),
-            optional: false,
-        }
-    }
-
-    /// 後置 `?` を付けた同じ形。`S?.?field` の結果型
-    pub fn optionalized(&self) -> Type {
-        Type {
-            kind: self.kind.clone(),
-            optional: true,
-        }
-    }
-
-    pub fn as_struct(&self) -> Option<StructId> {
-        match self.kind {
-            TypeKind::Struct(id) => Some(id),
-            _ => None,
-        }
-    }
-
-    pub fn as_enum(&self) -> Option<EnumId> {
-        match self.kind {
-            TypeKind::Enum(id) => Some(id),
-            _ => None,
-        }
-    }
-
-    pub fn element(&self) -> Option<&Type> {
-        match &self.kind {
-            TypeKind::Array(element) => Some(element),
-            _ => None,
-        }
-    }
 }
 
 /// 式の結果(design.md 決定4)。
@@ -728,14 +670,6 @@ impl Program {
         method: TraitMethodId,
     ) -> Option<CallableId> {
         self.trait_impls[impl_].methods.get(&method).copied()
-    }
-
-    /// その具体型がその trait を実装しているなら、その `impl`。
-    pub fn trait_impl_for(&self, type_: StructId, trait_: TraitId) -> Option<TraitImplId> {
-        self.trait_impls
-            .iter()
-            .find(|(_, i)| i.type_ == type_ && i.trait_ == trait_)
-            .map(|(id, _)| id)
     }
 
     /// 型検査が成功したのに残っている未解決。空でなければ検査器の不具合

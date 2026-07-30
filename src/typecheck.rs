@@ -1726,6 +1726,12 @@ fn assign(
                 out.push(format!("{ctx}: `{name}` はスロットなので代入できません"));
                 hir::ExprKind::Poison
             }
+            // トップレベルのスロットは `locals` に居ないが、書き込み先でもない
+            None if cx.decls.slots.is_slot(name) => {
+                synth(value, cx, locals, out);
+                out.push(format!("{ctx}: `{name}` はスロットなので代入できません"));
+                hir::ExprKind::Poison
+            }
             // 検査器が知らない名前への代入は新しい束縛を作る。読み出しは
             // 「値として読めません」になるので、この束縛は誰にも読めない
             None => {
@@ -2143,26 +2149,25 @@ fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
     // 左辺が裸の `nil` なら、右辺の非 optional な型がそのまま結果になる
     if matches!(lhs.kind, ExprKind::Nil) {
         let right = synth(rhs, cx, locals, out);
-        let outcome = match right.outcome.ty() {
-            Some(ty) if ty.optional => {
+        let ty = match &right.outcome {
+            Outcome::Typed(ty) if ty.optional => {
                 out.push(format!(
                     "{ctx}: `??` の右辺には非 optional の値が必要ですが、`{ty}` です"
                 ));
-                Outcome::Poisoned
+                return poison();
             }
-            _ => right.outcome.clone(),
+            Outcome::Typed(ty) => ty.clone(),
+            // 右辺が値を産まないなら、この式は右辺を評価するだけで終わる。
+            // 使われない `nil` に型を与える必要はない
+            Outcome::Diverges => return diverged(right.id),
+            Outcome::Poisoned => return poison(),
         };
         // 左辺の `nil` は結果型の optional 版。右辺を見てからでないと型が出ない
         let site = Site::What("`??` の左辺");
-        let bare = match outcome.ty() {
-            Some(ty) => {
-                let optional = optional_of(ty);
-                walk(lhs, Some((&optional, &site)), cx, locals, out)
-            }
-            None => synth(lhs, cx, locals, out),
-        };
-        return lowered(
-            outcome,
+        let optional = optional_of(&ty);
+        let bare = walk(lhs, Some((&optional, &site)), cx, locals, out);
+        return typed(
+            ty,
             hir::ExprKind::Coalesce {
                 lhs: bare.id,
                 rhs: right.id,
@@ -5832,7 +5837,10 @@ rank: Rank }
         let program = check_and_lower(&loaded.program).expect("診断なしで下がるはず");
 
         assert_eq!(program.structs.len(), 1, "宣言は1つだけ");
-        let user = crate::hir::Type::struct_(program.structs.ids().next().unwrap());
+        let user = hir::Type {
+            kind: hir::TypeKind::Struct(program.structs.ids().next().unwrap()),
+            optional: false,
+        };
         // 注釈・struct リテラル・引数・戻り値のすべてが同じ ID を指す
         let mark = program.free_callable("dep::mark").expect("`mark` がある");
         assert_eq!(program.callables[mark].ret, user);

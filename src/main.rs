@@ -1,9 +1,12 @@
-// 構文木のフィールドは次の段(要求推論)で読む。それまでは未使用になる。
+// 構文木のフィールドは module loader とその単体テストが読む。処理系の意味は
+// HIR が持つので、AST 側で使われないままの読み取り口が残る
 #[allow(dead_code)]
 mod ast;
 mod diag;
 mod eval;
-// HIR は段ごとに使われ始める。移行が終わるまでは未使用の語彙が残る
+// HIR は宣言 span と所属を語彙として全部持つ。診断と次段(C 下ろし)が読むもの、
+// そして `dump` のように下ろしのテストだけが使うものがあるので、いまの3つの
+// 利用者(検査・要求解析・評価)が触らない要素も残す
 #[allow(dead_code)]
 mod hir;
 mod lex;
@@ -68,27 +71,18 @@ fn main() -> ExitCode {
     }
 
     // 検査を通ったので走らせる
-    run(&program, &entry, &sources)
+    run(&checked, &entry, &sources)
 }
 
 /// `test` があれば全部走らせる。無ければ `main` を走らせる。
-fn run(program: &ast::Program, entry: &str, sources: &[module::SourceFile]) -> ExitCode {
-    let interp = eval::Interp::new(program);
+fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> ExitCode {
+    let interp = eval::Interp::new(checked);
 
-    let tests: Vec<(&str, &[ast::Expr])> = program
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            ast::Item::Test { name, body, .. } => Some((name.as_str(), body.as_slice())),
-            _ => None,
-        })
-        .collect();
-
-    if tests.is_empty() {
+    if checked.tests.is_empty() {
         println!("\n実行:");
         return match interp.run(entry) {
             Ok(v) => {
-                println!("  main -> {}", v.show());
+                println!("  main -> {}", interp.show(&v));
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -101,8 +95,9 @@ fn run(program: &ast::Program, entry: &str, sources: &[module::SourceFile]) -> E
 
     println!("\nテスト:");
     let mut failed = 0;
-    for (name, body) in &tests {
-        match interp.run_body(body) {
+    for (id, declared) in checked.tests.iter() {
+        let name = &declared.name;
+        match interp.run_test(id) {
             Ok(_) => println!("  ok   {name}"),
             Err(e) => {
                 failed += 1;
@@ -112,7 +107,8 @@ fn run(program: &ast::Program, entry: &str, sources: &[module::SourceFile]) -> E
         }
     }
 
-    println!("\n{} 件中 {} 件成功", tests.len(), tests.len() - failed);
+    let total = checked.tests.len();
+    println!("\n{total} 件中 {} 件成功", total - failed);
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
