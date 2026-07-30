@@ -33,16 +33,16 @@ The checker SHALL require every `with` provision whose slot is declared by an `e
 - **WHEN** a non-conforming provision appears in a `with` block whose body never runs
 - **THEN** the checker still reports it, because the check happens at the declaration
 
-### Requirement: Unknown provision types defer to the runtime check
-The checker SHALL skip a `with slot(value)` provision whose value type it cannot infer, and SHALL skip any provision whose head name is not a declared slot. The evaluator SHALL keep rejecting a provision that does not implement the slot's trait when it is reached at run time.
+### Requirement: Unknown provision types fail static checking
+The checker SHALL require every `with slot(value)` provision for a declared slot to have a concrete inferred value type and SHALL compare that type with the slot trait before evaluation. A provision value whose type cannot be determined SHALL fail checking. A head name that is not a declared slot SHALL continue to use the existing undeclared-slot diagnostic.
 
-#### Scenario: Provision value outside the inference boundary
-- **WHEN** a `with slot(value)` provision's value has no inferable type
-- **THEN** the checker defers that provision and the evaluator performs the check when the `with` head is evaluated
+#### Scenario: Provision value has no type
+- **WHEN** a `with slot(value)` provision's value type cannot be determined
+- **THEN** checking fails at the provision value instead of deferring to evaluation
 
 #### Scenario: Head name is not a slot
 - **WHEN** a `with` head names something that is not a declared slot
-- **THEN** the provision check produces no diagnostic and the existing undeclared-slot report stands
+- **THEN** checking fails through the existing undeclared-slot diagnostic
 
 ### Requirement: Canonical provisions pass statically
 The canonical program SHALL keep passing checking and execution with its provisions validated before it runs.

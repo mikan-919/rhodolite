@@ -34,15 +34,15 @@ The checker SHALL require every trait `impl` to name a declared trait and struct
 - **THEN** the checker reports the invalid declaration
 
 ### Requirement: Calls resolve with the language's declared candidate rules
-The checker SHALL resolve calls by callee form. A dot call on an inferable concrete receiver SHALL select by concrete type and method name across inherent and trait implementations. A dot call on an ambient slot SHALL select the named slot trait's declaration. A `Type::function` call SHALL select by concrete type and function name, and a `slot::function` call SHALL select the named slot trait's declaration. Concrete-type lookup SHALL require exactly one named candidate before validating whether its receiver form matches the call syntax.
+The checker SHALL resolve every call by callee form. A dot call on a concrete receiver SHALL select by concrete type and method name across inherent and trait implementations. A dot call on an ambient slot SHALL select the named slot trait's declaration. A `Type::function` call SHALL select by concrete type and function name, and a `slot::function` call SHALL select the named slot trait's declaration. Concrete-type lookup SHALL require exactly one named candidate before validating whether its receiver form matches the call syntax. Failure to determine the receiver type or a unique candidate SHALL fail checking.
 
 #### Scenario: Concrete receiver selects a unique method
-- **WHEN** an inferable concrete receiver's type has exactly one implementation candidate with the called name
+- **WHEN** a concrete receiver's type has exactly one implementation candidate with the called name
 - **THEN** the checker resolves the dot call to that candidate
 
 #### Scenario: Ambient slot selects its trait
 - **WHEN** a dot or path call begins with an unshadowed ambient slot
-- **THEN** the checker resolves the call only against that slot's declared trait, even if a runtime implementation has another same-named method
+- **THEN** the checker resolves the call only against that slot's declared trait
 
 #### Scenario: Concrete type selects a unique associated function
 - **WHEN** a declared concrete type has exactly one implementation candidate with the called path name
@@ -56,9 +56,9 @@ The checker SHALL resolve calls by callee form. A dot call on an inferable concr
 - **WHEN** a concrete type has more than one implementation candidate with the called name and no slot trait selects one
 - **THEN** the checker reports that the member's trait cannot be determined
 
-#### Scenario: Unknown receiver type
-- **WHEN** a dot-call receiver has no inferable type and is not an ambient slot
-- **THEN** resolution and signature diagnostics for that call are deferred
+#### Scenario: Receiver type cannot be determined
+- **WHEN** a dot-call receiver has no concrete type and is not an ambient slot
+- **THEN** checking fails at the receiver instead of deferring resolution
 
 ### Requirement: Call syntax matches the declared receiver form
 The checker SHALL require dot calls to resolve to a signature that declares `self` and type or slot path calls to resolve to a signature that does not declare `self`.
@@ -80,7 +80,7 @@ The checker SHALL require dot calls to resolve to a signature that declares `sel
 - **THEN** the checker reports that the method requires a receiver value
 
 ### Requirement: Resolved calls enforce declared signatures
-The checker SHALL compare a resolved call's explicit argument count and every inferable argument type with the selected signature. Argument compatibility SHALL use the existing directional destination rule, including `T` to `T?` injection but not `T?` to `T`.
+The checker SHALL compare a resolved call's explicit argument count and every argument type with the selected signature. Argument compatibility SHALL use the existing directional destination rule, including `T` to `T?` injection but not `T?` to `T`. Failure to determine an argument type SHALL fail checking.
 
 #### Scenario: Matching resolved call
 - **WHEN** a resolved method or associated-function call has the declared number of compatible arguments
@@ -90,16 +90,16 @@ The checker SHALL compare a resolved call's explicit argument count and every in
 - **WHEN** a resolved call has fewer or more explicit arguments than its selected signature declares after excluding `self`
 - **THEN** the checker reports the member and expected and actual argument counts
 
-#### Scenario: Wrong known argument type
-- **WHEN** an inferable argument is incompatible with its resolved parameter type
+#### Scenario: Wrong argument type
+- **WHEN** an argument is incompatible with its resolved parameter type
 - **THEN** the checker reports the member, argument position, expected type, and actual type
 
-#### Scenario: Unknown argument type
-- **WHEN** a resolved call argument remains outside the current inference boundary
-- **THEN** the checker defers only that argument's type comparison
+#### Scenario: Argument type cannot be determined
+- **WHEN** the checker cannot determine a resolved call argument's type
+- **THEN** checking fails at that argument
 
-### Requirement: Resolved call results carry declared return types
-The checker SHALL infer the selected signature's declared return type for a resolved method or associated-function call and SHALL expose it to bindings and all existing expression, assignment, argument, and return checks. A selected signature without a return annotation SHALL produce no inferred result type.
+### Requirement: Resolved call results carry return types
+The checker SHALL assign the selected signature's effective return type to every resolved method or associated-function call and SHALL expose it to bindings and all expression, assignment, argument, and return checks. A selected signature without a return annotation SHALL have effective return type `unit`.
 
 #### Scenario: Method result feeds optional fallback
 - **WHEN** a resolved method returns `T?` and its result is the left operand of `??` with a compatible `T` fallback
@@ -110,12 +110,12 @@ The checker SHALL infer the selected signature's declared return type for a reso
 - **THEN** the checker validates the field against that struct declaration
 
 #### Scenario: Resolved result reaches an existing mismatch
-- **WHEN** a resolved call's return type is incompatible with a known destination or operand
+- **WHEN** a resolved call's return type is incompatible with a destination or operand
 - **THEN** the existing compatibility check reports the mismatch
 
-#### Scenario: No declared return type
+#### Scenario: No return annotation
 - **WHEN** a resolved member has no return annotation
-- **THEN** the checker leaves the call result type unknown
+- **THEN** the call result has type `unit`
 
 ### Requirement: Canonical calls are statically typed
 The canonical program SHALL continue to pass checking and execution while its slot methods and associated constructors participate in static type checking.

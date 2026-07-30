@@ -111,23 +111,27 @@ that have no unconditional arm SHALL span the match expression.
 - **THEN** the arm set is considered exhaustive
 
 ### Requirement: Match arms produce a compatible result type
-The checker SHALL check every arm body against an expected type supplied by the surrounding expression. Without an expected type, it SHALL use the first inferable arm type as the match result type and SHALL check every other known arm type with the existing assignability rules.
+The checker SHALL check every value-producing arm body against an expected type supplied by the surrounding expression. Without an expected type, it SHALL use the first concrete value-producing arm type as the match result type and SHALL check every other value-producing arm with existing assignability rules. A value-producing match with no expected type and no concrete arm result type SHALL fail checking. An empty match over an empty enum MAY be classified as non-value-producing.
 
 #### Scenario: Expected result type
-- **WHEN** a match occurs at a destination with expected type `str` and every arm produces `str`
+- **WHEN** a match occurs at a destination with expected type `str` and every value-producing arm produces `str`
 - **THEN** the match satisfies that destination
 
 #### Scenario: Incompatible arm
-- **WHEN** one known arm result is incompatible with the expected or inferred match result type
+- **WHEN** one arm result is incompatible with the expected or inferred match result type
 - **THEN** checking fails with a diagnostic identifying the incompatible arm types
 
 #### Scenario: Result feeds later checking
-- **WHEN** a context-free match has an inferable result type and its result is passed to a checked call or operator
-- **THEN** that inferred type participates in the existing downstream check
+- **WHEN** a context-free match has a concrete result type and its result is passed to a checked call or operator
+- **THEN** that type participates in the downstream check
 
 #### Scenario: No inferable arm
-- **WHEN** an empty match or a match whose arm results are all outside the inference boundary has no expected type
-- **THEN** the checker leaves the match result type unknown without inventing a bottom or union type
+- **WHEN** a value-producing match has no expected type and no arm with a concrete result type
+- **THEN** checking fails instead of leaving the match result unknown
+
+#### Scenario: Empty enum match
+- **WHEN** an empty enum is matched with zero arms
+- **THEN** the checker classifies the expression as non-value-producing
 
 ### Requirement: Match arms preserve lexical and ambient analysis
 Each arm body and guard SHALL use the surrounding lexical and ambient
@@ -190,25 +194,17 @@ The catch-all arm SHALL match a remaining variant as a whole without exposing it
 - **WHEN** the catch-all body directly or transitively uses an ambient slot
 - **THEN** the containing function carries that slot requirement even if a qualified arm would be selected at runtime
 
-### Requirement: Qualified match arms may carry boolean guards
-A qualified variant pattern MAY be followed by `if` and a guard expression
-before its arm body. The checker SHALL check an inferable guard expression
-against `bool`; a known non-boolean guard SHALL fail checking at the guard
-expression. If the guard type is outside the current inference boundary,
-evaluation SHALL still require a boolean value at runtime.
+### Requirement: Qualified match arms require boolean guards
+A qualified variant pattern MAY be followed by `if` and a guard expression before its arm body. The checker SHALL require every guard expression to have concrete type `bool`; a non-boolean or unresolved guard SHALL fail checking at the guard expression.
 
 #### Scenario: Boolean guard
-- **WHEN** a qualified arm has a guard whose inferred type is `bool`
+- **WHEN** a qualified arm has a guard whose type is `bool`
 - **THEN** checking succeeds and arm selection uses that boolean value
 
-#### Scenario: Known non-boolean guard
-- **WHEN** a qualified arm has a guard whose inferred type is not `bool`
+#### Scenario: Non-boolean guard
+- **WHEN** a qualified arm has a guard whose type is not `bool`
 - **THEN** checking fails with a diagnostic spanning the guard expression
 
-#### Scenario: Unknown guard type
-- **WHEN** a qualified arm's guard type is outside the current inference boundary
-- **THEN** static checking defers the type mismatch and evaluation requires the guard to produce `bool`
-
-#### Scenario: Runtime non-boolean guard
-- **WHEN** a deferred guard evaluates to a non-boolean value
-- **THEN** evaluation fails with a runtime diagnostic spanning the guard expression
+#### Scenario: Guard type cannot be determined
+- **WHEN** the checker cannot determine a qualified arm guard's type
+- **THEN** checking fails before evaluation

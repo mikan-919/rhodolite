@@ -34,7 +34,7 @@ Optional field evaluation SHALL evaluate its receiver exactly once. It SHALL ret
 - **THEN** the remaining optional projections propagate `nil`
 
 ### Requirement: Optional field typing requires an optional struct
-For a receiver with known type `S?`, the checker SHALL require `S` to name a loaded struct and SHALL require that struct to declare the selected field. The result SHALL be the declared field type with its optional bit set.
+For every optional field expression, the checker SHALL require its receiver to have a known type `S?`, SHALL require `S` to name a loaded struct, and SHALL require that struct to declare the selected field. The result SHALL be the declared field type with its optional bit set. Failure to determine the receiver type SHALL fail checking.
 
 #### Scenario: Read a non-optional declared field
 - **WHEN** `user` has type `User?` and `User` declares `name: str`
@@ -57,8 +57,8 @@ For a receiver with known type `S?`, the checker SHALL require `S` to name a loa
 - **THEN** checking fails because optional field access requires an optional receiver
 
 #### Scenario: Unknown receiver
-- **WHEN** the receiver type remains outside the current inference boundary
-- **THEN** checking defers field validation and does not infer a result type
+- **WHEN** the checker cannot determine the receiver type
+- **THEN** checking fails at the receiver instead of deferring field validation
 
 ### Requirement: Optional field results chain and reach existing checks
 The optional result of `.?` SHALL be available to subsequent optional projections and all existing destination compatibility checks.

@@ -86,7 +86,7 @@ An unshadowed bare variant reference or a resolved qualified variant path SHALL 
 - **THEN** evaluation fails instead of treating the enum as a zero-field struct
 
 ### Requirement: Known enum values are checked at enum-typed struct fields
-The checker SHALL reject a struct construction or field assignment when the destination is a known, non-optional enum type and the source is known to be a variant of a different enum. It SHALL accept a variant of the expected enum.
+The checker SHALL compare every struct construction or field assignment source with its enum-typed destination. It SHALL accept a variant of the expected enum and SHALL reject a variant of a different enum or any source whose concrete type cannot be determined.
 
 #### Scenario: Matching variant in struct construction
 - **WHEN** field `rank` is declared as `Rank` and a struct literal gives it `Gold` from `Rank`
@@ -104,9 +104,9 @@ The checker SHALL reject a struct construction or field assignment when the dest
 - **WHEN** a receiver is known to have a `rank: Rank` field and code assigns a variant from another enum
 - **THEN** checking fails with a diagnostic identifying the expected and actual enum types
 
-#### Scenario: Source type is not yet known
-- **WHEN** an enum-typed field receives an expression whose type is outside this change's inference boundary
-- **THEN** this capability emits no enum-type diagnostic for that expression
+#### Scenario: Source type cannot be determined
+- **WHEN** an enum-typed field receives an expression whose type cannot be determined
+- **THEN** checking fails before evaluation
 
 ### Requirement: The canonical program uses a declared Rank enum
 The canonical program SHALL declare `Rank` as a fieldless enum and SHALL use its variants without zero-field struct stand-ins.

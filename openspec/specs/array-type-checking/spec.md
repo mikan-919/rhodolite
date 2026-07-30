@@ -23,7 +23,7 @@ The language SHALL accept `[T]` in every type annotation position where a named 
 - **THEN** the parser represents it as an array whose element type is `[int]`
 
 ### Requirement: Array literal inference
-The type checker SHALL infer `[T]` for a non-empty array literal when its inferable elements have the same type `T`, and SHALL diagnose conflicting known element types.
+The type checker SHALL infer `[T]` for a non-empty array literal without an expected type only when every element has the same concrete type `T`. It SHALL diagnose conflicting element types and any element whose type cannot be determined.
 
 #### Scenario: Homogeneous literal
 - **WHEN** the checker sees `[1, 2, 3]` without an expected type
@@ -33,20 +33,20 @@ The type checker SHALL infer `[T]` for a non-empty array literal when its infera
 - **WHEN** the checker sees `[1, true]`
 - **THEN** it reports that the array elements have incompatible types
 
-#### Scenario: Unknown element prevents complete inference
-- **WHEN** an array literal contains an element whose type is not known and has no expected array type
-- **THEN** the checker does not assign a known type to the array from later assignments
+#### Scenario: Element type cannot be determined
+- **WHEN** an array literal contains an element whose type cannot be determined and has no expected array type
+- **THEN** checking fails at that element
 
 ### Requirement: Contextual array literal checking
-When an array literal occurs at a boundary with expected type `[T]`, the type checker SHALL check every element against `T` using the existing assignability rules. An empty array literal SHALL fit an expected array type but SHALL have no independently inferred element type.
+When an array literal occurs at a boundary with expected type `[T]`, the type checker SHALL check every element against `T` using the existing assignability rules. An empty array literal SHALL fit an expected array type. An empty array literal without an expected type SHALL fail checking.
 
 #### Scenario: Empty array with expected type
-- **WHEN** `[]` initializes a field declared as `[User]`
+- **WHEN** `[]` initializes a field or annotated local declared as `[User]`
 - **THEN** the checker accepts the literal as `[User]`
 
 #### Scenario: Empty array without expected type
 - **WHEN** `let xs = []` has no expected type
-- **THEN** the checker leaves `xs` without a known type
+- **THEN** checking fails and identifies that an element type annotation is required
 
 #### Scenario: Element mismatch at expected boundary
 - **WHEN** `[1, true]` is passed to a parameter declared as `[int]`
@@ -72,23 +72,23 @@ The type checker SHALL consider two known array value types assignable only when
 - **THEN** the checker accepts the value using the existing non-optional-to-optional injection rule
 
 ### Requirement: For-loop element typing
-For a `for x in xs` head, the type checker SHALL require a known iterable type to be a non-optional array and SHALL bind `x` to the array element type within the loop body.
+For a `for x in xs` head, the type checker SHALL require the iterable to have a concrete, non-optional array type and SHALL bind `x` to the array element type within the loop body. Failure to determine the iterable type SHALL fail checking.
 
 #### Scenario: Loop variable receives element type
 - **WHEN** `users` has type `[User]` and the program evaluates `for u in users { u.id }`
 - **THEN** the checker treats `u` as `User` and validates the `id` field access
 
 #### Scenario: Non-array iterable
-- **WHEN** the iterable expression has known type `int`
+- **WHEN** the iterable expression has type `int`
 - **THEN** the checker reports that `for` requires an array
 
 #### Scenario: Optional array iterable
-- **WHEN** the iterable expression has known type `[User]?`
+- **WHEN** the iterable expression has type `[User]?`
 - **THEN** the checker reports that an optional array cannot be iterated without explicit handling
 
-#### Scenario: Unknown iterable
-- **WHEN** the iterable expression has no known type
-- **THEN** the checker preserves existing behavior by leaving the loop variable type unknown
+#### Scenario: Iterable type cannot be determined
+- **WHEN** the iterable expression has no concrete type
+- **THEN** checking fails at the iterable instead of leaving the loop variable untyped
 
 ### Requirement: Array type names follow module resolution
 The module loader SHALL resolve named leaf types inside array types using the same local, imported, and canonical-name rules as standalone named types.

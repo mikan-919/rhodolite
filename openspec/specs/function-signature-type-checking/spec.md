@@ -25,27 +25,27 @@ The checker SHALL compare the argument count of a direct top-level function call
 - **WHEN** a direct top-level function is called with more arguments than declared
 - **THEN** the checker reports the called function and the expected and actual argument counts
 
-### Requirement: Direct top-level calls check known argument types
-The checker SHALL compare each inferable argument type with the corresponding declared parameter type using directional destination compatibility. Exact nominal identity and optionality SHALL be compatible. A non-optional `T` argument SHALL also be compatible with a parameter of the same nominal type `T?`. An optional `T?` argument SHALL NOT be compatible with a non-optional `T` parameter.
+### Requirement: Direct top-level calls check argument types
+The checker SHALL compare every argument type with the corresponding declared parameter type using directional destination compatibility. Exact nominal identity and optionality SHALL be compatible. A non-optional `T` argument SHALL also be compatible with a parameter of the same nominal type `T?`. An optional `T?` argument SHALL NOT be compatible with a non-optional `T` parameter. Failure to determine an argument type SHALL fail checking.
 
-#### Scenario: Matching known argument type
-- **WHEN** a direct top-level function parameter and its inferable argument have the same nominal type and optionality
+#### Scenario: Matching argument type
+- **WHEN** a direct top-level function parameter and its argument have the same nominal type and optionality
 - **THEN** the checker produces no argument-type diagnostic
 
 #### Scenario: Present argument for an optional parameter
-- **WHEN** a direct top-level function parameter has type `T?` and its inferable argument has type `T`
-- **THEN** the checker produces no argument-type diagnostic and the argument remains inferred as `T`
+- **WHEN** a direct top-level function parameter has type `T?` and its argument has type `T`
+- **THEN** the checker produces no argument-type diagnostic and the argument remains typed as `T`
 
-#### Scenario: Mismatched known argument type
-- **WHEN** a direct top-level function parameter and its inferable argument have incompatible nominal types or optionality
+#### Scenario: Mismatched argument type
+- **WHEN** a direct top-level function parameter and its argument have incompatible nominal types or optionality
 - **THEN** the checker reports the called function, argument position, expected type, and actual type
 
-#### Scenario: Argument type is unknown
-- **WHEN** an argument expression is outside the change's inference boundary
-- **THEN** the checker produces no argument-type diagnostic for that argument
+#### Scenario: Argument type cannot be determined
+- **WHEN** the checker cannot determine an argument expression's type
+- **THEN** checking fails at that argument before evaluation
 
-### Requirement: Direct call results carry declared return types
-The checker SHALL infer the declared return type of a direct top-level function call and make that type available to subsequent checks.
+### Requirement: Direct call results carry return types
+The checker SHALL assign the declared return type to a direct top-level function call. A function without a return annotation SHALL have return type `unit`, and its calls SHALL have type `unit`.
 
 #### Scenario: Bind a direct call result
 - **WHEN** a direct top-level function with a declared return type is called and its result is bound to a local
@@ -55,36 +55,40 @@ The checker SHALL infer the declared return type of a direct top-level function 
 - **WHEN** a direct call's declared enum return type is incompatible with a known enum-typed struct field
 - **THEN** the existing field-type check reports the mismatch
 
-#### Scenario: Function has no declared return type
+#### Scenario: Function has no return annotation
 - **WHEN** a direct top-level function without a return annotation is called
-- **THEN** the checker treats the call result type as unknown
+- **THEN** the call has type `unit`
 
-### Requirement: Declared function returns check known values
-For a function with a declared return type, the checker SHALL compare inferable explicit return values and the inferable final body expression with the declared return type using directional destination compatibility. A non-optional `T` result SHALL satisfy a return type of the same nominal type `T?`, while an optional `T?` result SHALL NOT satisfy a non-optional `T` return type.
+### Requirement: Function bodies satisfy their return types
+The checker SHALL compare every value-carrying explicit return and every value-producing final body expression with the function's effective return type using directional destination compatibility. The effective return type SHALL be the annotation when present and `unit` otherwise. A non-optional `T` result SHALL satisfy `T?`, while `T?` SHALL NOT satisfy `T`. Failure to determine a returned expression's type SHALL fail checking.
 
 #### Scenario: Matching final expression
-- **WHEN** a function's final expression has an inferable type matching its declared return type
+- **WHEN** a function's final expression has a type matching its effective return type
 - **THEN** the checker produces no return-type diagnostic
 
 #### Scenario: Present final expression for an optional return
-- **WHEN** a function declares return type `T?` and its final expression has inferable type `T`
-- **THEN** the checker produces no return-type diagnostic and the expression remains inferred as `T`
+- **WHEN** a function declares return type `T?` and its final expression has type `T`
+- **THEN** checking succeeds and the expression remains typed as `T`
 
 #### Scenario: Present explicit return for an optional return
-- **WHEN** a function declares return type `T?` and an explicit `return` carries an inferable value of type `T`
+- **WHEN** a function declares return type `T?` and an explicit `return` carries a value of type `T`
 - **THEN** the checker produces no return-type diagnostic
 
 #### Scenario: Mismatched final expression
-- **WHEN** a function's final expression has an inferable type incompatible with its declared return type
+- **WHEN** a function's final expression is incompatible with its effective return type
 - **THEN** the checker reports the function, expected return type, and actual type
 
 #### Scenario: Mismatched explicit return
-- **WHEN** an explicit `return` carries an inferable type incompatible with the containing function's declared return type
+- **WHEN** an explicit `return` carries a type incompatible with the containing function's effective return type
 - **THEN** the checker reports the function, expected return type, and actual type
 
-#### Scenario: Returned expression type is unknown
-- **WHEN** an explicit or final returned expression is outside the change's inference boundary
-- **THEN** the checker produces no return-type diagnostic for that expression
+#### Scenario: Returned expression type cannot be determined
+- **WHEN** the checker cannot determine an explicit or final returned expression's type
+- **THEN** checking fails at that expression
+
+#### Scenario: Omitted annotation returns unit
+- **WHEN** a function without a return annotation ends in a non-`unit` value
+- **THEN** checking fails with expected type `unit`
 
 ### Requirement: Unsupported call forms remain outside signature checking
 The checker SHALL limit this capability to direct top-level function calls. Method and associated-function calls SHALL be governed by the dedicated `method-call-type-checking` capability instead of being left without an inferred signature.
