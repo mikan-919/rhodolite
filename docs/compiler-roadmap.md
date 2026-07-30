@@ -55,7 +55,7 @@ compiled v1
 | 段階 | 状態 | 想定 OpenSpec change | 成果 |
 |---|---|---|---|
 | 0 | 完了 | archived changes | AST インタプリタと v1 正典 |
-| 1 | 進行中 | `close-static-type-checking` | Unknown のない検査成功 |
+| 1 | 完了 | archived `close-static-type-checking` | Unknown のない検査成功 |
 | 2 | 未着手 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
 | 3 | 未着手 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 未着手 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |

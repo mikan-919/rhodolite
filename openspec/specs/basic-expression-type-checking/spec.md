@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Give the smallest expressions a type. Scalar literals, ordinary and optional
-struct-field reads, primitive operators, boolean contexts, and known
-assignments are checked before evaluation, on top of four reserved built-in
-scalar type names. Arrays and method or associated-function resolution stay
-outside this boundary and are deferred rather than treated as a wildcard type.
+Give every basic expression a concrete type before evaluation. Scalar
+literals, struct-field reads, primitive operators, boolean contexts, and
+assignments are checked on top of four reserved built-in scalar type names.
+Dedicated capabilities type arrays, optionals, matches, and calls; no accepted
+expression is deferred or treated as a wildcard type.
 
 ## Requirements
 
