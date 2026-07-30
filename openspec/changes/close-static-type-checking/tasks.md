@@ -63,9 +63,9 @@
 
 ## 8. Whole-Program Closure and Documentation
 
-- [ ] 8.1 Add a whole-program audit that prevents successful checking when any loaded expression or call remains unclassified
-- [ ] 8.2 Add integration fixtures covering all expression variants in both directly executed and unexecuted loaded declarations
-- [ ] 8.3 Verify all pre-execution failures retain source spans and that successful canonical behavior and requirement rendering remain unchanged
-- [ ] 8.4 Update `README.md`, `docs/overview.md`, and `docs/grammar.md` to replace partial inference and runtime deferral with the total-checking contract and local annotation syntax
-- [ ] 8.5 Run `cargo fmt --check`, the full test suite, and strict OpenSpec validation
-- [ ] 8.6 Commit the completed type-checking closure as a stable snapshot ready for HIR work
+- [x] 8.1 Add a whole-program audit that prevents successful checking when any loaded expression or call remains unclassified
+- [x] 8.2 Add integration fixtures covering all expression variants in both directly executed and unexecuted loaded declarations
+- [x] 8.3 Verify all pre-execution failures retain source spans and that successful canonical behavior and requirement rendering remain unchanged
+- [x] 8.4 Update `README.md`, `docs/overview.md`, and `docs/grammar.md` to replace partial inference and runtime deferral with the total-checking contract and local annotation syntax
+- [x] 8.5 Run `cargo fmt --check`, the full test suite, and strict OpenSpec validation
+- [x] 8.6 Commit the completed type-checking closure as a stable snapshot ready for HIR work

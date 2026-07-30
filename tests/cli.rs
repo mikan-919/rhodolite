@@ -1409,6 +1409,75 @@ fn 型の決まらない提供は実行前に失敗する() {
     );
 }
 
+/// 受理される式の形を全部並べたプログラムが、検査を通って走る。
+/// 型検査に規則の抜けがあれば「型が決まりません」で落ちるので、これが
+/// 「全ての式が分類されている」ことの網になる(total-static-type-checking)
+#[test]
+fn 全ての式の形を含むプログラムが検査を通って走る() {
+    // `every` は main から呼ばれ、`unused` は一度も呼ばれない。
+    // 検査は到達性に依らないので、どちらも同じ規則で閉じている必要がある
+    const ALL: &str = "trait Clock { fn now(self -> int) }\n\
+         struct SystemClock {}\n\
+         impl Clock for SystemClock { fn now(self -> int) { 1000 } }\n\
+         effect clock: Clock\n\
+         enum Rank { Bronze Gold }\n\
+         enum Lookup { Found(User, int) Missing(str) Skipped }\n\
+         struct Profile { name: str\n\
+         alias: str? }\n\
+         struct User { id: int\n\
+         rank: Rank\n\
+         profile: Profile? }\n\
+         fn make(-> User) { User { id = 1, rank = Gold, profile = nil } }\n\
+         fn every(u: User, us: [User], o: Rank?, l: Lookup -> int) {\n\
+         \x20 let n = 1\n\
+         \x20 let s = \"x\"\n\
+         \x20 let b = true\n\
+         \x20 let nothing: User? = nil\n\
+         \x20 let empty: [User] = []\n\
+         \x20 let id = u.id\n\
+         \x20 let alias = u.profile.?name\n\
+         \x20 let made = make()\n\
+         \x20 let xs = [u, made]\n\
+         \x20 let lit = User { id = 2, rank = Bronze, profile = nil }\n\
+         \x20 let qualified = Rank::Gold\n\
+         \x20 let bare = Bronze\n\
+         \x20 let ctor = Lookup::Found(u, n)\n\
+         \x20 let neg = -n\n\
+         \x20 let unwrapped = o ?? Gold\n\
+         \x20 n = n + 1 - 1 * 1 / 1\n\
+         \x20 assert b == true\n\
+         \x20 assert qualified == unwrapped\n\
+         \x20 assert alias == nil\n\
+         \x20 { assert s == \"x\" }\n\
+         \x20 if b { assert true } elif n == 2 { assert true } else { assert true }\n\
+         \x20 for x in xs { assert x.id == x.id }\n\
+         \x20 while false { assert true }\n\
+         \x20 with clock(SystemClock {}) { assert clock.now() == 1000 }\n\
+         \x20 let m = match l {\n\
+         \x20   Lookup::Found(f, c) if c == n: f.id\n\
+         \x20   Lookup::Missing(reason): 0\n\
+         \x20   Lookup::Skipped: 0\n\
+         \x20   _: 0\n\
+         \x20 }\n\
+         \x20 if m == 0 { return 0 }\n\
+         \x20 m + id + neg + nothing_id(nothing)\n\
+         }\n\
+         fn nothing_id(u: User? -> int) { u.?id ?? 0 }\n\
+         fn unused(u: User, l: Lookup -> int) { every(u, [u], nil, l) }\n";
+
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        &format!("{ALL}fn main(-> int) {{ every(make(), [make()], Gold, Lookup::Skipped) }}\n"),
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    // `m` は Skipped の arm で 0 になり、`if m == 0` で早期に返る
+    assert!(text.contains("main -> 0"), "{text}");
+}
+
 /// 局所注釈を与えれば、同じ形が検査を通って走る
 #[test]
 fn 局所型注釈で文脈を与えたプログラムは走る() {

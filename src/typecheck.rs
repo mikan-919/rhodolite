@@ -4410,6 +4410,69 @@ rank: Rank }
         assert!(e.contains("`int`"), "{e}");
     }
 
+    // ---- 全域性の網 ----
+
+    /// 型を出せなかった式が診断なしで残ったら、規則の抜けとして落とす。
+    /// この網があるので、新しい式の形を足したときに黙って Unknown が
+    /// 戻ることはない(design.md 決定3)
+    #[test]
+    fn 説明の無い型不明は規則の抜けとして落ちる() {
+        // 捨てられる裸の `nil` は誰も期待型を与えないので、この網だけが拾う
+        let e = only("fn f() {\n nil\n assert true\n}\n");
+        assert!(e.contains("型検査の規則が足りていません"), "{e}");
+        assert_eq!(
+            spanned("fn f() {\n nil\n assert true\n}\n", "規則が"),
+            "nil"
+        );
+    }
+
+    /// 実行前に落ちる診断はすべて位置を持つ。位置の無い診断は render できない
+    #[test]
+    fn 全域性を閉じた診断は位置を持つ() {
+        for (src, part, pointed) in [
+            // 注釈を促す診断は束縛そのものを指す
+            (
+                "fn f() { let x = nil }\n",
+                "初期化子から決まりません",
+                "let x = nil",
+            ),
+            (
+                "fn f() { let xs = [] }\n",
+                "配列の要素型が決まりません",
+                "[]",
+            ),
+            (
+                "fn f(-> bool) { nil == nil }\n",
+                "両辺が `nil`",
+                "nil == nil",
+            ),
+            ("fn f() { nope() }\n", "呼び出し先が決まりません", "nope()"),
+            (
+                "struct S { a: int }\nfn f() { S }\n",
+                "フィールドを 1 個",
+                "S",
+            ),
+        ] {
+            assert_eq!(spanned(src, part), pointed, "{src}");
+        }
+    }
+
+    /// 呼ばれない宣言も同じ規則で閉じている。検査は到達性に依らない
+    #[test]
+    fn 呼ばれない宣言も全域性を閉じる() {
+        let e = errors(
+            "struct S { a: int }\n\
+             fn unused(s: S?) {\n\
+             \x20 let x = nil\n\
+             \x20 let xs = []\n\
+             \x20 s.nope()\n\
+             }\n\
+             fn main() { assert true }\n",
+        );
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert!(e.iter().all(|e| e.starts_with("unused: ")), "{e:?}");
+    }
+
     // ---- 正典 ----
 
     #[test]
