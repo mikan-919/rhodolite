@@ -20,23 +20,23 @@
 
 ## 3. Typed Expression Lowering
 
-- [ ] 3.1 Allocate callable-local IDs for parameters, `self`, `let`, loop bindings, and match payload bindings while preserving current lexical scopes
-- [ ] 3.2 Lower literals, local references, zero-field structs, fieldless variants, unary expressions, and binary expressions with concrete result types
-- [ ] 3.3 Lower `let`, assignment, return, assert, blocks, and discarded intermediate expressions with `Value(Type)` or `Diverges` classification
-- [ ] 3.4 Lower struct literals, field reads, field assignments, arrays, optional field access, and fallback with resolved declaration and field IDs
-- [ ] 3.5 Lower loops, conditionals, `with`, and nested block heads while preserving lexical slot shadowing and expression result types
-- [ ] 3.6 Lower enum constructors and matches with `VariantId`, payload `LocalId`s, guard expressions, catch-all arms, and divergent-arm joins
-- [ ] 3.7 Lower direct, concrete method, concrete associated, slot value/type method, and enum-constructor calls to their resolved HIR call forms
-- [ ] 3.8 Lower value and type provisions to `SlotId` and the statically checked `TraitImplId`
-- [ ] 3.9 Add structural coverage for every accepted `ExprKind`, including executed and unexecuted declarations and dependency modules
-- [ ] 3.10 Run formatting, the full test suite, and strict OpenSpec validation, then commit expression lowering as a stable snapshot
+- [x] 3.1 Allocate callable-local IDs for parameters, `self`, `let`, loop bindings, and match payload bindings while preserving current lexical scopes
+- [x] 3.2 Lower literals, local references, zero-field structs, fieldless variants, unary expressions, and binary expressions with concrete result types
+- [x] 3.3 Lower `let`, assignment, return, assert, blocks, and discarded intermediate expressions with `Value(Type)` or `Diverges` classification
+- [x] 3.4 Lower struct literals, field reads, field assignments, arrays, optional field access, and fallback with resolved declaration and field IDs
+- [x] 3.5 Lower loops, conditionals, `with`, and nested block heads while preserving lexical slot shadowing and expression result types
+- [x] 3.6 Lower enum constructors and matches with `VariantId`, payload `LocalId`s, guard expressions, catch-all arms, and divergent-arm joins
+- [x] 3.7 Lower direct, concrete method, concrete associated, slot value/type method, and enum-constructor calls to their resolved HIR call forms
+- [x] 3.8 Lower value and type provisions to `SlotId` and the statically checked `TraitImplId`
+- [x] 3.9 Add structural coverage for every accepted `ExprKind`, including executed and unexecuted declarations and dependency modules
+- [x] 3.10 Run formatting, the full test suite, and strict OpenSpec validation, then commit expression lowering as a stable snapshot
 
 ## 4. Authoritative Check-and-Lower Boundary
 
-- [ ] 4.1 Change the authoritative type-checking traversal to emit HIR as it computes types and call targets instead of recovering facts in a second pass
-- [ ] 4.2 Expose `check_and_lower` as `Result<hir::Program, Vec<Diag>>` and discard all partial HIR when diagnostics exist
+- [x] 4.1 Change the authoritative type-checking traversal to emit HIR as it computes types and call targets instead of recovering facts in a second pass
+- [x] 4.2 Expose `check_and_lower` as `Result<hir::Program, Vec<Diag>>` and discard all partial HIR when diagnostics exist
 - [ ] 4.3 Keep a temporary diagnostics-only compatibility wrapper for existing checker tests and migrate tests to the new result boundary in small groups
-- [ ] 4.4 Add invariants proving successful HIR contains no poisoned expression, unknown type, unresolved call, unresolved field, or unresolved provision
+- [x] 4.4 Add invariants proving successful HIR contains no poisoned expression, unknown type, unresolved call, unresolved field, or unresolved provision
 - [ ] 4.5 Pin existing diagnostic text, ordering, labels, help, related spans, and cross-module source rendering across failed lowering
 - [ ] 4.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the authoritative HIR boundary as a stable snapshot
 

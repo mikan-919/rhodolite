@@ -89,23 +89,19 @@ struct Decls {
     /// inherent も混ぜて入れる。呼び出し地点で trait が分かるとは限らないので、
     /// 絞り込みは名前だけで行い、複数残れば曖昧とする(eval.rs `find_method`)
     impls: BTreeMap<String, Vec<(String, FnSig)>>,
-    /// `impl Trait for Type` の (具体型名, trait 名)。`with` の提供が
-    /// スロットの契約を満たすか見るためだけに持つ
-    trait_impls: BTreeSet<(String, String)>,
     /// スロット名 → trait 名。`requirement` の表をそのまま借りる
     slots: Slots,
     /// struct ではない宣言名(trait / effect / fn / enum / variant)。
     /// 「未知」と「struct ではない」を言い分けるためだけに持つ
     others: BTreeSet<String>,
-    /// 正準名から HIR の ID を引く橋。段3(式の下ろし)が引く
-    #[allow(dead_code)]
+    /// 正準名から HIR の ID を引く橋
     ids: Ids,
+    /// 型注釈の名前を解決する表。`let` の注釈と式の型を下ろすのに要る
+    nominal: Nominal,
 }
 
 /// 正準名 → HIR の ID。AST が名前で書かれている間だけ要る橋で、HIR の中には
 /// 出て行かない(design.md 決定1)。
-// 段3(式の下ろし)が全部を引く。宣言だけを下ろしている間は未使用になる
-#[allow(dead_code)]
 #[derive(Default)]
 struct Ids {
     structs: BTreeMap<String, hir::StructId>,
@@ -143,8 +139,6 @@ struct Nominal {
 /// `Discard` は置き場所を決められなかった宣言(struct でない型の `impl` など)。
 /// 本体の検査は続けるが HIR には残さない。そういう宣言は必ず診断を伴うので、
 /// 成功した HIR に欠けは無い。
-// 段3が本体の置き場所として読む
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 enum Target {
     Callable(hir::CallableId),
@@ -234,7 +228,9 @@ fn effective_ret(sig: &Sig) -> KnownType {
 /// ローカルはスロットを隠す(design.md 決定3)。
 #[derive(Clone)]
 enum Binding {
-    Value(Option<KnownType>),
+    /// 値の束縛。型が分かっているものだけ型を持つ。`LocalId` は本体の中で
+    /// 一意で、`Locals` の複製がそのまま HIR の字句スコープになる
+    Value(Option<KnownType>, hir::LocalId),
     Slot(String),
 }
 
@@ -293,6 +289,12 @@ struct Out {
     /// 既に報告した「宣言されていない型」の名前。同じ名前が注釈のあちこちに
     /// 書かれていても診断は最初の1件だけにする
     unknown_types: BTreeSet<String>,
+    /// いま下ろしている本体。式と局所束縛はここへ確保する。
+    ///
+    /// 診断と同じ受け皿に載せてあるのは、検査と下ろしが**同じ1回の走査**
+    /// (design.md 決定7)で、走査の全ての関数が既にこれを可変で持って
+    /// いるため。宣言ごとに `check_body` が差し替える
+    body: hir::Body,
 }
 
 impl Out {
@@ -354,6 +356,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
         span: None,
         unexplained: None,
         unknown_types: BTreeSet::new(),
+        body: hir::Body::default(),
     };
     let (decls, mut lowered, targets) = collect(program, &mut out);
     let out = &mut out;
@@ -364,15 +367,11 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
         match item {
             Item::Fn { sig, body, .. } => {
                 let target = next_target(&mut targets);
-                let locals = sig
-                    .params
-                    .iter()
-                    .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
-                    .collect();
                 check_body(
                     body,
+                    Some(sig),
+                    None,
                     &decls,
-                    locals,
                     &sig.name,
                     &effective_ret(sig),
                     target,
@@ -388,8 +387,9 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                 let ctx = format!("test \"{name}\"");
                 check_body(
                     body,
+                    None,
+                    None,
                     &decls,
-                    Locals::new(),
                     &ctx,
                     &plain("unit"),
                     target,
@@ -402,20 +402,13 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
             } => {
                 for (sig, body) in methods {
                     let target = next_target(&mut targets);
-                    let mut locals: Locals = sig
-                        .params
-                        .iter()
-                        .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
-                        .collect();
-                    if sig.has_self {
-                        locals.insert("self".to_string(), Binding::Value(Some(plain(type_name))));
-                    }
                     let ctx = format!("impl {type_name}::{}", sig.name);
                     out.span = Some(sig.span);
                     check_body(
                         body,
+                        Some(sig),
+                        sig.has_self.then(|| plain(type_name)),
                         &decls,
-                        locals,
                         &ctx,
                         &effective_ret(sig),
                         target,
@@ -475,7 +468,6 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
     let mut fns = BTreeMap::new();
     let mut traits: BTreeMap<String, BTreeMap<String, FnSig>> = BTreeMap::new();
     let mut impls: BTreeMap<String, Vec<(String, FnSig)>> = BTreeMap::new();
-    let mut trait_impls = BTreeSet::new();
     let mut others = BTreeSet::new();
 
     // 宣言の前半。型注釈が前方参照できるよう、名前と ID だけ先に全部揃える
@@ -617,7 +609,6 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 let id = lowered.callables.alloc(callable_shell(
                     sig,
                     hir::CallableOwner::Free,
-                    None,
                     *span,
                     &nominal,
                     out,
@@ -631,9 +622,6 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 methods,
                 span,
             } => {
-                if let Some(trait_name) = trait_name {
-                    trait_impls.insert((type_name.clone(), trait_name.clone()));
-                }
                 let entry = impls.entry(type_name.clone()).or_default();
                 for (sig, _) in methods {
                     entry.push((sig.name.clone(), signature(sig)));
@@ -678,10 +666,10 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
         fns,
         traits,
         impls,
-        trait_impls,
         slots: collect_slots(program),
         others,
         ids,
+        nominal,
     };
 
     // 契約の検査は索引が揃ってから。前方参照の trait も引ける(design.md 決定2)
@@ -757,29 +745,49 @@ fn collect_nominal(program: &Program, lowered: &mut hir::Program) -> Nominal {
     nominal
 }
 
-/// 型注釈を HIR の型へ。名前は組み込み型か宣言済みの struct / enum でなければ
-/// ならない。
+/// 型注釈を HIR の型へ。宣言されていない名前を報告するのはここだけ。
+fn lower_type(ty: &Type, nominal: &Nominal, out: &mut Out) -> hir::Type {
+    report_unknown(ty, nominal, out);
+    lower_known(&known(ty), nominal)
+}
+
+/// 注釈の名前が宣言を指しているか。
 ///
 /// 宣言されていない名前を通していた頃は、その型の値がどの宣言のものか誰にも
 /// 分からないまま検査を抜けられた。後段が「全ての型は宣言を指す」前提で
-/// 書かれる以上、ここで閉じる(design.md 決定7)。
-fn lower_type(ty: &Type, nominal: &Nominal, out: &mut Out) -> hir::Type {
-    let kind = match &ty.kind {
-        TypeKind::Array(element) => {
-            hir::TypeKind::Array(Box::new(lower_type(element, nominal, out)))
+/// 書かれる以上、名前を書ける唯一の場所である注釈で閉じる(design.md 決定7)。
+fn report_unknown(ty: &Type, nominal: &Nominal, out: &mut Out) {
+    match &ty.kind {
+        TypeKind::Array(element) => report_unknown(element, nominal, out),
+        TypeKind::Named(name) => {
+            if builtin(name).is_none()
+                && !nominal.types.contains_key(name)
+                // 同じ名前を注釈のあちこちで見ても言うのは一度だけ
+                && out.unknown_types.insert(name.clone())
+            {
+                out.push(format!("型 `{name}` は宣言されていません"));
+            }
         }
-        TypeKind::Named(name) => match builtin(name) {
+    }
+}
+
+/// 分かっている型を HIR の型へ。
+///
+/// 解決できない名前は `Poison` になる。式の型の名前はどれも注釈か宣言から
+/// 来ているので、解決できないものは `report_unknown` が既に報告している
+/// (診断が空のまま `Poison` が残ることはない)。
+fn lower_known(ty: &KnownType, nominal: &Nominal) -> hir::Type {
+    let kind = match &ty.kind {
+        KnownKind::Array(element) => {
+            hir::TypeKind::Array(Box::new(lower_known(element, nominal)))
+        }
+        KnownKind::Named(name) => match builtin(name) {
             Some(builtin) => hir::TypeKind::Builtin(builtin),
-            None => match nominal.types.get(name) {
-                Some(kind) => kind.clone(),
-                None => {
-                    // 同じ名前を注釈のあちこちで見ても言うのは一度だけ
-                    if out.unknown_types.insert(name.clone()) {
-                        out.push(format!("型 `{name}` は宣言されていません"));
-                    }
-                    hir::TypeKind::Poison
-                }
-            },
+            None => nominal
+                .types
+                .get(name)
+                .cloned()
+                .unwrap_or(hir::TypeKind::Poison),
         },
     };
     hir::Type {
@@ -807,44 +815,22 @@ fn builtin(name: &str) -> Option<hir::Builtin> {
     }
 }
 
-/// 本体が空の callable。引数と `self` はここで局所束縛になり、`LocalId` は
-/// `self` → 宣言順の引数の順に振られる。本体の式は段3で埋める。
+/// 本体が空の callable。署名だけを下ろす。`self` と引数の局所束縛、および
+/// 本体の式は、本体を検査するときに同じ走査で確保する(design.md 決定7)。
 fn callable_shell(
     sig: &Sig,
     owner: hir::CallableOwner,
-    receiver: Option<hir::Type>,
     span: Span,
     nominal: &Nominal,
     out: &mut Out,
 ) -> hir::Callable {
-    let mut body = hir::Body::default();
-    if let Some(ty) = receiver {
-        body.receiver = Some(body.alloc_local(hir::LocalDecl {
-            name: "self".to_string(),
-            ty: Some(ty),
-            span: sig.span,
-        }));
-    }
-    let params = sig
-        .params
-        .iter()
-        .map(|p| {
-            let ty = lower_type(&p.ty, nominal, out);
-            body.alloc_local(hir::LocalDecl {
-                name: p.name.clone(),
-                ty: Some(ty),
-                span: sig.span,
-            })
-        })
-        .collect();
-    let ret = lower_ret(sig, nominal, out);
     hir::Callable {
         name: sig.name.clone(),
         owner,
         has_self: sig.has_self,
-        params,
-        ret,
-        body,
+        params: Vec::new(),
+        ret: lower_ret(sig, nominal, out),
+        body: hir::Body::default(),
         span,
     }
 }
@@ -900,12 +886,9 @@ fn lower_impl(
             targets.push(Target::Discard);
             continue;
         };
-        let receiver = sig
-            .has_self
-            .then(|| hir::Type::struct_(type_.expect("owner があるなら実装先も分かる")));
         let id = lowered
             .callables
-            .alloc(callable_shell(sig, owner, receiver, sig.span, nominal, out));
+            .alloc(callable_shell(sig, owner, sig.span, nominal, out));
         ids.methods
             .entry((type_name.to_string(), sig.name.clone()))
             .or_default()
@@ -1062,11 +1045,6 @@ impl Outcome {
     }
 }
 
-/// `unit` を産む式。`let` / 代入 / `assert` / ループ / 空ブロックの結果。
-fn unit() -> Outcome {
-    Outcome::Typed(plain("unit"))
-}
-
 /// 宛先の型へ値の型が収まるか。厳密一致か、同名の非 optional から optional への
 /// 一方向の注入だけ(design.md 決定1)。値の側の推論型は変えない。
 fn fits(actual: &KnownType, expected: &KnownType) -> bool {
@@ -1125,56 +1103,185 @@ struct Cx<'a> {
 // 走査
 // ---------------------------------------------------------------------------
 
+/// 走査から戻るもの。検査側の分類と、arena に入った式の ID。
+///
+/// どんな式でも ID を1つ持つので、親は子を必ず指せる。型を出せなかった式は
+/// `ExprResult::Poison` として arena に残るが、診断を伴わずに外へ出ることは
+/// ない(`hir::Program::poisoned`)。
+#[derive(Clone)]
+struct Checked {
+    outcome: Outcome,
+    id: hir::ExprId,
+}
+
+/// `walk_kind` が返すもの。span と結果分類を付けて arena へ入れるのは `walk`。
+struct Lowered {
+    outcome: Outcome,
+    kind: hir::ExprKind,
+}
+
+fn lowered(outcome: Outcome, kind: hir::ExprKind) -> Lowered {
+    Lowered { outcome, kind }
+}
+
+fn typed(ty: KnownType, kind: hir::ExprKind) -> Lowered {
+    lowered(Outcome::Typed(ty), kind)
+}
+
+/// `unit` を産む式。`let` / 代入 / `assert` / ループ / 空ブロックの結果。
+fn produces_unit(kind: hir::ExprKind) -> Lowered {
+    typed(plain("unit"), kind)
+}
+
+/// 型を出せなかった式。理由の診断は既に出ている(design.md 決定3)。
+fn poison() -> Lowered {
+    lowered(Outcome::Poisoned, hir::ExprKind::Poison)
+}
+
+/// 部分式が制御を抜けたので、この式は値を産まない。実行されるのはその部分式
+/// までなので、それを評価するだけの形へ畳む。
+fn diverged(child: hir::ExprId) -> Lowered {
+    lowered(Outcome::Diverges, hir::ExprKind::Block(vec![child]))
+}
+
+/// 局所束縛を1つ確保する。型は HIR の型へ下ろして持たせる。
+fn alloc_local(
+    name: &str,
+    ty: Option<&KnownType>,
+    span: Span,
+    decls: &Decls,
+    out: &mut Out,
+) -> hir::LocalId {
+    let ty = ty.map(|ty| lower_known(ty, &decls.nominal));
+    out.body.alloc_local(hir::LocalDecl {
+        name: name.to_string(),
+        ty,
+        span,
+    })
+}
+
+/// 1つの宣言の本体を検査して HIR へ下ろす。
+///
+/// 宣言パスが確保した置き場所から本体を借り出し、`self` と引数の局所束縛を
+/// 確保してから走査に入る。式は `out.body` へ溜まる。
 #[allow(clippy::too_many_arguments)]
 fn check_body(
     body: &[Expr],
+    sig: Option<&Sig>,
+    receiver: Option<KnownType>,
     decls: &Decls,
-    mut locals: Locals,
     ctx: &str,
     ret: &KnownType,
     target: Target,
     lowered: &mut hir::Program,
     out: &mut Out,
 ) {
+    let borrowed = match target {
+        Target::Callable(id) => std::mem::take(&mut lowered.callables.get_mut(id).body),
+        Target::Test(id) => std::mem::take(&mut lowered.tests.get_mut(id).body),
+        // 置き場所を決められなかった宣言。検査は続けるが下ろした先は捨てる
+        Target::Discard => hir::Body::default(),
+    };
+    let outer = std::mem::replace(&mut out.body, borrowed);
+
+    let span = sig.map_or(ret_span(out), |sig| sig.span);
+    let mut locals = Locals::new();
+    // `self` を先に確保するので `LocalId` は self → 宣言順の引数の順になる
+    let receiver_local = receiver.map(|ty| {
+        let id = alloc_local("self", Some(&ty), span, decls, out);
+        locals.insert("self".to_string(), Binding::Value(Some(ty), id));
+        id
+    });
+    let params: Vec<hir::LocalId> = sig
+        .map(|sig| {
+            sig.params
+                .iter()
+                .map(|p| {
+                    let ty = known(&p.ty);
+                    let id = alloc_local(&p.name, Some(&ty), span, decls, out);
+                    locals.insert(p.name.clone(), Binding::Value(Some(ty), id));
+                    id
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let cx = Cx { decls, ctx, ret };
     // 本体は値ベースなので最後の式も戻り値。明示 `return` と同じ位置で照合する
-    block(body, Some((ret, &Site::Return)), &cx, &mut locals, out);
-    // 段3でここが本体を HIR へ下ろす。宣言パスが確保した置き場所へ書き込む
-    let _ = (target, lowered);
+    let (_, root) = sequence(body, Some((ret, &Site::Return)), &cx, &mut locals, out);
+    out.body.root = root;
+    out.body.receiver = receiver_local;
+
+    let filled = std::mem::replace(&mut out.body, outer);
+    match target {
+        Target::Callable(id) => {
+            let callable = lowered.callables.get_mut(id);
+            callable.params = params;
+            callable.body = filled;
+        }
+        Target::Test(id) => lowered.tests.get_mut(id).body = filled,
+        Target::Discard => {}
+    }
+}
+
+/// 署名を持たない本体(`test`)の局所束縛に使う位置。宣言全体を指す
+fn ret_span(out: &Out) -> Span {
+    out.span.expect("宣言の走査に入る前に span が入っている")
 }
 
 /// 式の列。値になるのは最後の式だけで、手前の式は値を産んでも捨てる
-/// (design.md 決定5)。空ブロックは値を産まないので `unit`。
-fn block(body: &[Expr], expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
+/// (design.md 決定5)。空の列は値を産まないので `unit`。
+fn sequence(
+    body: &[Expr],
+    expected: Expect,
+    cx: &Cx,
+    locals: &mut Locals,
+    out: &mut Out,
+) -> (Outcome, Vec<hir::ExprId>) {
     let Some((last, init)) = body.split_last() else {
-        return unit();
+        return (Outcome::Typed(plain("unit")), Vec::new());
     };
     // 手前の式のどれかが制御を抜けるなら、この列は最後まで続かない。
     // ただし到達しない式も宣言の検査対象なので走査は続ける
+    let mut ids = Vec::with_capacity(body.len());
     let mut diverged = false;
     for e in init {
-        if matches!(synth(e, cx, locals, out), Outcome::Diverges) {
+        let checked = synth(e, cx, locals, out);
+        if matches!(checked.outcome, Outcome::Diverges) {
             diverged = true;
         }
+        ids.push(checked.id);
     }
     let result = walk(last, expected, cx, locals, out);
-    if diverged { Outcome::Diverges } else { result }
+    ids.push(result.id);
+    let outcome = if diverged {
+        Outcome::Diverges
+    } else {
+        result.outcome
+    };
+    (outcome, ids)
+}
+
+fn block(body: &[Expr], expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
+    let (outcome, ids) = sequence(body, expected, cx, locals, out);
+    lowered(outcome, hir::ExprKind::Block(ids))
 }
 
 /// 期待型の無い位置の式。自分の型を推論するだけ。
-fn synth(e: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
+fn synth(e: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Checked {
     walk(e, None, cx, locals, out)
 }
 
 /// 検査中の式を診断の位置にして、種類ごとの規則へ回す。部分木から戻ったら
 /// 外側の式へ span を戻す(戻さないと、子を見た後の親の診断が子の位置を指す)。
 ///
-/// 最後に期待型との境界を1箇所で照合する。`Diverges` はそこを通らないので
-/// 照合せず、`Poisoned` は既に説明済みなので重ねない(design.md 決定3・4)。
-fn walk(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
+/// 期待型との境界の照合はここ1箇所。`Diverges` はそこを通らないので照合せず、
+/// `Poisoned` は既に説明済みなので重ねない(design.md 決定3・4)。
+/// 最後に、下ろした形と結果分類と span を1つの HIR 式として arena へ入れる。
+fn walk(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Checked {
     let before = out.count();
     let outer = out.span.replace(e.span);
-    let outcome = walk_kind(e, expected, cx, locals, out);
+    let Lowered { outcome, kind } = walk_kind(e, expected, cx, locals, out);
     out.span = outer;
     let outcome = match (&outcome, expected) {
         (Outcome::Typed(actual), Some((expected, site))) if !fits(actual, expected) => {
@@ -1184,51 +1291,65 @@ fn walk(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out)
         _ => outcome,
     };
     // 検査を閉じる網。型を出せなかった式は理由の診断を伴っていなければならず、
-    // 伴わないまま検査が成功しかけたら `check` が最後にここを指して落とす
+    // 伴わないまま検査が成功しかけたら `check_and_lower` が最後にここを指して落とす
     // (design.md 決定3、リスク「規則の抜けが Unknown を再生する」)
     if matches!(outcome, Outcome::Poisoned) {
         out.note_unexplained(before, e.span);
     }
-    outcome
+    let result = match &outcome {
+        Outcome::Typed(ty) => hir::ExprResult::Value(lower_known(ty, &cx.decls.nominal)),
+        Outcome::Diverges => hir::ExprResult::Diverges,
+        Outcome::Poisoned => hir::ExprResult::Poison,
+    };
+    let id = out.body.alloc_expr(hir::Expr {
+        result,
+        kind,
+        span: e.span,
+    });
+    Checked { outcome, id }
 }
 
-fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
+fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
     let decls = cx.decls;
     let ctx = cx.ctx;
     match &e.kind {
-        ExprKind::Int(_) => Outcome::Typed(plain("int")),
-        ExprKind::Str(_) => Outcome::Typed(plain("str")),
-        ExprKind::Bool(_) => Outcome::Typed(plain("bool")),
+        ExprKind::Int(n) => typed(plain("int"), hir::ExprKind::Int(*n)),
+        ExprKind::Str(s) => typed(plain("str"), hir::ExprKind::Str(s.clone())),
+        ExprKind::Bool(b) => typed(plain("bool"), hir::ExprKind::Bool(*b)),
 
         // `nil` は自分だけでは nominal 型を持たない。期待型が optional の
         // ときだけその型になる(design.md 決定7)
         ExprKind::Nil => match expected {
-            Some((expected, _)) if expected.optional => Outcome::Typed(expected.clone()),
+            Some((expected, _)) if expected.optional => typed(expected.clone(), hir::ExprKind::Nil),
             Some((expected, site)) => {
                 out.push_at(e.span, site.message(ctx, expected, "nil"));
-                Outcome::Poisoned
+                lowered(Outcome::Poisoned, hir::ExprKind::Nil)
             }
-            None => Outcome::Poisoned,
+            None => lowered(Outcome::Poisoned, hir::ExprKind::Nil),
         },
 
         ExprKind::Ident(name) => {
             let before = out.count();
             check_bare(name, decls, locals, ctx, out);
             match locals.get(name) {
-                Some(Binding::Value(Some(ty))) => Outcome::Typed(ty.clone()),
+                Some(Binding::Value(Some(ty), local)) => {
+                    typed(ty.clone(), hir::ExprKind::Local(*local))
+                }
                 // 型の分からないローカル。束縛した側が既に診断している
-                Some(Binding::Value(None)) => Outcome::Poisoned,
+                Some(Binding::Value(None, local)) => {
+                    lowered(Outcome::Poisoned, hir::ExprKind::Local(*local))
+                }
                 // スロットは trait の窓であって値ではない
                 Some(Binding::Slot(_)) => {
                     out.push(format!("{ctx}: `{name}` はスロットなので値になりません"));
-                    Outcome::Poisoned
+                    poison()
                 }
                 None => {
-                    let outcome = bare_value(name, decls);
-                    if matches!(outcome, Outcome::Poisoned) {
+                    let value = bare_value(name, decls);
+                    if matches!(value.outcome, Outcome::Poisoned) {
                         out.explain(before, format!("{ctx}: `{name}` は値として読めません"));
                     }
-                    outcome
+                    value
                 }
             }
         }
@@ -1243,29 +1364,32 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                     "{ctx}: `{}` は値として読めません",
                     parts.join("::")
                 ));
-                return Outcome::Poisoned;
+                return poison();
             };
             if !decls.enums.contains_key(enum_name) {
                 out.push(format!(
                     "{ctx}: `{enum_name}::{variant}` は値として読めません"
                 ));
-                return Outcome::Poisoned;
+                return poison();
             }
             match payload_of(enum_name, variant, decls) {
                 None => {
                     out.push(format!(
                         "{ctx}: `{enum_name}::{variant}` は `{enum_name}` の variant ではありません"
                     ));
-                    Outcome::Poisoned
+                    poison()
                 }
                 Some(payload) if !payload.is_empty() => {
                     out.push(format!(
                         "{ctx}: `{enum_name}::{variant}` は payload を {} 個取ります。`{enum_name}::{variant}(...)` で生成してください",
                         payload.len()
                     ));
-                    Outcome::Poisoned
+                    poison()
                 }
-                Some(_) => Outcome::Typed(plain(enum_name)),
+                Some(_) => typed(
+                    plain(enum_name),
+                    hir::ExprKind::Variant(variant_id(enum_name, variant, decls)),
+                ),
             }
         }
 
@@ -1276,6 +1400,7 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
 
         ExprKind::StructLit { name, fields } => {
             check_literal(name, fields, decls, ctx, out);
+            let mut given = Vec::with_capacity(fields.len());
             for (field, value) in fields {
                 match declared_field(name, field, decls) {
                     Some(declared) => {
@@ -1283,7 +1408,10 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                             type_name: name,
                             field,
                         };
-                        walk(value, Some((&declared, &site)), cx, locals, out);
+                        let checked = walk(value, Some((&declared, &site)), cx, locals, out);
+                        if let Some(id) = decls.ids.fields.get(&(name.clone(), field.clone())) {
+                            given.push((*id, checked.id));
+                        }
                     }
                     // 宣言に無いフィールドは `check_literal` が報告済み
                     None => {
@@ -1291,7 +1419,17 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                     }
                 }
             }
-            Outcome::Typed(plain(name))
+            match decls.ids.structs.get(name) {
+                Some(struct_) => typed(
+                    plain(name),
+                    hir::ExprKind::StructLit {
+                        struct_: *struct_,
+                        fields: given,
+                    },
+                ),
+                // 宣言されていない struct。`check_literal` が報告済み
+                None => lowered(Outcome::Typed(plain(name)), hir::ExprKind::Poison),
+            }
         }
 
         // 注釈があれば初期化子の期待型になり、そのまま束縛の型として固定される。
@@ -1301,22 +1439,26 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
             annotation,
             value,
         } => {
-            let ty = match annotation.as_ref().map(known) {
+            if let Some(annotation) = annotation {
+                report_unknown(annotation, &decls.nominal, out);
+            }
+            let (ty, value_id) = match annotation.as_ref().map(known) {
                 Some(declared) => {
                     let what = format!("`{name}` の初期化子");
-                    walk(
+                    let checked = walk(
                         value,
                         Some((&declared, &Site::What(&what))),
                         cx,
                         locals,
                         out,
                     );
-                    Some(declared)
+                    (Some(declared), checked.id)
                 }
                 None => {
                     let before = out.count();
-                    match synth(value, cx, locals, out) {
-                        Outcome::Typed(ty) => Some(ty),
+                    let checked = synth(value, cx, locals, out);
+                    let ty = match &checked.outcome {
+                        Outcome::Typed(ty) => Some(ty.clone()),
                         // 初期化子だけでは型が決まらない束縛は型無しで作らない。
                         // 期待型を与えられる唯一の場所が注釈(design.md 決定2)
                         Outcome::Poisoned => {
@@ -1329,23 +1471,25 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                             None
                         }
                         Outcome::Diverges => None,
-                    }
+                    };
+                    (ty, checked.id)
                 }
             };
-            locals.insert(name.clone(), Binding::Value(ty));
-            unit()
+            let local = alloc_local(name, ty.as_ref(), e.span, decls, out);
+            locals.insert(name.clone(), Binding::Value(ty, local));
+            produces_unit(hir::ExprKind::Let {
+                local,
+                value: value_id,
+            })
         }
 
-        ExprKind::Assign { target, value } => {
-            assign(target, value, cx, locals, out);
-            unit()
-        }
+        ExprKind::Assign { target, value } => produces_unit(assign(target, value, cx, locals, out)),
 
         ExprKind::Unary(UnOp::Neg, inner) => {
             let int = plain("int");
             let site = Site::What("単項 `-` の被演算子");
-            walk(inner, Some((&int, &site)), cx, locals, out);
-            Outcome::Typed(int)
+            let checked = walk(inner, Some((&int, &site)), cx, locals, out);
+            typed(int, hir::ExprKind::Neg(checked.id))
         }
 
         ExprKind::Binary { op, lhs, rhs } => match op {
@@ -1354,10 +1498,17 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                 let int = plain("int");
                 let sym = symbol(*op);
                 let left = Site::What(&format!("`{sym}` の左辺"));
-                walk(lhs, Some((&int, &left)), cx, locals, out);
+                let lhs = walk(lhs, Some((&int, &left)), cx, locals, out);
                 let right = Site::What(&format!("`{sym}` の右辺"));
-                walk(rhs, Some((&int, &right)), cx, locals, out);
-                Outcome::Typed(int)
+                let rhs = walk(rhs, Some((&int, &right)), cx, locals, out);
+                typed(
+                    int,
+                    hir::ExprKind::Arith {
+                        op: arith(*op),
+                        lhs: lhs.id,
+                        rhs: rhs.id,
+                    },
+                )
             }
             BinOp::Eq => equality(lhs, rhs, cx, locals, out),
             BinOp::Coalesce => coalesce(lhs, rhs, cx, locals, out),
@@ -1365,16 +1516,16 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
 
         // 値を運ぶかに関わらず制御を抜ける。運ぶ値は宣言の実効戻り値と照合する
         ExprKind::Return(value) => {
-            if let Some(value) = value {
-                walk(value, Some((cx.ret, &Site::Return)), cx, locals, out);
-            }
-            Outcome::Diverges
+            let id = value
+                .as_ref()
+                .map(|value| walk(value, Some((cx.ret, &Site::Return)), cx, locals, out).id);
+            lowered(Outcome::Diverges, hir::ExprKind::Return(id))
         }
 
         ExprKind::Assert(inner) => {
             let site = Site::What("`assert` の対象");
-            walk(inner, Some((&plain("bool"), &site)), cx, locals, out);
-            unit()
+            let checked = walk(inner, Some((&plain("bool"), &site)), cx, locals, out);
+            produces_unit(hir::ExprKind::Assert(checked.id))
         }
 
         // 期待要素型があればそれを各要素へ配る。無ければ最初に型の分かった要素を
@@ -1383,34 +1534,37 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
             let contextual = want(expected).and_then(KnownType::element).cloned();
             let mut element = contextual.clone();
             let mut poisoned = false;
+            let mut ids = Vec::with_capacity(items.len());
             for (n, item) in items.iter().enumerate() {
                 let what = format!("配列の第 {} 要素", n + 1);
                 let site = Site::What(&what);
-                let outcome = match &element {
+                let checked = match &element {
                     Some(element) => walk(item, Some((element, &site)), cx, locals, out),
                     None => synth(item, cx, locals, out),
                 };
-                match outcome {
+                ids.push(checked.id);
+                match checked.outcome {
                     Outcome::Typed(ty) if element.is_none() => element = Some(ty),
                     Outcome::Typed(_) | Outcome::Diverges => {}
                     Outcome::Poisoned => poisoned = true,
                 }
             }
+            let kind = hir::ExprKind::Array(ids);
             match (want(expected), &contextual, element) {
                 // 期待型のある位置は生成の境界。要素は個別に照合済みなので、
                 // 配列全体はその期待型として適合する
-                (Some(expected), Some(_), _) => Outcome::Typed(expected.clone()),
+                (Some(expected), Some(_), _) => typed(expected.clone(), kind),
                 // 型の分かる要素が一つも無い。空配列も、`nil` だけの配列もここ。
                 // 後の使用から遡らず、この場で要素型を要求する
                 (_, _, None) => {
                     out.push(format!(
                         "{ctx}: 配列の要素型が決まりません。宛先の型か `let xs: [T] = ...` の注釈で要素型を与えてください"
                     ));
-                    Outcome::Poisoned
+                    lowered(Outcome::Poisoned, kind)
                 }
                 // どれかの要素が基準と食い違った。理由はその要素の位置にある
-                (_, _, Some(_)) if poisoned => Outcome::Poisoned,
-                (_, _, Some(element)) => Outcome::Typed(array_of(element)),
+                (_, _, Some(_)) if poisoned => lowered(Outcome::Poisoned, kind),
+                (_, _, Some(element)) => typed(array_of(element), kind),
             }
         }
 
@@ -1423,25 +1577,55 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
         // (design.md 決定3・5)
         ExprKind::Match { subject, arms } => match_expr(expected, subject, arms, cx, locals, out),
 
-        ExprKind::Head { head, body, orelse } => {
-            head_expr(expected, head, body, orelse.as_deref(), cx, locals, out)
-        }
+        ExprKind::Head { head, body, orelse } => head_expr(
+            expected,
+            head,
+            body,
+            orelse.as_deref(),
+            e.span,
+            cx,
+            locals,
+            out,
+        ),
+    }
+}
+
+/// 限定 variant が指す宣言の ID。宣言済み enum の variant だと分かった後に引く。
+fn variant_id(enum_name: &str, variant: &str, decls: &Decls) -> hir::VariantId {
+    let canonical =
+        declared_variant(enum_name, variant, decls).expect("宣言済み variant だと分かっている");
+    decls.ids.variants[canonical]
+}
+
+fn arith(op: BinOp) -> hir::ArithOp {
+    match op {
+        BinOp::Add => hir::ArithOp::Add,
+        BinOp::Sub => hir::ArithOp::Sub,
+        BinOp::Mul => hir::ArithOp::Mul,
+        BinOp::Div => hir::ArithOp::Div,
+        BinOp::Eq | BinOp::Coalesce => unreachable!("算術だけを回す"),
     }
 }
 
 /// ローカルに隠されていない裸の名前の値。フィールド0個の struct と payload 0個の
 /// enum variant だけが名前そのままで値になる(`check_bare` が診断する側)。
-fn bare_value(name: &str, decls: &Decls) -> Outcome {
+fn bare_value(name: &str, decls: &Decls) -> Lowered {
     if let Some(enum_name) = decls.variants.get(name) {
         return if decls.ctors[name].params.is_empty() {
-            Outcome::Typed(plain(enum_name))
+            typed(
+                plain(enum_name),
+                hir::ExprKind::Variant(decls.ids.variants[name]),
+            )
         } else {
-            Outcome::Poisoned
+            poison()
         };
     }
     match decls.structs.get(name) {
-        Some(fields) if fields.is_empty() => Outcome::Typed(plain(name)),
-        _ => Outcome::Poisoned,
+        Some(fields) if fields.is_empty() => typed(
+            plain(name),
+            hir::ExprKind::UnitStruct(decls.ids.structs[name]),
+        ),
+        _ => poison(),
     }
 }
 
@@ -1454,128 +1638,210 @@ fn field_read(
     cx: &Cx,
     locals: &mut Locals,
     out: &mut Out,
-) -> Outcome {
+) -> Lowered {
     let ctx = cx.ctx;
-    let ty = match synth(recv, cx, locals, out) {
-        Outcome::Typed(ty) => ty,
+    let receiver = synth(recv, cx, locals, out);
+    let ty = match &receiver.outcome {
+        Outcome::Typed(ty) => ty.clone(),
         // レシーバが値を産まないなら読みも起きない。理由はレシーバ側にある
-        other => return other,
+        Outcome::Diverges => return diverged(receiver.id),
+        Outcome::Poisoned => return poison(),
     };
     if optional {
         if !ty.optional {
             out.push(format!(
                 "{ctx}: `.?{field}` のレシーバは optional である必要がありますが、`{ty}` です"
             ));
-            return Outcome::Poisoned;
+            return poison();
         }
     } else if ty.optional {
         out.push(format!(
             "{ctx}: optional 型 `{ty}` から `{field}` を読むには `.?{field}` を使うか、先に `??` で展開してください"
         ));
-        return Outcome::Poisoned;
+        return poison();
     }
-    let Some(declared) = ty.name().and_then(|name| cx.decls.structs.get(name)) else {
-        out.push(if optional {
-            format!("{ctx}: `{ty}` の中身は struct ではないので `.?{field}` を読めません")
-        } else {
-            format!("{ctx}: `{ty}` は struct ではないので `{field}` を読めません")
-        });
-        return Outcome::Poisoned;
+    let Some(type_name) = ty.name() else {
+        out.push(non_struct_message(ctx, &ty, field, optional));
+        return poison();
+    };
+    let Some(declared) = cx.decls.structs.get(type_name) else {
+        out.push(non_struct_message(ctx, &ty, field, optional));
+        return poison();
     };
     let Some(declared) = declared.get(field) else {
         out.push(if optional {
-            format!(
-                "{ctx}: `{}` にフィールド `{field}` はありません",
-                ty.name().unwrap_or_default()
-            )
+            format!("{ctx}: `{type_name}` にフィールド `{field}` はありません")
         } else {
             format!("{ctx}: `{ty}` にフィールド `{field}` はありません")
         });
-        return Outcome::Poisoned;
+        return poison();
     };
     let mut result = declared.clone();
     // optional は1 bit。宣言型が既に `T?` でも `S?.?field` は `T?` のまま
     if optional {
         result.optional = true;
     }
-    Outcome::Typed(result)
+    typed(
+        result,
+        hir::ExprKind::Field {
+            recv: receiver.id,
+            field: cx.decls.ids.fields[&(type_name.to_string(), field.to_string())],
+            optional,
+        },
+    )
+}
+
+fn non_struct_message(ctx: &str, ty: &KnownType, field: &str, optional: bool) -> String {
+    if optional {
+        format!("{ctx}: `{ty}` の中身は struct ではないので `.?{field}` を読めません")
+    } else {
+        format!("{ctx}: `{ty}` は struct ではないので `{field}` を読めません")
+    }
 }
 
 /// 代入。宛先の型が分かるときだけ値を照合する。束縛の型は宣言時に決まるので、
 /// 後の代入では変えない(design.md 決定4)。
-fn assign(target: &Expr, value: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) {
+///
+/// 宛先は局所束縛か宣言フィールドのどちらかでなければならない。実行時に必ず
+/// 失敗する左辺(スロット・struct でない値・呼び出しの結果)はここで止める。
+fn assign(
+    target: &Expr,
+    value: &Expr,
+    cx: &Cx,
+    locals: &mut Locals,
+    out: &mut Out,
+) -> hir::ExprKind {
+    let ctx = cx.ctx;
     match &target.kind {
         // 代入先の裸の名前は書き込み先であって値の読みではない
-        ExprKind::Ident(name) => {
-            let declared = match locals.get(name) {
-                Some(Binding::Value(ty)) => ty.clone(),
-                _ => None,
-            };
-            match declared {
-                Some(declared) => {
-                    let what = format!("`{name}` への代入");
-                    walk(
-                        value,
-                        Some((&declared, &Site::What(&what))),
-                        cx,
-                        locals,
-                        out,
-                    );
-                }
-                None => {
-                    synth(value, cx, locals, out);
+        ExprKind::Ident(name) => match locals.get(name).cloned() {
+            Some(Binding::Value(declared, local)) => {
+                let value = match &declared {
+                    Some(declared) => {
+                        let what = format!("`{name}` への代入");
+                        walk(value, Some((declared, &Site::What(&what))), cx, locals, out)
+                    }
+                    None => synth(value, cx, locals, out),
+                };
+                hir::ExprKind::AssignLocal {
+                    local,
+                    value: value.id,
                 }
             }
-        }
+            Some(Binding::Slot(_)) => {
+                synth(value, cx, locals, out);
+                out.push(format!("{ctx}: `{name}` はスロットなので代入できません"));
+                hir::ExprKind::Poison
+            }
+            // 検査器が知らない名前への代入は新しい束縛を作る。読み出しは
+            // 「値として読めません」になるので、この束縛は誰にも読めない
+            None => {
+                let value = synth(value, cx, locals, out);
+                let local = alloc_local(name, value.outcome.ty(), target.span, cx.decls, out);
+                hir::ExprKind::AssignLocal {
+                    local,
+                    value: value.id,
+                }
+            }
+        },
         ExprKind::Field(recv, field) => {
-            // optional の中身を取り出す規則はまだ無いので、レシーバは
-            // 非 optional と分かるときだけ宛先を引く
-            let owner = synth(recv, cx, locals, out)
-                .ty()
+            let receiver = synth(recv, cx, locals, out);
+            let ty = receiver.outcome.ty().cloned();
+            // 値の照合は、レシーバが非 optional と分かるときだけ(既存の規則)。
+            // 宛先のフィールドは optional の中身でも同じ宣言を指す
+            let checkable = ty
+                .as_ref()
                 .filter(|ty| !ty.optional)
                 .and_then(KnownType::name)
                 .map(str::to_string);
-            let declared = owner
+            let declared = checkable
                 .as_deref()
                 .and_then(|owner| declared_field(owner, field, cx.decls));
-            match (owner.as_deref(), declared) {
+            let value = match (checkable.as_deref(), declared) {
                 (Some(type_name), Some(declared)) => {
                     let site = Site::Field { type_name, field };
-                    walk(value, Some((&declared, &site)), cx, locals, out);
+                    walk(value, Some((&declared, &site)), cx, locals, out)
                 }
-                _ => {
-                    synth(value, cx, locals, out);
+                _ => synth(value, cx, locals, out),
+            };
+            let owner = ty.as_ref().and_then(KnownType::name);
+            let resolved = owner.and_then(|owner| {
+                cx.decls
+                    .ids
+                    .fields
+                    .get(&(owner.to_string(), field.clone()))
+                    .copied()
+            });
+            match (resolved, ty) {
+                (Some(id), _) => hir::ExprKind::AssignField {
+                    recv: receiver.id,
+                    field: id,
+                    value: value.id,
+                },
+                // 宣言に無いフィールドへの代入は、宣言どおりの形をした struct 値を
+                // 評価器へ渡す約束を破る。読みと同じ文言でここで止める
+                (None, Some(ty)) => {
+                    out.push(if cx.decls.structs.contains_key(ty.name().unwrap_or("")) {
+                        format!("{ctx}: `{ty}` にフィールド `{field}` はありません")
+                    } else {
+                        format!("{ctx}: `{ty}` は struct ではないので `{field}` に代入できません")
+                    });
+                    hir::ExprKind::Poison
                 }
+                // レシーバの型が出なかった。理由はレシーバ側にある
+                (None, None) => hir::ExprKind::Poison,
             }
         }
         _ => {
+            synth(target, cx, locals, out);
             synth(value, cx, locals, out);
+            out.push(format!("{ctx}: この左辺には代入できません"));
+            hir::ExprKind::Poison
         }
     }
 }
 
+/// 解決した呼び出し先。署名は引数の検査に、宛先は下ろしに使う。
+struct Resolved<'d> {
+    sig: &'d FnSig,
+    target: CallTarget,
+}
+
+/// 既に選ばれている呼び出し先(design.md 決定6)。
+///
+/// `Unresolvable` は宣言を HIR に載せられなかったときだけで、その宣言は
+/// 必ず診断を伴う。
+enum CallTarget {
+    Direct(hir::CallableId),
+    Method {
+        callable: hir::CallableId,
+        recv: hir::ExprId,
+    },
+    Associated(hir::CallableId),
+    Slot {
+        slot: hir::SlotId,
+        method: hir::TraitMethodId,
+        receiver: hir::SlotReceiver,
+    },
+    Ctor(hir::VariantId),
+    Unresolvable,
+}
+
 /// 呼び出し。解決した署名から個数・引数型・結果型が決まる(design.md 決定6)。
-fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
-    let sig = match resolve(callee, cx, locals, out) {
-        Ok(sig) => sig,
-        Err(outcome) => {
+fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
+    let resolved = match resolve(callee, cx, locals, out) {
+        Ok(resolved) => resolved,
+        Err(lowered) => {
             // 解決できなくても実引数自身は検査する。期待型は配れない
             for arg in args {
                 synth(arg, cx, locals, out);
             }
-            return outcome;
+            return lowered;
         }
     };
     let name = member(callee);
-    if args.len() == sig.params.len() {
-        for (index, (arg, expected)) in args.iter().zip(&sig.params).enumerate() {
-            let site = Site::Arg {
-                callee: &name,
-                index,
-            };
-            walk(arg, Some((expected, &site)), cx, locals, out);
-        }
-    } else {
+    let ret = resolved.sig.ret.clone();
+    if args.len() != resolved.sig.params.len() {
         // 個数が合わなければ引数と宣言の対応が取れないので期待型は配らない
         for arg in args {
             synth(arg, cx, locals, out);
@@ -1583,47 +1849,118 @@ fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Ou
         out.push(format!(
             "{}: `{name}` は引数を {} 個取りますが、{} 個渡しています",
             cx.ctx,
-            sig.params.len(),
+            resolved.sig.params.len(),
             args.len()
         ));
+        return lowered(Outcome::Typed(ret), hir::ExprKind::Poison);
     }
+    let mut ids = Vec::with_capacity(args.len());
+    for (index, (arg, expected)) in args.iter().zip(&resolved.sig.params).enumerate() {
+        let site = Site::Arg {
+            callee: &name,
+            index,
+        };
+        ids.push(walk(arg, Some((expected, &site)), cx, locals, out).id);
+    }
+    let kind = match resolved.target {
+        CallTarget::Direct(callable) => hir::ExprKind::Call(hir::Call::Direct {
+            callable,
+            args: ids,
+        }),
+        CallTarget::Method { callable, recv } => hir::ExprKind::Call(hir::Call::Method {
+            callable,
+            recv,
+            args: ids,
+        }),
+        CallTarget::Associated(callable) => hir::ExprKind::Call(hir::Call::Associated {
+            callable,
+            args: ids,
+        }),
+        CallTarget::Slot {
+            slot,
+            method,
+            receiver,
+        } => hir::ExprKind::Call(hir::Call::Slot {
+            slot,
+            method,
+            receiver,
+            args: ids,
+        }),
+        CallTarget::Ctor(variant) => hir::ExprKind::Call(hir::Call::Ctor { variant, args: ids }),
+        CallTarget::Unresolvable => hir::ExprKind::Poison,
+    };
     // 解決した呼び出しは実効戻り値型を持つ(design.md 決定1・6)
-    Outcome::Typed(sig.ret.clone())
+    typed(ret, kind)
 }
 
-/// 呼び出し先の署名を選ぶ。レシーバの走査もここで1度だけ行うので、
+/// 呼び出し先の署名と宛先を選ぶ。レシーバの走査もここで1度だけ行うので、
 /// 型を引くためにもう一周する必要が無い。
 ///
 /// 選び方は評価器と同じ順序で、宣言済み enum の限定 variant を constructor として
 /// 最初に見てから、スロット経由なら宣言 trait の契約だけ、具体型なら inherent と
 /// trait 実装をまとめて名前で絞り一意を要求する(design.md 決定6)。
-/// `Err` はそのまま呼び出し式の結果になる。
+/// `Err` はそのまま呼び出し式の下ろした形になる。
 fn resolve<'d>(
     callee: &Expr,
     cx: &Cx<'d>,
     locals: &mut Locals,
     out: &mut Out,
-) -> Result<&'d FnSig, Outcome> {
+) -> Result<Resolved<'d>, Lowered> {
     let decls = cx.decls;
     let before = out.count();
     let selected = match &callee.kind {
         // 直接呼び出し。名前は値として読まれない
-        ExprKind::Ident(name) => Ok(decls.fns.get(name)),
+        ExprKind::Ident(name) => Ok(decls.fns.get(name).map(|sig| {
+            let target = decls
+                .ids
+                .fns
+                .get(name)
+                .map_or(CallTarget::Unresolvable, |id| CallTarget::Direct(*id));
+            (sig, target)
+        })),
         ExprKind::Field(recv, name) => {
             // ambient スロット経由は宣言 trait の契約だけを見る。スロット名は
             // 値ではないのでレシーバとして走査しない
             if let ExprKind::Ident(recv_name) = &recv.kind
                 && let Some(trait_name) = slot_trait(recv_name, decls, locals)
             {
-                from_trait(&trait_name, name, true, decls)
+                from_trait(&trait_name, name, true, decls).map(|found| {
+                    found.map(|sig| {
+                        (
+                            sig,
+                            slot_target(
+                                recv_name,
+                                &trait_name,
+                                name,
+                                hir::SlotReceiver::Value,
+                                decls,
+                            ),
+                        )
+                    })
+                })
             } else {
-                match synth(recv, cx, locals, out) {
+                let receiver = synth(recv, cx, locals, out);
+                match &receiver.outcome {
                     // optional の中身を取り出す規則はまだ無く、配列にメソッドも無い
                     Outcome::Typed(ty) => match ty.name().filter(|_| !ty.optional) {
-                        Some(type_name) => from_type(type_name, name, true, decls),
+                        Some(type_name) => from_type(type_name, name, true, decls).map(|found| {
+                            found.map(|sig| {
+                                (
+                                    sig,
+                                    concrete_target(type_name, name, decls).map_or(
+                                        CallTarget::Unresolvable,
+                                        |callable| CallTarget::Method {
+                                            callable,
+                                            recv: receiver.id,
+                                        },
+                                    ),
+                                )
+                            })
+                        }),
                         None => Ok(None),
                     },
-                    other => return Err(other),
+                    Outcome::Diverges => return Err(diverged(receiver.id)),
+                    Outcome::Poisoned => return Err(poison()),
                 }
             }
         }
@@ -1634,16 +1971,40 @@ fn resolve<'d>(
                     cx.ctx,
                     parts.join("::")
                 ));
-                return Err(Outcome::Poisoned);
+                return Err(poison());
             };
             // 宣言済み enum の variant なら constructor。関連関数や ambient の
             // 型射影より先に見る(design.md 決定6)
             if let Some(ctor) = variant_ctor(first, name, decls) {
-                Ok(Some(ctor))
+                Ok(Some((
+                    ctor,
+                    CallTarget::Ctor(variant_id(first, name, decls)),
+                )))
             } else {
                 match slot_trait(first, decls, locals) {
-                    Some(trait_name) => from_trait(&trait_name, name, false, decls),
-                    None => from_type(first, name, false, decls),
+                    Some(trait_name) => from_trait(&trait_name, name, false, decls).map(|found| {
+                        found.map(|sig| {
+                            (
+                                sig,
+                                slot_target(
+                                    first,
+                                    &trait_name,
+                                    name,
+                                    hir::SlotReceiver::Type,
+                                    decls,
+                                ),
+                            )
+                        })
+                    }),
+                    None => from_type(first, name, false, decls).map(|found| {
+                        found.map(|sig| {
+                            (
+                                sig,
+                                concrete_target(first, name, decls)
+                                    .map_or(CallTarget::Unresolvable, CallTarget::Associated),
+                            )
+                        })
+                    }),
                 }
             }
         }
@@ -1653,7 +2014,7 @@ fn resolve<'d>(
         }
     };
     match selected {
-        Ok(Some(sig)) => Ok(sig),
+        Ok(Some((sig, target))) => Ok(Resolved { sig, target }),
         // 宣言を知らない関数・型・レシーバの形。検査済みプログラムでは
         // 呼び出し先が必ず一意に決まる(design.md 決定6)
         Ok(None) => {
@@ -1665,19 +2026,54 @@ fn resolve<'d>(
                     member(callee)
                 ),
             );
-            Err(Outcome::Poisoned)
+            Err(poison())
         }
         Err(message) => {
             out.push(format!("{}: {message}", cx.ctx));
-            Err(Outcome::Poisoned)
+            Err(poison())
         }
+    }
+}
+
+/// スロット経由の宛先。実行する本体はその場の提供が決めるので、ここでは
+/// スロットと契約メソッドだけを指す(design.md 決定6)。
+fn slot_target(
+    slot: &str,
+    trait_name: &str,
+    method: &str,
+    receiver: hir::SlotReceiver,
+    decls: &Decls,
+) -> CallTarget {
+    let contract = decls
+        .ids
+        .trait_methods
+        .get(&(trait_name.to_string(), method.to_string()));
+    match (decls.ids.slots.get(slot), contract) {
+        (Some(slot), Some(method)) => CallTarget::Slot {
+            slot: *slot,
+            method: *method,
+            receiver,
+        },
+        _ => CallTarget::Unresolvable,
+    }
+}
+
+/// 具体型のメンバーの本体。名前で絞って一意でなければ呼び出し自体が曖昧として
+/// 落ちているので、候補が1つのときだけ引ける(`from_type` と同じ規則)。
+fn concrete_target(type_name: &str, method: &str, decls: &Decls) -> Option<hir::CallableId> {
+    match decls
+        .ids
+        .methods
+        .get(&(type_name.to_string(), method.to_string()))
+    {
+        Some(found) if found.len() == 1 => Some(found[0]),
+        _ => None,
     }
 }
 
 /// 等価比較。`nil` は反対側の optional 性を文脈にする(design.md 決定7)。
 /// 結果はどちらにせよ `bool`。
-fn equality(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
-    let result = Outcome::Typed(plain("bool"));
+fn equality(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
     let left_nil = matches!(lhs.kind, ExprKind::Nil);
     let right_nil = matches!(rhs.kind, ExprKind::Nil);
     // 両辺 `nil` は nominal な optional 型を決められない(design.md 決定7)
@@ -1686,12 +2082,14 @@ fn equality(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
             "{}: `==` の両辺が `nil` なので optional の型が決まりません",
             cx.ctx
         ));
-        return Outcome::Poisoned;
+        return poison();
     }
     if left_nil || right_nil {
-        let value = if left_nil { rhs } else { lhs };
+        let (value, bare) = if left_nil { (rhs, lhs) } else { (lhs, rhs) };
         // 片側が `nil` なら、もう片側の型がそのまま optional 性の文脈になる
-        if let Outcome::Typed(ty) = synth(value, cx, locals, out)
+        let checked = synth(value, cx, locals, out);
+        let ty = checked.outcome.ty().cloned();
+        if let Some(ty) = &ty
             && !ty.optional
         {
             let (left, right) = if left_nil {
@@ -1704,11 +2102,23 @@ fn equality(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
                 cx.ctx
             ));
         }
-        return result;
+        // `nil` 側は相手の型を期待型にして下ろす。相手が optional でなければ
+        // 型を与えられないが、その理由は既に上で報告している
+        let site = Site::What("`==` の `nil` 側");
+        let bare = match &ty {
+            Some(ty) if ty.optional => walk(bare, Some((ty, &site)), cx, locals, out),
+            _ => synth(bare, cx, locals, out),
+        };
+        let (lhs, rhs) = if left_nil {
+            (bare.id, checked.id)
+        } else {
+            (checked.id, bare.id)
+        };
+        return typed(plain("bool"), hir::ExprKind::Eq { lhs, rhs });
     }
     let left = synth(lhs, cx, locals, out);
     let right = synth(rhs, cx, locals, out);
-    if let (Outcome::Typed(left), Outcome::Typed(right)) = (&left, &right)
+    if let (Some(left), Some(right)) = (left.outcome.ty(), right.outcome.ty())
         && left != right
     {
         out.push(format!(
@@ -1716,52 +2126,93 @@ fn equality(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
             cx.ctx
         ));
     }
-    result
+    typed(
+        plain("bool"),
+        hir::ExprKind::Eq {
+            lhs: left.id,
+            rhs: right.id,
+        },
+    )
 }
 
 /// `T? ?? T` は `T` を返す。右辺が枝を抜けるなら中身の型との照合は要らない
 /// (design.md 決定7)。
-fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
+fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
     let ctx = cx.ctx;
     // 左辺が裸の `nil` なら、右辺の非 optional な型がそのまま結果になる
     if matches!(lhs.kind, ExprKind::Nil) {
-        return match synth(rhs, cx, locals, out) {
-            Outcome::Typed(ty) if ty.optional => {
+        let right = synth(rhs, cx, locals, out);
+        let outcome = match right.outcome.ty() {
+            Some(ty) if ty.optional => {
                 out.push(format!(
                     "{ctx}: `??` の右辺には非 optional の値が必要ですが、`{ty}` です"
                 ));
                 Outcome::Poisoned
             }
-            other => other,
+            _ => right.outcome.clone(),
         };
+        // 左辺の `nil` は結果型の optional 版。右辺を見てからでないと型が出ない
+        let site = Site::What("`??` の左辺");
+        let bare = match outcome.ty() {
+            Some(ty) => {
+                let optional = optional_of(ty);
+                walk(lhs, Some((&optional, &site)), cx, locals, out)
+            }
+            None => synth(lhs, cx, locals, out),
+        };
+        return lowered(
+            outcome,
+            hir::ExprKind::Coalesce {
+                lhs: bare.id,
+                rhs: right.id,
+            },
+        );
     }
     let before = out.count();
-    let left = match synth(lhs, cx, locals, out) {
-        Outcome::Typed(ty) => ty,
+    let left = synth(lhs, cx, locals, out);
+    let ty = match &left.outcome {
+        Outcome::Typed(ty) => ty.clone(),
         other => {
             if matches!(other, Outcome::Poisoned) {
                 out.explain(before, format!("{ctx}: `??` の左辺の型が決まりません"));
             }
             synth(rhs, cx, locals, out);
-            return other;
+            // 左辺が値を産まないなら右辺も走らない
+            return match other {
+                Outcome::Diverges => diverged(left.id),
+                _ => poison(),
+            };
         }
     };
-    if !left.optional {
+    if !ty.optional {
         out.push(format!(
-            "{ctx}: `??` の左辺は optional である必要がありますが、`{left}` です"
+            "{ctx}: `??` の左辺は optional である必要がありますが、`{ty}` です"
         ));
         synth(rhs, cx, locals, out);
-        return Outcome::Poisoned;
+        return poison();
     }
     let inner = KnownType {
-        kind: left.kind,
+        kind: ty.kind,
         optional: false,
     };
     let site = Site::What("`??` の右辺");
-    match walk(rhs, Some((&inner, &site)), cx, locals, out) {
+    let right = walk(rhs, Some((&inner, &site)), cx, locals, out);
+    let kind = hir::ExprKind::Coalesce {
+        lhs: left.id,
+        rhs: right.id,
+    };
+    match right.outcome {
         // 右辺が値を産まずに枝を終えても、続く経路の値は左辺の中身
-        Outcome::Typed(_) | Outcome::Diverges => Outcome::Typed(inner),
-        Outcome::Poisoned => Outcome::Poisoned,
+        Outcome::Typed(_) | Outcome::Diverges => typed(inner, kind),
+        Outcome::Poisoned => lowered(Outcome::Poisoned, kind),
+    }
+}
+
+/// 後置 `?` を付けた同じ形。
+fn optional_of(ty: &KnownType) -> KnownType {
+    KnownType {
+        kind: ty.kind.clone(),
+        optional: true,
     }
 }
 
@@ -1774,23 +2225,25 @@ fn match_expr(
     cx: &Cx,
     locals: &mut Locals,
     out: &mut Out,
-) -> Outcome {
+) -> Lowered {
     let before = out.count();
-    let matched = matched_enum(subject, cx, locals, out);
+    let (checked, matched) = matched_enum(subject, cx, locals, out);
     check_arms(arms, matched.as_deref(), cx.decls, cx.ctx, out);
 
     let mut result = want(expected).cloned();
     let mut poisoned = false;
     // arm が1つも無い(空 enum の網羅的な match)ときも、値は産まれない
     let mut continues = false;
+    let mut lowered_arms = Vec::with_capacity(arms.len());
+    let mut resolvable = true;
     for arm in arms {
-        let mut inner = arm_locals(arm, cx.decls, locals);
+        let (mut inner, pattern) = arm_locals(arm, cx.decls, locals, out);
         // guard は payload を見られるが、本体へ束縛を漏らさないよう複製で検査する
-        if let Some(guard) = &arm.guard {
+        let guard = arm.guard.as_ref().map(|guard| {
             let mut guard_locals = inner.clone();
             let site = Site::What("arm の guard");
             let before = out.count();
-            let outcome = walk(
+            let checked = walk(
                 guard,
                 Some((&plain("bool"), &site)),
                 cx,
@@ -1798,20 +2251,21 @@ fn match_expr(
                 out,
             );
             // guard が偽になりうるかは網羅性に効くので、実行前に `bool` を確定する
-            if matches!(outcome, Outcome::Poisoned) {
+            if matches!(checked.outcome, Outcome::Poisoned) {
                 out.explain(
                     before,
                     format!("{}: arm の guard の型が決まりません", cx.ctx),
                 );
             }
-        }
+            checked.id
+        });
         let what = format!("arm `{}` の値", arm.pattern.label());
         let site = Site::What(&what);
-        let outcome = match &result {
+        let body = match &result {
             Some(result) => walk(&arm.body, Some((result, &site)), cx, &mut inner, out),
             None => synth(&arm.body, cx, &mut inner, out),
         };
-        match outcome {
+        match body.outcome {
             Outcome::Typed(ty) => {
                 continues = true;
                 if result.is_none() {
@@ -1825,47 +2279,71 @@ fn match_expr(
                 poisoned = true;
             }
         }
+        match pattern {
+            Some(pattern) => lowered_arms.push(hir::MatchArm {
+                pattern,
+                guard,
+                body: body.id,
+                span: arm.span,
+            }),
+            // 宣言に無い variant を指す arm。`check_arms` が報告済み
+            None => resolvable = false,
+        }
     }
 
+    let kind = if resolvable {
+        hir::ExprKind::Match {
+            subject: checked.id,
+            arms: lowered_arms,
+        }
+    } else {
+        hir::ExprKind::Poison
+    };
     match want(expected) {
         // 全 arm が抜けるなら合流点も抜ける。空 enum を 0 arm で網羅した
         // `match` もここ。宛先があっても値は産まれない(design.md 決定5)
-        _ if !continues => Outcome::Diverges,
+        _ if !continues => lowered(Outcome::Diverges, kind),
         // 期待型のある位置は arm ごとに照合済みなので、式全体では二度言わない
-        Some(expected) => Outcome::Typed(expected.clone()),
-        None if poisoned => Outcome::Poisoned,
+        Some(expected) => typed(expected.clone(), kind),
+        None if poisoned => lowered(Outcome::Poisoned, kind),
         None => match result {
-            Some(result) => Outcome::Typed(result),
+            Some(result) => typed(result, kind),
             None => {
                 out.explain(
                     before,
                     format!("{}: `match` の結果型が決まりません", cx.ctx),
                 );
-                Outcome::Poisoned
+                lowered(Outcome::Poisoned, kind)
             }
         },
     }
 }
 
-/// `match` の対象の enum。既知の非 optional な enum のときだけ返す。
+/// `match` の対象の enum。既知の非 optional な enum のときだけ名前を返す。
 ///
 /// 型不明の対象を実行時へ委ねると arm の所属・網羅性・結果型の基準を決められない
 /// ので、ここで診断する(design.md 決定3)。
-fn matched_enum(subject: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Option<String> {
+fn matched_enum(
+    subject: &Expr,
+    cx: &Cx,
+    locals: &mut Locals,
+    out: &mut Out,
+) -> (Checked, Option<String>) {
     let before = out.count();
-    let ty = match synth(subject, cx, locals, out) {
-        Outcome::Typed(ty) => ty,
+    let checked = synth(subject, cx, locals, out);
+    let ty = match &checked.outcome {
+        Outcome::Typed(ty) => ty.clone(),
         // 対象が抜けるなら arm へ入らない
-        Outcome::Diverges => return None,
+        Outcome::Diverges => return (checked, None),
         Outcome::Poisoned => {
             out.explain(
                 before,
                 format!("{}: `match` の対象の型が決まりません", cx.ctx),
             );
-            return None;
+            return (checked, None);
         }
     };
-    match ty.name() {
+    let matched = match ty.name() {
         Some(name) if !ty.optional && cx.decls.enums.contains_key(name) => Some(name.to_string()),
         _ => {
             out.push(format!(
@@ -1874,29 +2352,48 @@ fn matched_enum(subject: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> 
             ));
             None
         }
-    }
+    };
+    (checked, matched)
 }
 
 /// `Head` で始まる式。`with` と条件式は本体の値を産み、ループは `unit`
 /// (design.md 決定5)。
+#[allow(clippy::too_many_arguments)]
 fn head_expr(
     expected: Expect,
     head: &Head,
     body: &Expr,
     orelse: Option<&Expr>,
+    span: Span,
     cx: &Cx,
     locals: &mut Locals,
     out: &mut Out,
-) -> Outcome {
+) -> Lowered {
     match head {
         Head::Ambient(binders) => {
             // 提供値は外側で評価される
+            let mut provisions = Vec::with_capacity(binders.len());
+            let mut resolvable = true;
             for binder in binders {
-                let ty = match binder {
-                    Provision::Type { type_name, .. } => Some(plain(type_name)),
-                    Provision::Value { value, .. } => synth(value, cx, locals, out).ty().cloned(),
+                let (ty, value) = match binder {
+                    Provision::Type { type_name, .. } => (Some(plain(type_name)), None),
+                    Provision::Value { value, .. } => {
+                        let checked = synth(value, cx, locals, out);
+                        (checked.outcome.ty().cloned(), Some(checked.id))
+                    }
                 };
-                check_provision(binder, ty.as_ref(), cx, out);
+                let implementation = check_provision(binder, ty.as_ref(), cx, out);
+                match (cx.decls.ids.slots.get(binder.slot()), implementation) {
+                    (Some(slot), Some(implementation)) => provisions.push(hir::Provision {
+                        slot: *slot,
+                        implementation,
+                        value,
+                        span,
+                    }),
+                    // スロットでない名前、あるいは契約を満たさない提供。
+                    // `check_provision` と requirement 側が報告する
+                    _ => resolvable = false,
+                }
             }
             // 本体では内側の束縛が勝つ。スロットでない名前は requirement 側が
             // 報告するので、ここでは型不明の値にする
@@ -1905,15 +2402,27 @@ fn head_expr(
                 let slot = binder.slot();
                 let binding = match cx.decls.slots.trait_of(slot) {
                     Some(trait_name) => Binding::Slot(trait_name.to_string()),
-                    None => Binding::Value(None),
+                    None => {
+                        let local = alloc_local(slot, None, span, cx.decls, out);
+                        Binding::Value(None, local)
+                    }
                 };
                 inner.insert(slot.to_string(), binding);
             }
-            walk(body, expected, cx, &mut inner, out)
+            let body = walk(body, expected, cx, &mut inner, out);
+            let kind = if resolvable {
+                hir::ExprKind::With {
+                    provisions,
+                    body: body.id,
+                }
+            } else {
+                hir::ExprKind::Poison
+            };
+            lowered(body.outcome, kind)
         }
         Head::If(condition) | Head::Elif(condition) => {
             let site = Site::What("条件");
-            walk(condition, Some((&plain("bool"), &site)), cx, locals, out);
+            let condition = walk(condition, Some((&plain("bool"), &site)), cx, locals, out);
             // `else` で終わらない連鎖はどの枝の値も使わないので `unit` を産む。
             // 使われない値に期待型を課さないため、枝へ配るのもそのときだけ
             // (design.md 決定5)
@@ -1921,29 +2430,49 @@ fn head_expr(
             let branch = if valued { expected } else { None };
             let taken = walk(body, branch, cx, &mut locals.clone(), out);
             let Some(orelse) = orelse else {
-                return unit();
+                return produces_unit(hir::ExprKind::If {
+                    cond: condition.id,
+                    then: taken.id,
+                    orelse: None,
+                });
             };
             let other = walk(orelse, branch, cx, &mut locals.clone(), out);
+            let kind = hir::ExprKind::If {
+                cond: condition.id,
+                then: taken.id,
+                orelse: Some(other.id),
+            };
             if valued {
-                merge(expected, taken, other)
+                lowered(merge(expected, taken.outcome, other.outcome), kind)
             } else {
-                unit()
+                produces_unit(kind)
             }
         }
         Head::While(condition) => {
             let site = Site::What("条件");
-            walk(condition, Some((&plain("bool"), &site)), cx, locals, out);
-            synth(body, cx, &mut locals.clone(), out);
-            unit()
+            let condition = walk(condition, Some((&plain("bool"), &site)), cx, locals, out);
+            let body = synth(body, cx, &mut locals.clone(), out);
+            produces_unit(hir::ExprKind::While {
+                cond: condition.id,
+                body: body.id,
+            })
         }
         Head::For { var, iter } => {
-            let element = iterated(iter, cx, locals, out);
+            let (iter, element) = iterated(iter, cx, locals, out);
             let mut inner = locals.clone();
-            inner.insert(var.clone(), Binding::Value(element));
-            synth(body, cx, &mut inner, out);
-            unit()
+            let local = alloc_local(var, element.as_ref(), span, cx.decls, out);
+            inner.insert(var.clone(), Binding::Value(element, local));
+            let body = synth(body, cx, &mut inner, out);
+            produces_unit(hir::ExprKind::For {
+                var: local,
+                iter: iter.id,
+                body: body.id,
+            })
         }
-        Head::Else => walk(body, expected, cx, &mut locals.clone(), out),
+        Head::Else => {
+            let body = walk(body, expected, cx, &mut locals.clone(), out);
+            lowered(body.outcome, hir::ExprKind::Block(vec![body.id]))
+        }
     }
 }
 
@@ -1976,45 +2505,55 @@ fn merge(expected: Expect, taken: Outcome, other: Outcome) -> Outcome {
 
 /// `for x in xs` のループ変数の型。反復対象は非 optional な配列でなければ
 /// ならない(design.md 決定5)。
-fn iterated(iter: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Option<KnownType> {
+fn iterated(
+    iter: &Expr,
+    cx: &Cx,
+    locals: &mut Locals,
+    out: &mut Out,
+) -> (Checked, Option<KnownType>) {
     let before = out.count();
-    let outcome = synth(iter, cx, locals, out);
-    let Outcome::Typed(ty) = outcome else {
+    let checked = synth(iter, cx, locals, out);
+    let Outcome::Typed(ty) = &checked.outcome else {
         // 反復対象の型が決まらないとループ変数の型も決まらない
-        if matches!(outcome, Outcome::Poisoned) {
+        if matches!(checked.outcome, Outcome::Poisoned) {
             out.explain(
                 before,
                 format!("{}: `for` の反復対象の型が決まりません", cx.ctx),
             );
         }
-        return None;
+        return (checked, None);
     };
+    let ty = ty.clone();
     let Some(element) = ty.element() else {
         out.push(format!(
             "{}: `for` の反復対象は配列である必要がありますが、`{ty}` です",
             cx.ctx
         ));
-        return None;
+        return (checked, None);
     };
     if ty.optional {
         out.push(format!(
             "{}: optional な配列 `{ty}` はそのまま反復できません。先に `??` で展開してください",
             cx.ctx
         ));
-        return None;
+        return (checked, None);
     }
-    Some(element.clone())
+    let element = element.clone();
+    (checked, Some(element))
 }
 
-/// `with` の提供がスロットの契約を満たすか見る。`with db<Postgres>` は型名が
-/// そのまま分かるので常に、`with db(v)` は `v` の型が分かるときだけ見る
-/// (design.md 決定3)。スロットでない名前は requirement / eval 側が報告する。
+/// `with` の提供がスロットの契約を満たすか見て、満たすならその `impl` を返す。
+/// `with db<Postgres>` は型名がそのまま分かるので常に、`with db(v)` は `v` の型が
+/// 分かるときだけ見る(design.md 決定3)。
 ///
-/// eval.rs にも同じ判定がある。あちらは型の分からない提供を実行時に止める網。
-fn check_provision(binder: &Provision, ty: Option<&KnownType>, cx: &Cx, out: &mut Out) {
-    let Some(want) = cx.decls.slots.trait_of(binder.slot()) else {
-        return;
-    };
+/// スロットでない名前は requirement 側が報告する。
+fn check_provision(
+    binder: &Provision,
+    ty: Option<&KnownType>,
+    cx: &Cx,
+    out: &mut Out,
+) -> Option<hir::TraitImplId> {
+    let want = cx.decls.slots.trait_of(binder.slot())?;
     let Some(ty) = ty else {
         // 型の分からない提供を実行時へ回さない(design.md 決定3)
         out.push(format!(
@@ -2022,23 +2561,28 @@ fn check_provision(binder: &Provision, ty: Option<&KnownType>, cx: &Cx, out: &mu
             cx.ctx,
             binder.slot()
         ));
-        return;
+        return None;
     };
     // 提供できるのは trait を実装した具体型そのものだけ。配列と optional は
     // 名前を持たないので、この時点で落ちる
-    let implemented = !ty.optional
-        && ty.name().is_some_and(|name| {
+    let implemented = (!ty.optional)
+        .then(|| ty.name())
+        .flatten()
+        .and_then(|name| {
             cx.decls
+                .ids
                 .trait_impls
-                .contains(&(name.to_string(), want.to_string()))
-        });
-    if !implemented {
+                .get(&(name.to_string(), want.to_string()))
+        })
+        .copied();
+    if implemented.is_none() {
         out.push(format!(
             "{}: `{ty}` は `{want}` を実装していないので `{}` に提供できません",
             cx.ctx,
             binder.slot()
         ));
     }
+    implemented
 }
 
 // ---------------------------------------------------------------------------
@@ -2048,7 +2592,12 @@ fn check_provision(binder: &Provision, ty: Option<&KnownType>, cx: &Cx, out: &mu
 /// arm 本体から見えるローカル。pattern の名前は対応する宣言 payload 型を持ち、
 /// 同名の外側束縛をこの arm の間だけ隠す。`_` は名前を作らない
 /// (design.md 決定5)。
-fn arm_locals(arm: &MatchArm, decls: &Decls, locals: &Locals) -> Locals {
+fn arm_locals(
+    arm: &MatchArm,
+    decls: &Decls,
+    locals: &Locals,
+    out: &mut Out,
+) -> (Locals, Option<hir::Pattern>) {
     let mut inner = locals.clone();
     // `_` は variant も payload も晒さないので、外側のローカルがそのまま見える
     let MatchPattern::Variant {
@@ -2057,16 +2606,34 @@ fn arm_locals(arm: &MatchArm, decls: &Decls, locals: &Locals) -> Locals {
         bindings,
     } = &arm.pattern
     else {
-        return inner;
+        return (inner, Some(hir::Pattern::CatchAll));
     };
-    let payload = payload_of(enum_name, variant, decls).unwrap_or(&[]);
-    for (n, binding) in bindings.iter().enumerate() {
-        if let PatternBinding::Bind(name) = binding {
-            // 個数が合わないときは `check_arms` が診断済み。型は付けずに束縛だけ作る
-            inner.insert(name.clone(), Binding::Value(payload.get(n).cloned()));
+    let payload: Vec<Option<KnownType>> = {
+        let declared = payload_of(enum_name, variant, decls).unwrap_or(&[]);
+        (0..bindings.len())
+            .map(|n| declared.get(n).cloned())
+            .collect()
+    };
+    let mut bound = Vec::with_capacity(bindings.len());
+    for (binding, ty) in bindings.iter().zip(payload) {
+        match binding {
+            PatternBinding::Bind(name) => {
+                // 個数が合わないときは `check_arms` が診断済み。型は付けずに束縛だけ作る
+                let local = alloc_local(name, ty.as_ref(), arm.span, decls, out);
+                inner.insert(name.clone(), Binding::Value(ty, local));
+                bound.push(Some(local));
+            }
+            // `_` は値を捨てるので名前を作らない
+            PatternBinding::Discard => bound.push(None),
         }
     }
-    inner
+    let pattern = declared_variant(enum_name, variant, decls)
+        .and_then(|canonical| decls.ids.variants.get(canonical))
+        .map(|variant| hir::Pattern::Variant {
+            variant: *variant,
+            bindings: bound,
+        });
+    (inner, pattern)
 }
 
 /// arm の集合が対象 enum の宣言 variant を余さず一度ずつ扱うか見る。`_` が
@@ -2216,7 +2783,7 @@ fn payload_of<'d>(enum_name: &str, variant: &str, decls: &'d Decls) -> Option<&'
 fn slot_trait(name: &str, decls: &Decls, locals: &Locals) -> Option<String> {
     match locals.get(name) {
         Some(Binding::Slot(trait_name)) => Some(trait_name.clone()),
-        Some(Binding::Value(_)) => None,
+        Some(Binding::Value(..)) => None,
         None => decls.slots.trait_of(name).map(str::to_string),
     }
 }
@@ -4995,14 +5562,21 @@ rank: Rank }
              \x20 now -> callable#0\n\
              callable#0 impl#0 now(self) -> int\n\
              \x20 local#0 self: Frozen\n\
-             \x20 root []\n\
+             \x20 expr#0 : Frozen = local#0\n\
+             \x20 expr#1 : int = field #0 .at\n\
+             \x20 root [#1]\n\
              callable#1 inherent Frozen make() -> Frozen\n\
-             \x20 root []\n\
+             \x20 expr#0 : int = int 0\n\
+             \x20 expr#1 : Frozen = struct-lit Frozen { at=#0 }\n\
+             \x20 root [#1]\n\
              callable#2 fn rank(Rank) -> Rank\n\
              \x20 local#0 r: Rank\n\
-             \x20 root []\n\
+             \x20 expr#0 : Rank = local#0\n\
+             \x20 root [#0]\n\
              test#0 \"t\"\n\
-             \x20 root []\n",
+             \x20 expr#0 : bool = bool true\n\
+             \x20 expr#1 : unit = assert #0\n\
+             \x20 root [#1]\n",
             "{dumped}"
         );
     }
@@ -5057,6 +5631,147 @@ rank: Rank }
             .expect("正典に `users` がある");
         assert_eq!(program.structs[users.1.owner].name, "InMemoryDb");
         assert_eq!(program.show_type(&users.1.ty), "[User]");
+    }
+
+    /// 受理される式の形すべてが HIR の形へ下がること。1つでも `Poison` が
+    /// 残れば `check_and_lower` が落ちるので、下がったことは成功が示す。
+    /// ここで数えるのは「どの形も一度は通った」ことだけ(tasks 3.9)
+    #[test]
+    fn 受理される全ての式の形が下がる() {
+        let program = lowered(
+            "trait Clock { fn now(self -> int)\n fn zero(-> int) }\n\
+             struct Frozen { t: int }\n\
+             struct Empty {}\n\
+             enum Lookup { Found(int) Missing }\n\
+             effect clock: Clock\n\
+             impl Clock for Frozen {\n\
+             \x20 fn now(self -> int) { self.t }\n\
+             \x20 fn zero(-> int) { 0 }\n\
+             }\n\
+             impl Frozen { fn at(t: int -> Frozen) { Frozen { t = t } } }\n\
+             fn pick(n: int -> Lookup) { Lookup::Found(n) }\n\
+             fn sink(n: int -> int) { n }\n\
+             fn all(-> int) {\n\
+             \x20 let f = Frozen::at(1)\n\
+             \x20 let e = Empty\n\
+             \x20 let m = Missing\n\
+             \x20 let text = \"x\"\n\
+             \x20 let flag = true\n\
+             \x20 let maybe: Frozen? = nil\n\
+             \x20 let xs = [f]\n\
+             \x20 let t = maybe.?t ?? -1\n\
+             \x20 f.t = f.t + 2 - 1 * 1 / 1\n\
+             \x20 let mut_target = 0\n\
+             \x20 mut_target = 1\n\
+             \x20 assert flag == true\n\
+             \x20 while false { sink(0) }\n\
+             \x20 for x in xs { sink(x.t) }\n\
+             \x20 if flag { sink(1) } else { sink(2) }\n\
+             \x20 let branch = if flag: 1 else: 2\n\
+             \x20 let found = match pick(1) {\n\
+             \x20   Lookup::Found(n) if n == 1: n\n\
+             \x20   _: 0\n\
+             \x20 }\n\
+             \x20 with clock(f) {\n\
+             \x20   let via_value = clock.now()\n\
+             \x20   let via_type = clock::zero()\n\
+             \x20   sink(via_value + via_type)\n\
+             \x20 }\n\
+             \x20 with clock<Frozen> { sink(clock::zero()) }\n\
+             \x20 let shown = { f.now() }\n\
+             \x20 let _unused = [e, Empty]\n\
+             \x20 sink(t + branch + found + shown + mut_target + m_count(m) + text_len(text))\n\
+             \x20 return 0\n\
+             }\n\
+             fn m_count(l: Lookup -> int) { match l { Lookup::Found(n): n\n Lookup::Missing: 0 } }\n\
+             fn text_len(s: str -> int) { if s == \"x\": 1 else: 0 }\n\
+             fn main() { assert true }\n",
+        );
+
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (_, callable) in program.callables.iter() {
+            for (_, expr) in callable.body.exprs() {
+                seen.insert(kind_label(&expr.kind));
+            }
+        }
+        for form in [
+            "int",
+            "str",
+            "bool",
+            "nil",
+            "local",
+            "unit-struct",
+            "variant",
+            "field",
+            "optional-field",
+            "struct-lit",
+            "array",
+            "let",
+            "assign-local",
+            "assign-field",
+            "neg",
+            "arith",
+            "eq",
+            "coalesce",
+            "return",
+            "assert",
+            "block",
+            "if",
+            "while",
+            "for",
+            "with",
+            "match",
+            "direct",
+            "method",
+            "associated",
+            "slot",
+            "ctor",
+        ] {
+            assert!(
+                seen.contains(form),
+                "`{form}` の形が下がっていない: {seen:?}"
+            );
+        }
+        assert!(!seen.contains("poison"), "{seen:?}");
+    }
+
+    /// 下ろした形の名前。どの形も一度は通ったことを数えるためだけに使う
+    fn kind_label(kind: &hir::ExprKind) -> &'static str {
+        use hir::ExprKind::*;
+        match kind {
+            Int(_) => "int",
+            Str(_) => "str",
+            Bool(_) => "bool",
+            Nil => "nil",
+            Local(_) => "local",
+            UnitStruct(_) => "unit-struct",
+            Variant(_) => "variant",
+            Field { optional: true, .. } => "optional-field",
+            Field { .. } => "field",
+            StructLit { .. } => "struct-lit",
+            Array(_) => "array",
+            Let { .. } => "let",
+            AssignLocal { .. } => "assign-local",
+            AssignField { .. } => "assign-field",
+            Neg(_) => "neg",
+            Arith { .. } => "arith",
+            Eq { .. } => "eq",
+            Coalesce { .. } => "coalesce",
+            Return(_) => "return",
+            Assert(_) => "assert",
+            Block(_) => "block",
+            If { .. } => "if",
+            While { .. } => "while",
+            For { .. } => "for",
+            With { .. } => "with",
+            Match { .. } => "match",
+            Call(hir::Call::Direct { .. }) => "direct",
+            Call(hir::Call::Method { .. }) => "method",
+            Call(hir::Call::Associated { .. }) => "associated",
+            Call(hir::Call::Slot { .. }) => "slot",
+            Call(hir::Call::Ctor { .. }) => "ctor",
+            Poison => "poison",
+        }
     }
 
     /// 別のモジュールから見た同じ宣言は、正準名が同じなので同じ ID になる。
