@@ -835,9 +835,10 @@ impl<'a> Interp<'a> {
                 _ => fail(format!("`{}` は値ではありません", parts.join("::"))),
             },
 
-            // 対象は一度だけ評価し、一致した arm の本体だけを走らせる。payload は
+            // 対象は一度だけ評価し、選ばれた arm の本体だけを走らせる。payload は
             // その arm だけのスコープへ束縛し、`_` は捨てる(design.md 決定5)。
-            // 静的検査を通っていれば下の3つの失敗は起きない(design.md 決定4)
+            // guard があれば payload を束縛した後に一度だけ評価し、偽なら `_` へ
+            // 落ちる(design.md 決定6)。静的検査を通っていれば下の失敗は起きない
             ExprKind::Match { subject, arms } => {
                 let value = self.eval(subject, env, ambient)?;
                 let Value::Enum {
@@ -855,36 +856,64 @@ impl<'a> Interp<'a> {
                             if e == enum_name && *v == short_name(variant)
                     )
                 });
-                // 限定 arm が無いときだけ `_` へ落ちる。静的検査は `_` を最後に
-                // 強制するが、選択規則そのものを順序に頼らせない(design.md 決定4)
-                let arm = exact.or_else(|| {
-                    arms.iter()
-                        .find(|arm| matches!(arm.pattern, MatchPattern::CatchAll))
-                });
-                let Some(arm) = arm else {
+
+                if let Some(arm) = exact {
+                    let MatchPattern::Variant { bindings, .. } = &arm.pattern else {
+                        unreachable!("`exact` は限定 arm だけを拾う")
+                    };
+                    if bindings.len() != payload.len() {
+                        return fail(format!(
+                            "arm `{}` は payload {} 個を束縛しますが、値の payload は {} 個です",
+                            arm.pattern.label(),
+                            bindings.len(),
+                            payload.len()
+                        ));
+                    }
+                    env.push_scope(bindings.iter().zip(payload).filter_map(|(b, v)| match b {
+                        PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
+                        PatternBinding::Discard => None,
+                    }));
+                    // guard は payload の見えるこのスコープで一度だけ走る
+                    let selected = match &arm.guard {
+                        Some(guard) => self.eval(guard, env, ambient).and_then(|v| match v {
+                            Value::Bool(b) => Ok(b),
+                            // 静的検査の推論境界の外を通った guard はここで止める。
+                            // 位置は arm 全体ではなく guard 式そのもの
+                            other => Err(Flow::Error(Diag::at(
+                                guard.span,
+                                format!("arm の guard は bool だけです ({})", other.show()),
+                            ))),
+                        }),
+                        None => Ok(true),
+                    };
+                    match selected {
+                        Ok(true) => {
+                            let result = self.eval(&arm.body, env, ambient);
+                            env.pop_scope();
+                            return result;
+                        }
+                        // 偽の guard は payload ごと畳んで `_` へ譲る
+                        Ok(false) => env.pop_scope(),
+                        Err(flow) => {
+                            env.pop_scope();
+                            return Err(flow);
+                        }
+                    }
+                }
+
+                // 限定 arm が無いか guard が偽のときだけ `_` へ落ちる。静的検査は
+                // `_` を最後に強制するが、選択規則そのものを順序に頼らせない
+                // (design.md 決定4)
+                let catch_all = arms
+                    .iter()
+                    .find(|arm| matches!(arm.pattern, MatchPattern::CatchAll));
+                let Some(arm) = catch_all else {
                     return fail(format!(
                         "`{enum_name}.{variant}` に一致する arm がありません"
                     ));
                 };
-                // `_` は payload を晒さないので、arity も問わず空スコープで走る
-                let bindings: &[PatternBinding] = match &arm.pattern {
-                    MatchPattern::Variant { bindings, .. } => {
-                        if bindings.len() != payload.len() {
-                            return fail(format!(
-                                "arm `{}` は payload {} 個を束縛しますが、値の payload は {} 個です",
-                                arm.pattern.label(),
-                                bindings.len(),
-                                payload.len()
-                            ));
-                        }
-                        bindings
-                    }
-                    MatchPattern::CatchAll => &[],
-                };
-                env.push_scope(bindings.iter().zip(payload).filter_map(|(b, v)| match b {
-                    PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
-                    PatternBinding::Discard => None,
-                }));
+                // `_` は payload を晒さないので空スコープで走る
+                env.push_scope(std::iter::empty());
                 let result = self.eval(&arm.body, env, ambient);
                 env.pop_scope();
                 result
@@ -1395,6 +1424,99 @@ mod tests {
         );
         // payload の名前は増えないので、外側の `reason` がそのまま見える
         assert_eq!(int(&src), 1);
+    }
+
+    // ---- arm の guard ----
+
+    #[test]
+    fn 真のguardは限定armの本体を選ぶ() {
+        let src = format!(
+            "{RANKS}fn main(-> str) {{\n\
+             \x20 match Gold {{\n\
+             \x20   Rank::Gold if 1 == 1: \"gold\"\n\
+             \x20   _: \"other\"\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Str(s)) if s == "gold"));
+    }
+
+    /// 偽の guard は本体を走らせず `_` へ落ちる(design.md 決定6)
+    #[test]
+    fn 偽のguardはcatch_allへ落ちて本体を走らせない() {
+        let src = format!(
+            "{RANKS}fn boom(-> int) {{ 1 / 0 }}\n\
+             fn main() {{\n\
+             \x20 match Gold {{\n\
+             \x20   Rank::Gold if 1 == 2: boom()\n\
+             \x20   _: 7\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 7);
+    }
+
+    #[test]
+    fn guardはpayloadを束縛した後に走る() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 match Lookup::Found(User {{ id = 5 }}, 5) {{\n\
+             \x20   Lookup::Found(u, n) if u.id == n: n\n\
+             \x20   _: 0\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert_eq!(int(&src), 5);
+    }
+
+    /// 対象は一度、guard は variant が一致したときだけ一度、本体はその後だけ
+    #[test]
+    fn guardは一致したarmで一度だけ走る() {
+        let src = format!(
+            "{RANKS}struct Counter {{ n: int }}\n\
+             fn bump(c: Counter -> bool) {{\n\
+             \x20 c.n = c.n + 1\n\
+             \x20 true\n\
+             }}\n\
+             fn main() {{\n\
+             \x20 let c = Counter {{ n = 0 }}\n\
+             \x20 let picked = match Gold {{\n\
+             \x20   Rank::Bronze if bump(c): 1\n\
+             \x20   Rank::Gold if bump(c): 2\n\
+             \x20   _: 3\n\
+             \x20 }}\n\
+             \x20 c.n * 10 + picked\n\
+             }}\n"
+        );
+        // 一致しない `Bronze` の guard は走らないので、増分は1回だけ
+        assert_eq!(int(&src), 12);
+    }
+
+    /// 推論境界の外を通った guard の実行時の網。位置は arm 全体でなく guard 式
+    #[test]
+    fn 非boolのguardは実行時に失敗して原因の位置を指す() {
+        let src = format!(
+            "{RANKS}fn unknown() {{ 1 }}\n\
+             fn main() {{\n\
+             \x20 match Gold {{\n\
+             \x20   Rank::Gold if unknown(): 1\n\
+             \x20   _: 0\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        let e = run(&src, "main").expect_err("guard が bool ではない");
+        assert!(e.msg.contains("arm の guard は bool だけです"), "{e}");
+        assert_eq!(failing_source(&src, "main"), "unknown()");
+    }
+
+    /// 静的検査は偽の guard に `_` を強制するが、評価器は網を残す
+    #[test]
+    fn 偽のguardでcatch_allが無ければ実行時エラー() {
+        let src = format!(
+            "{RANKS}fn main() {{\n match Gold {{ Rank::Bronze: 0\nRank::Gold if 1 == 2: 1 }}\n}}\n"
+        );
+        let e = run(&src, "main").expect_err("落ちる先が無い");
+        assert!(e.msg.contains("一致する arm がありません"), "{e}");
     }
 
     /// 静的検査を通さず評価器を直接使う経路の防御。型検査を通れば起きない

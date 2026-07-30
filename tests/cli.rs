@@ -790,6 +790,92 @@ fn catch_allの中の提供忘れは到達経路付きで失敗する() {
     );
 }
 
+// ---- arm の guard (src/parse.rs, src/typecheck.rs, src/eval.rs) ----
+
+/// guard の縦切り。真の guard の選択、偽の guard の `_` への脱落、guard から
+/// 見える payload、モジュールを跨ぐ名前まで1本のプログラムで通す
+#[test]
+fn guard付きのarmは条件どおりに選ばれて実行される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{threshold}\n\
+         enum Lookup {\n\
+         \x20 Found(int)\n\
+         \x20 Missing(str)\n\
+         \x20 Skipped\n\
+         }\n\
+         fn describe(l: Lookup -> str) {\n\
+         \x20 match l {\n\
+         \x20   Lookup::Found(n) if n == threshold(): \"exact\"\n\
+         \x20   Lookup::Missing(reason) if reason == \"gone\" {\n\
+         \x20     \"gone\"\n\
+         \x20   }\n\
+         \x20   Lookup::Skipped: \"skipped\"\n\
+         \x20   _: \"other\"\n\
+         \x20 }\n\
+         }\n\
+         fn main(-> str) {\n\
+         \x20 assert describe(Lookup::Found(7)) == \"exact\"\n\
+         \x20 assert describe(Lookup::Found(1)) == \"other\"\n\
+         \x20 assert describe(Lookup::Missing(\"gone\")) == \"gone\"\n\
+         \x20 assert describe(Lookup::Missing(\"lost\")) == \"other\"\n\
+         \x20 assert describe(Skipped) == \"skipped\"\n\
+         \x20 describe(Lookup::Found(1))\n\
+         }\n",
+    );
+    project.write("dep.rd", "fn threshold(-> int) { 7 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> \"other\""), "{text}");
+}
+
+#[test]
+fn 型の分かる非boolのguardは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank, n: int -> int) { match r { Rank::Gold if n: 1\n_: 0 } }\n\
+         fn main() { 1 }\n",
+        "arm の guardは `bool` ですが、`int` です",
+    );
+}
+
+/// guard 付きの arm は偽になりうるので、その variant を網羅したことにならない
+#[test]
+fn guard付きのarmだけのmatchは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank, ready: bool -> int) {\n\
+         \x20 match r {\n\
+         \x20   Rank::Bronze: 0\n\
+         \x20   Rank::Gold if ready: 1\n\
+         \x20 }\n\
+         }\n\
+         fn main() { 1 }\n",
+        "の variant `Gold` を扱っていません",
+    );
+}
+
+/// guard の ambient 使用も、実行時に variant が一致するかによらず要求になる
+#[test]
+fn guardの中の提供忘れは到達経路付きで失敗する() {
+    実行前に失敗する(
+        "trait Clock { fn now(self -> bool) }\n\
+         effect clock: Clock\n\
+         enum Rank { Bronze Gold }\n\
+         fn ready(-> bool) { clock.now() }\n\
+         fn main(r: Rank -> int) {\n\
+         \x20 match r {\n\
+         \x20   Rank::Gold if ready(): 1\n\
+         \x20   _: 0\n\
+         \x20 }\n\
+         }\n",
+        "main::clock が要る ← main::ready ← main::main",
+    );
+}
+
 // ---- payload を持つ variant (src/parse.rs, src/typecheck.rs, src/eval.rs) ----
 
 /// 構築と分解が往復する縦切り。payload の順序・`_`・fieldless の共存・

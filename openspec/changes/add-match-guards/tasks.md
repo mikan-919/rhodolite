@@ -14,11 +14,11 @@
 
 ## 3. Requirement analysis and evaluation
 
-- [ ] 3.1 Scan every guard conservatively for calls and ambient requirements under payload locals without leaking guard or body bindings, and add shadowing coverage.
-- [ ] 3.2 Evaluate a matching qualified arm's guard exactly once after binding its payload, select its body only on `true`, and fall back to `_` on `false`.
-- [ ] 3.3 Preserve runtime safety nets for non-boolean guards and missing fallback arms, with diagnostics pointing to the guard expression and tests pinning subject, guard, and body evaluation counts.
-- [ ] 3.4 Add CLI coverage for a true guard, false-guard fallback, payload use in a guard, a static guard type error, and an ambient requirement originating in a guard.
-- [ ] 3.5 Run formatting and the complete Rust test suite, then commit the verified runtime and analysis snapshot.
+- [x] 3.1 Scan every guard conservatively for calls and ambient requirements under payload locals without leaking guard or body bindings, and add shadowing coverage.
+- [x] 3.2 Evaluate a matching qualified arm's guard exactly once after binding its payload, select its body only on `true`, and fall back to `_` on `false`.
+- [x] 3.3 Preserve runtime safety nets for non-boolean guards and missing fallback arms, with diagnostics pointing to the guard expression and tests pinning subject, guard, and body evaluation counts.
+- [x] 3.4 Add CLI coverage for a true guard, false-guard fallback, payload use in a guard, a static guard type error, and an ambient requirement originating in a guard.
+- [x] 3.5 Run formatting and the complete Rust test suite, then commit the verified runtime and analysis snapshot.
 
 ## 4. Documentation and final verification
 

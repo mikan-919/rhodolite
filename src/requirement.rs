@@ -314,9 +314,9 @@ fn scan(
         ExprKind::Assert(inner) => scan(inner, slots, provided, locals, out),
         ExprKind::Block(body) => scan_exprs(body, slots, provided, locals, out),
 
-        // どの arm も実行されうるので、全 arm の要求と呼び出し辺を合流する。
-        // payload の束縛は同名スロットをその arm の間だけ隠し、本体の `let` と
-        // ともに他の arm へは漏らさない
+        // どの arm も実行されうるので、全 arm の guard と本体の要求と呼び出し辺を
+        // 合流する。payload の束縛は同名スロットをその arm の間だけ隠し、本体の
+        // `let` とともに他の arm へは漏らさない
         ExprKind::Match { subject, arms } => {
             scan(subject, slots, provided, locals, out);
             for arm in arms {
@@ -328,6 +328,11 @@ fn scan(
                             inner_locals.insert(name.clone());
                         }
                     }
+                }
+                // guard は実行時に飛ばされうるが、静的解析は保守的に全部見る。
+                // 片方で増えた束縛をもう片方へ漏らさないよう複製で入る
+                if let Some(guard) = &arm.guard {
+                    scan(guard, slots, provided, &mut inner_locals.clone(), out);
                 }
                 scan(&arm.body, slots, provided, &mut inner_locals, out);
             }
@@ -1114,6 +1119,60 @@ mod tests {
              \x20 match l {\n\
              \x20   Lookup::Found(db): db.save(u)\n\
              \x20   _: db.find(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db"]));
+    }
+
+    /// 実行時に variant が一致しなくても、guard の要求と呼び出し辺は残る
+    #[test]
+    fn guardの要求も合流する() {
+        let p = program(
+            "effect db: Database\n\
+             effect clock: Clock\n\
+             fn f(r: Rank) {\n\
+             \x20 match r {\n\
+             \x20   Rank::Gold if clock.now(): db.find(id)\n\
+             \x20   _: 0\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["clock", "db"]));
+        assert_eq!(
+            callees(&p, "f"),
+            set(&["impl Clock::now", "impl Database::find"])
+        );
+    }
+
+    /// payload の名前は guard の中でも同名スロットを隠す。隠した arm は
+    /// 要求を作らず、隠していない arm の要求は残る
+    #[test]
+    fn guardのpayload束縛はスロットを隠す() {
+        let p = program(
+            "effect db: Database\n\
+             effect clock: Clock\n\
+             fn f(l: Lookup) {\n\
+             \x20 match l {\n\
+             \x20   Lookup::Found(db) if db.save(u): 1\n\
+             \x20   Lookup::Missing(reason) if clock.now(): 2\n\
+             \x20   _: 0\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["clock"]));
+    }
+
+    /// guard の中の束縛は本体へも隣の arm へも漏らさない。漏れるとスロットを
+    /// 隠してしまい、要求が消える
+    #[test]
+    fn guardの束縛は本体へ漏れない() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(r: Rank) {\n\
+             \x20 match r {\n\
+             \x20   Rank::Gold if { let db = 1\ntrue }: db.find(id)\n\
+             \x20   _: 0\n\
              \x20 }\n\
              }\n",
         );
