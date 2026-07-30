@@ -17,12 +17,12 @@
 
 ## 3. Total Checking Result
 
-- [ ] 3.1 Introduce internal `Typed`, `Diverges`, and `Poisoned` outcomes and preserve the current `KnownType` compatibility rules
-- [ ] 3.2 Replace optional compatibility helpers with directional synthesis/checking that can pass expected types into contextual expressions
-- [ ] 3.3 Classify `return`, empty blocks, ordinary blocks, discarded intermediate expressions, loops, conditionals, and `with` bodies without using Unknown for control-flow divergence
-- [ ] 3.4 Prevent cascaded diagnostics when a child is already poisoned while ensuring every unexplained untyped expression gets a positioned diagnostic
-- [ ] 3.5 Add focused tests for divergent branches, poisoned parents, unused invalid declarations, and diagnostics in dependency modules
-- [ ] 3.6 Run the full test suite and commit the total-checking foundation as a stable snapshot
+- [x] 3.1 Introduce internal `Typed`, `Diverges`, and `Poisoned` outcomes and preserve the current `KnownType` compatibility rules
+- [x] 3.2 Replace optional compatibility helpers with directional synthesis/checking that can pass expected types into contextual expressions
+- [x] 3.3 Classify `return`, empty blocks, ordinary blocks, discarded intermediate expressions, loops, conditionals, and `with` bodies without using Unknown for control-flow divergence
+- [x] 3.4 Prevent cascaded diagnostics when a child is already poisoned while ensuring every unexplained untyped expression gets a positioned diagnostic
+- [x] 3.5 Add focused tests for divergent branches, poisoned parents, unused invalid declarations, and diagnostics in dependency modules
+- [x] 3.6 Run the full test suite and commit the total-checking foundation as a stable snapshot
 
 ## 4. Basic Expressions and Bindings
 

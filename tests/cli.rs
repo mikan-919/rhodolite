@@ -64,7 +64,7 @@ fn 同名スロットを持つ二つのモジュールを別々に提供して�
         "main.rd",
         "use sides::{left as primary, right as replica}\n\
          \n\
-         fn main() {\n\
+         fn main(-> int) {\n\
            with primary::db(primary::Store {}), replica::db(replica::Store {}) {\n\
              primary::read() + replica::read()\n\
            }\n\
