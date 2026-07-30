@@ -7,10 +7,10 @@
 
 ## 2. Static guard semantics
 
-- [ ] 2.1 Check each guard expression under payload locals and require inferable guard types to be `bool`, preserving the existing deferral boundary for unknown types.
-- [ ] 2.2 Track guarded and unconditional variant coverage separately so guarded arms require a final `_`, while keeping duplicate-variant and catch-all rules unchanged.
-- [ ] 2.3 Add checker tests for boolean, known non-boolean, and unknown guards; guarded exhaustiveness; duplicate guarded variants; payload types; result typing; and guard diagnostic spans.
-- [ ] 2.4 Run formatting and the complete Rust test suite, then commit the verified static-semantics snapshot.
+- [x] 2.1 Check each guard expression under payload locals and require inferable guard types to be `bool`, preserving the existing deferral boundary for unknown types.
+- [x] 2.2 Track guarded and unconditional variant coverage separately so guarded arms require a final `_`, while keeping duplicate-variant and catch-all rules unchanged.
+- [x] 2.3 Add checker tests for boolean, known non-boolean, and unknown guards; guarded exhaustiveness; duplicate guarded variants; payload types; result typing; and guard diagnostic spans.
+- [x] 2.4 Run formatting and the complete Rust test suite, then commit the verified static-semantics snapshot.
 
 ## 3. Requirement analysis and evaluation
 

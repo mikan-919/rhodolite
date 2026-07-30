@@ -736,6 +736,22 @@ fn check_expr_kind(
             };
             for arm in arms {
                 let mut inner = arm_locals(arm, decls, locals);
+                // guard は payload を見られるが、`if`/`while` の条件と同じく
+                // 型が分かるときだけ `bool` を課す(design.md 決定5)。
+                // 本体へ束縛が漏れないよう複製で検査する
+                if let Some(guard) = &arm.guard {
+                    let mut guard_locals = inner.clone();
+                    check_expr(guard, decls, &mut guard_locals, ctx, ret, out);
+                    require(
+                        guard,
+                        &plain("bool"),
+                        "arm の guard",
+                        decls,
+                        &guard_locals,
+                        ctx,
+                        out,
+                    );
+                }
                 check_expr_at(&arm.body, result.as_ref(), decls, &mut inner, ctx, ret, out);
                 if let Some(result) = &result {
                     let what = format!("arm `{}` の値", arm.pattern.label());
@@ -888,7 +904,11 @@ fn arm_locals(arm: &MatchArm, decls: &Decls, locals: &Locals) -> Locals {
 /// あれば残りは全部そこへ行くので、一意で最後であることだけを課す
 /// (design.md 決定3)。対象の enum が分からないときは arm 自身の整合だけを見る。
 fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str, out: &mut Out) {
+    // 重複は guard の有無に関わらず禁じるので、限定 arm は全部ここへ入れる
     let mut covered: BTreeSet<&str> = BTreeSet::new();
+    // guard は偽になりうるので、網羅を満たすのは guard の無い arm だけ
+    // (design.md 決定4)
+    let mut unconditional: BTreeSet<&str> = BTreeSet::new();
     // 呼び出し時点の span は `match` 式全体。arm を指す診断の間だけ差し替える
     let whole = out.span;
     // 先頭 `_` の span。後続 arm が現れたときに「最後でない」と言う位置
@@ -939,13 +959,17 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
         if !covered.insert(variant.as_str()) {
             out.push(format!("{ctx}: arm `{arm_name}` が重複しています"));
         }
+        if arm.guard.is_none() {
+            unconditional.insert(variant.as_str());
+        }
     }
 
     out.span = whole;
 
     // 欠落は「無いもの」なので指すべき arm が無い。式全体が唯一正しい位置。
     // `_` があれば欠落は残らない。全 variant を書いた上での `_` は冗長だが、
-    // 到達しない式を言う一般の診断がまだ無いので黙って許す(design.md 決定3)
+    // 到達しない式を言う一般の診断がまだ無いので黙って許す(design.md 決定3)。
+    // guard 付きの arm は偽になりうるので、欠落は無条件 arm だけから測る
     let Some(matched) = matched else { return };
     if catch_all.is_some() {
         return;
@@ -953,7 +977,7 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
     let missing: Vec<&str> = decls.enums[matched]
         .iter()
         .map(|variant| short_name(variant))
-        .filter(|variant| !covered.contains(variant))
+        .filter(|variant| !unconditional.contains(variant))
         .collect();
     if !missing.is_empty() {
         out.push(format!(
@@ -2193,6 +2217,142 @@ rank: Rank }
         let src =
             format!("{RANKS}fn f(r: Rank -> int) {{ match r {{ Rank::Gold: 1\n_: 0\n_: 2 }} }}\n");
         assert_eq!(spanned(&src, "重複"), "_: 2");
+    }
+
+    // ---- 4d. arm の guard ----
+
+    #[test]
+    fn bool_のguardは診断を出さない() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank, ready: bool -> int) {{\n\
+                 \x20 match r {{\n\
+                 \x20   Rank::Gold if ready: 1\n\
+                 \x20   _: 0\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 型の分かる非bool_のguardを報告する() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank, n: int -> int) {{ match r {{ Rank::Gold if n: 1\n_: 0 }} }}\n"
+        ));
+        assert!(e.contains("arm の guard"), "{e}");
+        assert!(e.contains("`bool` ですが、`int` です"), "{e}");
+    }
+
+    /// 診断は arm 全体でなく guard 式そのものを指す(design.md 決定5)
+    #[test]
+    fn guardの診断はguard式を指す() {
+        let src = format!(
+            "{RANKS}fn f(r: Rank, n: int -> int) {{ match r {{ Rank::Gold if n: 1\n_: 0 }} }}\n"
+        );
+        assert_eq!(spanned(&src, "arm の guard"), "n");
+    }
+
+    /// `if` の条件と同じ推論境界。型が分からない guard は実行時へ委ねる
+    #[test]
+    fn 型の分からないguardは実行時へ委ねる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn unknown() {{ nil }}\n\
+                 fn f(r: Rank -> int) {{ match r {{ Rank::Gold if unknown(): 1\n_: 0 }} }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn guardはpayloadの束縛をその型ごと見る() {
+        assert!(
+            errors(&format!(
+                "{LOOKUP}fn f(l: Lookup, n: int -> int) {{\n\
+                 \x20 match l {{\n\
+                 \x20   Lookup::Found(user, count) if count == n: count\n\
+                 \x20   _: 0\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+
+        // payload の型は guard の中でも効く
+        let e = only(&format!(
+            "{LOOKUP}fn f(l: Lookup -> int) {{\n\
+             \x20 match l {{\n\
+             \x20   Lookup::Found(user, count) if user: count\n\
+             \x20   _: 0\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("`bool` ですが、`User` です"), "{e}");
+    }
+
+    /// guard は偽になりうるので、その variant を網羅したことにはならない
+    /// (design.md 決定4)
+    #[test]
+    fn guard付きのarmだけでは網羅にならない() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank, ready: bool -> int) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Bronze: 1\n\
+             \x20   Rank::Gold if ready: 2\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("`Gold`"), "{e}");
+        assert!(!e.contains("`Bronze`"), "{e}");
+    }
+
+    #[test]
+    fn guard付きのarmは最後のcatch_allで網羅になる() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank, ready: bool -> int) {{\n\
+                 \x20 match r {{\n\
+                 \x20   Rank::Bronze: 1\n\
+                 \x20   Rank::Gold if ready: 2\n\
+                 \x20   _: 0\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    /// guard の有無に関わらず、同じ variant の arm は一度だけ
+    #[test]
+    fn guardがあってもvariantの重複は報告する() {
+        let errors = errors(&format!(
+            "{RANKS}fn f(r: Rank, ready: bool -> int) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Gold if ready: 1\n\
+             \x20   Rank::Gold: 2\n\
+             \x20   Rank::Bronze: 3\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("arm `Rank::Gold` が重複"), "{errors:?}");
+    }
+
+    /// guard は選択だけを決める。結果型は従来どおり本体から測る
+    #[test]
+    fn guard付きのarmの値も結果型で照合する() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank, ready: bool -> str) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Gold if ready: 1\n\
+             \x20   _: \"other\"\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        assert!(e.contains("arm `Rank::Gold` の値"), "{e}");
+        assert!(e.contains("`str` ですが、`int` です"), "{e}");
     }
 
     #[test]
