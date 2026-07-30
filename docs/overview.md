@@ -305,12 +305,10 @@ struct Diag {
 
 ## 8. 次の一歩
 
-残っている穴埋めの優先順は次の通り。
+型付き HIR への移行まで完了した。次は C 生成へ入る前に、要求推論で求めた slot を
+関数間で運ぶ **ambient の低水準契約**を決める。
 
-1. **pattern は variant ごとの平坦な束縛だけ。** payload の構築と分解は
-   往復するようになったが、variant 全体を覆う catch-all pattern と guard は
-   網羅性モデルを変えるので入れていない。入れ子 pattern、名前付き payload、
-   payload の field access、enum のメソッドも無い
-2. **実行時の診断は失敗した式1つだけ。** 呼び出しの経路は残らないので、
-   どこから呼ばれて落ちたかはスタックトレースが要る
-3. 配列の可変性・所有権と、ADR-0003 の whole-program 単相化
+隠し ambient 引数、値提供と型提供、内側の `with` による置換、型要求と値要求の違い、
+再帰・相互再帰の呼び出し規約を、正典プログラム全体を機械的に下ろせる粒度まで固定する。
+順序と完了線は [`compiler-roadmap.md`](./compiler-roadmap.md) に置き、個別の設計判断は
+次の OpenSpec change と ADR に残す。

@@ -106,7 +106,8 @@ variant を網羅したことにはならない。入れ子 pattern と、同じ
 実装しているかも実行前に確定する。
 
 型検査を通ったプログラムには未知の式型も未解決の呼び出しも残らないので、
-次の一歩は型付き HIR([docs/compiler-roadmap.md](./docs/compiler-roadmap.md))。
+次の一歩は、要求推論の結果を C 生成へ渡せる ambient の低水準契約を決めること
+([docs/compiler-roadmap.md](./docs/compiler-roadmap.md))。
 
 所有権・借用・`'a` 推論の柱はv1スコープ外として棚上げ中
 （[ADR-0001](./docs/adr/0001-v1-scope-effects-only.md)）。

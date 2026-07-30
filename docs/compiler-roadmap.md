@@ -28,13 +28,13 @@ compiled v1 は汎用言語としての完成ではない。外部パッケー�
 v1 interpreter（完了）
         │
         ▼
-close-static-type-checking（進行中）
+close-static-type-checking（完了）
         │
         ▼
-introduce-typed-hir
+introduce-typed-hir（完了）
         │
         ▼
-define-ambient-runtime-abi
+define-ambient-runtime-abi（次）
         │
         ▼
 emit-core-c-programs
@@ -86,7 +86,7 @@ OpenSpec:
 ## 2. 型付き HIR を導入する
 
 OpenSpec:
-[`introduce-typed-hir`](../openspec/changes/introduce-typed-hir/)
+[`introduce-typed-hir`](../openspec/changes/archive/2026-07-30-introduce-typed-hir/)
 
 この段階は利用者向けの新機能ではなく内部表現の置換なので、OpenSpec では
 `skip_specs: true` のリファクタ change とする。
