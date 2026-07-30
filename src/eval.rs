@@ -631,7 +631,8 @@ impl<'a> Interp<'a> {
                 None => fail(format!("`{name}` が束縛されていません")),
             },
 
-            ExprKind::Let { name, value } => {
+            // 注釈は検査済みなので実行時には見ない。束縛するのは評価した値だけ
+            ExprKind::Let { name, value, .. } => {
                 let v = self.eval(value, env, ambient)?;
                 env.insert(name.clone(), v);
                 Ok(Value::Unit)

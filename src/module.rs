@@ -924,7 +924,21 @@ fn resolve_expr(
                 );
             }
         }
-        ExprKind::Let { name, value } => {
+        ExprKind::Let {
+            name,
+            annotation,
+            value,
+        } => {
+            // 注釈の名前の葉は引数・フィールド・戻り値と同じ規則で正準化する
+            if let Some(annotation) = annotation {
+                resolve_type(
+                    annotation,
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                );
+            }
             resolve_expr(
                 value,
                 locals,
@@ -1373,7 +1387,15 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
                     collect_expr_paths(std::slice::from_ref(value), locals, paths);
                 }
             }
-            ExprKind::Let { name, value } => {
+            ExprKind::Let {
+                name,
+                annotation,
+                value,
+            } => {
+                // 注釈が他モジュールの型を名乗るなら、その参照も収集する
+                if let Some(annotation) = annotation {
+                    collect_type_paths(annotation, paths);
+                }
                 collect_expr_paths(std::slice::from_ref(value), locals, paths);
                 locals.insert(name.clone());
             }
@@ -1522,6 +1544,43 @@ mod tests {
         let loaded = load(&root.join("main.rd"));
         std::fs::remove_dir_all(&root).unwrap();
         loaded
+    }
+
+    /// 局所注釈の名前の葉も、引数や戻り値と同じ規則で正準名になる。
+    /// import した型を注釈に書けないと `let u: User? = nil` が他モジュールの
+    /// 型に使えない
+    #[test]
+    fn letの型注釈も正準名へ解決する() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "use dep::{User}\nfn main() {\n  let u: User? = nil\n  let us: [User] = []\n}\n",
+            ),
+            ("dep.rd", "struct User { name: str }\n"),
+        ])
+        .expect("ロードできる");
+
+        let annotations: Vec<String> = loaded
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Fn { sig, body, .. } if short_name(&sig.name) == "main" => Some(body),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|e| match &e.kind {
+                ExprKind::Let { annotation, .. } => annotation.as_ref(),
+                _ => None,
+            })
+            .map(|ty| format!("{:?}", ty.kind))
+            .collect();
+
+        // どちらの注釈も `dep::User` を指す。配列の内側も同じ
+        assert_eq!(annotations.len(), 2, "{annotations:?}");
+        for shown in &annotations {
+            assert!(shown.contains("dep::User"), "{shown}");
+        }
     }
 
     /// 畳んだ後の span 単体から元のファイルへ戻れること(design.md 決定1・2)。

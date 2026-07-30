@@ -1,10 +1,10 @@
 ## 1. Local Binding Type Annotations
 
-- [ ] 1.1 Extend `ExprKind::Let` with an optional `Type`, parse `let name: Type = value`, and cover named, optional, array, and malformed annotations with parser tests
-- [ ] 1.2 Canonicalize named leaves inside local annotations in the module loader and add cross-module annotation tests
-- [ ] 1.3 Thread the annotation through requirement scanning and evaluation without changing runtime binding behavior
-- [ ] 1.4 Use an annotation as the initializer's expected type and the binding's fixed type, including positive and negative initializer and reassignment tests
-- [ ] 1.5 Run the full test suite and commit the annotation support as a stable snapshot
+- [x] 1.1 Extend `ExprKind::Let` with an optional `Type`, parse `let name: Type = value`, and cover named, optional, array, and malformed annotations with parser tests
+- [x] 1.2 Canonicalize named leaves inside local annotations in the module loader and add cross-module annotation tests
+- [x] 1.3 Thread the annotation through requirement scanning and evaluation without changing runtime binding behavior
+- [x] 1.4 Use an annotation as the initializer's expected type and the binding's fixed type, including positive and negative initializer and reassignment tests
+- [x] 1.5 Run the full test suite and commit the annotation support as a stable snapshot
 
 ## 2. Effective Unit Returns
 

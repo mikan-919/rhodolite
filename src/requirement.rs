@@ -296,7 +296,8 @@ fn scan(
                 scan(v, slots, provided, locals, out);
             }
         }
-        ExprKind::Let { name, value } => {
+        // 注釈は要求集合に影響しない(型だけの情報で、提供も消費もしない)
+        ExprKind::Let { name, value, .. } => {
             scan(value, slots, provided, locals, out);
             locals.insert(name.clone());
         }

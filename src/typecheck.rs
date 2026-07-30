@@ -575,9 +575,30 @@ fn check_expr_kind(
             }
         }
 
-        ExprKind::Let { name, value } => {
-            check_expr(value, decls, locals, ctx, ret, out);
-            let ty = infer(value, decls, locals);
+        // 注釈があれば初期化子の期待型になり、そのまま束縛の型として固定される。
+        // 無ければ従来どおり初期化子の推論型だけが束縛の型(design.md 決定2)
+        ExprKind::Let {
+            name,
+            annotation,
+            value,
+        } => {
+            let declared = annotation.as_ref().map(known);
+            check_expr_at(value, declared.as_ref(), decls, locals, ctx, ret, out);
+            let ty = match &declared {
+                Some(declared) => {
+                    require(
+                        value,
+                        declared,
+                        &format!("`{name}` の初期化子"),
+                        decls,
+                        locals,
+                        ctx,
+                        out,
+                    );
+                    Some(declared.clone())
+                }
+                None => infer(value, decls, locals),
+            };
             locals.insert(name.clone(), Binding::Value(ty));
         }
 
@@ -2737,6 +2758,61 @@ rank: Rank }
                 "payload を 1 個束縛"
             ),
             "Lookup::Found(a): 1"
+        );
+    }
+
+    // ---- 4e. let の型注釈 ----
+
+    #[test]
+    fn 注釈どおりの初期化子は受理される() {
+        assert!(errors("fn main() { let n: int = 1 }\n").is_empty());
+        assert!(errors(&format!("{RANKS}fn main() {{ let g: Rank = Gold }}\n")).is_empty());
+    }
+
+    #[test]
+    fn 注釈と違う初期化子を報告する() {
+        let e = only("fn main() { let n: int = true }\n");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`bool`"), "{e}");
+        assert!(e.contains("`n`"), "{e}");
+    }
+
+    /// 注釈は宛先なので、非 optional から optional への注入がそのまま効く
+    #[test]
+    fn optional注釈は非optionalの値を受け取れる() {
+        let e = errors(&format!("{RANKS}fn main(u: User) {{ let o: User? = u }}\n"));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    #[test]
+    fn optionalな値は非optional注釈へ入らない() {
+        let e = only(&format!("{RANKS}fn main(u: User?) {{ let o: User = u }}\n"));
+        assert!(e.contains("`User`"), "{e}");
+        assert!(e.contains("`User?`"), "{e}");
+    }
+
+    /// 束縛の型は注釈で固定される。初期化子の推論型では上書きしない
+    #[test]
+    fn 注釈で固定した型は後の参照に届く() {
+        let e = only(&format!(
+            "{RANKS}fn main() {{\n let g: Grade = Low\n User {{ rank = g }}\n}}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
+    }
+
+    #[test]
+    fn 注釈で固定した型は再代入にも効く() {
+        let e = only("fn main() {\n let n: int = 1\n n = true\n}\n");
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`bool`"), "{e}");
+    }
+
+    #[test]
+    fn 注釈の初期化子の診断は初期化子を指す() {
+        assert_eq!(
+            spanned("fn main() { let n: int = true }\n", "の初期化子"),
+            "true"
         );
     }
 

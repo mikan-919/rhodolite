@@ -979,6 +979,12 @@ impl<'a> Parser<'a> {
             Tok::Let => {
                 self.bump();
                 let name = self.expect_ident("変数名")?;
+                // 型注釈は引数・フィールド・戻り値と同じ型文法を使う
+                let annotation = if self.eat(&Tok::Colon) {
+                    Some(self.ty()?)
+                } else {
+                    None
+                };
                 self.expect(&Tok::Eq, "`=`")?;
                 // 値は `stmt` で読む。値ベースなので Head も値を産む
                 // (`let r = with db(replica) { collect() }` — CONTEXT.md「第二級ブロック」)。
@@ -987,6 +993,7 @@ impl<'a> Parser<'a> {
                 let value = self.stmt()?;
                 ExprKind::Let {
                     name,
+                    annotation,
                     value: Box::new(value),
                 }
             }
@@ -1214,6 +1221,63 @@ mod tests {
     fn enumのvariantは値を持てない() {
         let e = parse_src("enum Rank { Bronze = 1 }\n").unwrap_err();
         assert!(e.msg.contains("variant 名"), "{}", e.msg);
+    }
+
+    // ---- let の型注釈 ----
+
+    /// 本体の最初の `let` の注釈を綴りで取り出す。注釈が無ければ `None`
+    fn let_annotation(src: &str) -> Option<String> {
+        let p = ok(src);
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!("fn ではない: {:?}", p.items[0])
+        };
+        let ExprKind::Let { annotation, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        annotation.as_ref().map(show_type)
+    }
+
+    #[test]
+    fn letは型注釈を省略できる() {
+        assert_eq!(let_annotation("fn f() {\n  let n = 1\n}\n"), None);
+    }
+
+    #[test]
+    fn letの型注釈は名前付き型を取る() {
+        assert_eq!(
+            let_annotation("fn f() {\n  let n: int = 1\n}\n"),
+            Some("int".to_string())
+        );
+    }
+
+    /// 注釈は引数・フィールド・戻り値と同じ型文法なので、後置 `?` も
+    /// 角括弧もそのまま読める
+    #[test]
+    fn letの型注釈はoptionalと配列の形をそのまま取る() {
+        assert_eq!(
+            let_annotation("fn f() {\n  let u: User? = nil\n}\n"),
+            Some("User?".to_string())
+        );
+        assert_eq!(
+            let_annotation("fn f() {\n  let us: [User] = []\n}\n"),
+            Some("[User]".to_string())
+        );
+        assert_eq!(
+            let_annotation("fn f() {\n  let us: [User?]? = nil\n}\n"),
+            Some("[User?]?".to_string())
+        );
+    }
+
+    #[test]
+    fn letの型注釈は型名を要求する() {
+        let e = parse_src("fn f() {\n  let n: 1 = 1\n}\n").unwrap_err();
+        assert!(e.msg.contains("型名"), "{}", e.msg);
+    }
+
+    #[test]
+    fn 型注釈のあるletも初期化子を要求する() {
+        let e = parse_src("fn f() {\n  let n: int\n}\n").unwrap_err();
+        assert!(e.msg.contains("`=`"), "{}", e.msg);
     }
 
     // ---- match ----

@@ -176,6 +176,9 @@ pub enum ExprKind {
     },
     Let {
         name: String,
+        /// `let name: T = value` の `T`。推論できない初期化子(裸の `nil`、
+        /// 空配列)へ期待型を与える唯一の局所注釈(design.md 決定2)
+        annotation: Option<Type>,
         value: Box<Expr>,
     },
     Assign {
