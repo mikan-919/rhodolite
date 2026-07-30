@@ -60,6 +60,7 @@ use crate::ast::{
     Sig, Type, TypeKind, UnOp,
 };
 use crate::diag::Diag;
+use crate::hir;
 use crate::lex::Span;
 use crate::module::short_name;
 use crate::requirement::{Slots, collect_slots};
@@ -96,6 +97,59 @@ struct Decls {
     /// struct ではない宣言名(trait / effect / fn / enum / variant)。
     /// 「未知」と「struct ではない」を言い分けるためだけに持つ
     others: BTreeSet<String>,
+    /// 正準名から HIR の ID を引く橋。段3(式の下ろし)が引く
+    #[allow(dead_code)]
+    ids: Ids,
+}
+
+/// 正準名 → HIR の ID。AST が名前で書かれている間だけ要る橋で、HIR の中には
+/// 出て行かない(design.md 決定1)。
+// 段3(式の下ろし)が全部を引く。宣言だけを下ろしている間は未使用になる
+#[allow(dead_code)]
+#[derive(Default)]
+struct Ids {
+    structs: BTreeMap<String, hir::StructId>,
+    /// (struct の正準名, フィールド名) → フィールド
+    fields: BTreeMap<(String, String), hir::FieldId>,
+    enums: BTreeMap<String, hir::EnumId>,
+    /// variant の正準名 → variant
+    variants: BTreeMap<String, hir::VariantId>,
+    traits: BTreeMap<String, hir::TraitId>,
+    /// (trait の正準名, メソッド名) → 契約メソッド
+    trait_methods: BTreeMap<(String, String), hir::TraitMethodId>,
+    slots: BTreeMap<String, hir::SlotId>,
+    /// トップレベル関数
+    fns: BTreeMap<String, hir::CallableId>,
+    /// (具体型の正準名, メンバー名) → 本体。inherent と trait 実装を混ぜるのは
+    /// 呼び出し側の絞り方と同じ。同名が複数残ることもあるので候補の列で持つ
+    /// (`from_type` と同じく、一意でなければ呼び出しを曖昧として落とす)
+    methods: BTreeMap<(String, String), Vec<hir::CallableId>>,
+    /// (具体型の正準名, trait の正準名) → `impl`
+    trait_impls: BTreeMap<(String, String), hir::TraitImplId>,
+}
+
+/// 宣言パスの前半で分かる名前だけ。型注釈の解決に要る分で、宣言の前方参照を
+/// 許すために本体より前に全部揃える(design.md 決定7の宣言パス)。
+#[derive(Default)]
+struct Nominal {
+    /// struct と enum の正準名 → HIR の型の形
+    types: BTreeMap<String, hir::TypeKind>,
+    traits: BTreeMap<String, hir::TraitId>,
+}
+
+/// 段3で本体を埋める先。宣言パスが item 順(`impl` の中はメソッド順)に積み、
+/// 本体の検査が同じ順で取り出す。
+///
+/// `Discard` は置き場所を決められなかった宣言(struct でない型の `impl` など)。
+/// 本体の検査は続けるが HIR には残さない。そういう宣言は必ず診断を伴うので、
+/// 成功した HIR に欠けは無い。
+// 段3が本体の置き場所として読む
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum Target {
+    Callable(hir::CallableId),
+    Test(hir::TestId),
+    Discard,
 }
 
 /// 分かっている型。同一性は形と後置 `?` の一致(nominal, design.md 決定1)。
@@ -236,6 +290,9 @@ struct Out {
     /// 空で終わるのは検査規則の抜けなので、`check` が最後に診断へ変える
     /// (design.md 決定3)
     unexplained: Option<Span>,
+    /// 既に報告した「宣言されていない型」の名前。同じ名前が注釈のあちこちに
+    /// 書かれていても診断は最初の1件だけにする
+    unknown_types: BTreeSet<String>,
 }
 
 impl Out {
@@ -279,37 +336,72 @@ impl Out {
 }
 
 /// 診断を全件返す。空なら struct の形と分かる enum 型は正しい。
+///
+/// 下ろした HIR を捨てて診断だけを見る呼び出し口。既存のテストと、HIR を
+/// 要らない場所のために残す(design.md 決定7)。
 pub fn check(program: &Program) -> Vec<Diag> {
+    check_and_lower(program).err().unwrap_or_default()
+}
+
+/// 型検査と HIR の構築。**同じ1回の走査**で型と呼び出し先を決めながら下ろすので、
+/// 検査が知った事実を後から復元し直すことがない(design.md 決定7)。
+///
+/// 診断が1件でもあれば下ろしかけた HIR は捨てる。返った HIR には
+/// `Poison` な式も未解決の型も残らない。
+pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
     let mut out = Out {
         diagnostics: Vec::new(),
         span: None,
         unexplained: None,
+        unknown_types: BTreeSet::new(),
     };
-    let decls = collect(program, &mut out);
+    let (decls, mut lowered, targets) = collect(program, &mut out);
     let out = &mut out;
+    let mut targets = targets.into_iter();
 
     for item in &program.items {
         out.span = Some(item.span());
         match item {
             Item::Fn { sig, body, .. } => {
+                let target = next_target(&mut targets);
                 let locals = sig
                     .params
                     .iter()
                     .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
                     .collect();
-                check_body(body, &decls, locals, &sig.name, &effective_ret(sig), out);
+                check_body(
+                    body,
+                    &decls,
+                    locals,
+                    &sig.name,
+                    &effective_ret(sig),
+                    target,
+                    &mut lowered,
+                    out,
+                );
             }
             // test は呼び出されないので署名を持たないが、本体の最後の式と
             // `return` はどこかの型と照合されなければ検査が閉じない。
             // 値を返す先が無いので `unit` を実効戻り値にする
             Item::Test { name, body, .. } => {
+                let target = next_target(&mut targets);
                 let ctx = format!("test \"{name}\"");
-                check_body(body, &decls, Locals::new(), &ctx, &plain("unit"), out);
+                check_body(
+                    body,
+                    &decls,
+                    Locals::new(),
+                    &ctx,
+                    &plain("unit"),
+                    target,
+                    &mut lowered,
+                    out,
+                );
             }
             Item::Impl {
                 type_name, methods, ..
             } => {
                 for (sig, body) in methods {
+                    let target = next_target(&mut targets);
                     let mut locals: Locals = sig
                         .params
                         .iter()
@@ -320,12 +412,25 @@ pub fn check(program: &Program) -> Vec<Diag> {
                     }
                     let ctx = format!("impl {type_name}::{}", sig.name);
                     out.span = Some(sig.span);
-                    check_body(body, &decls, locals, &ctx, &effective_ret(sig), out);
+                    check_body(
+                        body,
+                        &decls,
+                        locals,
+                        &ctx,
+                        &effective_ret(sig),
+                        target,
+                        &mut lowered,
+                        out,
+                    );
                 }
             }
             _ => {}
         }
     }
+    debug_assert!(
+        targets.next().is_none(),
+        "宣言パスが積んだ本体の数が検査した本体の数と合いません"
+    );
 
     // 診断が空なのに型の出なかった式が残っているのは検査規則の抜け。
     // 後続段へ「全ての式が型を持つ」と渡せないので、その式を指して落とす
@@ -339,10 +444,30 @@ pub fn check(program: &Program) -> Vec<Diag> {
         );
     }
 
-    std::mem::take(&mut out.diagnostics)
+    if !out.diagnostics.is_empty() {
+        // 部分的な HIR は渡さない。不完全な参照が後段へ漏れる口を作らないため
+        return Err(std::mem::take(&mut out.diagnostics));
+    }
+    // 検査が成功したのに型の出ない式が残っているのは検査器の不具合。
+    // 後段は「全ての式が具体型を持つ」前提で書かれているので、ここで落とす
+    if let Some(span) = lowered.poisoned() {
+        return Err(vec![Diag::at(
+            span,
+            "この式の型が決まりません(型検査の規則が足りていません)".to_string(),
+        )]);
+    }
+    Ok(lowered)
 }
 
-fn collect(program: &Program, out: &mut Out) -> Decls {
+/// 宣言パスが積んだ次の置き場所。数が合わないのは宣言パスと本体の走査が
+/// 食い違ったときだけなので、そこで落とす。
+fn next_target(targets: &mut std::vec::IntoIter<Target>) -> Target {
+    targets
+        .next()
+        .expect("宣言パスが積んだ本体を同じ順で取り出す")
+}
+
+fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target>) {
     let mut structs = BTreeMap::new();
     let mut variants = BTreeMap::new();
     let mut enums = BTreeMap::new();
@@ -352,6 +477,13 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
     let mut impls: BTreeMap<String, Vec<(String, FnSig)>> = BTreeMap::new();
     let mut trait_impls = BTreeSet::new();
     let mut others = BTreeSet::new();
+
+    // 宣言の前半。型注釈が前方参照できるよう、名前と ID だけ先に全部揃える
+    let mut lowered = hir::Program::default();
+    let nominal = collect_nominal(program, &mut lowered);
+    let mut ids = Ids::default();
+    let mut targets: Vec<Target> = Vec::new();
+    let mut pending: Vec<PendingImpl> = Vec::new();
 
     for item in &program.items {
         out.span = Some(item.span());
@@ -363,7 +495,9 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
             }
         }
         match item {
-            Item::Struct { name, fields, .. } => {
+            Item::Struct { name, fields, span } => {
+                let owner = nominal.struct_of(name).expect("宣言パス前半で確保済み");
+                ids.structs.insert(name.clone(), owner);
                 let mut declared: BTreeMap<String, KnownType> = BTreeMap::new();
                 let mut duplicates = BTreeSet::new();
                 for (field, ty) in fields {
@@ -371,6 +505,15 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
                     if previous.is_some() {
                         duplicates.insert(field.clone());
                     }
+                    // フィールド単体の span は構文木が持たないので宣言全体を指す
+                    let id = lowered.fields.alloc(hir::FieldDecl {
+                        name: field.clone(),
+                        owner,
+                        ty: lower_type(ty, &nominal, out),
+                        span: *span,
+                    });
+                    lowered.structs.get_mut(owner).fields.push(id);
+                    ids.fields.insert((name.clone(), field.clone()), id);
                 }
                 for field in &duplicates {
                     out.push(format!(
@@ -382,9 +525,13 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
             // variant の重複は宣言名前空間の衝突として module.rs が報告する。
             // ここは所属の索引を作るだけ
             Item::Enum {
-                name, variants: vs, ..
+                name,
+                variants: vs,
+                span,
             } => {
                 others.insert(name.clone());
+                let owner = nominal.enum_of(name).expect("宣言パス前半で確保済み");
+                ids.enums.insert(name.clone(), owner);
                 for variant in vs {
                     variants.insert(variant.name.clone(), name.clone());
                     others.insert(variant.name.clone());
@@ -396,6 +543,18 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
                             ret: plain(name),
                         },
                     );
+                    let id = lowered.variants.alloc(hir::VariantDecl {
+                        name: variant.name.clone(),
+                        owner,
+                        payload: variant
+                            .payload
+                            .iter()
+                            .map(|ty| lower_type(ty, &nominal, out))
+                            .collect(),
+                        span: *span,
+                    });
+                    lowered.enums.get_mut(owner).variants.push(id);
+                    ids.variants.insert(variant.name.clone(), id);
                 }
                 enums.insert(name.clone(), vs.iter().map(|v| v.name.clone()).collect());
             }
@@ -403,6 +562,25 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
             // 実装側の過不足は `check_impl` が契約と突き合わせて報告する
             Item::Trait { name, methods, .. } => {
                 others.insert(name.clone());
+                let owner = nominal.traits[name];
+                ids.traits.insert(name.clone(), owner);
+                for sig in methods {
+                    let id = lowered.trait_methods.alloc(hir::TraitMethodDecl {
+                        name: sig.name.clone(),
+                        owner,
+                        has_self: sig.has_self,
+                        params: sig
+                            .params
+                            .iter()
+                            .map(|p| lower_type(&p.ty, &nominal, out))
+                            .collect(),
+                        ret: lower_ret(sig, &nominal, out),
+                        span: sig.span,
+                    });
+                    lowered.traits.get_mut(owner).methods.push(id);
+                    ids.trait_methods
+                        .insert((name.clone(), sig.name.clone()), id);
+                }
                 traits.insert(
                     name.clone(),
                     methods
@@ -411,18 +589,47 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
                         .collect(),
                 );
             }
-            Item::Effect { slot, .. } => {
+            // スロットは trait の窓なので、trait でないものを名指したら
+            // 実装を選ぶ手がかりが無い。HIR に載せる前にここで止める
+            Item::Effect {
+                slot,
+                trait_name,
+                span,
+            } => {
                 others.insert(slot.clone());
+                match nominal.traits.get(trait_name) {
+                    Some(trait_) => {
+                        let id = lowered.slots.alloc(hir::SlotDecl {
+                            name: slot.clone(),
+                            trait_: *trait_,
+                            span: *span,
+                        });
+                        ids.slots.insert(slot.clone(), id);
+                    }
+                    None => out.push(format!(
+                        "effect `{slot}`: `{trait_name}` は trait ではありません"
+                    )),
+                }
             }
-            Item::Fn { sig, .. } => {
+            Item::Fn { sig, span, .. } => {
                 others.insert(sig.name.clone());
                 fns.insert(sig.name.clone(), signature(sig));
+                let id = lowered.callables.alloc(callable_shell(
+                    sig,
+                    hir::CallableOwner::Free,
+                    None,
+                    *span,
+                    &nominal,
+                    out,
+                ));
+                ids.fns.insert(sig.name.clone(), id);
+                targets.push(Target::Callable(id));
             }
             Item::Impl {
                 trait_name,
                 type_name,
                 methods,
-                ..
+                span,
             } => {
                 if let Some(trait_name) = trait_name {
                     trait_impls.insert((type_name.clone(), trait_name.clone()));
@@ -431,10 +638,37 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
                 for (sig, _) in methods {
                     entry.push((sig.name.clone(), signature(sig)));
                 }
+                lower_impl(
+                    item,
+                    trait_name,
+                    type_name,
+                    methods,
+                    *span,
+                    &nominal,
+                    &mut ids,
+                    &mut lowered,
+                    &mut targets,
+                    &mut pending,
+                    out,
+                );
             }
-            Item::Test { .. } => {}
+            Item::Test {
+                name,
+                body: _,
+                span,
+            } => {
+                let id = lowered.tests.alloc(hir::TestDecl {
+                    name: name.clone(),
+                    body: hir::Body::default(),
+                    span: *span,
+                });
+                targets.push(Target::Test(id));
+            }
         }
     }
+
+    // trait の契約が全部揃ってから実装の表を埋める(`impl` は前方参照できる)
+    link_trait_impls(pending, &ids, &mut lowered);
 
     let decls = Decls {
         structs,
@@ -447,6 +681,7 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
         trait_impls,
         slots: collect_slots(program),
         others,
+        ids,
     };
 
     // 契約の検査は索引が揃ってから。前方参照の trait も引ける(design.md 決定2)
@@ -463,7 +698,256 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
         }
     }
 
-    decls
+    (decls, lowered, targets)
+}
+
+impl Nominal {
+    fn struct_of(&self, name: &str) -> Option<hir::StructId> {
+        match self.types.get(name) {
+            Some(hir::TypeKind::Struct(id)) => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn enum_of(&self, name: &str) -> Option<hir::EnumId> {
+        match self.types.get(name) {
+            Some(hir::TypeKind::Enum(id)) => Some(*id),
+            _ => None,
+        }
+    }
+}
+
+/// 宣言パスの前半。struct / enum / trait の名前と ID だけを確保する。
+///
+/// 型注釈は後から宣言された型も名指せるので、注釈を解決する前に全部の
+/// 名前が要る(design.md 決定7)。
+fn collect_nominal(program: &Program, lowered: &mut hir::Program) -> Nominal {
+    let mut nominal = Nominal::default();
+    for item in &program.items {
+        match item {
+            Item::Struct { name, span, .. } => {
+                let id = lowered.structs.alloc(hir::StructDecl {
+                    name: name.clone(),
+                    fields: Vec::new(),
+                    span: *span,
+                });
+                nominal
+                    .types
+                    .insert(name.clone(), hir::TypeKind::Struct(id));
+            }
+            Item::Enum { name, span, .. } => {
+                let id = lowered.enums.alloc(hir::EnumDecl {
+                    name: name.clone(),
+                    variants: Vec::new(),
+                    span: *span,
+                });
+                nominal.types.insert(name.clone(), hir::TypeKind::Enum(id));
+            }
+            Item::Trait { name, span, .. } => {
+                let id = lowered.traits.alloc(hir::TraitDecl {
+                    name: name.clone(),
+                    methods: Vec::new(),
+                    span: *span,
+                });
+                nominal.traits.insert(name.clone(), id);
+            }
+            _ => {}
+        }
+    }
+    nominal
+}
+
+/// 型注釈を HIR の型へ。名前は組み込み型か宣言済みの struct / enum でなければ
+/// ならない。
+///
+/// 宣言されていない名前を通していた頃は、その型の値がどの宣言のものか誰にも
+/// 分からないまま検査を抜けられた。後段が「全ての型は宣言を指す」前提で
+/// 書かれる以上、ここで閉じる(design.md 決定7)。
+fn lower_type(ty: &Type, nominal: &Nominal, out: &mut Out) -> hir::Type {
+    let kind = match &ty.kind {
+        TypeKind::Array(element) => {
+            hir::TypeKind::Array(Box::new(lower_type(element, nominal, out)))
+        }
+        TypeKind::Named(name) => match builtin(name) {
+            Some(builtin) => hir::TypeKind::Builtin(builtin),
+            None => match nominal.types.get(name) {
+                Some(kind) => kind.clone(),
+                None => {
+                    // 同じ名前を注釈のあちこちで見ても言うのは一度だけ
+                    if out.unknown_types.insert(name.clone()) {
+                        out.push(format!("型 `{name}` は宣言されていません"));
+                    }
+                    hir::TypeKind::Poison
+                }
+            },
+        },
+    };
+    hir::Type {
+        kind,
+        optional: ty.optional,
+    }
+}
+
+/// 宣言の実効戻り値型を HIR へ。注釈の省略は `unit` を返す宣言と同じ意味。
+fn lower_ret(sig: &Sig, nominal: &Nominal, out: &mut Out) -> hir::Type {
+    match &sig.ret {
+        Some(ty) => lower_type(ty, nominal, out),
+        None => hir::Type::unit(),
+    }
+}
+
+/// 組み込み型を名乗る名前。正準名は修飾されているので末尾だけを見る。
+fn builtin(name: &str) -> Option<hir::Builtin> {
+    match short_name(name) {
+        "int" => Some(hir::Builtin::Int),
+        "bool" => Some(hir::Builtin::Bool),
+        "str" => Some(hir::Builtin::Str),
+        "unit" => Some(hir::Builtin::Unit),
+        _ => None,
+    }
+}
+
+/// 本体が空の callable。引数と `self` はここで局所束縛になり、`LocalId` は
+/// `self` → 宣言順の引数の順に振られる。本体の式は段3で埋める。
+fn callable_shell(
+    sig: &Sig,
+    owner: hir::CallableOwner,
+    receiver: Option<hir::Type>,
+    span: Span,
+    nominal: &Nominal,
+    out: &mut Out,
+) -> hir::Callable {
+    let mut body = hir::Body::default();
+    if let Some(ty) = receiver {
+        body.receiver = Some(body.alloc_local(hir::LocalDecl {
+            name: "self".to_string(),
+            ty: Some(ty),
+            span: sig.span,
+        }));
+    }
+    let params = sig
+        .params
+        .iter()
+        .map(|p| {
+            let ty = lower_type(&p.ty, nominal, out);
+            body.alloc_local(hir::LocalDecl {
+                name: p.name.clone(),
+                ty: Some(ty),
+                span: sig.span,
+            })
+        })
+        .collect();
+    let ret = lower_ret(sig, nominal, out);
+    hir::Callable {
+        name: sig.name.clone(),
+        owner,
+        has_self: sig.has_self,
+        params,
+        ret,
+        body,
+        span,
+    }
+}
+
+/// `impl` を HIR へ。実装先が struct でなければ置き場所が無いので、本体の
+/// 検査だけ続けて HIR には残さない(`Target::Discard`)。
+///
+/// 契約メソッドから実装本体への表はここでは埋めない。`impl` は trait の宣言より
+/// 前に書けるので、trait の契約が全部揃ってから `link_trait_impls` が埋める。
+#[allow(clippy::too_many_arguments)]
+fn lower_impl(
+    item: &Item,
+    trait_name: &Option<String>,
+    type_name: &str,
+    methods: &[(Sig, Vec<Expr>)],
+    span: Span,
+    nominal: &Nominal,
+    ids: &mut Ids,
+    lowered: &mut hir::Program,
+    targets: &mut Vec<Target>,
+    pending: &mut Vec<PendingImpl>,
+    out: &mut Out,
+) {
+    let type_ = nominal.struct_of(type_name);
+    // trait 側の誤りは `check_impl` が契約と突き合わせて報告する。
+    // inherent な `impl` はそこを通らないので、実装先だけここで見る
+    if type_.is_none() && trait_name.is_none() {
+        out.span = Some(item.span());
+        out.push(format!(
+            "impl {type_name}: `{type_name}` は struct ではありません"
+        ));
+    }
+    let owner = match (type_, trait_name) {
+        (Some(type_), Some(trait_name)) => match nominal.traits.get(trait_name) {
+            Some(trait_) => {
+                let id = lowered.trait_impls.alloc(hir::TraitImplDecl {
+                    trait_: *trait_,
+                    type_,
+                    methods: BTreeMap::new(),
+                    span,
+                });
+                ids.trait_impls
+                    .insert((type_name.to_string(), trait_name.clone()), id);
+                Some(hir::CallableOwner::TraitImpl(id))
+            }
+            None => None,
+        },
+        (Some(type_), None) => Some(hir::CallableOwner::Inherent(type_)),
+        (None, _) => None,
+    };
+    for (sig, _) in methods {
+        let Some(owner) = owner else {
+            targets.push(Target::Discard);
+            continue;
+        };
+        let receiver = sig
+            .has_self
+            .then(|| hir::Type::struct_(type_.expect("owner があるなら実装先も分かる")));
+        let id = lowered
+            .callables
+            .alloc(callable_shell(sig, owner, receiver, sig.span, nominal, out));
+        ids.methods
+            .entry((type_name.to_string(), sig.name.clone()))
+            .or_default()
+            .push(id);
+        if let (hir::CallableOwner::TraitImpl(impl_), Some(trait_name)) = (owner, trait_name) {
+            pending.push(PendingImpl {
+                impl_,
+                trait_name: trait_name.clone(),
+                method: sig.name.clone(),
+                callable: id,
+            });
+        }
+        targets.push(Target::Callable(id));
+    }
+}
+
+/// trait の契約が揃うのを待っている実装メソッド1つ。
+struct PendingImpl {
+    impl_: hir::TraitImplId,
+    trait_name: String,
+    method: String,
+    callable: hir::CallableId,
+}
+
+/// 契約メソッド → 実装本体の表を埋める。スロット呼び出しはこの表を1手で引くので、
+/// 実行時に名前で候補を探す必要がなくなる(design.md 決定6)。
+///
+/// 契約に無いメソッドは `check_impl` が報告するので、ここでは黙って落とす。
+fn link_trait_impls(pending: Vec<PendingImpl>, ids: &Ids, lowered: &mut hir::Program) {
+    for entry in pending {
+        if let Some(method) = ids
+            .trait_methods
+            .get(&(entry.trait_name, entry.method))
+            .copied()
+        {
+            lowered
+                .trait_impls
+                .get_mut(entry.impl_)
+                .methods
+                .insert(method, entry.callable);
+        }
+    }
 }
 
 /// trait `impl` を契約と突き合わせる。呼び出しの到達性に依らせないため、
@@ -641,17 +1125,22 @@ struct Cx<'a> {
 // 走査
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn check_body(
     body: &[Expr],
     decls: &Decls,
     mut locals: Locals,
     ctx: &str,
     ret: &KnownType,
+    target: Target,
+    lowered: &mut hir::Program,
     out: &mut Out,
 ) {
     let cx = Cx { decls, ctx, ret };
     // 本体は値ベースなので最後の式も戻り値。明示 `return` と同じ位置で照合する
     block(body, Some((ret, &Site::Return)), &cx, &mut locals, out);
+    // 段3でここが本体を HIR へ下ろす。宣言パスが確保した置き場所へ書き込む
+    let _ = (target, lowered);
 }
 
 /// 式の列。値になるのは最後の式だけで、手前の式は値を産んでも捨てる
@@ -1985,14 +2474,14 @@ rank: Rank }
 
     #[test]
     fn 重複した宣言フィールドを報告する() {
-        let e = only("struct User { rank: Rank\nrank: Rank }\n");
+        let e = only("enum Rank { Gold }\nstruct User { rank: Rank\nrank: Rank }\n");
         assert!(e.contains("struct `User`"), "{e}");
         assert!(e.contains("`rank`"), "{e}");
     }
 
     #[test]
     fn 相異なる宣言フィールドは診断を出さない() {
-        assert!(errors("struct User { id: int\nrank: Rank }\n").is_empty());
+        assert!(errors("enum Rank { Gold }\nstruct User { id: int\nrank: Rank }\n").is_empty());
     }
 
     // ---- 2. リテラル ----
@@ -2123,6 +2612,7 @@ rank: Rank }
         assert!(
             errors(
                 "struct User { id: int }\n\
+                 struct Users {}\n\
                  struct Store { users: Users }\n\
                  impl Store { fn first(self -> Users) { self.users } }\n",
             )
@@ -3463,7 +3953,7 @@ rank: Rank }
             "enum bool { Yes No }\n",
             "enum E { str Other }\n",
             "trait unit { fn f(self) }\n",
-            "effect int: Clock\n",
+            "trait Clock { fn now(self -> int) }\neffect int: Clock\n",
             "fn bool(-> int) { 1 }\n",
         ] {
             let e = only(src);
@@ -4469,6 +4959,154 @@ rank: Rank }
         );
         assert_eq!(e.len(), 3, "{e:?}");
         assert!(e.iter().all(|e| e.starts_with("unused: ")), "{e:?}");
+    }
+
+    // ---- 宣言の下ろし ----
+
+    /// 下ろした HIR。診断があれば失敗させる
+    fn lowered(src: &str) -> hir::Program {
+        let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
+        check_and_lower(&program).expect("診断なしで下がるはず")
+    }
+
+    /// 宣言だけの小さなプログラムを丸ごと固定する。宣言種ごとの ID の振り方と
+    /// 参照の解決が一目で読める形でここに書いてある
+    #[test]
+    fn 全宣言種の下ろしを固定する() {
+        let dumped = lowered(
+            "trait Clock { fn now(self -> int) }\n\
+             struct Frozen { at: int }\n\
+             enum Rank { Bronze Gold }\n\
+             effect clock: Clock\n\
+             impl Clock for Frozen { fn now(self -> int) { self.at } }\n\
+             impl Frozen { fn make(-> Frozen) { Frozen { at = 0 } } }\n\
+             fn rank(r: Rank -> Rank) { r }\n\
+             test \"t\" { assert true }\n",
+        )
+        .dump();
+        assert_eq!(
+            dumped,
+            "struct#0 Frozen { at#0: int }\n\
+             enum#0 Rank { Bronze#0, Gold#1 }\n\
+             trait#0 Clock\n\
+             \x20 method#0 now(self) -> int\n\
+             slot#0 clock: Clock\n\
+             impl#0 Clock for Frozen\n\
+             \x20 now -> callable#0\n\
+             callable#0 impl#0 now(self) -> int\n\
+             \x20 local#0 self: Frozen\n\
+             \x20 root []\n\
+             callable#1 inherent Frozen make() -> Frozen\n\
+             \x20 root []\n\
+             callable#2 fn rank(Rank) -> Rank\n\
+             \x20 local#0 r: Rank\n\
+             \x20 root []\n\
+             test#0 \"t\"\n\
+             \x20 root []\n",
+            "{dumped}"
+        );
+    }
+
+    /// 正典プログラムの宣言。個数と、名前ではなく ID で結ばれた参照を見る
+    #[test]
+    fn 正典の宣言はidで結ばれる() {
+        let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
+        let program = lowered(&src);
+
+        // 宣言順に詰まっているので、個数が変わればここが落ちる
+        assert_eq!(program.structs.len(), 5, "{}", program.dump());
+        assert_eq!(program.enums.len(), 1);
+        assert_eq!(program.traits.len(), 2);
+        assert_eq!(program.slots.len(), 2);
+        assert_eq!(program.trait_impls.len(), 4);
+
+        // スロットは trait 名ではなく `TraitId` を持つ
+        for (_, slot) in program.slots.iter() {
+            let trait_name = &program.traits[slot.trait_].name;
+            assert!(
+                trait_name.ends_with("Database") || trait_name.ends_with("Clock"),
+                "{trait_name}"
+            );
+        }
+
+        // trait 実装は契約メソッドから本体へ直接つながっている
+        for (id, impl_) in program.trait_impls.iter() {
+            let contract = &program.traits[impl_.trait_];
+            assert_eq!(
+                impl_.methods.len(),
+                contract.methods.len(),
+                "impl#{} は契約を全部埋める",
+                crate::hir::Id::index(id)
+            );
+            for method in &contract.methods {
+                let callable = program
+                    .implementation_of(id, *method)
+                    .expect("契約メソッドに本体がある");
+                assert_eq!(
+                    program.callables[callable].name,
+                    program.trait_methods[*method].name
+                );
+            }
+        }
+
+        // struct のフィールドは所属 struct を指し、型は宣言を指す
+        let users = program
+            .fields
+            .iter()
+            .find(|(_, f)| f.name == "users")
+            .expect("正典に `users` がある");
+        assert_eq!(program.structs[users.1.owner].name, "InMemoryDb");
+        assert_eq!(program.show_type(&users.1.ty), "[User]");
+    }
+
+    /// 別のモジュールから見た同じ宣言は、正準名が同じなので同じ ID になる。
+    /// 名前で引き直す段が無くなるのはこれが成り立つから
+    #[test]
+    fn 同じ宣言を複数モジュールから見ても一つのidになる() {
+        let loaded = crate::module::load_files(&[
+            (
+                "main.rd",
+                "use dep::{User, mark}\n\
+                 fn main() { let u: User = User { id = 1 }\n let m = mark(u) }\n",
+            ),
+            (
+                "dep.rd",
+                "struct User { id: int }\n\
+                 fn mark(u: User -> User) { u }\n",
+            ),
+        ])
+        .expect("ロードできる");
+        let program = check_and_lower(&loaded.program).expect("診断なしで下がるはず");
+
+        assert_eq!(program.structs.len(), 1, "宣言は1つだけ");
+        let user = crate::hir::Type::struct_(program.structs.ids().next().unwrap());
+        // 注釈・struct リテラル・引数・戻り値のすべてが同じ ID を指す
+        let mark = program.free_callable("dep::mark").expect("`mark` がある");
+        assert_eq!(program.callables[mark].ret, user);
+        let param = program.callables[mark].params[0];
+        assert_eq!(program.callables[mark].body.local(param).ty, Some(user));
+    }
+
+    /// 宣言されていない型を注釈に書くと、その型の値がどの宣言のものか誰にも
+    /// 分からない。HIR へ下ろせないので実行前に止める(design.md 決定7)
+    #[test]
+    fn 宣言されていない型の注釈を報告する() {
+        let e = only("fn f(x: Nope -> Nope) { x }\nfn main() { assert true }\n");
+        assert!(e.contains("型 `Nope` は宣言されていません"), "{e}");
+    }
+
+    #[test]
+    fn traitでないスロット宣言と_structでない実装先を報告する() {
+        let e = only("effect db: Nope\nfn main() { assert true }\n");
+        assert!(
+            e.contains("effect `db`: `Nope` は trait ではありません"),
+            "{e}"
+        );
+        let e = only("impl Nope { fn f(-> int) { 1 } }\nfn main() { assert true }\n");
+        assert!(
+            e.contains("impl Nope: `Nope` は struct ではありません"),
+            "{e}"
+        );
     }
 
     // ---- 正典 ----

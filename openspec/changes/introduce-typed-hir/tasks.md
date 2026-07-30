@@ -9,14 +9,14 @@
 
 ## 2. Declaration Lowering
 
-- [ ] 2.1 Refactor type-checker declaration collection to allocate deterministic HIR IDs while retaining canonical names and declaration spans for presentation
-- [ ] 2.2 Lower builtin, struct, field, enum, variant, and payload types to resolved HIR types
-- [ ] 2.3 Lower traits and trait method signatures, including receiver form and effective `unit` returns
-- [ ] 2.4 Lower top-level function and test shells with parameter locals, effective return types, and source declaration order
-- [ ] 2.5 Lower inherent and trait implementation shells, map trait methods to implementing callables, and retain existing conformance diagnostics
-- [ ] 2.6 Lower effects to `SlotId` plus `TraitId` and preserve duplicate-slot diagnostics
-- [ ] 2.7 Add declaration snapshots for the canonical and multi-module programs and prove equivalent canonical names receive one ID
-- [ ] 2.8 Run formatting, the full test suite, and strict OpenSpec validation, then commit declaration lowering as a stable snapshot
+- [x] 2.1 Refactor type-checker declaration collection to allocate deterministic HIR IDs while retaining canonical names and declaration spans for presentation
+- [x] 2.2 Lower builtin, struct, field, enum, variant, and payload types to resolved HIR types
+- [x] 2.3 Lower traits and trait method signatures, including receiver form and effective `unit` returns
+- [x] 2.4 Lower top-level function and test shells with parameter locals, effective return types, and source declaration order
+- [x] 2.5 Lower inherent and trait implementation shells, map trait methods to implementing callables, and retain existing conformance diagnostics
+- [x] 2.6 Lower effects to `SlotId` plus `TraitId` and preserve duplicate-slot diagnostics
+- [x] 2.7 Add declaration snapshots for the canonical and multi-module programs and prove equivalent canonical names receive one ID
+- [x] 2.8 Run formatting, the full test suite, and strict OpenSpec validation, then commit declaration lowering as a stable snapshot
 
 ## 3. Typed Expression Lowering
 

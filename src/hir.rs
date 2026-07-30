@@ -196,6 +196,9 @@ pub enum TypeKind {
     Struct(StructId),
     Enum(EnumId),
     Array(Box<Type>),
+    /// 型注釈が宣言されていない名前を指していた型。`ExprKind::Poison` と同じで
+    /// **診断を伴うときだけ**存在する(`Program::poisoned` が検査する)
+    Poison,
 }
 
 impl Type {
@@ -661,6 +664,7 @@ impl Program {
             TypeKind::Struct(id) => self.structs[*id].name.clone(),
             TypeKind::Enum(id) => self.enums[*id].name.clone(),
             TypeKind::Array(element) => format!("[{}]", self.show_type(element)),
+            TypeKind::Poison => "?".to_string(),
         };
         if ty.optional {
             out.push('?');
@@ -700,22 +704,62 @@ impl Program {
             .map(|(id, _)| id)
     }
 
-    /// 型検査が成功したのに残っている `Poison` 式。空でなければ検査器の不具合
-    /// (design.md 決定7)。最初に見つけた1件の span を返す
+    /// 型検査が成功したのに残っている未解決。空でなければ検査器の不具合
+    /// (design.md 決定7)。最初に見つけた1件の span を返す。
+    ///
+    /// 見るのは `Poison` な式・結果型・宣言型の3つ。呼び出し先とフィールドと
+    /// 提供は ID しか持てない形なので、構築できた時点で解決済み
     pub fn poisoned(&self) -> Option<Span> {
+        for (_, field) in self.fields.iter() {
+            if poisoned_type(&field.ty) {
+                return Some(field.span);
+            }
+        }
+        for (_, variant) in self.variants.iter() {
+            if variant.payload.iter().any(poisoned_type) {
+                return Some(variant.span);
+            }
+        }
+        for (_, method) in self.trait_methods.iter() {
+            if method.params.iter().any(poisoned_type) || poisoned_type(&method.ret) {
+                return Some(method.span);
+            }
+        }
+        for (_, callable) in self.callables.iter() {
+            if poisoned_type(&callable.ret) {
+                return Some(callable.span);
+            }
+        }
         let bodies = self
             .callables
             .iter()
             .map(|(_, c)| &c.body)
             .chain(self.tests.iter().map(|(_, t)| &t.body));
         for body in bodies {
+            for (_, local) in body.locals() {
+                if local.ty.as_ref().is_some_and(poisoned_type) {
+                    return Some(local.span);
+                }
+            }
             for (_, expr) in body.exprs() {
-                if matches!(expr.kind, ExprKind::Poison) || expr.result == ExprResult::Poison {
+                if matches!(expr.kind, ExprKind::Poison)
+                    || expr.result == ExprResult::Poison
+                    || expr.result.ty().is_some_and(poisoned_type)
+                {
                     return Some(expr.span);
                 }
             }
         }
         None
+    }
+}
+
+/// 名前を解決できなかった型を含むか。配列は要素まで辿る
+fn poisoned_type(ty: &Type) -> bool {
+    match &ty.kind {
+        TypeKind::Poison => true,
+        TypeKind::Array(element) => poisoned_type(element),
+        TypeKind::Builtin(_) | TypeKind::Struct(_) | TypeKind::Enum(_) => false,
     }
 }
 

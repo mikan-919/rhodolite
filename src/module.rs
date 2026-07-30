@@ -1496,8 +1496,28 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
     }
 }
 
+/// 一時ディレクトリに書いて `main.rd` を読み込み、後片付けまでやる。
+/// 複数モジュールを畳んだ `Program` を要るテストはどの段からもここを使う。
+#[cfg(test)]
+pub fn load_files(files: &[(&str, &str)]) -> Result<LoadedProgram, LoadError> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "rhodolite-module-unit-{}-{number}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, source) in files {
+        std::fs::write(root.join(name), source).unwrap();
+    }
+    let loaded = load(&root.join("main.rd"));
+    std::fs::remove_dir_all(&root).unwrap();
+    loaded
+}
+
 #[cfg(test)]
 mod tests {
+    use super::load_files;
     use super::*;
     use crate::lex::{join, lex};
     use crate::parse;
@@ -1527,23 +1547,6 @@ mod tests {
             }
         }
         assert_eq!(checked, 2, "正典の `Rank` は variant を2つ持つ");
-    }
-
-    /// 一時ディレクトリに書いて `main.rd` を読み込み、後片付けまでやる。
-    fn load_files(files: &[(&str, &str)]) -> Result<LoadedProgram, LoadError> {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "rhodolite-module-unit-{}-{number}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        for (name, source) in files {
-            std::fs::write(root.join(name), source).unwrap();
-        }
-        let loaded = load(&root.join("main.rd"));
-        std::fs::remove_dir_all(&root).unwrap();
-        loaded
     }
 
     /// 局所注釈の名前の葉も、引数や戻り値と同じ規則で正準名になる。
