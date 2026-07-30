@@ -26,40 +26,40 @@
 
 ## 4. Basic Expressions and Bindings
 
-- [ ] 4.1 Make every identifier, path, ordinary field read, and optional field read either synthesize a concrete type or produce a positioned diagnostic
-- [ ] 4.2 Require concrete operand types for arithmetic, negation, equality, conditions, and assertions
-- [ ] 4.3 Require concrete source and destination types for struct fields, field assignments, annotated initializers, and local reassignments
-- [ ] 4.4 Reject unannotated bindings whose initializer cannot synthesize a concrete type
-- [ ] 4.5 Replace tests that expected basic-expression deferral with success-or-diagnostic assertions and add CLI coverage
-- [ ] 4.6 Run the full test suite and commit closed basic expression checking as a stable snapshot
+- [x] 4.1 Make every identifier, path, ordinary field read, and optional field read either synthesize a concrete type or produce a positioned diagnostic
+- [x] 4.2 Require concrete operand types for arithmetic, negation, equality, conditions, and assertions
+- [x] 4.3 Require concrete source and destination types for struct fields, field assignments, annotated initializers, and local reassignments
+- [x] 4.4 Reject unannotated bindings whose initializer cannot synthesize a concrete type
+- [x] 4.5 Replace tests that expected basic-expression deferral with success-or-diagnostic assertions and add CLI coverage
+- [x] 4.6 Run the full test suite and commit closed basic expression checking as a stable snapshot
 
 ## 5. Calls and Signatures
 
-- [ ] 5.1 Make direct calls resolve to one loaded function and require every argument to have a compatible concrete type
-- [ ] 5.2 Make method and associated-function resolution reject untyped receivers, absent members, ambiguities, and receiver-form mismatches before evaluation
-- [ ] 5.3 Require every resolved method, associated-function, slot, and enum-constructor argument to have a compatible concrete type
-- [ ] 5.4 Add tests proving unresolved calls in unexecuted functions and dependency modules fail before evaluation
-- [ ] 5.5 Retain evaluator lookup defenses and add CLI tests proving checked programs do not rely on them
-- [ ] 5.6 Run the full test suite and commit complete call resolution as a stable snapshot
+- [x] 5.1 Make direct calls resolve to one loaded function and require every argument to have a compatible concrete type
+- [x] 5.2 Make method and associated-function resolution reject untyped receivers, absent members, ambiguities, and receiver-form mismatches before evaluation
+- [x] 5.3 Require every resolved method, associated-function, slot, and enum-constructor argument to have a compatible concrete type
+- [x] 5.4 Add tests proving unresolved calls in unexecuted functions and dependency modules fail before evaluation
+- [x] 5.5 Retain evaluator lookup defenses and add CLI tests proving checked programs do not rely on them
+- [x] 5.6 Run the full test suite and commit complete call resolution as a stable snapshot
 
 ## 6. Arrays and Optionals
 
-- [ ] 6.1 Reject context-free empty arrays and arrays containing untyped elements while accepting empty arrays under annotated or destination context
-- [ ] 6.2 Require every `for` iterable to have a concrete non-optional array type and bind a concrete element type
-- [ ] 6.3 Contextualize `nil` only from a concrete optional destination, typed equality operand, or concrete fallback right operand
-- [ ] 6.4 Reject `let x = nil`, `nil == nil`, unresolved fallback operands, and unresolved optional-field receivers with positioned diagnostics
-- [ ] 6.5 Add positive annotation tests and replace deferred array and optional tests with total-checking expectations
-- [ ] 6.6 Run the full test suite and commit closed array and optional checking as a stable snapshot
+- [x] 6.1 Reject context-free empty arrays and arrays containing untyped elements while accepting empty arrays under annotated or destination context
+- [x] 6.2 Require every `for` iterable to have a concrete non-optional array type and bind a concrete element type
+- [x] 6.3 Contextualize `nil` only from a concrete optional destination, typed equality operand, or concrete fallback right operand
+- [x] 6.4 Reject `let x = nil`, `nil == nil`, unresolved fallback operands, and unresolved optional-field receivers with positioned diagnostics
+- [x] 6.5 Add positive annotation tests and replace deferred array and optional tests with total-checking expectations
+- [x] 6.6 Run the full test suite and commit closed array and optional checking as a stable snapshot
 
 ## 7. Match, Heads, and Provisions
 
-- [ ] 7.1 Join all continuing match arm result types, propagate divergence, and reject a value-producing match with no concrete result type
-- [ ] 7.2 Classify an exhaustive zero-arm match over an empty enum as divergent and cover it in return and destination contexts
-- [ ] 7.3 Require every match guard to have concrete type `bool` before evaluation
-- [ ] 7.4 Require every conditional branch needed for a value to have a compatible concrete type while preserving `unit` for a conditional without `else`
-- [ ] 7.5 Require every `with slot(value)` expression to have a concrete type implementing the slot trait and remove runtime deferral from CLI behavior
-- [ ] 7.6 Replace deferred match, guard, enum-source, head, and provision tests with total-checking expectations
-- [ ] 7.7 Run the full test suite and commit closed composite-expression checking as a stable snapshot
+- [x] 7.1 Join all continuing match arm result types, propagate divergence, and reject a value-producing match with no concrete result type
+- [x] 7.2 Classify an exhaustive zero-arm match over an empty enum as divergent and cover it in return and destination contexts
+- [x] 7.3 Require every match guard to have concrete type `bool` before evaluation
+- [x] 7.4 Require every conditional branch needed for a value to have a compatible concrete type while preserving `unit` for a conditional without `else`
+- [x] 7.5 Require every `with slot(value)` expression to have a concrete type implementing the slot trait and remove runtime deferral from CLI behavior
+- [x] 7.6 Replace deferred match, guard, enum-source, head, and provision tests with total-checking expectations
+- [x] 7.7 Run the full test suite and commit closed composite-expression checking as a stable snapshot
 
 ## 8. Whole-Program Closure and Documentation
 

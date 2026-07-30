@@ -388,8 +388,15 @@ fn ローカル束縛は修飾参照でもモジュールimportを隠す() {
 
     let output = project.run("main.rd");
     let text = output_text(&output);
-    assert!(output.status.success(), "{text}");
-    assert!(text.contains("main -> 0"), "{text}");
+    // ローカルが隠すので `services/users.rd` は読み込まれない。読んでいれば
+    // そのファイルを指す構文エラーが出る
+    assert!(!text.contains("users.rd"), "{text}");
+    // 隠された修飾参照は呼び出し先が決まらないので、呼ばれない宣言でも
+    // 実行前に落ちる(total-static-type-checking)
+    assert!(
+        text.contains("`services::users::run` の呼び出し先が決まりません"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1333,6 +1340,94 @@ fn 型の違う再代入は実行前に失敗する() {
         "fn f(n: int) { n = \"x\" }\nfn main(-> int) { 1 }\n",
         "`n` への代入",
     );
+}
+
+// ---- 型検査の全域性 (total-static-type-checking) ----
+
+/// 型が決まらない式は、呼ばれない宣言の中にあっても実行前に落ちる。
+/// 検査を通ったプログラムでは、後続段が未知の式型に出会わない
+#[test]
+fn 型の決まらない式は呼ばれない宣言でも実行前に失敗する() {
+    実行前に失敗する(
+        "fn unused() { let x = nil }\nfn main(-> int) { 1 }\n",
+        "`x` の型が初期化子から決まりません",
+    );
+    実行前に失敗する(
+        "fn unused() { let xs = [] }\nfn main(-> int) { 1 }\n",
+        "配列の要素型が決まりません",
+    );
+}
+
+/// 呼び出し先が一意に決まらない呼び出しも、実行に到達する前に落ちる。
+/// 評価器の同じ防御(`find_method` など)には頼らない
+#[test]
+fn 解決できない呼び出しは実行前に失敗する() {
+    実行前に失敗する(
+        "struct Store {}\nfn unused(s: Store) { s.nope() }\nfn main(-> int) { 1 }\n",
+        "`main::Store` に `nope` はありません",
+    );
+    実行前に失敗する(
+        "fn unused() { nope() }\nfn main(-> int) { 1 }\n",
+        "`nope` の呼び出し先が決まりません",
+    );
+}
+
+/// 依存モジュールの中の型エラーも、そのモジュールを指して実行前に落ちる
+#[test]
+fn 依存モジュールの型エラーもそのモジュールを指して落ちる() {
+    let project = Project::new();
+    project.write("main.rd", "use dep\nfn main(-> int) { dep::value() }\n");
+    project.write(
+        "dep.rd",
+        "fn value(-> int) { 1 }\nfn broken() { let x = nil }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("`x` の型が初期化子から決まりません"),
+        "{text}"
+    );
+    // 抜粋は `dep.rd` の該当行を指す
+    assert!(text.contains("dep.rd"), "{text}");
+    assert!(text.contains("let x = nil"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+/// 型の分からない提供を実行時へ回さない。`with` の中が実行されなくても落ちる
+#[test]
+fn 型の決まらない提供は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Clock { fn now(self -> int) }\n\
+         effect clock: Clock\n\
+         fn main(-> int) {\n\
+         \x20 let c = nil\n\
+         \x20 with clock(c) { 1 }\n\
+         }\n",
+        "`c` の型が初期化子から決まりません",
+    );
+}
+
+/// 局所注釈を与えれば、同じ形が検査を通って走る
+#[test]
+fn 局所型注釈で文脈を与えたプログラムは走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "struct User { id: int }\n\
+         fn main(-> int) {\n\
+         \x20 let missing: User? = nil\n\
+         \x20 let empty: [User] = []\n\
+         \x20 for u in empty { assert u.id == 0 }\n\
+         \x20 (missing ?? User { id = 7 }).id\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 7"), "{text}");
 }
 
 // ---- 診断の描画 (src/render.rs) ----

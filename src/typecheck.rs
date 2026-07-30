@@ -234,6 +234,10 @@ struct Out {
     diagnostics: Vec<Diag>,
     /// 走査に入る前だけ `None`。以降は必ず何かを指している
     span: Option<Span>,
+    /// 診断を伴わずに型を出せなかった最初の式。ここが `Some` のまま診断が
+    /// 空で終わるのは検査規則の抜けなので、`check` が最後に診断へ変える
+    /// (design.md 決定3)
+    unexplained: Option<Span>,
 }
 
 impl Out {
@@ -262,6 +266,18 @@ impl Out {
             self.push(msg);
         }
     }
+
+    /// 型を出せなかった式を覚えておく。部分木が理由を説明していれば
+    /// (走査で診断が増えていれば)覚えない。
+    ///
+    /// 検査が成功しかけているときだけ意味があるので、既に診断が1件でも
+    /// あれば何もしない。「最初の1件」だけ残すのは、根本原因に近い位置を
+    /// 指すため。
+    fn note_unexplained(&mut self, before: usize, span: Span) {
+        if self.count() == before && self.diagnostics.is_empty() && self.unexplained.is_none() {
+            self.unexplained = Some(span);
+        }
+    }
 }
 
 /// 診断を全件返す。空なら struct の形と分かる enum 型は正しい。
@@ -269,6 +285,7 @@ pub fn check(program: &Program) -> Vec<Diag> {
     let mut out = Out {
         diagnostics: Vec::new(),
         span: None,
+        unexplained: None,
     };
     let decls = collect(program, &mut out);
     let out = &mut out;
@@ -310,6 +327,18 @@ pub fn check(program: &Program) -> Vec<Diag> {
             }
             _ => {}
         }
+    }
+
+    // 診断が空なのに型の出なかった式が残っているのは検査規則の抜け。
+    // 後続段へ「全ての式が型を持つ」と渡せないので、その式を指して落とす
+    // (design.md 決定3)
+    if let Some(span) = out.unexplained
+        && out.diagnostics.is_empty()
+    {
+        out.push_at(
+            span,
+            "この式の型が決まりません(型検査の規則が足りていません)".to_string(),
+        );
     }
 
     std::mem::take(&mut out.diagnostics)
@@ -656,16 +685,24 @@ fn synth(e: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
 /// 最後に期待型との境界を1箇所で照合する。`Diverges` はそこを通らないので
 /// 照合せず、`Poisoned` は既に説明済みなので重ねない(design.md 決定3・4)。
 fn walk(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
+    let before = out.count();
     let outer = out.span.replace(e.span);
     let outcome = walk_kind(e, expected, cx, locals, out);
     out.span = outer;
-    match (&outcome, expected) {
+    let outcome = match (&outcome, expected) {
         (Outcome::Typed(actual), Some((expected, site))) if !fits(actual, expected) => {
             out.push_at(e.span, site.message(cx.ctx, expected, &actual.to_string()));
             Outcome::Poisoned
         }
         _ => outcome,
+    };
+    // 検査を閉じる網。型を出せなかった式は理由の診断を伴っていなければならず、
+    // 伴わないまま検査が成功しかけたら `check` が最後にここを指して落とす
+    // (design.md 決定3、リスク「規則の抜けが Unknown を再生する」)
+    if matches!(outcome, Outcome::Poisoned) {
+        out.note_unexplained(before, e.span);
     }
+    outcome
 }
 
 fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Outcome {
@@ -688,14 +725,24 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
         },
 
         ExprKind::Ident(name) => {
+            let before = out.count();
             check_bare(name, decls, locals, ctx, out);
             match locals.get(name) {
                 Some(Binding::Value(Some(ty))) => Outcome::Typed(ty.clone()),
-                // 型の分からないローカル。理由は束縛した側にある
+                // 型の分からないローカル。束縛した側が既に診断している
                 Some(Binding::Value(None)) => Outcome::Poisoned,
-                // スロットは値ではない。読みの診断は requirement / eval の側にある
-                Some(Binding::Slot(_)) => Outcome::Poisoned,
-                None => bare_value(name, decls),
+                // スロットは trait の窓であって値ではない
+                Some(Binding::Slot(_)) => {
+                    out.push(format!("{ctx}: `{name}` はスロットなので値になりません"));
+                    Outcome::Poisoned
+                }
+                None => {
+                    let outcome = bare_value(name, decls);
+                    if matches!(outcome, Outcome::Poisoned) {
+                        out.explain(before, format!("{ctx}: `{name}` は値として読めません"));
+                    }
+                    outcome
+                }
             }
         }
 
@@ -705,9 +752,16 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
         // 関連関数や ambient の型射影なので、値にはならない
         ExprKind::Path(parts) => {
             let [enum_name, variant] = parts.as_slice() else {
+                out.push(format!(
+                    "{ctx}: `{}` は値として読めません",
+                    parts.join("::")
+                ));
                 return Outcome::Poisoned;
             };
             if !decls.enums.contains_key(enum_name) {
+                out.push(format!(
+                    "{ctx}: `{enum_name}::{variant}` は値として読めません"
+                ));
                 return Outcome::Poisoned;
             }
             match payload_of(enum_name, variant, decls) {
@@ -772,7 +826,24 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                     );
                     Some(declared)
                 }
-                None => synth(value, cx, locals, out).ty().cloned(),
+                None => {
+                    let before = out.count();
+                    match synth(value, cx, locals, out) {
+                        Outcome::Typed(ty) => Some(ty),
+                        // 初期化子だけでは型が決まらない束縛は型無しで作らない。
+                        // 期待型を与えられる唯一の場所が注釈(design.md 決定2)
+                        Outcome::Poisoned => {
+                            out.explain(
+                                before,
+                                format!(
+                                    "{ctx}: `{name}` の型が初期化子から決まりません。`let {name}: T = ...` と注釈してください"
+                                ),
+                            );
+                            None
+                        }
+                        Outcome::Diverges => None,
+                    }
+                }
             };
             locals.insert(name.clone(), Binding::Value(ty));
             unit()
@@ -838,16 +909,21 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                     Outcome::Poisoned => poisoned = true,
                 }
             }
-            match (want(expected), &contextual) {
+            match (want(expected), &contextual, element) {
                 // 期待型のある位置は生成の境界。要素は個別に照合済みなので、
                 // 配列全体はその期待型として適合する
-                (Some(expected), Some(_)) => Outcome::Typed(expected.clone()),
-                // 空配列も、型の分かる要素が一つも無い配列も、独立には型を持たない
-                _ if poisoned => Outcome::Poisoned,
-                _ => match element {
-                    Some(element) => Outcome::Typed(array_of(element)),
-                    None => Outcome::Poisoned,
-                },
+                (Some(expected), Some(_), _) => Outcome::Typed(expected.clone()),
+                // 型の分かる要素が一つも無い。空配列も、`nil` だけの配列もここ。
+                // 後の使用から遡らず、この場で要素型を要求する
+                (_, _, None) => {
+                    out.push(format!(
+                        "{ctx}: 配列の要素型が決まりません。宛先の型か `let xs: [T] = ...` の注釈で要素型を与えてください"
+                    ));
+                    Outcome::Poisoned
+                }
+                // どれかの要素が基準と食い違った。理由はその要素の位置にある
+                (_, _, Some(_)) if poisoned => Outcome::Poisoned,
+                (_, _, Some(element)) => Outcome::Typed(array_of(element)),
             }
         }
 
@@ -1042,8 +1118,9 @@ fn resolve<'d>(
     out: &mut Out,
 ) -> Result<&'d FnSig, Outcome> {
     let decls = cx.decls;
+    let before = out.count();
     let selected = match &callee.kind {
-        // 直接呼び出し。名前は値として読まれない。未宣言の関数は requirement が報告する
+        // 直接呼び出し。名前は値として読まれない
         ExprKind::Ident(name) => Ok(decls.fns.get(name)),
         ExprKind::Field(recv, name) => {
             // ambient スロット経由は宣言 trait の契約だけを見る。スロット名は
@@ -1065,6 +1142,11 @@ fn resolve<'d>(
         }
         ExprKind::Path(parts) => {
             let [first, name] = parts.as_slice() else {
+                out.push(format!(
+                    "{}: `{}` の呼び出し先が決まりません",
+                    cx.ctx,
+                    parts.join("::")
+                ));
                 return Err(Outcome::Poisoned);
             };
             // 宣言済み enum の variant なら constructor。関連関数や ambient の
@@ -1085,8 +1167,19 @@ fn resolve<'d>(
     };
     match selected {
         Ok(Some(sig)) => Ok(sig),
-        // レシーバの型が分からない、あるいは宣言を知らない型のメンバー
-        Ok(None) => Err(Outcome::Poisoned),
+        // 宣言を知らない関数・型・レシーバの形。検査済みプログラムでは
+        // 呼び出し先が必ず一意に決まる(design.md 決定6)
+        Ok(None) => {
+            out.explain(
+                before,
+                format!(
+                    "{}: `{}` の呼び出し先が決まりません",
+                    cx.ctx,
+                    member(callee)
+                ),
+            );
+            Err(Outcome::Poisoned)
+        }
         Err(message) => {
             out.push(format!("{}: {message}", cx.ctx));
             Err(Outcome::Poisoned)
@@ -1100,9 +1193,13 @@ fn equality(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
     let result = Outcome::Typed(plain("bool"));
     let left_nil = matches!(lhs.kind, ExprKind::Nil);
     let right_nil = matches!(rhs.kind, ExprKind::Nil);
-    // 両辺 `nil` は nominal な optional 型を決められない
+    // 両辺 `nil` は nominal な optional 型を決められない(design.md 決定7)
     if left_nil && right_nil {
-        return result;
+        out.push(format!(
+            "{}: `==` の両辺が `nil` なので optional の型が決まりません",
+            cx.ctx
+        ));
+        return Outcome::Poisoned;
     }
     if left_nil || right_nil {
         let value = if left_nil { rhs } else { lhs };
@@ -1151,9 +1248,13 @@ fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
             other => other,
         };
     }
+    let before = out.count();
     let left = match synth(lhs, cx, locals, out) {
         Outcome::Typed(ty) => ty,
         other => {
+            if matches!(other, Outcome::Poisoned) {
+                out.explain(before, format!("{ctx}: `??` の左辺の型が決まりません"));
+            }
             synth(rhs, cx, locals, out);
             return other;
         }
@@ -1187,6 +1288,7 @@ fn match_expr(
     locals: &mut Locals,
     out: &mut Out,
 ) -> Outcome {
+    let before = out.count();
     let matched = matched_enum(subject, cx, locals, out);
     check_arms(arms, matched.as_deref(), cx.decls, cx.ctx, out);
 
@@ -1200,13 +1302,21 @@ fn match_expr(
         if let Some(guard) = &arm.guard {
             let mut guard_locals = inner.clone();
             let site = Site::What("arm の guard");
-            walk(
+            let before = out.count();
+            let outcome = walk(
                 guard,
                 Some((&plain("bool"), &site)),
                 cx,
                 &mut guard_locals,
                 out,
             );
+            // guard が偽になりうるかは網羅性に効くので、実行前に `bool` を確定する
+            if matches!(outcome, Outcome::Poisoned) {
+                out.explain(
+                    before,
+                    format!("{}: arm の guard の型が決まりません", cx.ctx),
+                );
+            }
         }
         let what = format!("arm `{}` の値", arm.pattern.label());
         let site = Site::What(&what);
@@ -1231,14 +1341,21 @@ fn match_expr(
     }
 
     match want(expected) {
+        // 全 arm が抜けるなら合流点も抜ける。空 enum を 0 arm で網羅した
+        // `match` もここ。宛先があっても値は産まれない(design.md 決定5)
+        _ if !continues => Outcome::Diverges,
         // 期待型のある位置は arm ごとに照合済みなので、式全体では二度言わない
         Some(expected) => Outcome::Typed(expected.clone()),
-        // 全 arm が抜けるなら合流点も抜ける(空 enum の 0 arm を含む)
-        None if !continues => Outcome::Diverges,
         None if poisoned => Outcome::Poisoned,
         None => match result {
             Some(result) => Outcome::Typed(result),
-            None => Outcome::Poisoned,
+            None => {
+                out.explain(
+                    before,
+                    format!("{}: `match` の結果型が決まりません", cx.ctx),
+                );
+                Outcome::Poisoned
+            }
         },
     }
 }
@@ -1373,7 +1490,16 @@ fn merge(expected: Expect, taken: Outcome, other: Outcome) -> Outcome {
 /// `for x in xs` のループ変数の型。反復対象は非 optional な配列でなければ
 /// ならない(design.md 決定5)。
 fn iterated(iter: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Option<KnownType> {
-    let Outcome::Typed(ty) = synth(iter, cx, locals, out) else {
+    let before = out.count();
+    let outcome = synth(iter, cx, locals, out);
+    let Outcome::Typed(ty) = outcome else {
+        // 反復対象の型が決まらないとループ変数の型も決まらない
+        if matches!(outcome, Outcome::Poisoned) {
+            out.explain(
+                before,
+                format!("{}: `for` の反復対象の型が決まりません", cx.ctx),
+            );
+        }
         return None;
     };
     let Some(element) = ty.element() else {
@@ -1403,6 +1529,12 @@ fn check_provision(binder: &Provision, ty: Option<&KnownType>, cx: &Cx, out: &mu
         return;
     };
     let Some(ty) = ty else {
+        // 型の分からない提供を実行時へ回さない(design.md 決定3)
+        out.push(format!(
+            "{}: `{}` に提供する値の型が決まりません",
+            cx.ctx,
+            binder.slot()
+        ));
         return;
     };
     // 提供できるのは trait を実装した具体型そのものだけ。配列と optional は
@@ -2015,8 +2147,9 @@ rank: Rank }
     #[test]
     fn 呼び出し先の名前は裸のstructとして読まない() {
         // `User(1)` は関数呼び出しであって struct 値の読みではない。
-        // 未定義関数の検査は requirement の仕事
-        assert!(errors("struct User { id: int }\nfn main() { User(1) }\n").is_empty());
+        // 責められるのは呼び出し先で、フィールドを持つ struct の裸の読みではない
+        let e = only("struct User { id: int }\nfn main() { User(1) }\n");
+        assert!(e.contains("`User` の呼び出し先が決まりません"), "{e}");
     }
 
     // ---- 4. 分かる enum 型 ----
@@ -2141,7 +2274,9 @@ rank: Rank }
             ))
             .is_empty()
         );
-        assert!(errors(&format!("{RANKS}fn f() {{ User::nope }}\n")).is_empty());
+        // enum を修飾していない path は値にならないので、実行前に落ちる
+        let e = only(&format!("{RANKS}fn f() {{ User::nope }}\n"));
+        assert!(e.contains("`User::nope` は値として読めません"), "{e}");
     }
 
     // ---- 4c. match ----
@@ -2177,13 +2312,24 @@ rank: Rank }
             assert!(e.contains(expected), "{subject}: {e}");
         }
 
-        let e = only(&format!(
+        // 対象の型が決まらない `match` も実行前に落ちる。根本は束縛の側なので
+        // どちらも位置付きで出る
+        let e = errors(&format!(
             "{RANKS}fn f() {{\n\
              \x20 let unknown = nil\n\
              \x20 let n = match unknown {{ Rank::Bronze: 1\nRank::Gold: 2 }}\n\
              }}\n"
         ));
-        assert!(e.contains("`match` の対象の型が決まりません"), "{e}");
+        assert!(
+            e.iter()
+                .any(|e| e.contains("`unknown` の型が初期化子から決まりません")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|e| e.contains("`match` の対象の型が決まりません")),
+            "{e:?}"
+        );
     }
 
     #[test]
@@ -2341,16 +2487,19 @@ rank: Rank }
     }
 
     /// `if` の条件と同じ推論境界。型が分からない guard は実行時へ委ねる
+    /// guard が偽になりうるかは網羅性に効くので、`bool` を実行前に確定する
     #[test]
-    fn 型の分からないguardは実行時へ委ねる() {
+    fn 型の決まらないguardを実行前に報告する() {
+        let e = errors(&format!(
+            "{RANKS}fn f(r: Rank -> int) {{\n\
+             \x20 let unknown = nil\n\
+             \x20 match r {{ Rank::Gold if unknown: 1\n_: 0 }}\n\
+             }}\n"
+        ));
         assert!(
-            errors(&format!(
-                "{RANKS}fn f(r: Rank -> int) {{\n\
-                 \x20 let unknown = nil\n\
-                 \x20 match r {{ Rank::Gold if unknown: 1\n_: 0 }}\n\
-                 }}\n"
-            ))
-            .is_empty()
+            e.iter()
+                .any(|e| e.contains("arm の guard の型が決まりません")),
+            "{e:?}"
         );
     }
 
@@ -2817,8 +2966,12 @@ rank: Rank }
             .is_empty()
         );
         // 宣言済み enum を修飾していても variant でなければ constructor に
-        // ならず、宣言を知らない型のメンバーとして従来どおり保留される
-        assert!(errors(&format!("{LOOKUP}fn f() {{ Lookup::Nope(1) }}\n")).is_empty());
+        // ならず、呼び出し先が一意に決まらないので実行前に落ちる
+        let e = only(&format!("{LOOKUP}fn f() {{ Lookup::Nope(1) }}\n"));
+        assert!(
+            e.contains("`Lookup::Nope` の呼び出し先が決まりません"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -2979,6 +3132,34 @@ rank: Rank }
             "{RANKS}fn never_called(-> int) {{ Gold }}\nfn main() {{ assert true }}\n"
         ));
         assert!(e.starts_with("never_called: "), "{e}");
+    }
+
+    // ---- 4g. 空 enum の match ----
+
+    /// 空 enum を 0 arm で網羅した `match` は値を産まない。宛先があっても
+    /// 期待型と照合しない(design.md 決定5)
+    #[test]
+    fn 空enumの0armmatchは値を産まない() {
+        const NEVER: &str = "enum Never {}\n";
+
+        // 戻り値の位置
+        let e = errors(&format!(
+            "{NEVER}fn f(n: Never -> int) {{ match n {{}} }}\n"
+        ));
+        assert!(e.is_empty(), "{e:?}");
+
+        // 宛先の位置
+        let e = errors(&format!(
+            "{NEVER}fn f(n: Never -> int) {{ let x: int = match n {{}}\n 0 }}\n"
+        ));
+        assert!(e.is_empty(), "{e:?}");
+
+        // 引数の位置
+        let e = errors(&format!(
+            "{NEVER}fn take(x: int -> int) {{ x }}\n\
+             fn f(n: Never -> int) {{ take(match n {{}}) }}\n"
+        ));
+        assert!(e.is_empty(), "{e:?}");
     }
 
     // ---- 5. 今回の保証外 ----
@@ -3332,18 +3513,26 @@ rank: Rank }
         assert!(e.contains("`int` は struct ではない"), "{e}");
     }
 
+    /// 型の決まらないレシーバは、フィールドの読みを実行時へ委ねずに落とす
     #[test]
-    fn 型の分からないレシーバのフィールドは診断しない() {
-        // 型の分からない反復対象の束縛と、戻り値型の無い呼び出し結果は推論の外
+    fn 型の決まらないレシーバのフィールドを実行前に報告する() {
+        let e = errors(&format!(
+            "{NESTED}fn f() {{\n\
+             \x20 let unknown = nil\n\
+             \x20 for x in unknown {{ x.nope }}\n\
+             \x20 unknown.?nope\n\
+             }}\n"
+        ));
+        // 根本は束縛。反復対象も optional field access もそこから説明される
         assert!(
-            errors(&format!(
-                "{NESTED}fn f() {{\n\
-                 \x20 let unknown = nil\n\
-                 \x20 for x in unknown {{ x.nope }}\n\
-                 \x20 unknown.?nope\n\
-                 }}\n"
-            ))
-            .is_empty()
+            e.iter()
+                .any(|e| e.contains("`unknown` の型が初期化子から決まりません")),
+            "{e:?}"
+        );
+        assert!(
+            e.iter()
+                .any(|e| e.contains("`for` の反復対象の型が決まりません")),
+            "{e:?}"
         );
     }
 
@@ -3515,7 +3704,9 @@ rank: Rank }
             assert!(e.contains("`Rank`"), "{expr}: {e}");
             assert!(e.contains("`nil`"), "{expr}: {e}");
         }
-        assert!(errors("fn f(-> bool) { nil == nil }\n").is_empty());
+        // 両辺 `nil` はどちらからも nominal な optional 型を決められない
+        let e = only("fn f(-> bool) { nil == nil }\n");
+        assert!(e.contains("両辺が `nil`"), "{e}");
     }
 
     // ---- 12. optional fallback ----
@@ -3588,16 +3779,27 @@ rank: Rank }
     }
 
     #[test]
-    fn 型の分からない左辺のfallbackは保留する() {
+    fn 型の決まらない左辺のfallbackを実行前に報告する() {
+        let e = errors(&format!(
+            "{RANKS}fn f(-> Grade) {{\n\
+             \x20 let unknown = nil\n\
+             \x20 unknown ?? Gold\n\
+             }}\n"
+        ));
         assert!(
-            errors(&format!(
-                "{RANKS}fn f(-> Grade) {{\n\
-                 \x20 let unknown = nil\n\
-                 \x20 unknown ?? Gold\n\
-                 }}\n"
-            ))
-            .is_empty()
+            e.iter()
+                .any(|e| e.contains("`unknown` の型が初期化子から決まりません")),
+            "{e:?}"
         );
+
+        // 注釈を与えれば通る
+        let e = errors(&format!(
+            "{RANKS}fn f(-> Rank) {{\n\
+             \x20 let known: Rank? = nil\n\
+             \x20 known ?? Gold\n\
+             }}\n"
+        ));
+        assert!(e.is_empty(), "{e:?}");
     }
 
     #[test]
@@ -3645,10 +3847,13 @@ rank: Rank }
     }
 
     #[test]
-    fn 型の分からない条件と表明は診断しない() {
+    fn 型の決まらない条件と表明を実行前に報告する() {
+        let e =
+            errors("fn f() {\n let unknown = nil\n for x in unknown { if x { assert x } }\n}\n");
         assert!(
-            errors("fn f() {\n let unknown = nil\n for x in unknown { if x { assert x } }\n}\n")
-                .is_empty()
+            e.iter()
+                .any(|e| e.contains("`unknown` の型が初期化子から決まりません")),
+            "{e:?}"
         );
     }
 
@@ -3731,13 +3936,24 @@ rank: Rank }
 
     #[test]
     fn 型の分からない初期化子の束縛は後の代入で型を得ない() {
-        // 代入から遡って型を決めるには分岐の合流と到達性が要る(design.md 決定4)
+        // 代入から遡って型を決めるには分岐の合流と到達性が要る(design.md 決定4)。
+        // 遡らない代わりに、束縛の時点で注釈を要求する
+        let e = errors(&format!(
+            "{FIELDS}fn f() {{\n let r = nil\n r = Gold\n r = Low\n}}\n"
+        ));
         assert!(
-            errors(&format!(
-                "{FIELDS}fn f() {{\n let r = nil\n r = Gold\n r = Low\n}}\n"
-            ))
-            .is_empty()
+            e.iter()
+                .any(|e| e.contains("`r` の型が初期化子から決まりません")),
+            "{e:?}"
         );
+
+        // 注釈があれば宛先の型が決まるので、食い違う代入が報告される
+        let e = only(&format!(
+            "{FIELDS}fn f() {{\n let r: Rank? = nil\n r = Gold\n r = Low\n}}\n"
+        ));
+        assert!(e.contains("`r` への代入"), "{e}");
+        assert!(e.contains("`Rank?`"), "{e}");
+        assert!(e.contains("`Grade`"), "{e}");
     }
 
     #[test]
@@ -3778,19 +3994,31 @@ rank: Rank }
 
     #[test]
     fn 型の分からない要素を含む配列は型を持たない() {
-        // 空配列も、`nil` しか無い配列も、後の使用から遡って型を得ない
-        assert!(
-            errors(
-                "fn take(n: int -> int) { n }\n\
-                 fn main() {\n\
-                 \x20 let empty = []\n\
-                 \x20 let nils = [nil, nil]\n\
-                 \x20 let a = take(empty)\n\
-                 \x20 let b = take(nils)\n\
-                 }\n",
-            )
-            .is_empty()
+        // 空配列も、`nil` しか無い配列も、後の使用から遡って型を得ない。
+        // 遡らない代わりに、リテラルの時点で要素型を要求する
+        let e = errors(
+            "fn main() {\n\
+             \x20 let empty = []\n\
+             \x20 let nils = [nil, nil]\n\
+             }\n",
         );
+        assert_eq!(e.len(), 2, "{e:?}");
+        assert!(
+            e.iter().all(|e| e.contains("配列の要素型が決まりません")),
+            "{e:?}"
+        );
+
+        // 注釈か宛先の型があれば要素型が決まる
+        let e = errors(
+            "struct User { id: int }\n\
+             fn take(xs: [User] -> [User]) { xs }\n\
+             fn main() {\n\
+             \x20 let empty: [User] = []\n\
+             \x20 let nils: [User?] = [nil, nil]\n\
+             \x20 let direct = take([])\n\
+             }\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
     }
 
     /// 配列の検査環境。要素が enum・optional・入れ子のフィールドを1つずつ持つ
@@ -4057,17 +4285,28 @@ rank: Rank }
         assert!(e.contains("`Database` に `save` はありません"), "{e}");
     }
 
+    /// レシーバの型が決まらない呼び出しは解決できないので実行前に落ちる。
+    /// 根本は束縛なので、そこだけを指す(design.md 決定6)
     #[test]
-    fn 型の分からないレシーバの呼び出しは保留する() {
-        assert!(
-            errors(&format!(
-                "{CALLS}fn f() {{\n\
-                 \x20 let u = nil\n\
-                 \x20 u.nope(1)\n\
-                 }}\n"
-            ))
-            .is_empty()
-        );
+    fn 型の決まらないレシーバの呼び出しを実行前に報告する() {
+        let e = only(&format!(
+            "{CALLS}fn f() {{\n\
+             \x20 let u = nil\n\
+             \x20 u.nope(1)\n\
+             }}\n"
+        ));
+        assert!(e.contains("`u` の型が初期化子から決まりません"), "{e}");
+    }
+
+    /// 配列と optional にはメンバーが無いので、レシーバの型が分かっても
+    /// 呼び出し先は決まらない
+    #[test]
+    fn メンバーを持たないレシーバの呼び出しを報告する() {
+        let e = only(&format!("{CALLS}fn f(xs: [Store]) {{ xs.nope(1) }}\n"));
+        assert!(e.contains("`nope` の呼び出し先が決まりません"), "{e}");
+
+        let e = only(&format!("{CALLS}fn f(s: Store?) {{ s.nope(1) }}\n"));
+        assert!(e.contains("`nope` の呼び出し先が決まりません"), "{e}");
     }
 
     #[test]
