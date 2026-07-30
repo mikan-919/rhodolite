@@ -30,6 +30,8 @@
 //!     variant は呼び出さない限り値にならない
 //!   - `match` の arm は宣言 payload と同じ個数の pattern 要素を持ち、
 //!     一つの pattern が同じ名前を二度束縛しない
+//!   - `match` の catch-all `_` は一度だけ、最後の arm として現れる。
+//!     あれば残りの variant を全部受けるので網羅的になる
 //!
 //! 型の同一性は形と後置 `?` の一致だけ(nominal)。配列は要素型まで含めて
 //! 一致しないと同じ型ではない。期待型のある宛先では
@@ -882,13 +884,25 @@ fn arm_locals(arm: &MatchArm, decls: &Decls, locals: &Locals) -> Locals {
     inner
 }
 
-/// arm の集合が対象 enum の宣言 variant と完全に一致するか見る。
-/// 対象の enum が分からないときは、arm 自身の整合だけを見る。
+/// arm の集合が対象 enum の宣言 variant を余さず一度ずつ扱うか見る。`_` が
+/// あれば残りは全部そこへ行くので、一意で最後であることだけを課す
+/// (design.md 決定3)。対象の enum が分からないときは arm 自身の整合だけを見る。
 fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str, out: &mut Out) {
     let mut covered: BTreeSet<&str> = BTreeSet::new();
     // 呼び出し時点の span は `match` 式全体。arm を指す診断の間だけ差し替える
     let whole = out.span;
+    // 先頭 `_` の span。後続 arm が現れたときに「最後でない」と言う位置
+    let mut catch_all: Option<Span> = None;
+    let mut said_non_final = false;
     for arm in arms {
+        // 後続 arm は到達しないが、それ自体の整合は続けて見る
+        if let Some(first) = catch_all
+            && !said_non_final
+        {
+            out.span = Some(first);
+            out.push(format!("{ctx}: `_` は最後の arm でなければなりません"));
+            said_non_final = true;
+        }
         out.span = Some(arm.span);
         let MatchPattern::Variant {
             enum_name,
@@ -896,6 +910,11 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
             bindings,
         } = &arm.pattern
         else {
+            if catch_all.is_none() {
+                catch_all = Some(arm.span);
+            } else {
+                out.push(format!("{ctx}: arm `_` が重複しています"));
+            }
             continue;
         };
         let arm_name = arm.pattern.label();
@@ -924,8 +943,13 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
 
     out.span = whole;
 
-    // 欠落は「無いもの」なので指すべき arm が無い。式全体が唯一正しい位置
+    // 欠落は「無いもの」なので指すべき arm が無い。式全体が唯一正しい位置。
+    // `_` があれば欠落は残らない。全 variant を書いた上での `_` は冗長だが、
+    // 到達しない式を言う一般の診断がまだ無いので黙って許す(design.md 決定3)
     let Some(matched) = matched else { return };
+    if catch_all.is_some() {
+        return;
+    }
     let missing: Vec<&str> = decls.enums[matched]
         .iter()
         .map(|variant| short_name(variant))
@@ -2105,6 +2129,73 @@ rank: Rank }
     }
 
     #[test]
+    fn catch_all_armは残りのvariantを網羅する() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank -> int) {{ match r {{ Rank::Gold: 1\n_: 0 }} }}\n"
+            ))
+            .is_empty()
+        );
+        // payload を持つ variant も `_` が引き受ける
+        assert!(
+            errors(&format!(
+                "{LOOKUP}fn f(l: Lookup -> str) {{\n\
+                 \x20 match l {{\n\
+                 \x20   Lookup::Missing(reason): reason\n\
+                 \x20   _: \"other\"\n\
+                 \x20 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    /// 全 variant を書いた上での `_` は到達しないが、到達しない式を言う一般の
+    /// 診断がまだ無いので黙って許す(design.md 決定3)
+    #[test]
+    fn 全variantを書いた後のcatch_allは許す() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn f(r: Rank -> int) {{\n\
+                 \x20 match r {{ Rank::Bronze: 1\nRank::Gold: 2\n_: 0 }}\n\
+                 }}\n"
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn 重複したcatch_allを報告する() {
+        let errors = errors(&format!(
+            "{RANKS}fn f(r: Rank -> int) {{ match r {{ Rank::Gold: 1\n_: 0\n_: 2 }} }}\n"
+        ));
+        // 2つ目の `_` は重複であり、同時に1つ目を最後でなくする
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].contains("`_` は最後の arm"), "{errors:?}");
+        assert!(errors[1].contains("arm `_` が重複"), "{errors:?}");
+    }
+
+    #[test]
+    fn catch_allの後ろにarmは書けない() {
+        let errors = errors(&format!(
+            "{RANKS}fn f(r: Rank -> int) {{ match r {{ _: 0\nRank::Gold: 1 }} }}\n"
+        ));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("`_` は最後の arm"), "{errors:?}");
+    }
+
+    /// `_` を巡る診断はどれも arm を指す。欠落だけが match 式全体を指す
+    #[test]
+    fn catch_allの診断はそのarmを指す() {
+        let src = format!("{RANKS}fn f(r: Rank -> int) {{ match r {{ _: 0\nRank::Gold: 1 }} }}\n");
+        assert_eq!(spanned(&src, "最後の arm"), "_: 0");
+
+        let src =
+            format!("{RANKS}fn f(r: Rank -> int) {{ match r {{ Rank::Gold: 1\n_: 0\n_: 2 }} }}\n");
+        assert_eq!(spanned(&src, "重複"), "_: 2");
+    }
+
+    #[test]
     fn 空のenumはarmゼロで網羅的() {
         assert!(
             errors("enum Never {}\nfn f(n: Never -> int) { match n { } }\n")
@@ -2141,6 +2232,38 @@ rank: Rank }
              }}\n"
         ));
         assert!(e.contains("arm `Rank::Gold` の値"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+    }
+
+    /// `_` の本体も他の arm と同じ結果型の検査を受け、診断では `_` と綴られる
+    #[test]
+    fn catch_allの本体も結果型を照合する() {
+        assert!(
+            errors(&format!(
+                "{RANKS}fn take(s: str) {{ s }}\n\
+                 fn f(r: Rank) {{ take(match r {{ Rank::Gold: \"g\"\n_: \"other\" }}) }}\n"
+            ))
+            .is_empty()
+        );
+
+        let e = only(&format!(
+            "{RANKS}fn take(s: str) {{ s }}\n\
+             fn f(r: Rank) {{ take(match r {{ Rank::Gold: \"g\"\n_: 0 }}) }}\n"
+        ));
+        assert!(e.contains("arm `_` の値"), "{e}");
+        assert!(e.contains("`str`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
+    }
+
+    /// 期待型が無ければ最初に型の分かる arm が基準。`_` が先頭でも同じ
+    #[test]
+    fn catch_allも結果型の基準になれる() {
+        let e = only(&format!(
+            "{RANKS}fn f(r: Rank) {{\n\
+             \x20 let label = match r {{ _: \"other\" }}\n\
+             \x20 let n = label + 1\n\
+             }}\n"
+        ));
         assert!(e.contains("`str`"), "{e}");
     }
 

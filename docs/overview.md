@@ -183,9 +183,11 @@ payload を持たない variant は、裸の名前に加えて `Rank::Gold` と�
 複数あっても曖昧にならない。`match` は既知の非 optional な enum の値を variant
 ごとに分岐し、選ばれた arm の値を式全体の値にする。arm は対象 enum の宣言 variant
 を過不足なく一度ずつ持たなければならず、欠落・重複・別 enum の variant は実行前に
-落ちる。arm の結果型は期待型、無ければ最初に型の分かる arm を基準にして照合し、
-その型が後続の検査へ流れる。要求推論はどの arm も実行されうるものとして
-全 arm の要求を合流する。
+落ちる。ただし catch-all pattern `_` を最後の arm に一度だけ書けば、限定 arm が
+拾わなかった variant を全部そこが受けるので網羅的になる。`_` の重複と後続 arm は
+実行前に落ちる。実行時は一致する限定 arm が先で、無ければ `_` へ落ちる。arm の
+結果型は期待型、無ければ最初に型の分かる arm を基準にして照合し、その型が後続の
+検査へ流れる。要求推論はどの arm も実行されうるものとして全 arm の要求を合流する。
 
 variant は0個以上の型付き positional payload を宣言できる。payload の型は他の型
 注釈と同じ nominal 規則で正準化される。payload を持つ variant は
@@ -199,7 +201,9 @@ arm は宣言 payload と同じ個数の平坦な pattern 要素を並べる。�
 対応する宣言 payload の型を持ち、その arm 本体の間だけ同名の外側ローカル・宣言・
 ambient スロットを隠す。その型は field の読み・呼び出しの引数・代入・戻り値という
 既存の検査へそのまま流れ、隣の arm にも match の後にも漏れない。`_` は値を捨て、
-名前を導入しないので何も隠さない。enum 値の等値は enum・variant の同一性と payload
+名前を導入しないので何も隠さない。arm 全体の pattern としての `_` も同じで、受けた
+variant の識別も payload も晒さず、本体からは外側の名前がそのまま見える。
+enum 値の等値は enum・variant の同一性と payload
 の対応ごとの構造的同値で、payload の比較には既存の値の等値規則が効く。
 
 `with` の提供は、スロットの契約を実装した具体型だけが置ける。`with db<Postgres>`
@@ -240,6 +244,8 @@ struct Diag {
 | 宣言名の重複・組み込み型名の宣言 | その宣言 |
 | 型検査の式に関する診断 | その式(引数・戻り値・フィールド値は部分式そのもの) |
 | `match` の重複・別 enum・未知 variant・pattern の個数と重複束縛 | その arm |
+| `_` の重複 | 2つ目以降の `_` の arm |
+| `_` が最後でない | 先頭の `_` の arm |
 | `match` の variant 欠落 | `match` 式全体 |
 | `effect` の重複 | その `effect` 宣言 |
 | 未定義の直接呼び出し | その呼び出し |

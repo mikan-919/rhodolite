@@ -1358,6 +1358,45 @@ mod tests {
         assert_eq!(int(&src), 2);
     }
 
+    #[test]
+    fn 限定armが無いvariantはcatch_allへ落ちる() {
+        let src = format!(
+            "{RANKS}fn label(r: Rank -> str) {{\n\
+             \x20 match r {{\n\
+             \x20   Rank::Gold: \"gold\"\n\
+             \x20   _ {{ \"other\" }}\n\
+             \x20 }}\n\
+             }}\n\
+             fn main() {{\n label(Bronze)\n}}\n"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Str(s)) if s == "other"));
+    }
+
+    /// 限定 arm が先。`_` があっても一致する arm の本体だけが走る
+    #[test]
+    fn 限定armはcatch_allより優先する() {
+        let src = format!(
+            "{RANKS}fn boom(-> int) {{ 1 / 0 }}\n\
+             fn main() {{\n match Gold {{ Rank::Gold: 7\n_: boom() }}\n}}\n"
+        );
+        assert_eq!(int(&src), 7);
+    }
+
+    #[test]
+    fn catch_allはpayloadを束縛しない() {
+        let src = format!(
+            "{LOOKUP}fn main() {{\n\
+             \x20 let reason = 1\n\
+             \x20 match Lookup::Missing(\"gone\") {{\n\
+             \x20   Lookup::Skipped: 0\n\
+             \x20   _: reason\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        // payload の名前は増えないので、外側の `reason` がそのまま見える
+        assert_eq!(int(&src), 1);
+    }
+
     /// 静的検査を通さず評価器を直接使う経路の防御。型検査を通れば起きない
     #[test]
     fn 対象がenumでないかarmが無ければ実行時エラー() {

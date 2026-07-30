@@ -1077,6 +1077,49 @@ mod tests {
         assert_eq!(escaping(&p, "f"), set(&["db"]));
     }
 
+    /// 実行時に選ばれるのは1つでも、走査は保守的に全 arm を見る。`_` の本体の
+    /// 要求と呼び出し辺も落とさない
+    #[test]
+    fn catch_allの本体の要求も合流する() {
+        let p = program(
+            "effect db: Database\n\
+             effect clock: Clock\n\
+             effect mail: Mailer\n\
+             fn f(r: Rank) {\n\
+             \x20 match r {\n\
+             \x20   Rank::Gold: db.find(id)\n\
+             \x20   _ {\n\
+             \x20     clock.now()\n\
+             \x20     stamp(r)\n\
+             \x20   }\n\
+             \x20 }\n\
+             }\n\
+             fn stamp(r: Rank) { mail.send(r) }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db", "clock"]));
+        assert_eq!(
+            callees(&p, "f"),
+            set(&["impl Database::find", "impl Clock::now", "stamp"])
+        );
+        // 実行時に `_` が選ばれなくても、その本体の間接要求は残る
+        assert_eq!(analyze(&p).reqs["f"]["mail"].path_names(), vec!["stamp"]);
+    }
+
+    /// `_` は名前を作らないので、同名スロットも隠さない
+    #[test]
+    fn catch_allはスロットを隠さない() {
+        let p = program(
+            "effect db: Database\n\
+             fn f(l: Lookup) {\n\
+             \x20 match l {\n\
+             \x20   Lookup::Found(db): db.save(u)\n\
+             \x20   _: db.find(id)\n\
+             \x20 }\n\
+             }\n",
+        );
+        assert_eq!(escaping(&p, "f"), set(&["db"]));
+    }
+
     /// arm は束縛を導入しないが、本体の `let` は隣の arm へ漏らさない。
     /// 漏れるとスロットを隠してしまい、要求が消える
     #[test]

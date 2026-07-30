@@ -1734,6 +1734,57 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
+    /// `_` の arm は正準化する enum パスを持たないが、本体は他の arm と同じに
+    /// 辿る。輸入モジュールの名前も本体の中で解決される
+    #[test]
+    fn catch_all_armの本体も正準名へ解決する() {
+        let mut program = parse::parse(&join(
+            lex("fn main(r: Rank) {\n\
+                 \x20 match r {\n\
+                 \x20   Rank::Bronze: local()\n\
+                 \x20   _: dep::audit()\n\
+                 \x20 }\n\
+                 }\n")
+            .unwrap(),
+        ))
+        .unwrap();
+        let Item::Fn { body, .. } = &mut program.items[0] else {
+            panic!()
+        };
+
+        let module = ModulePath(vec!["dep".to_string()]);
+        let local = BTreeMap::from([
+            ("Rank".to_string(), "main::Rank".to_string()),
+            ("local".to_string(), "main::local".to_string()),
+        ]);
+        let imported_modules = BTreeMap::from([("dep".to_string(), module.clone())]);
+        let declarations = BTreeMap::from([(
+            module,
+            BTreeMap::from([("audit".to_string(), "dep::audit".to_string())]),
+        )]);
+        let mut diagnostics = Vec::new();
+        resolve_exprs(
+            body,
+            &mut BTreeSet::from(["r".to_string()]),
+            &local,
+            &BTreeMap::new(),
+            &imported_modules,
+            &declarations,
+            &mut diagnostics,
+        );
+
+        let ExprKind::Match { arms, .. } = &body[0].kind else {
+            panic!("match ではない: {:?}", body[0].kind)
+        };
+        assert_eq!(arms[0].pattern.label(), "main::Rank::Bronze");
+        assert_eq!(arms[1].pattern.label(), "_");
+        let ExprKind::Call(callee, _) = &arms[1].body.kind else {
+            panic!("arm 本体が呼び出しではない: {:?}", arms[1].body.kind)
+        };
+        assert!(matches!(&callee.kind, ExprKind::Ident(name) if name == "dep::audit"));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
     /// payload の型は struct フィールドと同じ規則で正準名になる
     #[test]
     fn payloadの型も正準名へ解決する() {

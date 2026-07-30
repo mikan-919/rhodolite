@@ -706,6 +706,90 @@ fn armの中の提供忘れは到達経路付きで失敗する() {
     );
 }
 
+// ---- catch-all arm (src/parse.rs, src/typecheck.rs, src/eval.rs) ----
+
+/// `_` の縦切り。限定 arm の優先、payload を持つ variant の受け止め、
+/// モジュールを跨ぐ enum まで1本のプログラムで通す
+#[test]
+fn catch_all_armは残りのvariantを受けて実行される() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "use dep::{Grade, Low}\n\
+         enum Lookup {\n\
+         \x20 Found(int)\n\
+         \x20 Missing(str)\n\
+         \x20 Skipped\n\
+         }\n\
+         fn describe(l: Lookup -> str) {\n\
+         \x20 match l {\n\
+         \x20   Lookup::Found(n) {\n\
+         \x20     assert n == 7\n\
+         \x20     \"found\"\n\
+         \x20   }\n\
+         \x20   _: \"other\"\n\
+         \x20 }\n\
+         }\n\
+         fn score(g: Grade -> int) {\n\
+         \x20 match g {\n\
+         \x20   Grade::High: 2\n\
+         \x20   _: 0\n\
+         \x20 }\n\
+         }\n\
+         fn main(-> str) {\n\
+         \x20 assert describe(Lookup::Found(7)) == \"found\"\n\
+         \x20 assert describe(Lookup::Missing(\"gone\")) == \"other\"\n\
+         \x20 assert describe(Skipped) == \"other\"\n\
+         \x20 assert score(Low) == 0\n\
+         \x20 describe(Skipped)\n\
+         }\n",
+    );
+    project.write("dep.rd", "enum Grade { Low High }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> \"other\""), "{text}");
+}
+
+#[test]
+fn 型の違うcatch_allの値は実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank -> str) { match r { Rank::Gold: \"g\"\n_: 2 } }\n\
+         fn main() { 1 }\n",
+        "arm `_` の値は `str` ですが、`int` です",
+    );
+}
+
+#[test]
+fn catch_allの後ろのarmは実行前に失敗する() {
+    実行前に失敗する(
+        "enum Rank { Bronze Gold }\n\
+         fn unused(r: Rank -> int) { match r { _: 0\nRank::Gold: 1 } }\n\
+         fn main() { 1 }\n",
+        "`_` は最後の arm でなければなりません",
+    );
+}
+
+/// `_` の本体の ambient 使用も、実行時に選ばれるかによらず要求になる
+#[test]
+fn catch_allの中の提供忘れは到達経路付きで失敗する() {
+    実行前に失敗する(
+        "trait Clock { fn now(self -> int) }\n\
+         effect clock: Clock\n\
+         enum Rank { Bronze Gold }\n\
+         fn stamp(-> int) { clock.now() }\n\
+         fn main(r: Rank -> int) {\n\
+         \x20 match r {\n\
+         \x20   Rank::Gold: 0\n\
+         \x20   _: stamp()\n\
+         \x20 }\n\
+         }\n",
+        "main::clock が要る ← main::stamp ← main::main",
+    );
+}
+
 // ---- payload を持つ variant (src/parse.rs, src/typecheck.rs, src/eval.rs) ----
 
 /// 構築と分解が往復する縦切り。payload の順序・`_`・fieldless の共存・

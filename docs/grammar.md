@@ -266,7 +266,8 @@ enum の値を variant ごとに分岐する。選ばれた arm の値が式全�
 
 ```ebnf
 match_expr    ::= 'match' expr '{' match_arm* '}'
-match_arm     ::= module_path '::' ident pattern? (':' 単純式 | '{' expr* '}')
+match_arm     ::= (module_path '::' ident pattern? | '_')
+                  (':' 単純式 | '{' expr* '}')
 pattern       ::= '(' (pattern_elem (',' pattern_elem)*)? ')'
 pattern_elem  ::= ident | '_'
 ```
@@ -288,17 +289,29 @@ let message = match result {
     }
     Lookup::Skipped: "skipped"
 }
+
+let message = match result {
+    Lookup::Found(user): user.name
+    _: "なし"
+}
 ```
 
 arm の本体は Head と同じ2つの形だけで、区切りはブロックと同じ改行(カンマは
-無い)。arm の pattern は限定参照に固定してあるので、arm 単体から所属 enum が
-決まる。
+無い)。arm の pattern は限定参照か `_` のどちらかで、限定参照に固定してある
+ので arm 単体から所属 enum が決まる。
 
 - 対象は**既知の非 optional な enum**でなければならない。optional なら先に `??`
   で展開する。型が分からない対象は実行時へ回さず、その場で診断する
 - arm は対象 enum の宣言 variant を**過不足なく一度ずつ**持つ。欠落・重複・
   別 enum の variant・宣言に無い variant はすべて実行前に落ちる。宣言 variant が
   0個の enum は arm ゼロで網羅的
+- `_` は限定 arm が拾わなかった variant を**全部**受ける。`_` があれば網羅的
+  なので、残りの variant を書かなくてよい。`_` は**一度だけ**、**最後の arm**
+  として書く。重複と後続 arm は実行前に落ちる。全 variant を書いた上での `_` は
+  到達しないが、到達しない式を言う一般の診断がまだ無いので黙って許す
+- `_` は payload を書けず、**名前を導入しない**。変数も隠さないので、本体からは
+  外側のローカル・宣言・ambient スロットがそのまま見える。値そのものが要るなら
+  限定 arm を書く
 - 期待型のある位置(引数・戻り値・field・代入)では、各 arm をその型と既存の
   適合規則で照合する。期待型が無ければ最初に型の分かる arm を結果型にして残りを
   照合し、その型が後続の検査へ流れる。全 arm が推論の外なら結果型も分からないまま
@@ -312,13 +325,15 @@ arm の本体は Head と同じ2つの形だけで、区切りはブロックと
   そのまま流れる
 - 本体は第二級ブロックで、そこで導入した `let` も隣の arm と後続へ漏れない。
   `return` は既存どおり関数を抜ける
-- 対象は一度だけ評価し、一致した arm だけを走らせる。constructor の引数も
+- 対象は一度だけ評価し、一致した限定 arm だけを走らせる。限定 arm が無ければ
+  `_` へ落ちる。constructor の引数も
   左から一度ずつ評価する。要求推論はどの arm も実行されうるものとして
   **全 arm の要求を合流**する(`if` と同じ保守的な意味論)。payload の名前が
   隠したスロットは、その arm の中では要求にならない
 
-variant 全体を覆う catch-all pattern、guard、入れ子 pattern、名前付き payload、
-payload の field access、enum のメソッドは無い。
+guard、入れ子 pattern、literal や OR の pattern、名前付き payload、
+payload の field access、enum のメソッドは無い。`_` で受けた値そのものを
+名前で受け取る pattern も無い。
 
 ## ambient は4箇所にしか現れない
 

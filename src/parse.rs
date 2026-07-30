@@ -655,9 +655,19 @@ impl<'a> Parser<'a> {
         Ok(arms)
     }
 
-    /// arm 全体の pattern。限定 `Enum::Variant` に payload 要素が続く形だけ。
+    /// arm 全体の pattern。限定 `Enum::Variant` に payload 要素が続く形か、
+    /// 残りの variant を全部受ける `_`(design.md 決定2)。
+    /// 一意性と最後であることは arm span を持つ型検査の側で見る。
     fn match_pattern(&mut self) -> PResult<MatchPattern> {
-        let path = self.name_path("arm の `Enum::Variant`")?;
+        if self.eat(&Tok::Ident("_".to_string())) {
+            // `_` は値を晒さないので payload を書く先が無い
+            if self.at(&Tok::LParen) {
+                return Err(self.err("`_` は payload を束縛できません"));
+            }
+            return Ok(MatchPattern::CatchAll);
+        }
+
+        let path = self.name_path("arm の `Enum::Variant` または `_`")?;
         let Some((enum_name, variant)) = path.rsplit_once("::") else {
             return Err(self.err(&format!(
                 "arm には `Enum::Variant` の形が必要です (実際は `{path}`)"
@@ -1306,6 +1316,34 @@ mod tests {
         let e =
             parse_src("fn f(l: Lookup) {\n match l { Lookup::Found(user: 1 }\n}\n").unwrap_err();
         assert!(e.msg.contains("`)`"), "{}", e.msg);
+    }
+
+    /// `_` は arm 全体の pattern として、単純式形もブロック形も取れる
+    #[test]
+    fn armの全体patternにアンダースコアを書ける() {
+        assert_eq!(
+            arm_patterns(
+                "fn f(r: Rank) {\n\
+                  \x20 let x = match r {\n\
+                  \x20   Rank::Gold: 1\n\
+                  \x20   _ {\n\
+                  \x20     audit()\n\
+                  \x20     0\n\
+                  \x20   }\n\
+                  \x20 }\n\
+                  }\n"
+            ),
+            vec![
+                ("Rank::Gold".to_string(), Vec::new()),
+                ("_".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn 全体patternのアンダースコアはpayloadを取れない() {
+        let e = parse_src("fn f(l: Lookup) {\n match l { _(reason): 1 }\n}\n").unwrap_err();
+        assert!(e.msg.contains("payload を束縛できません"), "{}", e.msg);
     }
 
     #[test]

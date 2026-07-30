@@ -192,8 +192,8 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     /// `{ ... }` — 第二級。値は最後の式
     Block(Vec<Expr>),
-    /// `match rank { Rank::Gold: "gold" }` — fieldless enum の variant ごとの分岐。
-    /// 選ばれた arm の値がこの式の値になる(design.md 決定1)
+    /// `match rank { Rank::Gold: "gold"  _: "other" }` — enum の variant ごとの
+    /// 分岐。選ばれた arm の値がこの式の値になる(design.md 決定1)
     Match {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
