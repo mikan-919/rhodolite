@@ -778,9 +778,7 @@ fn report_unknown(ty: &Type, nominal: &Nominal, out: &mut Out) {
 /// (診断が空のまま `Poison` が残ることはない)。
 fn lower_known(ty: &KnownType, nominal: &Nominal) -> hir::Type {
     let kind = match &ty.kind {
-        KnownKind::Array(element) => {
-            hir::TypeKind::Array(Box::new(lower_known(element, nominal)))
-        }
+        KnownKind::Array(element) => hir::TypeKind::Array(Box::new(lower_known(element, nominal))),
         KnownKind::Named(name) => match builtin(name) {
             Some(builtin) => hir::TypeKind::Builtin(builtin),
             None => nominal
@@ -2969,9 +2967,10 @@ mod tests {
         diagnostics(src).into_iter().map(|d| d.msg).collect()
     }
 
+    /// 診断だけを見る。下ろした HIR は捨てる
     fn diagnostics(src: &str) -> Vec<Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        check(&program)
+        check_and_lower(&program).err().unwrap_or_default()
     }
 
     fn only(src: &str) -> String {
@@ -5772,6 +5771,42 @@ rank: Rank }
             Call(hir::Call::Ctor { .. }) => "ctor",
             Poison => "poison",
         }
+    }
+
+    /// 下ろしが失敗したときの診断。文言・並び・位置と、位置がどのファイルの
+    /// ものかが、モジュールを跨いでも変わらないこと(tasks 4.5)
+    #[test]
+    fn 下ろしの失敗はモジュールを跨いでも同じ診断を出す() {
+        let loaded = crate::module::load_files(&[
+            (
+                "main.rd",
+                "use dep::{User, mark}\nfn main() { let m = mark(1) }\n",
+            ),
+            (
+                "dep.rd",
+                "struct User { id: int }\n\
+                 fn mark(u: User -> User) { u.nope }\n",
+            ),
+        ])
+        .expect("ロードできる");
+        let diagnostics =
+            check_and_lower(&loaded.program).expect_err("どちらのモジュールにも誤りがある");
+
+        let shown: Vec<&str> = diagnostics.iter().map(|d| d.msg.as_str()).collect();
+        assert_eq!(
+            shown,
+            [
+                "dep::mark: `dep::User` にフィールド `nope` はありません",
+                "main::main: `dep::mark` の第 1 引数は `dep::User` ですが、`int` を渡しています",
+            ],
+            "宣言順に出る"
+        );
+        // 位置はそれぞれ自分のファイルを指す。`main.rd` が src 0
+        let sources: Vec<u32> = diagnostics
+            .iter()
+            .map(|d| d.span.expect("実行前の診断は位置を持つ").src)
+            .collect();
+        assert_eq!(sources, [1, 0], "{diagnostics:?}");
     }
 
     /// 別のモジュールから見た同じ宣言は、正準名が同じなので同じ ID になる。

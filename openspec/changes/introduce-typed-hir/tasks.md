@@ -35,10 +35,10 @@
 
 - [x] 4.1 Change the authoritative type-checking traversal to emit HIR as it computes types and call targets instead of recovering facts in a second pass
 - [x] 4.2 Expose `check_and_lower` as `Result<hir::Program, Vec<Diag>>` and discard all partial HIR when diagnostics exist
-- [ ] 4.3 Keep a temporary diagnostics-only compatibility wrapper for existing checker tests and migrate tests to the new result boundary in small groups
+- [x] 4.3 Keep a temporary diagnostics-only compatibility wrapper for existing checker tests and migrate tests to the new result boundary in small groups
 - [x] 4.4 Add invariants proving successful HIR contains no poisoned expression, unknown type, unresolved call, unresolved field, or unresolved provision
-- [ ] 4.5 Pin existing diagnostic text, ordering, labels, help, related spans, and cross-module source rendering across failed lowering
-- [ ] 4.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the authoritative HIR boundary as a stable snapshot
+- [x] 4.5 Pin existing diagnostic text, ordering, labels, help, related spans, and cross-module source rendering across failed lowering
+- [x] 4.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the authoritative HIR boundary as a stable snapshot
 
 ## 5. HIR Requirement Analysis
 
