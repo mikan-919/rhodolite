@@ -8,12 +8,12 @@
 
 ## 2. Effective Unit Returns
 
-- [ ] 2.1 Give every function, trait member, and implementation method an effective return type, using explicit annotations when present and `unit` otherwise
-- [ ] 2.2 Type direct, method, associated-function, and slot call results from their effective return types
-- [ ] 2.3 Check explicit returns and final body expressions against effective `unit` for declarations without a return annotation
-- [ ] 2.4 Migrate maintained sources and test fixtures that intentionally return non-`unit` values without annotations
-- [ ] 2.5 Add tests for omitted `unit` returns, invalid omitted non-`unit` returns, recursion, trait conformance, and call-result propagation
-- [ ] 2.6 Run the full test suite and commit effective return types as a stable snapshot
+- [x] 2.1 Give every function, trait member, and implementation method an effective return type, using explicit annotations when present and `unit` otherwise
+- [x] 2.2 Type direct, method, associated-function, and slot call results from their effective return types
+- [x] 2.3 Check explicit returns and final body expressions against effective `unit` for declarations without a return annotation
+- [x] 2.4 Migrate maintained sources and test fixtures that intentionally return non-`unit` values without annotations
+- [x] 2.5 Add tests for omitted `unit` returns, invalid omitted non-`unit` returns, recursion, trait conformance, and call-result propagation
+- [x] 2.6 Run the full test suite and commit effective return types as a stable snapshot
 
 ## 3. Total Checking Result
 

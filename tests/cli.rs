@@ -80,7 +80,7 @@ fn 同名スロットを持つ二つのモジュールを別々に提供して�
            fn read(self -> int) { 1 }\n\
          }\n\
          effect db: StoreApi\n\
-         fn read() { db.read() }\n",
+         fn read(-> int) { db.read() }\n",
     );
     project.write(
         "sides/right.rd",
@@ -92,7 +92,7 @@ fn 同名スロットを持つ二つのモジュールを別々に提供して�
            fn read(self -> int) { 2 }\n\
          }\n\
          effect db: StoreApi\n\
-         fn read() { db.read() }\n",
+         fn read(-> int) { db.read() }\n",
     );
 
     let output = project.run("main.rd");
@@ -109,10 +109,10 @@ fn import名とローカル宣言の衝突を報告する() {
     project.write(
         "main.rd",
         "use dep::{run}\n\
-         fn run() { 1 }\n\
+         fn run(-> int) { 1 }\n\
          fn main() { run() }\n",
     );
-    project.write("dep.rd", "fn run() { 2 }\n");
+    project.write("dep.rd", "fn run(-> int) { 2 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -126,8 +126,8 @@ fn import名とローカル宣言の衝突を報告する() {
 #[test]
 fn useしていないモジュール参照を報告する() {
     let project = Project::new();
-    project.write("main.rd", "fn main() { services::users::run() }\n");
-    project.write("services/users.rd", "fn run() { 1 }\n");
+    project.write("main.rd", "fn main(-> int) { services::users::run() }\n");
+    project.write("services/users.rd", "fn run(-> int) { 1 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -144,9 +144,9 @@ fn ディレクトリuseは参照した子モジュールだけを読み込む()
     project.write(
         "main.rd",
         "use services\n\
-         fn main() { services::users::run() }\n",
+         fn main(-> int) { services::users::run() }\n",
     );
-    project.write("services/users.rd", "fn run() { 7 }\n");
+    project.write("services/users.rd", "fn run(-> int) { 7 }\n");
     project.write("services/billing.rd", "これは読まれてはいけない\n");
 
     let output = project.run("main.rd");
@@ -162,7 +162,7 @@ fn 存在しない選択メンバーを報告する() {
     project.write(
         "main.rd",
         "use services::{missing}\n\
-         fn main() { 0 }\n",
+         fn main(-> int) { 0 }\n",
     );
     std::fs::create_dir_all(project.root.join("services")).unwrap();
 
@@ -181,18 +181,18 @@ fn 循環useを解決できる() {
     project.write(
         "main.rd",
         "use a::{through_b}\n\
-         fn main() { through_b() }\n",
+         fn main(-> int) { through_b() }\n",
     );
     project.write(
         "a.rd",
         "use b::{value as b_value}\n\
-         fn value() { 1 }\n\
-         fn through_b() { b_value() }\n",
+         fn value(-> int) { 1 }\n\
+         fn through_b(-> int) { b_value() }\n",
     );
     project.write(
         "b.rd",
         "use a::{value as a_value}\n\
-         fn value() { a_value() + 1 }\n",
+         fn value(-> int) { a_value() + 1 }\n",
     );
 
     let output = project.run("main.rd");
@@ -207,7 +207,7 @@ fn 存在しないモジュールを報告する() {
     project.write(
         "main.rd",
         "use missing\n\
-         fn main() { 0 }\n",
+         fn main(-> int) { 0 }\n",
     );
 
     let output = project.run("main.rd");
@@ -225,10 +225,10 @@ fn リーフとディレクトリの衝突を報告する() {
     project.write(
         "main.rd",
         "use conflict\n\
-         fn main() { 0 }\n",
+         fn main(-> int) { 0 }\n",
     );
-    project.write("conflict.rd", "fn value() { 1 }\n");
-    project.write("conflict/child.rd", "fn value() { 2 }\n");
+    project.write("conflict.rd", "fn value(-> int) { 1 }\n");
+    project.write("conflict/child.rd", "fn value(-> int) { 2 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -246,8 +246,8 @@ fn import同士の衝突を報告する() {
          use right::{run}\n\
          fn main() { run() }\n",
     );
-    project.write("left.rd", "fn run() { 1 }\n");
-    project.write("right.rd", "fn run() { 2 }\n");
+    project.write("left.rd", "fn run(-> int) { 1 }\n");
+    project.write("right.rd", "fn run(-> int) { 2 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -264,12 +264,12 @@ fn リーフのメンバーを複数行で選択して別名導入できる() {
            answer as first,\n\
            other as second,\n\
          }\n\
-         fn main() { first() + second() }\n",
+         fn main(-> int) { first() + second() }\n",
     );
     project.write(
         "values.rd",
-        "fn answer() { 20 }\n\
-         fn other() { 22 }\n",
+        "fn answer(-> int) { 20 }\n\
+         fn other(-> int) { 22 }\n",
     );
 
     let output = project.run("main.rd");
@@ -281,7 +281,7 @@ fn リーフのメンバーを複数行で選択して別名導入できる() {
 #[test]
 fn 単一ファイルの既存動作を維持する() {
     let project = Project::new();
-    project.write("main.rd", "fn main() { 42 }\n");
+    project.write("main.rd", "fn main(-> int) { 42 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -295,9 +295,9 @@ fn 選択導入したディレクトリから参照した子だけを読み込�
     project.write(
         "main.rd",
         "use services::{admin as backoffice}\n\
-         fn main() { backoffice::users::run() }\n",
+         fn main(-> int) { backoffice::users::run() }\n",
     );
-    project.write("services/admin/users.rd", "fn run() { 9 }\n");
+    project.write("services/admin/users.rd", "fn run(-> int) { 9 }\n");
     project.write("services/admin/broken.rd", "読まない\n");
 
     let output = project.run("main.rd");
@@ -315,8 +315,8 @@ fn 深いパスでも親のリーフとディレクトリの衝突を報告す�
         "use conflict::child\n\
          fn main() { child::value() }\n",
     );
-    project.write("conflict.rd", "fn value() { 1 }\n");
-    project.write("conflict/child.rd", "fn value() { 2 }\n");
+    project.write("conflict.rd", "fn value(-> int) { 1 }\n");
+    project.write("conflict/child.rd", "fn value(-> int) { 2 }\n");
 
     let output = project.run("main.rd");
     let text = output_text(&output);
@@ -332,7 +332,7 @@ fn 宣言位置の修飾参照から子モジュールを読み込む() {
         "main.rd",
         "use services\n\
          effect db: services::users::StoreApi\n\
-         fn main() { 0 }\n",
+         fn main(-> int) { 0 }\n",
     );
     project.write(
         "services/users.rd",
@@ -357,7 +357,7 @@ fn useしていない宣言位置のモジュール参照を報告する() {
     project.write(
         "main.rd",
         "effect db: services::users::StoreApi\n\
-         fn main() { 0 }\n",
+         fn main(-> int) { 0 }\n",
     );
     project.write(
         "services/users.rd",
@@ -381,8 +381,8 @@ fn ローカル束縛は修飾参照でもモジュールimportを隠す() {
     project.write(
         "main.rd",
         "use services\n\
-         fn helper(services: int) { services::users::run() }\n\
-         fn main() { 0 }\n",
+         fn helper(services: int -> int) { services::users::run() }\n\
+         fn main(-> int) { 0 }\n",
     );
     project.write("services/users.rd", "this must not be read\n");
 
@@ -398,11 +398,11 @@ fn 依存モジュールのtestは今回の実行対象にしない() {
     project.write(
         "main.rd",
         "use dep\n\
-         fn main() { dep::value() }\n",
+         fn main(-> int) { dep::value() }\n",
     );
     project.write(
         "dep.rd",
-        "fn value() { 5 }\n\
+        "fn value(-> int) { 5 }\n\
          test \"dependency test\" { assert false }\n",
     );
 
@@ -416,7 +416,7 @@ fn 依存モジュールのtestは今回の実行対象にしない() {
 #[test]
 fn 裸の相対エントリ名を読み込める() {
     let project = Project::new();
-    project.write("main.rd", "fn main() { 6 }\n");
+    project.write("main.rd", "fn main(-> int) { 6 }\n");
 
     let output = project.run_relative("main.rd");
     let text = output_text(&output);
@@ -433,7 +433,7 @@ fn 呼ばれない関数の不正なstruct生成でも実行前に失敗する()
         "main.rd",
         "struct User { id: int }\n\
          fn unused() { User { id = 1, nope = 2 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
     );
 
     let output = project.run("main.rd");
@@ -466,7 +466,7 @@ fn 宣言どおりのstruct生成はモジュールを跨いでも実行され�
     project.write(
         "main.rd",
         "use dep::{User}\n\
-         fn main() {\n\
+         fn main(-> int) {\n\
            let u = User { rank = 2, id = 1 }\n\
            u.rank\n\
          }\n",
@@ -487,7 +487,7 @@ fn 同一モジュールの裸variantは宣言元へ解決される() {
     project.write(
         "main.rd",
         "enum Rank { Bronze Gold }\n\
-         fn main() { Gold == Gold }\n",
+         fn main(-> bool) { Gold == Gold }\n",
     );
 
     let output = project.run("main.rd");
@@ -503,7 +503,7 @@ fn 別モジュールのvariantをmember_importで導入できる() {
     project.write(
         "main.rd",
         "use dep::{Gold, Bronze}\n\
-         fn main() { Gold == Bronze }\n",
+         fn main(-> bool) { Gold == Bronze }\n",
     );
     project.write("dep.rd", "enum Rank { Bronze Gold }\n");
 
@@ -518,8 +518,8 @@ fn importしたvariantに別名を付けられる() {
     let project = Project::new();
     project.write(
         "main.rd",
-        "use dep::{Gold as Best}\n\
-         fn main() { Best }\n",
+        "use dep::{Rank, Gold as Best}\n\
+         fn main(-> Rank) { Best }\n",
     );
     project.write("dep.rd", "enum Rank { Bronze Gold }\n");
 
@@ -537,7 +537,7 @@ fn variantと同名の宣言を衝突として報告する() {
         "main.rd",
         "enum Rank { Bronze Gold }\n\
          struct Gold {}\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
     );
 
     let output = project.run("main.rd");
@@ -555,7 +555,7 @@ fn 同じvariantを二度並べたenumを報告する() {
     project.write(
         "main.rd",
         "enum Rank { Gold Gold }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
     );
 
     let output = project.run("main.rd");
@@ -573,7 +573,7 @@ fn ローカル束縛はvariantを隠す() {
     project.write(
         "main.rd",
         "enum Rank { Bronze Gold }\n\
-         fn main() {\n\
+         fn main(-> int) {\n\
            let Gold = 7\n\
            Gold\n\
          }\n",
@@ -635,7 +635,7 @@ fn enumでない対象のmatchは実行前に失敗する() {
     実行前に失敗する(
         "enum Rank { Bronze Gold }\n\
          fn unused(n: int) { match n { Rank::Bronze: 1\nRank::Gold: 2 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`match` の対象は非 optional な enum",
     );
 }
@@ -645,7 +645,7 @@ fn 網羅していないmatchは実行前に失敗する() {
     実行前に失敗する(
         "enum Rank { Bronze Gold }\n\
          fn unused(r: Rank -> int) { match r { Rank::Gold: 2 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`main::Rank` の variant `Bronze` を扱っていません",
     );
 }
@@ -664,7 +664,7 @@ fn 別のenumのarmは正準名で報告される() {
          \x20   dep::Grade::Low: 3\n\
          \x20 }\n\
          }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
     );
     project.write("dep.rd", "enum Grade { Low High }\n");
 
@@ -683,7 +683,7 @@ fn 型の違うarmの値は実行前に失敗する() {
     実行前に失敗する(
         "enum Rank { Bronze Gold }\n\
          fn unused(r: Rank -> str) { match r { Rank::Bronze: \"b\"\nRank::Gold: 2 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "arm `main::Rank::Gold` の値は `str` ですが、`int` です",
     );
 }
@@ -757,7 +757,7 @@ fn 型の違うcatch_allの値は実行前に失敗する() {
     実行前に失敗する(
         "enum Rank { Bronze Gold }\n\
          fn unused(r: Rank -> str) { match r { Rank::Gold: \"g\"\n_: 2 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "arm `_` の値は `str` ですが、`int` です",
     );
 }
@@ -767,7 +767,7 @@ fn catch_allの後ろのarmは実行前に失敗する() {
     実行前に失敗する(
         "enum Rank { Bronze Gold }\n\
          fn unused(r: Rank -> int) { match r { _: 0\nRank::Gold: 1 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`_` は最後の arm でなければなりません",
     );
 }
@@ -837,7 +837,7 @@ fn 型の分かる非boolのguardは実行前に失敗する() {
     実行前に失敗する(
         "enum Rank { Bronze Gold }\n\
          fn unused(r: Rank, n: int -> int) { match r { Rank::Gold if n: 1\n_: 0 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "arm の guardは `bool` ですが、`int` です",
     );
 }
@@ -853,7 +853,7 @@ fn guard付きのarmだけのmatchは実行前に失敗する() {
          \x20   Rank::Gold if ready: 1\n\
          \x20 }\n\
          }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "の variant `Gold` を扱っていません",
     );
 }
@@ -935,7 +935,7 @@ fn payloadの構築と分解が往復して実行される() {
 fn use_していないモジュールのpayload型を報告する() {
     実行前に失敗する(
         "enum Lookup { Found(dep::User) }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "モジュール名 `dep` は `use` されていません",
     );
 }
@@ -975,7 +975,7 @@ fn patternの個数違いは実行前に失敗する() {
     実行前に失敗する(
         "enum Lookup { Found(str) }\n\
          fn unused(l: Lookup -> int) { match l { Lookup::Found(a, b): 1 } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "arm `main::Lookup::Found` は payload を 2 個束縛しますが、\
          `main::Lookup::Found` の payload は 1 個です",
     );
@@ -986,7 +986,7 @@ fn 同じ名前を二度束縛するpatternは実行前に失敗する() {
     実行前に失敗する(
         "enum Lookup { Found(str, str) }\n\
          fn unused(l: Lookup -> str) { match l { Lookup::Found(x, x): x } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "arm `main::Lookup::Found` の pattern が `x` を二度束縛しています",
     );
 }
@@ -997,7 +997,7 @@ fn 束縛の型は後続の検査へ流れる() {
         "enum Lookup { Found(str) }\n\
          fn take(n: int) { n }\n\
          fn unused(l: Lookup -> int) { match l { Lookup::Found(reason): take(reason) } }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`main::take` の第 1 引数は `int` ですが、`str` を渡しています",
     );
 }
@@ -1040,7 +1040,7 @@ fn enum型フィールドに同じenumのvariantを入れたプログラムは�
         "main.rd",
         "enum Rank { Bronze Gold }\n\
          struct User { rank: Rank }\n\
-         fn main() {\n\
+         fn main(-> bool) {\n\
            let u = User { rank = Bronze }\n\
            u.rank = Gold\n\
            u.rank == Gold\n\
@@ -1140,7 +1140,7 @@ fn 宣言どおりの呼び出しと戻り値はモジュールを跨いでも�
         "main.rd",
         "use dep::{Rank, Gold, pick}\n\
          fn keep(r: Rank -> Rank) { r }\n\
-         fn main() { keep(pick()) == Gold }\n",
+         fn main(-> bool) { keep(pick()) == Gold }\n",
     );
     project.write(
         "dep.rd",
@@ -1172,7 +1172,7 @@ fn 実行前に失敗する(source: &str, expected: &str) {
 #[test]
 fn 組み込み型名の宣言は実行前に失敗する() {
     実行前に失敗する(
-        "struct int {}\nfn main() { 1 }\n",
+        "struct int {}\nfn main(-> int) { 1 }\n",
         "`int` は組み込み型の名前なので宣言できません",
     );
 }
@@ -1182,7 +1182,7 @@ fn 宣言に無いフィールドの読みは実行前に失敗する() {
     実行前に失敗する(
         "struct User { id: int }\n\
          fn f(u: User -> int) { u.nope }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`nope`",
     );
 }
@@ -1210,7 +1210,7 @@ fn nilを非optionalへ渡すと実行前に失敗する() {
     実行前に失敗する(
         "fn take(n: int) { n }\n\
          fn unused() { take(nil) }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`nil`",
     );
 }
@@ -1218,7 +1218,7 @@ fn nilを非optionalへ渡すと実行前に失敗する() {
 #[test]
 fn 非optionalの左辺へfallbackを使うと実行前に失敗する() {
     実行前に失敗する(
-        "fn unused(n: int) { n ?? 0 }\nfn main() { 1 }\n",
+        "fn unused(n: int) { n ?? 0 }\nfn main(-> int) { 1 }\n",
         "`??` の左辺",
     );
 }
@@ -1229,7 +1229,7 @@ fn fallbackの結果型は実行前の戻り値検査へ届く() {
         "enum Rank { Bronze Gold }\n\
          enum Grade { Low High }\n\
          fn unused(r: Rank? -> Grade) { r ?? Gold }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "戻り値は `main::Grade` ですが、`main::Rank`",
     );
 }
@@ -1242,7 +1242,7 @@ fn optional_field_accessは値を読みnilを伝播して実行できる() {
         "struct User { id: int }\n\
          fn some(-> User?) { User { id = 7 } }\n\
          fn none(-> User?) { nil }\n\
-         fn main() {\n\
+         fn main(-> bool) {\n\
          \x20 assert (some().?id ?? 0) == 7\n\
          \x20 none().?id == nil\n\
          }\n",
@@ -1259,13 +1259,13 @@ fn optional_field_accessのreceiver形式を実行前に検査する() {
     実行前に失敗する(
         "struct User { id: int }\n\
          fn unused(u: User) { u.?id }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "レシーバは optional",
     );
     実行前に失敗する(
         "struct User { id: int }\n\
          fn unused(u: User?) { u.id }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`.?id`",
     );
 }
@@ -1276,7 +1276,7 @@ fn optional_fieldの結果型は実行前の引数検査へ届く() {
         "struct User { name: str }\n\
          fn take(n: int?) { n }\n\
          fn unused(u: User?) { take(u.?name) }\n\
-         fn main() { 1 }\n",
+         fn main(-> int) { 1 }\n",
         "`str?`",
     );
 }
@@ -1330,7 +1330,7 @@ fn 契約を満たさない提供は実行前に失敗する() {
 #[test]
 fn 型の違う再代入は実行前に失敗する() {
     実行前に失敗する(
-        "fn f(n: int) { n = \"x\" }\nfn main() { 1 }\n",
+        "fn f(n: int) { n = \"x\" }\nfn main(-> int) { 1 }\n",
         "`n` への代入",
     );
 }
@@ -1357,7 +1357,7 @@ fn 位置を持つ診断はソース抜粋付きで出る() {
 #[test]
 fn 位置を持たない診断は抜粋なしで出る() {
     let project = Project::new();
-    project.write("main.txt", "fn main() { 1 }\n");
+    project.write("main.txt", "fn main(-> int) { 1 }\n");
 
     let output = project.run("main.txt");
     let text = output_text(&output);
@@ -1389,7 +1389,7 @@ fn テストの実行時エラーはテスト名と抜粋つきで出る() {
     let project = Project::new();
     project.write(
         "main.rd",
-        "fn main() { 1 }\n\
+        "fn main(-> int) { 1 }\n\
          test \"落ちる\" { assert false }\n\
          test \"通る\" { assert true }\n",
     );

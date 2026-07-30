@@ -20,8 +20,9 @@
 //!     一意の宣言へ解決され、`.` と `::` は宣言された `self` の有無と一致する
 //!   - 解決した呼び出しは宣言どおりの引数の個数を持ち、**型の分かる**引数は
 //!     宣言された引数型と適合する
-//!   - 戻り値型を宣言した関数の、**型の分かる**明示 `return` と最後の式は
-//!     その型と適合する
+//!   - 全ての関数・trait メンバー・実装メソッドは実効戻り値型を持つ。注釈が
+//!     あればそれ、無ければ `unit`。**型の分かる**明示 `return` と最後の式は
+//!     その型と適合する(注釈を省略して `unit` 以外を返すのはエラー)
 //!   - 配列リテラルの要素は、期待要素型があればそれと、無ければ互いに適合する
 //!   - `for` の反復対象は非 optional な配列で、ループ変数は要素型を持つ
 //!   - `with` の提供は、**型の分かる限り**スロットの trait を実装した具体型
@@ -140,11 +141,14 @@ impl std::fmt::Display for KnownType {
 
 /// 署名のうち、呼び出し側の検査に要る分だけ。`self` は引数に数えないので
 /// 別のフラグで持つ(design.md 決定1)。
+///
+/// 戻り値型は常に一つ決まる。注釈があればそれ、無ければ `unit`
+/// (design.md 決定1)。「戻り値型が分からない呼び出し」は存在しない
 #[derive(PartialEq, Eq)]
 struct FnSig {
     has_self: bool,
     params: Vec<KnownType>,
-    ret: Option<KnownType>,
+    ret: KnownType,
 }
 
 /// 宣言された署名を検査用の形にする。引数名は実装側の局所名なので落とす。
@@ -152,8 +156,14 @@ fn signature(sig: &Sig) -> FnSig {
     FnSig {
         has_self: sig.has_self,
         params: sig.params.iter().map(|p| known(&p.ty)).collect(),
-        ret: sig.ret.as_ref().map(known),
+        ret: effective_ret(sig),
     }
+}
+
+/// 宣言の実効戻り値型。注釈の省略は `unit` を返す宣言と同じ意味で、
+/// 本体から推論することはしない(design.md 決定1)。
+fn effective_ret(sig: &Sig) -> KnownType {
+    sig.ret.as_ref().map_or_else(|| plain("unit"), known)
 }
 
 /// ローカル束縛。**型が分かっているものだけ**型を持つ。
@@ -250,12 +260,14 @@ pub fn check(program: &Program) -> Vec<Diag> {
                     .iter()
                     .map(|p| (p.name.clone(), Binding::Value(Some(known(&p.ty)))))
                     .collect();
-                let ret = sig.ret.as_ref().map(known);
-                check_body(body, &decls, locals, &sig.name, ret.as_ref(), out);
+                check_body(body, &decls, locals, &sig.name, &effective_ret(sig), out);
             }
+            // test は呼び出されないので署名を持たないが、本体の最後の式と
+            // `return` はどこかの型と照合されなければ検査が閉じない。
+            // 値を返す先が無いので `unit` を実効戻り値にする
             Item::Test { name, body, .. } => {
                 let ctx = format!("test \"{name}\"");
-                check_body(body, &decls, Locals::new(), &ctx, None, out);
+                check_body(body, &decls, Locals::new(), &ctx, &plain("unit"), out);
             }
             Item::Impl {
                 type_name, methods, ..
@@ -270,9 +282,8 @@ pub fn check(program: &Program) -> Vec<Diag> {
                         locals.insert("self".to_string(), Binding::Value(Some(plain(type_name))));
                     }
                     let ctx = format!("impl {type_name}::{}", sig.name);
-                    let ret = sig.ret.as_ref().map(known);
                     out.span = Some(sig.span);
-                    check_body(body, &decls, locals, &ctx, ret.as_ref(), out);
+                    check_body(body, &decls, locals, &ctx, &effective_ret(sig), out);
                 }
             }
             _ => {}
@@ -333,7 +344,7 @@ fn collect(program: &Program, out: &mut Out) -> Decls {
                         FnSig {
                             has_self: false,
                             params: variant.payload.iter().map(known).collect(),
-                            ret: Some(plain(name)),
+                            ret: plain(name),
                         },
                     );
                 }
@@ -483,9 +494,9 @@ fn params(types: &[KnownType]) -> String {
     format!("({})", shown.join(", "))
 }
 
-/// 診断に出す戻り値型。
-fn returned(ty: &Option<KnownType>) -> String {
-    ty.as_ref().map_or("無し".to_string(), |t| format!("`{t}`"))
+/// 診断に出す戻り値型。省略した注釈は `unit` として出る。
+fn returned(ty: &KnownType) -> String {
+    format!("`{ty}`")
 }
 
 fn check_body(
@@ -493,7 +504,7 @@ fn check_body(
     decls: &Decls,
     mut locals: Locals,
     ctx: &str,
-    ret: Option<&KnownType>,
+    ret: &KnownType,
     out: &mut Out,
 ) {
     // ブロックは値ベースなので最後の式も戻り値。明示 `return` は走査側が見る。
@@ -502,7 +513,7 @@ fn check_body(
         return;
     };
     check_exprs(init, decls, &mut locals, ctx, ret, out);
-    check_expr_at(last, ret, decls, &mut locals, ctx, ret, out);
+    check_expr_at(last, Some(ret), decls, &mut locals, ctx, ret, out);
     check_return(last, decls, &locals, ctx, ret, out);
 }
 
@@ -511,7 +522,7 @@ fn check_exprs(
     decls: &Decls,
     locals: &mut Locals,
     ctx: &str,
-    ret: Option<&KnownType>,
+    ret: &KnownType,
     out: &mut Out,
 ) {
     for e in body {
@@ -525,7 +536,7 @@ fn check_expr(
     decls: &Decls,
     locals: &mut Locals,
     ctx: &str,
-    ret: Option<&KnownType>,
+    ret: &KnownType,
     out: &mut Out,
 ) {
     check_expr_at(e, None, decls, locals, ctx, ret, out);
@@ -545,7 +556,7 @@ fn check_expr_at(
     decls: &Decls,
     locals: &mut Locals,
     ctx: &str,
-    ret: Option<&KnownType>,
+    ret: &KnownType,
     out: &mut Out,
 ) {
     let outer = out.span.replace(e.span);
@@ -560,7 +571,7 @@ fn check_expr_kind(
     decls: &Decls,
     locals: &mut Locals,
     ctx: &str,
-    ret: Option<&KnownType>,
+    ret: &KnownType,
     out: &mut Out,
 ) {
     match &e.kind {
@@ -814,7 +825,7 @@ fn check_expr_kind(
             }
         }
         ExprKind::Return(Some(inner)) => {
-            check_expr_at(inner, ret, decls, locals, ctx, ret, out);
+            check_expr_at(inner, Some(ret), decls, locals, ctx, ret, out);
             check_return(inner, decls, locals, ctx, ret, out);
         }
         ExprKind::Unary(UnOp::Neg, inner) => {
@@ -1315,18 +1326,15 @@ fn check_return(
     decls: &Decls,
     locals: &Locals,
     ctx: &str,
-    ret: Option<&KnownType>,
+    ret: &KnownType,
     out: &mut Out,
 ) {
-    let Some(expected) = ret else {
-        return;
-    };
-    let Some(actual) = mismatch(value, expected, decls, locals) else {
+    let Some(actual) = mismatch(value, ret, decls, locals) else {
         return;
     };
     out.push_at(
         value.span,
-        format!("{ctx}: 戻り値は `{expected}` ですが、`{actual}` を返しています"),
+        format!("{ctx}: 戻り値は `{ret}` ですが、`{actual}` を返しています"),
     );
 }
 
@@ -1382,11 +1390,13 @@ fn infer(e: &Expr, decls: &Decls, locals: &Locals) -> Option<KnownType> {
             Some(field_ty)
         }
         // 解決できた呼び出しは宣言戻り値を持つ。診断は `check_expr` の側にある
-        ExprKind::Call(callee, _) => resolve_call(callee, decls, locals)
-            .ok()
-            .flatten()?
-            .ret
-            .clone(),
+        ExprKind::Call(callee, _) => Some(
+            resolve_call(callee, decls, locals)
+                .ok()
+                .flatten()?
+                .ret
+                .clone(),
+        ),
         // 全要素の型が分かって一致するときだけ配列型になる。空配列と、
         // 型の分からない要素や矛盾する要素を含む配列は不明のまま
         // (design.md 決定3)。矛盾の診断は `check_expr` の側にある
@@ -1818,7 +1828,7 @@ rank: Rank }
         assert!(
             errors(
                 "struct User { id: int\nrank: int }\n\
-                 fn main() { User { id = 1, rank = 2 } }\n",
+                 fn main() { let u = User { id = 1, rank = 2 } }\n",
             )
             .is_empty()
         );
@@ -1829,7 +1839,7 @@ rank: Rank }
         assert!(
             errors(
                 "struct User { id: int\nrank: int }\n\
-                 fn main() { User { rank = 2, id = 1 } }\n",
+                 fn main() { let u = User { rank = 2, id = 1 } }\n",
             )
             .is_empty()
         );
@@ -1837,20 +1847,21 @@ rank: Rank }
 
     #[test]
     fn 未知のstructを報告する() {
-        let e = only("fn main() { Missing { x = 1 } }\n");
+        let e = only("fn main() { let m = Missing { x = 1 } }\n");
         assert!(e.contains("struct `Missing` は宣言されていません"), "{e}");
         assert!(e.starts_with("main: "), "{e}");
     }
 
     #[test]
     fn structでない宣言をstructとして使うと報告する() {
-        let e = only("trait Database { fn find(self) }\nfn main() { Database { x = 1 } }\n");
+        let e =
+            only("trait Database { fn find(self) }\nfn main() { let d = Database { x = 1 } }\n");
         assert!(e.contains("`Database` は struct ではありません"), "{e}");
     }
 
     #[test]
     fn enumをstructとして生成すると報告する() {
-        let e = only("enum Rank { Bronze Gold }\nfn main() { Rank { x = 1 } }\n");
+        let e = only("enum Rank { Bronze Gold }\nfn main() { let r = Rank { x = 1 } }\n");
         assert!(e.contains("`Rank` は struct ではありません"), "{e}");
     }
 
@@ -1858,7 +1869,7 @@ rank: Rank }
     fn 不足フィールドを報告する() {
         let e = only(
             "struct User { id: int\nrank: int }\n\
-             fn main() { User { id = 1 } }\n",
+             fn main() { let u = User { id = 1 } }\n",
         );
         assert!(e.contains("`rank`"), "{e}");
         assert!(!e.contains("`id`"), "{e}");
@@ -1868,7 +1879,7 @@ rank: Rank }
     fn 余分なフィールドを報告する() {
         let e = only(
             "struct User { id: int }\n\
-             fn main() { User { id = 1, nope = 2 } }\n",
+             fn main() { let u = User { id = 1, nope = 2 } }\n",
         );
         assert!(e.contains("`nope`"), "{e}");
     }
@@ -1890,7 +1901,7 @@ rank: Rank }
              impl Store {\n\
              \x20 fn make(-> User) { User {} }\n\
              }\n\
-             test \"t\" { User {} }\n",
+             test \"t\" { let u = User {} }\n",
         );
         assert_eq!(errors.len(), 2, "{errors:?}");
         assert!(errors[0].starts_with("impl Store::make: "), "{errors:?}");
@@ -1912,13 +1923,14 @@ rank: Rank }
 
     #[test]
     fn 同名の引数はstruct名を隠す() {
-        assert!(errors("struct User { id: int }\nfn f(User: int) { User }\n").is_empty());
+        assert!(errors("struct User { id: int }\nfn f(User: int -> int) { User }\n").is_empty());
     }
 
     #[test]
     fn letはstruct名を隠す() {
         assert!(
-            errors("struct User { id: int }\nfn f(n: int) { let User = n\nUser }\n").is_empty()
+            errors("struct User { id: int }\nfn f(n: int -> int) { let User = n\nUser }\n")
+                .is_empty()
         );
     }
 
@@ -1972,12 +1984,19 @@ rank: Rank }
 
     #[test]
     fn 同じenumのvariantはstruct生成で受理される() {
-        assert!(errors(&format!("{RANKS}fn main() {{ User {{ rank = Gold }} }}\n")).is_empty());
+        assert!(
+            errors(&format!(
+                "{RANKS}fn main() {{ let u = User {{ rank = Gold }} }}\n"
+            ))
+            .is_empty()
+        );
     }
 
     #[test]
     fn 別のenumのvariantをstruct生成で報告する() {
-        let e = only(&format!("{RANKS}fn main() {{ User {{ rank = High }} }}\n"));
+        let e = only(&format!(
+            "{RANKS}fn main() {{ let u = User {{ rank = High }} }}\n"
+        ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Grade`"), "{e}");
         assert!(e.contains("`rank`"), "{e}");
@@ -1986,7 +2005,7 @@ rank: Rank }
     #[test]
     fn variantを束縛したローカルも型が分かる() {
         let e = only(&format!(
-            "{RANKS}fn main() {{\n let g = High\n User {{ rank = g }}\n}}\n"
+            "{RANKS}fn main() {{\n let g = High\n let u = User {{ rank = g }}\n}}\n"
         ));
         assert!(e.contains("`Grade`"), "{e}");
     }
@@ -2031,7 +2050,7 @@ rank: Rank }
     fn 限定したvariantは裸の参照と同じ値になる() {
         assert!(
             errors(&format!(
-                "{RANKS}fn take(r: Rank) {{ r }}\n\
+                "{RANKS}fn take(r: Rank -> Rank) {{ r }}\n\
                  fn f(-> bool) {{\n\
                  \x20 take(Rank::Gold)\n\
                  \x20 User {{ rank = Rank::Bronze }}\n\
@@ -2107,7 +2126,7 @@ rank: Rank }
             ("xs: [Rank]", "`[Rank]` です"),
         ] {
             let e = only(&format!(
-                "{RANKS}fn f({subject}) {{ match {} {{ Rank::Bronze: 1\nRank::Gold: 2 }} }}\n",
+                "{RANKS}fn f({subject}) {{ let n = match {} {{ Rank::Bronze: 1\nRank::Gold: 2 }} }}\n",
                 subject.split(':').next().unwrap()
             ));
             assert!(e.contains("非 optional な enum"), "{subject}: {e}");
@@ -2115,8 +2134,10 @@ rank: Rank }
         }
 
         let e = only(&format!(
-            "{RANKS}fn unknown() {{ nil }}\n\
-             fn f() {{ match unknown() {{ Rank::Bronze: 1\nRank::Gold: 2 }} }}\n"
+            "{RANKS}fn f() {{\n\
+             \x20 let unknown = nil\n\
+             \x20 let n = match unknown {{ Rank::Bronze: 1\nRank::Gold: 2 }}\n\
+             }}\n"
         ));
         assert!(e.contains("`match` の対象の型が決まりません"), "{e}");
     }
@@ -2280,8 +2301,10 @@ rank: Rank }
     fn 型の分からないguardは実行時へ委ねる() {
         assert!(
             errors(&format!(
-                "{RANKS}fn unknown() {{ nil }}\n\
-                 fn f(r: Rank -> int) {{ match r {{ Rank::Gold if unknown(): 1\n_: 0 }} }}\n"
+                "{RANKS}fn f(r: Rank -> int) {{\n\
+                 \x20 let unknown = nil\n\
+                 \x20 match r {{ Rank::Gold if unknown: 1\n_: 0 }}\n\
+                 }}\n"
             ))
             .is_empty()
         );
@@ -2390,15 +2413,15 @@ rank: Rank }
     fn 期待型のあるmatchは全armをその型で照合する() {
         assert!(
             errors(&format!(
-                "{RANKS}fn take(s: str) {{ s }}\n\
-                 fn f(r: Rank) {{ take(match r {{ Rank::Bronze: \"b\"\nRank::Gold: \"g\" }}) }}\n"
+                "{RANKS}fn take(s: str -> str) {{ s }}\n\
+                 fn f(r: Rank) {{ let s = take(match r {{ Rank::Bronze: \"b\"\nRank::Gold: \"g\" }}) }}\n"
             ))
             .is_empty()
         );
 
         let e = only(&format!(
-            "{RANKS}fn take(s: str) {{ s }}\n\
-             fn f(r: Rank) {{ take(match r {{ Rank::Bronze: \"b\"\nRank::Gold: 1 }}) }}\n"
+            "{RANKS}fn take(s: str -> str) {{ s }}\n\
+             fn f(r: Rank) {{ let s = take(match r {{ Rank::Bronze: \"b\"\nRank::Gold: 1 }}) }}\n"
         ));
         assert!(e.contains("arm `Rank::Gold` の値"), "{e}");
         assert!(e.contains("`str`"), "{e}");
@@ -2421,15 +2444,15 @@ rank: Rank }
     fn catch_allの本体も結果型を照合する() {
         assert!(
             errors(&format!(
-                "{RANKS}fn take(s: str) {{ s }}\n\
-                 fn f(r: Rank) {{ take(match r {{ Rank::Gold: \"g\"\n_: \"other\" }}) }}\n"
+                "{RANKS}fn take(s: str -> str) {{ s }}\n\
+                 fn f(r: Rank) {{ let s = take(match r {{ Rank::Gold: \"g\"\n_: \"other\" }}) }}\n"
             ))
             .is_empty()
         );
 
         let e = only(&format!(
-            "{RANKS}fn take(s: str) {{ s }}\n\
-             fn f(r: Rank) {{ take(match r {{ Rank::Gold: \"g\"\n_: 0 }}) }}\n"
+            "{RANKS}fn take(s: str -> str) {{ s }}\n\
+             fn f(r: Rank) {{ let s = take(match r {{ Rank::Gold: \"g\"\n_: 0 }}) }}\n"
         ));
         assert!(e.contains("arm `_` の値"), "{e}");
         assert!(e.contains("`str`"), "{e}");
@@ -2452,10 +2475,10 @@ rank: Rank }
     fn matchの結果型は後続の検査へ届く() {
         // 束縛を経由しても推論した結果型が残る
         let e = only(&format!(
-            "{RANKS}fn take(n: int) {{ n }}\n\
+            "{RANKS}fn take(n: int -> int) {{ n }}\n\
              fn f(r: Rank) {{\n\
              \x20 let label = match r {{ Rank::Bronze: \"b\"\nRank::Gold: \"g\" }}\n\
-             \x20 take(label)\n\
+             \x20 let n = take(label)\n\
              }}\n"
         ));
         assert!(e.contains("`take` の第 1 引数"), "{e}");
@@ -2494,7 +2517,7 @@ rank: Rank }
         // ブロック形の arm と `return` は推論の外。存在しない型を作らない
         assert!(
             errors(&format!(
-                "{RANKS}fn take(n: int) {{ n }}\n\
+                "{RANKS}fn take(n: int -> int) {{ n }}\n\
                  fn f(r: Rank -> int) {{\n\
                  \x20 take(match r {{\n\
                  \x20   Rank::Bronze {{ \"b\" }}\n\
@@ -2533,7 +2556,7 @@ rank: Rank }
     fn 限定した構築と分解は診断を出さない() {
         assert!(
             errors(&format!(
-                "{LOOKUP}fn take(u: User) {{ u }}\n\
+                "{LOOKUP}fn take(u: User -> User) {{ u }}\n\
                  fn f(u: User -> str) {{\n\
                  \x20 match Lookup::Found(u, 1) {{\n\
                  \x20   Lookup::Found(found, n) {{ take(found)\n\"found\" }}\n\
@@ -2552,7 +2575,7 @@ rank: Rank }
             ("Lookup::Found(u)", "1 個渡しています"),
             ("Lookup::Found(u, 1, 2)", "3 個渡しています"),
         ] {
-            let e = only(&format!("{LOOKUP}fn f(u: User) {{ {call} }}\n"));
+            let e = only(&format!("{LOOKUP}fn f(u: User) {{ let l = {call} }}\n"));
             assert!(e.contains("`Lookup::Found` は引数を 2 個取ります"), "{e}");
             assert!(e.contains(expected), "{e}");
         }
@@ -2561,7 +2584,7 @@ rank: Rank }
     #[test]
     fn 構築の引数の型違いを報告する() {
         let e = only(&format!(
-            "{LOOKUP}fn f(u: User) {{ Lookup::Found(u, \"x\") }}\n"
+            "{LOOKUP}fn f(u: User) {{ let l = Lookup::Found(u, \"x\") }}\n"
         ));
         assert!(e.contains("`Lookup::Found` の第 2 引数"), "{e}");
         assert!(e.contains("`int`"), "{e}");
@@ -2581,15 +2604,15 @@ rank: Rank }
     #[test]
     fn 構築した値は所属enumの型を持つ() {
         let e = only(&format!(
-            "{LOOKUP}fn take(r: Rank) {{ r }}\n\
-             fn f(u: User) {{ take(Lookup::Skipped) }}\n"
+            "{LOOKUP}fn take(r: Rank -> Rank) {{ r }}\n\
+             fn f(u: User) {{ let r = take(Lookup::Skipped) }}\n"
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Lookup`"), "{e}");
 
         let e = only(&format!(
-            "{LOOKUP}fn take(r: Rank) {{ r }}\n\
-             fn f(u: User) {{ take(Lookup::Found(u, 1)) }}\n"
+            "{LOOKUP}fn take(r: Rank -> Rank) {{ r }}\n\
+             fn f(u: User) {{ let r = take(Lookup::Found(u, 1)) }}\n"
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Lookup`"), "{e}");
@@ -2650,7 +2673,7 @@ rank: Rank }
     fn 束縛の型は既存の検査へ流れる() {
         // field の読み・呼び出しの引数・代入・戻り値の4つを1本の match で通す
         let errors = errors(&format!(
-            "{LOOKUP}fn take(n: int) {{ n }}\n\
+            "{LOOKUP}fn take(n: int -> int) {{ n }}\n\
              fn f(l: Lookup -> int) {{\n\
              \x20 match l {{\n\
              \x20   Lookup::Found(found, n) {{ found.rank = Gold\ntake(found) }}\n\
@@ -2739,7 +2762,7 @@ rank: Rank }
     fn payloadの診断は責めるべき式を指す() {
         assert_eq!(
             spanned(
-                &format!("{LOOKUP}fn f(u: User) {{ Lookup::Found(u, \"x\") }}\n"),
+                &format!("{LOOKUP}fn f(u: User) {{ let l = Lookup::Found(u, \"x\") }}\n"),
                 "第 2 引数"
             ),
             "\"x\""
@@ -2795,7 +2818,7 @@ rank: Rank }
     #[test]
     fn 注釈で固定した型は後の参照に届く() {
         let e = only(&format!(
-            "{RANKS}fn main() {{\n let g: Grade = Low\n User {{ rank = g }}\n}}\n"
+            "{RANKS}fn main() {{\n let g: Grade = Low\n let u = User {{ rank = g }}\n}}\n"
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Grade`"), "{e}");
@@ -2849,12 +2872,15 @@ rank: Rank }
 
     #[test]
     fn 宣言どおりの引数の個数は診断を出さない() {
-        assert!(errors("fn f(a: int, b: int) { a }\nfn main(n: int) { f(n, n) }\n").is_empty());
+        assert!(
+            errors("fn f(a: int, b: int -> int) { a }\nfn main(n: int) { let r = f(n, n) }\n")
+                .is_empty()
+        );
     }
 
     #[test]
     fn 引数が足りない呼び出しを報告する() {
-        let e = only("fn f(a: int, b: int) { a }\nfn main(n: int) { f(n) }\n");
+        let e = only("fn f(a: int, b: int -> int) { a }\nfn main(n: int) { let r = f(n) }\n");
         assert!(e.starts_with("main: "), "{e}");
         assert!(e.contains("`f`"), "{e}");
         assert!(e.contains("2 個取ります"), "{e}");
@@ -2863,7 +2889,7 @@ rank: Rank }
 
     #[test]
     fn 引数が多すぎる呼び出しを報告する() {
-        let e = only("fn f(a: int) { a }\nfn main(n: int) { f(n, n) }\n");
+        let e = only("fn f(a: int -> int) { a }\nfn main(n: int) { let r = f(n, n) }\n");
         assert!(e.contains("1 個取ります"), "{e}");
         assert!(e.contains("2 個渡しています"), "{e}");
     }
@@ -2883,7 +2909,7 @@ rank: Rank }
     fn 型の合う引数は診断を出さない() {
         assert!(
             errors(&format!(
-                "{RANKS}fn f(r: Rank) {{ r }}\nfn main() {{ f(Gold) }}\n"
+                "{RANKS}fn f(r: Rank -> Rank) {{ r }}\nfn main() {{ let x = f(Gold) }}\n"
             ))
             .is_empty()
         );
@@ -2892,7 +2918,7 @@ rank: Rank }
     #[test]
     fn 型の違う引数を位置付きで報告する() {
         let e = only(&format!(
-            "{RANKS}fn f(a: Rank, b: Rank) {{ a }}\nfn main() {{ f(Gold, High) }}\n"
+            "{RANKS}fn f(a: Rank, b: Rank -> Rank) {{ a }}\nfn main() {{ let x = f(Gold, High) }}\n"
         ));
         assert!(e.contains("`f` の第 2 引数"), "{e}");
         assert!(e.contains("`Rank`"), "{e}");
@@ -2903,7 +2929,7 @@ rank: Rank }
     fn 非optional引数は同名のoptional引数型へ注入できる() {
         assert!(
             errors(&format!(
-                "{RANKS}fn f(r: Rank?) {{ r }}\nfn main(r: Rank) {{ f(r) }}\n"
+                "{RANKS}fn f(r: Rank? -> Rank?) {{ r }}\nfn main(r: Rank) {{ let x = f(r) }}\n"
             ))
             .is_empty()
         );
@@ -2912,7 +2938,7 @@ rank: Rank }
     #[test]
     fn optional引数は非optional引数型へ注入できない() {
         let e = only(&format!(
-            "{RANKS}fn f(r: Rank) {{ r }}\nfn main(r: Rank?) {{ f(r) }}\n"
+            "{RANKS}fn f(r: Rank -> Rank) {{ r }}\nfn main(r: Rank?) {{ let x = f(r) }}\n"
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Rank?`"), "{e}");
@@ -2922,12 +2948,12 @@ rank: Rank }
     fn nil引数は期待するoptional性と照合する() {
         assert!(
             errors(&format!(
-                "{RANKS}fn f(r: Rank?) {{ r }}\nfn main() {{ f(nil) }}\n"
+                "{RANKS}fn f(r: Rank? -> Rank?) {{ r }}\nfn main() {{ let x = f(nil) }}\n"
             ))
             .is_empty()
         );
         let e = only(&format!(
-            "{RANKS}fn f(r: Rank) {{ r }}\nfn main() {{ f(nil) }}\n"
+            "{RANKS}fn f(r: Rank -> Rank) {{ r }}\nfn main() {{ let x = f(nil) }}\n"
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`nil`"), "{e}");
@@ -2939,7 +2965,7 @@ rank: Rank }
     fn 呼び出し結果を束縛したローカルは型が分かる() {
         let e = only(&format!(
             "{RANKS}fn pick(-> Grade) {{ Low }}\n\
-             fn main() {{\n let g = pick()\n User {{ rank = g }}\n}}\n"
+             fn main() {{\n let g = pick()\n let u = User {{ rank = g }}\n}}\n"
         ));
         assert!(e.contains("`Grade`"), "{e}");
     }
@@ -2947,7 +2973,7 @@ rank: Rank }
     #[test]
     fn 呼び出し結果はそのままフィールド検査に届く() {
         let e = only(&format!(
-            "{RANKS}fn pick(-> Grade) {{ Low }}\nfn main() {{ User {{ rank = pick() }} }}\n"
+            "{RANKS}fn pick(-> Grade) {{ Low }}\nfn main() {{ let u = User {{ rank = pick() }} }}\n"
         ));
         assert!(e.contains("`Rank`"), "{e}");
         assert!(e.contains("`Grade`"), "{e}");
@@ -2962,14 +2988,16 @@ rank: Rank }
         assert!(e.contains("`Grade`"), "{e}");
     }
 
+    /// 前提が反転したテスト。注釈の省略は `unit` を返す宣言そのものなので、
+    /// 呼び出しの結果型が分からないことはもう起きない(design.md 決定1)
     #[test]
-    fn 戻り値型の無い関数の結果は分からないまま() {
-        assert!(
-            errors(&format!(
-                "{RANKS}fn pick() {{ Low }}\nfn main() {{ User {{ rank = pick() }} }}\n"
-            ))
-            .is_empty()
-        );
+    fn 戻り値型を省略した関数の結果はunitとして届く() {
+        let e = only(&format!(
+            "{RANKS}fn pick() {{ assert true }}\n\
+             fn main() {{ let u = User {{ rank = pick() }} }}\n"
+        ));
+        assert!(e.contains("`Rank`"), "{e}");
+        assert!(e.contains("`unit`"), "{e}");
     }
 
     // ---- 8. 宣言された戻り値の検査 ----
@@ -3013,9 +3041,41 @@ rank: Rank }
         assert!(e.contains("`Grade`"), "{e}");
     }
 
+    /// **BREAKING**: 注釈を省略した宣言が `unit` 以外の値で終わるとエラー。
+    /// 本体から戻り値型を推論すると再帰と相互再帰に制約解決が要る(design.md 決定1)
     #[test]
-    fn 戻り値型を宣言しない関数は診断しない() {
-        assert!(errors(&format!("{RANKS}fn pick() {{ Gold }}\n")).is_empty());
+    fn 戻り値型を省略して値を返す関数を報告する() {
+        let e = only(&format!("{RANKS}fn pick() {{ Gold }}\n"));
+        assert!(e.contains("`unit`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+
+        // 明示 `return` も同じ実効戻り値と照合する
+        let e = only(&format!("{RANKS}fn pick() {{ return Gold }}\n"));
+        assert!(e.contains("`unit`"), "{e}");
+        assert!(e.contains("`Rank`"), "{e}");
+    }
+
+    #[test]
+    fn 戻り値型を省略した宣言はunitで終われる() {
+        let e = errors(&format!(
+            "{RANKS}fn stamp(u: User) {{ u.rank = Gold }}\n\
+             fn check(u: User) {{ assert u.rank == Gold }}\n\
+             fn bind(u: User) {{ let r = u.rank }}\n\
+             fn nothing() {{}}\n"
+        ));
+        assert!(e.is_empty(), "{e:?}");
+    }
+
+    /// 実効戻り値は宣言だけから決まるので、本体を辿らずに引ける。
+    /// 再帰と相互再帰がそのまま通る(design.md 決定1)
+    #[test]
+    fn 再帰する宣言も実効戻り値で検査できる() {
+        let e = errors(
+            "fn down(n: int -> int) { down(n - 1) }\n\
+             fn ping(n: int -> int) { pong(n - 1) }\n\
+             fn pong(n: int -> int) { ping(n - 1) }\n",
+        );
+        assert!(e.is_empty(), "{e:?}");
     }
 
     #[test]
@@ -3053,8 +3113,8 @@ rank: Rank }
     fn リテラルは組み込み型を持つ() {
         assert!(
             errors(
-                "fn f(a: int, b: bool, c: str) { a }\n\
-                 fn main() { f(1, true, \"x\") }\n",
+                "fn f(a: int, b: bool, c: str -> int) { a }\n\
+                 fn main() { let r = f(1, true, \"x\") }\n",
             )
             .is_empty()
         );
@@ -3062,7 +3122,7 @@ rank: Rank }
 
     #[test]
     fn 型の違うリテラル引数を報告する() {
-        let e = only("fn f(a: int) { a }\nfn main() { f(\"x\") }\n");
+        let e = only("fn f(a: int -> int) { a }\nfn main() { let r = f(\"x\") }\n");
         assert!(e.contains("`int`"), "{e}");
         assert!(e.contains("`str`"), "{e}");
     }
@@ -3083,7 +3143,7 @@ rank: Rank }
             "enum E { str Other }\n",
             "trait unit { fn f(self) }\n",
             "effect int: Clock\n",
-            "fn bool() { 1 }\n",
+            "fn bool(-> int) { 1 }\n",
         ] {
             let e = only(src);
             assert!(e.contains("組み込み型の名前"), "{src}: {e}");
@@ -3135,10 +3195,10 @@ rank: Rank }
         // 型の分からない反復対象の束縛と、戻り値型の無い呼び出し結果は推論の外
         assert!(
             errors(&format!(
-                "{NESTED}fn unknown() {{ nil }}\n\
-                 fn f() {{\n\
-                 \x20 for x in unknown() {{ x.nope }}\n\
-                 \x20 unknown().?nope\n\
+                "{NESTED}fn f() {{\n\
+                 \x20 let unknown = nil\n\
+                 \x20 for x in unknown {{ x.nope }}\n\
+                 \x20 unknown.?nope\n\
                  }}\n"
             ))
             .is_empty()
@@ -3195,7 +3255,7 @@ rank: Rank }
     fn optional_fieldの結果はfallbackと既存照合へ届く() {
         assert!(
             errors(&format!(
-                "{OPTIONAL_FIELDS}fn take(s: str?) {{ s }}\n\
+                "{OPTIONAL_FIELDS}fn take(s: str? -> str?) {{ s }}\n\
                  fn valid(u: User?, s: str? -> str) {{\n\
                  \x20 s = u.?profile.?name\n\
                  \x20 take(u.?profile.?name)\n\
@@ -3207,7 +3267,7 @@ rank: Rank }
         );
 
         let errors = errors(&format!(
-            "{OPTIONAL_FIELDS}fn take(n: int?) {{ n }}\n\
+            "{OPTIONAL_FIELDS}fn take(n: int? -> int?) {{ n }}\n\
              fn invalid(u: User?, n: int? -> int?) {{\n\
              \x20 n = u.?profile.?name\n\
              \x20 take(u.?profile.?name)\n\
@@ -3242,7 +3302,7 @@ rank: Rank }
         assert!(
             errors(
                 "fn f(a: int, b: int -> int) { a + b * -a / (a - b) }\n\
-                 fn main() { f(1, 2) }\n",
+                 fn main() { let r = f(1, 2) }\n",
             )
             .is_empty()
         );
@@ -3269,7 +3329,7 @@ rank: Rank }
 
     #[test]
     fn 演算の結果は整数として届く() {
-        let e = only("fn f(r: str) { r }\nfn main(n: int) { f(n + 1) }\n");
+        let e = only("fn f(r: str -> str) { r }\nfn main(n: int) { let x = f(n + 1) }\n");
         assert!(e.contains("`str`"), "{e}");
         assert!(e.contains("`int`"), "{e}");
     }
@@ -3322,7 +3382,7 @@ rank: Rank }
     fn optionalと同じ中身のfallbackは中身の型になる() {
         assert!(
             errors(&format!(
-                "{RANKS}fn take(r: Rank) {{ r }}\n\
+                "{RANKS}fn take(r: Rank -> Rank) {{ r }}\n\
                  fn f(o: Rank? -> Rank) {{\n\
                  \x20 let r = o ?? Gold\n\
                  \x20 r = o ?? Bronze\n\
@@ -3338,7 +3398,7 @@ rank: Rank }
     #[test]
     fn fallbackの結果型は後続の照合へ届く() {
         let errors = errors(&format!(
-            "{RANKS}fn take(g: Grade) {{ g }}\n\
+            "{RANKS}fn take(g: Grade -> Grade) {{ g }}\n\
              fn f(o: Rank?, g: Grade -> Grade) {{\n\
              \x20 let x = g\n\
              \x20 x = o ?? Gold\n\
@@ -3379,7 +3439,7 @@ rank: Rank }
     fn nilのfallbackは右辺から中身の型を得る() {
         assert!(
             errors(&format!(
-                "{RANKS}fn take(r: Rank) {{ r }}\nfn f() {{ take(nil ?? Gold) }}\n"
+                "{RANKS}fn take(r: Rank -> Rank) {{ r }}\nfn f() {{ let r = take(nil ?? Gold) }}\n"
             ))
             .is_empty()
         );
@@ -3389,8 +3449,10 @@ rank: Rank }
     fn 型の分からない左辺のfallbackは保留する() {
         assert!(
             errors(&format!(
-                "{RANKS}fn unknown() {{ nil }}\n\
-                 fn f(-> Grade) {{ unknown() ?? Gold }}\n"
+                "{RANKS}fn f(-> Grade) {{\n\
+                 \x20 let unknown = nil\n\
+                 \x20 unknown ?? Gold\n\
+                 }}\n"
             ))
             .is_empty()
         );
@@ -3443,7 +3505,7 @@ rank: Rank }
     #[test]
     fn 型の分からない条件と表明は診断しない() {
         assert!(
-            errors("fn unknown() { nil }\nfn f() { for x in unknown() { if x { assert x } } }\n")
+            errors("fn f() {\n let unknown = nil\n for x in unknown { if x { assert x } }\n}\n")
                 .is_empty()
         );
     }
@@ -3551,13 +3613,15 @@ rank: Rank }
     fn 同じ型の要素からなる配列は型が分かる() {
         assert!(
             errors(
-                "fn take(xs: [int]) { xs }\n\
-                 fn main() { take([1, 2, 3]) }\n",
+                "fn take(xs: [int] -> [int]) { xs }\n\
+                 fn main() { let r = take([1, 2, 3]) }\n",
             )
             .is_empty()
         );
         // 推論した配列型は束縛を越えて既存の照合へ届く
-        let e = only("fn take(xs: [str]) { xs }\nfn main() { let xs = [1, 2]\ntake(xs) }\n");
+        let e = only(
+            "fn take(xs: [str] -> [str]) { xs }\nfn main() { let xs = [1, 2]\nlet r = take(xs) }\n",
+        );
         assert!(e.contains("`[str]`"), "{e}");
         assert!(e.contains("`[int]`"), "{e}");
     }
@@ -3575,12 +3639,12 @@ rank: Rank }
         // 空配列も、`nil` しか無い配列も、後の使用から遡って型を得ない
         assert!(
             errors(
-                "fn take(n: int) { n }\n\
+                "fn take(n: int -> int) { n }\n\
                  fn main() {\n\
                  \x20 let empty = []\n\
                  \x20 let nils = [nil, nil]\n\
-                 \x20 take(empty)\n\
-                 \x20 take(nils)\n\
+                 \x20 let a = take(empty)\n\
+                 \x20 let b = take(nils)\n\
                  }\n",
             )
             .is_empty()
@@ -3629,14 +3693,14 @@ rank: Rank }
     fn 配列の値は要素型について不変() {
         assert!(
             errors(&format!(
-                "{ARRAYS}fn take(xs: [User]?) {{ xs }}\nfn main(xs: [User]) {{ take(xs) }}\n"
+                "{ARRAYS}fn take(xs: [User]? -> [User]?) {{ xs }}\nfn main(xs: [User]) {{ let r = take(xs) }}\n"
             ))
             .is_empty(),
             "外側の optional への注入は既存の規則どおり通る"
         );
 
         let e = only(&format!(
-            "{ARRAYS}fn take(xs: [User?]) {{ xs }}\nfn main(xs: [User]) {{ take(xs) }}\n"
+            "{ARRAYS}fn take(xs: [User?] -> [User?]) {{ xs }}\nfn main(xs: [User]) {{ let r = take(xs) }}\n"
         ));
         assert!(e.contains("`[User?]`"), "{e}");
         assert!(e.contains("`[User]`"), "{e}");
@@ -3721,7 +3785,7 @@ rank: Rank }
             "{CONTRACT}impl Database for Store {{\n\
              \x20 fn find(self, id: int -> User?) {{ nil }}\n\
              \x20 fn empty(-> User?) {{ nil }}\n\
-             \x20 fn extra(self) {{ 1 }}\n\
+             \x20 fn extra(self -> int) {{ 1 }}\n\
              }}\n"
         ));
         assert!(e.contains("`extra`"), "{e}");
@@ -3855,9 +3919,8 @@ rank: Rank }
     fn 型の分からないレシーバの呼び出しは保留する() {
         assert!(
             errors(&format!(
-                "{CALLS}fn unknown() {{ nil }}\n\
-                 fn f() {{\n\
-                 \x20 let u = unknown()\n\
+                "{CALLS}fn f() {{\n\
+                 \x20 let u = nil\n\
                  \x20 u.nope(1)\n\
                  }}\n"
             ))
@@ -3880,15 +3943,17 @@ rank: Rank }
 
     #[test]
     fn 解決した呼び出しの引数の個数と型を検査する() {
-        let e = only(&format!("{CALLS}fn f(s: Store) {{ s.find() }}\n"));
+        let e = only(&format!("{CALLS}fn f(s: Store) {{ let u = s.find() }}\n"));
         assert!(e.contains("`find` は引数を 1 個取ります"), "{e}");
 
-        let e = only(&format!("{CALLS}fn f(s: Store) {{ s.find(\"x\") }}\n"));
+        let e = only(&format!(
+            "{CALLS}fn f(s: Store) {{ let u = s.find(\"x\") }}\n"
+        ));
         assert!(e.contains("`find` の第 1 引数"), "{e}");
         assert!(e.contains("`int`"), "{e}");
         assert!(e.contains("`str`"), "{e}");
 
-        let e = only(&format!("{CALLS}fn f() {{ Store::new(1) }}\n"));
+        let e = only(&format!("{CALLS}fn f() {{ let s = Store::new(1) }}\n"));
         assert!(e.contains("`Store::new` は引数を 0 個取ります"), "{e}");
     }
 
@@ -3896,10 +3961,10 @@ rank: Rank }
     fn 解決した呼び出しの引数にも既存のoptional規則が効く() {
         assert!(
             errors(&format!(
-                "{CALLS}impl Store {{ fn take(self, u: User?) {{ u }} }}\n\
+                "{CALLS}impl Store {{ fn take(self, u: User? -> User?) {{ u }} }}\n\
                  fn f(s: Store, u: User) {{\n\
-                 \x20 s.take(u)\n\
-                 \x20 s.take(nil)\n\
+                 \x20 let a = s.take(u)\n\
+                 \x20 let b = s.take(nil)\n\
                  }}\n"
             ))
             .is_empty(),
@@ -3907,8 +3972,8 @@ rank: Rank }
         );
 
         let e = only(&format!(
-            "{CALLS}impl Store {{ fn take(self, u: User) {{ u }} }}\n\
-             fn f(s: Store, u: User?) {{ s.take(u) }}\n"
+            "{CALLS}impl Store {{ fn take(self, u: User -> User) {{ u }} }}\n\
+             fn f(s: Store, u: User? -> User) {{ s.take(u) }}\n"
         ));
         assert!(e.contains("`User?`"), "{e}");
     }
@@ -3934,14 +3999,34 @@ rank: Rank }
     }
 
     #[test]
-    fn 戻り値型の無いメソッドの結果は分からないまま() {
-        assert!(
-            errors(&format!(
-                "{CALLS}impl Store {{ fn nothing(self) {{ 1 }} }}\n\
-                 fn f(s: Store -> int) {{ s.nothing() }}\n"
-            ))
-            .is_empty()
+    fn 戻り値型を省略したメソッドの結果もunitとして届く() {
+        let e = only(&format!(
+            "{CALLS}impl Store {{ fn nothing(self) {{ assert true }} }}\n\
+             fn f(s: Store -> int) {{ s.nothing() }}\n"
+        ));
+        assert!(e.contains("`int`"), "{e}");
+        assert!(e.contains("`unit`"), "{e}");
+    }
+
+    /// 契約側が注釈を省略していれば、実装側も `unit` を返さなければならない。
+    /// 省略と `-> unit` は同じ宣言(design.md 決定1)
+    #[test]
+    fn trait契約の省略した戻り値はunitとして照合する() {
+        let e = errors(
+            "struct Store {}\n\
+             trait Sink { fn put(self, n: int) }\n\
+             impl Sink for Store { fn put(self, n: int -> unit) { assert n == n } }\n",
         );
+        assert!(e.is_empty(), "{e:?}");
+
+        let e = only(
+            "struct Store {}\n\
+             trait Sink { fn put(self, n: int) }\n\
+             impl Sink for Store { fn put(self, n: int -> int) { n } }\n",
+        );
+        assert!(e.contains("`put` の戻り値"), "{e}");
+        assert!(e.contains("`unit`"), "{e}");
+        assert!(e.contains("`int`"), "{e}");
     }
 
     // ---- 正典 ----
