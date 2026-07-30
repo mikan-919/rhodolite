@@ -129,6 +129,8 @@ $ cargo run examples/missing_handler.rd
 
 文法は `docs/grammar.md`、用語は `CONTEXT.md`、プロジェクトの目的は `README.md`。
 **まだ決まっていない設計は `docs/design-notes/`**（測った結果・却下案・未決の問い）。
+インタプリタを参照実装として残し、型付き HIR から C 生成へ進む順序と各段階の完了線は
+[`docs/compiler-roadmap.md`](./compiler-roadmap.md)。
 
 ## 6. 検査がいま保証すること
 
