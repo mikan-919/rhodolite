@@ -49,8 +49,8 @@
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
 use crate::ast::{
-    BinOp, Expr, ExprKind, Head, Item, MatchArm, PatternBinding, Program, Provision, Sig, Type,
-    TypeKind, UnOp,
+    BinOp, Expr, ExprKind, Head, Item, MatchArm, MatchPattern, PatternBinding, Program, Provision,
+    Sig, Type, TypeKind, UnOp,
 };
 use crate::diag::Diag;
 use crate::lex::Span;
@@ -736,7 +736,7 @@ fn check_expr_kind(
                 let mut inner = arm_locals(arm, decls, locals);
                 check_expr_at(&arm.body, result.as_ref(), decls, &mut inner, ctx, ret, out);
                 if let Some(result) = &result {
-                    let what = format!("arm `{}::{}` の値", arm.enum_name, arm.variant);
+                    let what = format!("arm `{}` の値", arm.pattern.label());
                     require(&arm.body, result, &what, decls, &inner, ctx, out);
                 }
             }
@@ -863,8 +863,17 @@ fn matched_enum(
 /// (design.md 決定5)。
 fn arm_locals(arm: &MatchArm, decls: &Decls, locals: &Locals) -> Locals {
     let mut inner = locals.clone();
-    let payload = payload_of(&arm.enum_name, &arm.variant, decls).unwrap_or(&[]);
-    for (n, binding) in arm.bindings.iter().enumerate() {
+    // `_` は variant も payload も晒さないので、外側のローカルがそのまま見える
+    let MatchPattern::Variant {
+        enum_name,
+        variant,
+        bindings,
+    } = &arm.pattern
+    else {
+        return inner;
+    };
+    let payload = payload_of(enum_name, variant, decls).unwrap_or(&[]);
+    for (n, binding) in bindings.iter().enumerate() {
         if let PatternBinding::Bind(name) = binding {
             // 個数が合わないときは `check_arms` が診断済み。型は付けずに束縛だけ作る
             inner.insert(name.clone(), Binding::Value(payload.get(n).cloned()));
@@ -881,27 +890,34 @@ fn check_arms(arms: &[MatchArm], matched: Option<&str>, decls: &Decls, ctx: &str
     let whole = out.span;
     for arm in arms {
         out.span = Some(arm.span);
-        let arm_name = format!("{}::{}", arm.enum_name, arm.variant);
-        if !decls.enums.contains_key(&arm.enum_name) {
-            out.push(format!("{ctx}: `{}` は enum ではありません", arm.enum_name));
+        let MatchPattern::Variant {
+            enum_name,
+            variant,
+            bindings,
+        } = &arm.pattern
+        else {
+            continue;
+        };
+        let arm_name = arm.pattern.label();
+        if !decls.enums.contains_key(enum_name) {
+            out.push(format!("{ctx}: `{enum_name}` は enum ではありません"));
             continue;
         }
-        let Some(payload) = payload_of(&arm.enum_name, &arm.variant, decls) else {
+        let Some(payload) = payload_of(enum_name, variant, decls) else {
             out.push(format!(
-                "{ctx}: `{arm_name}` は `{}` の variant ではありません",
-                arm.enum_name
+                "{ctx}: `{arm_name}` は `{enum_name}` の variant ではありません"
             ));
             continue;
         };
-        check_pattern(&arm_name, payload, &arm.bindings, ctx, out);
+        check_pattern(&arm_name, payload, bindings, ctx, out);
         let Some(matched) = matched else { continue };
-        if arm.enum_name != matched {
+        if enum_name != matched {
             out.push(format!(
                 "{ctx}: arm `{arm_name}` は `{matched}` の variant ではありません"
             ));
             continue;
         }
-        if !covered.insert(arm.variant.as_str()) {
+        if !covered.insert(variant.as_str()) {
             out.push(format!("{ctx}: arm `{arm_name}` が重複しています"));
         }
     }

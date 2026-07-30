@@ -11,7 +11,8 @@
 //! **この差1行が言語の全部**(CONTEXT.md「ambient」)。
 
 use crate::ast::{
-    BinOp, EnumVariant, Expr, ExprKind, Head, Item, PatternBinding, Program, Provision, Sig, UnOp,
+    BinOp, EnumVariant, Expr, ExprKind, Head, Item, MatchPattern, PatternBinding, Program,
+    Provision, Sig, UnOp,
 };
 use crate::diag::Diag;
 use crate::module::short_name;
@@ -847,31 +848,43 @@ impl<'a> Interp<'a> {
                 else {
                     return fail(format!("`match` の対象は enum だけです ({})", value.show()));
                 };
-                let arm = arms
-                    .iter()
-                    .find(|arm| arm.enum_name == *enum_name && arm.variant == short_name(variant));
+                let exact = arms.iter().find(|arm| {
+                    matches!(
+                        &arm.pattern,
+                        MatchPattern::Variant { enum_name: e, variant: v, .. }
+                            if e == enum_name && *v == short_name(variant)
+                    )
+                });
+                // 限定 arm が無いときだけ `_` へ落ちる。静的検査は `_` を最後に
+                // 強制するが、選択規則そのものを順序に頼らせない(design.md 決定4)
+                let arm = exact.or_else(|| {
+                    arms.iter()
+                        .find(|arm| matches!(arm.pattern, MatchPattern::CatchAll))
+                });
                 let Some(arm) = arm else {
                     return fail(format!(
                         "`{enum_name}.{variant}` に一致する arm がありません"
                     ));
                 };
-                if arm.bindings.len() != payload.len() {
-                    return fail(format!(
-                        "arm `{enum_name}::{}` は payload {} 個を束縛しますが、値の payload は {} 個です",
-                        arm.variant,
-                        arm.bindings.len(),
-                        payload.len()
-                    ));
-                }
-                env.push_scope(
-                    arm.bindings
-                        .iter()
-                        .zip(payload)
-                        .filter_map(|(b, v)| match b {
-                            PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
-                            PatternBinding::Discard => None,
-                        }),
-                );
+                // `_` は payload を晒さないので、arity も問わず空スコープで走る
+                let bindings: &[PatternBinding] = match &arm.pattern {
+                    MatchPattern::Variant { bindings, .. } => {
+                        if bindings.len() != payload.len() {
+                            return fail(format!(
+                                "arm `{}` は payload {} 個を束縛しますが、値の payload は {} 個です",
+                                arm.pattern.label(),
+                                bindings.len(),
+                                payload.len()
+                            ));
+                        }
+                        bindings
+                    }
+                    MatchPattern::CatchAll => &[],
+                };
+                env.push_scope(bindings.iter().zip(payload).filter_map(|(b, v)| match b {
+                    PatternBinding::Bind(name) => Some((name.clone(), v.clone())),
+                    PatternBinding::Discard => None,
+                }));
                 let result = self.eval(&arm.body, env, ambient);
                 env.pop_scope();
                 result

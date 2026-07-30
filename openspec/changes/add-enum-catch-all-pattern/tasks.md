@@ -1,8 +1,8 @@
 ## 1. Explicit arm-pattern representation
 
-- [ ] 1.1 Add `MatchPattern::{Variant, CatchAll}`, move qualified-arm fields under `Variant`, and update AST comments and test helpers.
-- [ ] 1.2 Mechanically update loader, checker, requirement analyzer, and evaluator consumers for the `Variant` case while preserving all existing match behavior.
-- [ ] 1.3 Run formatting and the complete Rust test suite, then commit the verified representation-only snapshot.
+- [x] 1.1 Add `MatchPattern::{Variant, CatchAll}`, move qualified-arm fields under `Variant`, and update AST comments and test helpers.
+- [x] 1.2 Mechanically update loader, checker, requirement analyzer, and evaluator consumers for the `Variant` case while preserving all existing match behavior.
+- [x] 1.3 Run formatting and the complete Rust test suite, then commit the verified representation-only snapshot.
 
 ## 2. Catch-all syntax and static semantics
 

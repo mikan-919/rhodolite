@@ -992,22 +992,29 @@ fn resolve_expr(
                 diagnostics,
             );
             for arm in arms {
-                if !arm
-                    .enum_name
-                    .split("::")
-                    .next()
-                    .is_some_and(|first| locals.contains(first))
-                {
-                    arm.enum_name = resolve_name(
-                        &arm.enum_name,
-                        local,
-                        imported_declarations,
-                        imported_modules,
-                        declarations,
-                    );
-                }
                 let mut arm_locals = locals.clone();
-                bind_pattern(&arm.bindings, &mut arm_locals);
+                // 正準化と payload 束縛は限定 variant にだけある。`_` は素通り
+                if let MatchPattern::Variant {
+                    enum_name,
+                    bindings,
+                    ..
+                } = &mut arm.pattern
+                {
+                    if !enum_name
+                        .split("::")
+                        .next()
+                        .is_some_and(|first| locals.contains(first))
+                    {
+                        *enum_name = resolve_name(
+                            enum_name,
+                            local,
+                            imported_declarations,
+                            imported_modules,
+                            declarations,
+                        );
+                    }
+                    bind_pattern(bindings, &mut arm_locals);
+                }
                 resolve_expr(
                     &mut arm.body,
                     &mut arm_locals,
@@ -1372,16 +1379,22 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             ExprKind::Match { subject, arms } => {
                 collect_expr_paths(std::slice::from_ref(subject), locals, paths);
                 for arm in arms {
-                    if !arm
-                        .enum_name
-                        .split("::")
-                        .next()
-                        .is_some_and(|first| locals.contains(first))
-                    {
-                        collect_name_path(&arm.enum_name, paths);
-                    }
                     let mut arm_locals = locals.clone();
-                    bind_pattern(&arm.bindings, &mut arm_locals);
+                    if let MatchPattern::Variant {
+                        enum_name,
+                        bindings,
+                        ..
+                    } = &arm.pattern
+                    {
+                        if !enum_name
+                            .split("::")
+                            .next()
+                            .is_some_and(|first| locals.contains(first))
+                        {
+                            collect_name_path(enum_name, paths);
+                        }
+                        bind_pattern(bindings, &mut arm_locals);
+                    }
                     collect_expr_paths(std::slice::from_ref(&arm.body), &mut arm_locals, paths);
                 }
             }
@@ -1649,10 +1662,8 @@ mod tests {
             panic!("match ではない: {:?}", body[0].kind)
         };
         assert!(matches!(&subject.kind, ExprKind::Ident(name) if name == "r"));
-        assert_eq!(arms[0].enum_name, "main::Rank");
-        assert_eq!(arms[0].variant, "Bronze");
-        assert_eq!(arms[1].enum_name, "dep::Grade");
-        assert_eq!(arms[1].variant, "Low");
+        assert_eq!(arms[0].pattern.label(), "main::Rank::Bronze");
+        assert_eq!(arms[1].pattern.label(), "dep::Grade::Low");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
         let ExprKind::Call(callee, _) = &arms[0].body.kind else {

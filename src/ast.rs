@@ -211,19 +211,43 @@ pub enum ExprKind {
     },
 }
 
-/// `Rank::Gold: "gold"` / `Lookup::Found(user) { ... }` — 限定 variant と、
-/// 既存 Head と同じ形の本体。限定を必須にすることで arm 単体から所属 enum が分かる。
+/// `Rank::Gold: "gold"` / `Lookup::Found(user) { ... }` / `_: "other"` —
+/// pattern と、既存 Head と同じ形の本体。
 #[derive(Debug)]
 pub struct MatchArm {
-    /// 書かれたままの enum パス。module loader が正準名へ書き換える
-    pub enum_name: String,
-    /// その enum に属する短い variant 名
-    pub variant: String,
-    /// 宣言 payload と同じ個数の平坦な pattern 要素。fieldless なら空
-    /// (design.md 決定3)
-    pub bindings: Vec<PatternBinding>,
+    pub pattern: MatchPattern,
     pub body: Expr,
     pub span: Span,
+}
+
+/// arm 全体の pattern。限定 variant か catch-all のどちらかで、
+/// payload の束縛を持てるのは前者だけ(design.md 決定1)。
+#[derive(Debug)]
+pub enum MatchPattern {
+    /// 限定を必須にすることで arm 単体から所属 enum が分かる
+    Variant {
+        /// 書かれたままの enum パス。module loader が正準名へ書き換える
+        enum_name: String,
+        /// その enum に属する短い variant 名
+        variant: String,
+        /// 宣言 payload と同じ個数の平坦な pattern 要素。fieldless なら空
+        /// (design.md 決定3)
+        bindings: Vec<PatternBinding>,
+    },
+    /// `_`。先行する限定 arm が拾わなかった全 variant を受け、名前を導入しない
+    CatchAll,
+}
+
+impl MatchPattern {
+    /// 診断で arm を指すときの綴り。書かれたままの形をそのまま返す
+    pub fn label(&self) -> String {
+        match self {
+            MatchPattern::Variant {
+                enum_name, variant, ..
+            } => format!("{enum_name}::{variant}"),
+            MatchPattern::CatchAll => "_".to_string(),
+        }
+    }
 }
 
 /// arm pattern の1要素。入れ子も literal も無く、名前か `_` だけ。

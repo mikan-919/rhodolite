@@ -637,34 +637,10 @@ impl<'a> Parser<'a> {
             }
 
             let start = self.span();
-            let path = self.name_path("arm の `Enum::Variant`")?;
-            let Some((enum_name, variant)) = path.rsplit_once("::") else {
-                return Err(self.err(&format!(
-                    "arm には `Enum::Variant` の形が必要です (実際は `{path}`)"
-                )));
-            };
-            // `Lookup::Found(user, _)` — 宣言 payload と同じ個数の平坦な要素。
-            // 個数と型の照合は宣言表を持つ型検査の側にある(design.md 決定3)
-            let mut bindings = Vec::new();
-            if self.eat(&Tok::LParen) {
-                while !self.at(&Tok::RParen) {
-                    let name = self.expect_ident("payload の束縛名または `_`")?;
-                    bindings.push(if name == "_" {
-                        PatternBinding::Discard
-                    } else {
-                        PatternBinding::Bind(name)
-                    });
-                    if !self.eat(&Tok::Comma) {
-                        break;
-                    }
-                }
-                self.expect(&Tok::RParen, "`)` または payload の束縛名")?;
-            }
+            let pattern = self.match_pattern()?;
             let body = self.head_body()?;
             arms.push(MatchArm {
-                enum_name: enum_name.to_string(),
-                variant: variant.to_string(),
-                bindings,
+                pattern,
                 body,
                 span: self.to(start),
             });
@@ -677,6 +653,38 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(arms)
+    }
+
+    /// arm 全体の pattern。限定 `Enum::Variant` に payload 要素が続く形だけ。
+    fn match_pattern(&mut self) -> PResult<MatchPattern> {
+        let path = self.name_path("arm の `Enum::Variant`")?;
+        let Some((enum_name, variant)) = path.rsplit_once("::") else {
+            return Err(self.err(&format!(
+                "arm には `Enum::Variant` の形が必要です (実際は `{path}`)"
+            )));
+        };
+        // `Lookup::Found(user, _)` — 宣言 payload と同じ個数の平坦な要素。
+        // 個数と型の照合は宣言表を持つ型検査の側にある(design.md 決定3)
+        let mut bindings = Vec::new();
+        if self.eat(&Tok::LParen) {
+            while !self.at(&Tok::RParen) {
+                let name = self.expect_ident("payload の束縛名または `_`")?;
+                bindings.push(if name == "_" {
+                    PatternBinding::Discard
+                } else {
+                    PatternBinding::Bind(name)
+                });
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::RParen, "`)` または payload の束縛名")?;
+        }
+        Ok(MatchPattern::Variant {
+            enum_name: enum_name.to_string(),
+            variant: variant.to_string(),
+            bindings,
+        })
     }
 }
 
@@ -1186,7 +1194,8 @@ mod tests {
 
     // ---- match ----
 
-    fn arms(src: &str) -> Vec<(String, String)> {
+    /// arm の pattern を書かれたままの綴りで取り出す。`_` は `"_"`
+    fn arms(src: &str) -> Vec<String> {
         let p = ok(src);
         let Item::Fn { body, .. } = &p.items[0] else {
             panic!()
@@ -1197,18 +1206,13 @@ mod tests {
         let ExprKind::Match { arms, .. } = &value.kind else {
             panic!("match ではない: {:?}", value.kind)
         };
-        arms.iter()
-            .map(|a| (a.enum_name.clone(), a.variant.clone()))
-            .collect()
+        arms.iter().map(|a| a.pattern.label()).collect()
     }
 
     #[test]
     fn matchは限定variantのarmを改行で並べる() {
         // 一行形とブロック形が混ざっても、arm の並びは同じ
-        let expected = vec![
-            ("Rank".to_string(), "Bronze".to_string()),
-            ("Rank".to_string(), "Gold".to_string()),
-        ];
+        let expected = vec!["Rank::Bronze".to_string(), "Rank::Gold".to_string()];
         assert_eq!(
             arms(
                 "fn f(r: Rank) {\n\
@@ -1226,7 +1230,7 @@ mod tests {
         // 修飾された enum パスも1つの名前として保つ
         assert_eq!(
             arms("fn f(r: Rank) {\n let x = match r { dep::Rank::Gold: 1 }\n}\n"),
-            vec![("dep::Rank".to_string(), "Gold".to_string())]
+            vec!["dep::Rank::Gold".to_string()]
         );
     }
 
@@ -1254,16 +1258,22 @@ mod tests {
             panic!("match ではない: {:?}", value.kind)
         };
         arms.iter()
-            .map(|a| {
-                let bindings = a
-                    .bindings
-                    .iter()
-                    .map(|b| match b {
-                        PatternBinding::Bind(name) => name.clone(),
-                        PatternBinding::Discard => "_".to_string(),
-                    })
-                    .collect();
-                (format!("{}::{}", a.enum_name, a.variant), bindings)
+            .map(|a| match &a.pattern {
+                MatchPattern::Variant {
+                    enum_name,
+                    variant,
+                    bindings,
+                } => {
+                    let bindings = bindings
+                        .iter()
+                        .map(|b| match b {
+                            PatternBinding::Bind(name) => name.clone(),
+                            PatternBinding::Discard => "_".to_string(),
+                        })
+                        .collect();
+                    (format!("{enum_name}::{variant}"), bindings)
+                }
+                MatchPattern::CatchAll => ("_".to_string(), Vec::new()),
             })
             .collect()
     }

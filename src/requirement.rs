@@ -20,7 +20,7 @@
 //! 「いま提供されているスロットの集合」を持ち回る必要が出た時点で、
 //! 同じ走査に畳んだ。`scan` の1回の再帰が2・3・4を兼ねている。
 
-use crate::ast::{Expr, ExprKind, Head, Item, PatternBinding, Program, Provision};
+use crate::ast::{Expr, ExprKind, Head, Item, MatchPattern, PatternBinding, Program, Provision};
 use crate::diag::Diag;
 use crate::lex::Span;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -321,9 +321,12 @@ fn scan(
             scan(subject, slots, provided, locals, out);
             for arm in arms {
                 let mut inner_locals = locals.clone();
-                for binding in &arm.bindings {
-                    if let PatternBinding::Bind(name) = binding {
-                        inner_locals.insert(name.clone());
+                // `_` は名前を作らないので、外側のローカルとスロットがそのまま見える
+                if let MatchPattern::Variant { bindings, .. } = &arm.pattern {
+                    for binding in bindings {
+                        if let PatternBinding::Bind(name) = binding {
+                            inner_locals.insert(name.clone());
+                        }
                     }
                 }
                 scan(&arm.body, slots, provided, &mut inner_locals, out);
