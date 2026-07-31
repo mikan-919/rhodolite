@@ -34,7 +34,7 @@ close-static-type-checking（完了）
 introduce-typed-hir（完了）
         │
         ▼
-define-ambient-runtime-abi（次）
+define-ambient-runtime-abi（進行中）
         │
         ▼
 emit-core-c-programs
@@ -57,7 +57,7 @@ compiled v1
 | 0 | 完了 | archived changes | AST インタプリタと v1 正典 |
 | 1 | 完了 | archived `close-static-type-checking` | Unknown のない検査成功 |
 | 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
-| 3 | 次 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
+| 3 | 進行中 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 未着手 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |
 | 5 | 未着手 | `compile-data-values` | struct・enum・optional・配列の C 表現 |
 | 6 | 未着手 | `compile-traits-and-ambient` | trait・slot・`with` の C 生成 |
@@ -113,7 +113,8 @@ HIR に置き場所が無い。
 
 ## 3. ambient の低水準契約を決める
 
-想定 change: `define-ambient-runtime-abi`
+OpenSpec:
+[`define-ambient-runtime-abi`](../openspec/changes/define-ambient-runtime-abi/)
 
 この段階も内部設計なので、原則として `skip_specs: true` とする。コード生成より先に、
 要求推論の結果をどの引数とランタイム表現へ落とすかを固定する。
