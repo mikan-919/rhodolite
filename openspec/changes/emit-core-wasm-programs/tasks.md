@@ -9,20 +9,20 @@
 
 ## 2. Add Public Re-exports
 
-- [ ] 2.1 Extend lexing/parsing and AST dumps for top-level-prefix `pub use`, preserving every
+- [x] 2.1 Extend lexing/parsing and AST dumps for top-level-prefix `pub use`, preserving every
   existing `use` path, selection, alias, multiline, and placement rule
-- [ ] 2.2 Build deterministic module public-member tables that preserve canonical declaration
+- [x] 2.2 Build deterministic module public-member tables that preserve canonical declaration
   identity through aliases and transitive selected re-exports, including cyclic graph resolution
-- [ ] 2.3 Enforce the existing single namespace for public/local/import names and add
+- [x] 2.3 Enforce the existing single namespace for public/local/import names and add
   source-positioned diagnostics for collisions, missing public members, and unresolved re-export
   cycles
-- [ ] 2.4 Carry all public item identities plus the entry module's explicitly selected public
+- [x] 2.4 Carry all public item identities plus the entry module's explicitly selected public
   function names through loading and typed HIR lowering without recursively flattening public
   module namespaces
-- [ ] 2.5 Add parser, loader, HIR, and CLI tests for ordinary-use privacy, public functions and
+- [x] 2.5 Add parser, loader, HIR, and CLI tests for ordinary-use privacy, public functions and
   types, aliases, transitive re-exports, module re-exports, collisions, cycles, and explicit entry
   function selection
-- [ ] 2.6 Run formatting, the full test suite, canonical and multi-module CLI cases, and strict
+- [x] 2.6 Run formatting, the full test suite, canonical and multi-module CLI cases, and strict
   OpenSpec validation, then commit public re-exports as a stable snapshot
 
 ## 3. Generalize Specialization Roots

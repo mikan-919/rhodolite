@@ -17,6 +17,9 @@ pub struct UseDecl {
     pub path: Vec<String>,
     pub alias: Option<String>,
     pub members: Option<Vec<UseMember>>,
+    /// `pub use` か。読み込みも局所名の導入も `use` と同じで、
+    /// 公開形だけが導入した名前を宣言元モジュールの公開メンバーにも載せる
+    pub public: bool,
     pub span: Span,
 }
 

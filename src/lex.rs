@@ -48,6 +48,9 @@ pub enum Tok {
     Effect,
     Test,
     Use,
+    /// `pub use` の接頭辞。`use` と同じく、トップレベル接頭部でだけ
+    /// キーワードとして働き、それ以外の位置では識別子に戻る
+    Pub,
     As,
     Return,
     Assert,
@@ -268,6 +271,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "effect" => Tok::Effect,
         "test" => Tok::Test,
         "use" => Tok::Use,
+        "pub" => Tok::Pub,
         "as" => Tok::As,
         "return" => Tok::Return,
         "assert" => Tok::Assert,
@@ -385,6 +389,7 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::Effect
             | Tok::Test
             | Tok::Use
+            | Tok::Pub
             | Tok::As
             | Tok::Return
             | Tok::Assert

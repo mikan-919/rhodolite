@@ -1661,3 +1661,35 @@ fn 割り算の失敗は実行時診断として出る() {
         assert!(text.contains(expected), "{text}");
     }
 }
+
+/// `pub use` を挟んだ多モジュール構成が、そのまま従来の実行経路で走る
+#[test]
+fn 再エクスポートした関数を跨いで実行できる() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "pub use mid::{find as find_user}\n\
+         fn main(-> int) { find_user() }\n",
+    );
+    project.write("mid.rd", "pub use users::{find}\n");
+    project.write("users.rd", "fn find(-> int) { 41 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("  main -> 41"), "{text}");
+}
+
+/// 普通の `use` は下流へ通らない。公開したいなら `pub` を書く
+#[test]
+fn 再エクスポートしていないメンバーの選択を報告する() {
+    let project = Project::new();
+    project.write("main.rd", "use mid::{find}\nfn main(-> int) { find() }\n");
+    project.write("mid.rd", "use users::{find}\n");
+    project.write("users.rd", "fn find(-> int) { 1 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("メンバー `find` がありません"), "{text}");
+}

@@ -88,6 +88,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok("use".to_string())
             }
+            Tok::Pub => {
+                self.bump();
+                Ok("pub".to_string())
+            }
             Tok::As => {
                 self.bump();
                 Ok("as".to_string())
@@ -126,7 +130,7 @@ impl<'a> Parser<'a> {
         let mut uses = Vec::new();
         let mut items = Vec::new();
         self.skip_newlines();
-        while self.at(&Tok::Use) {
+        while self.at(&Tok::Use) || self.starts_pub_use() {
             uses.push(self.use_decl()?);
             self.skip_newlines();
         }
@@ -135,7 +139,7 @@ impl<'a> Parser<'a> {
             if self.at(&Tok::Eof) {
                 break;
             }
-            if self.at(&Tok::Use) {
+            if self.at(&Tok::Use) || self.starts_pub_use() {
                 return Err(self.err("`use` はモジュール先頭の接頭部にだけ書けます"));
             }
             items.push(self.item()?);
@@ -143,8 +147,14 @@ impl<'a> Parser<'a> {
         Ok(Program { uses, items })
     }
 
+    /// `pub` 単体は識別子に戻るので、`use` が続くときだけ宣言の始まりと見る。
+    fn starts_pub_use(&self) -> bool {
+        self.at(&Tok::Pub) && self.toks.get(self.pos + 1).map(|t| &t.tok) == Some(&Tok::Use)
+    }
+
     fn use_decl(&mut self) -> PResult<UseDecl> {
         let start = self.span();
+        let public = self.eat(&Tok::Pub);
         self.expect(&Tok::Use, "`use`")?;
         let first = self.expect_ident("モジュール名")?;
         if first == "super" || first == "crate" {
@@ -181,6 +191,7 @@ impl<'a> Parser<'a> {
                     path,
                     alias: None,
                     members: Some(members),
+                    public,
                     span: self.to(start),
                 });
             }
@@ -196,6 +207,7 @@ impl<'a> Parser<'a> {
             path,
             alias,
             members: None,
+            public,
             span: self.to(start),
         })
     }
@@ -970,6 +982,10 @@ impl<'a> Parser<'a> {
             Tok::Use => {
                 self.bump();
                 ExprKind::Ident("use".to_string())
+            }
+            Tok::Pub => {
+                self.bump();
+                ExprKind::Ident("pub".to_string())
             }
             Tok::As => {
                 self.bump();
@@ -1764,6 +1780,39 @@ mod tests {
     #[test]
     fn asはuse以外では既存どおり識別子として使える() {
         ok("fn as() { 1 }\nfn main() { as() }\n");
+    }
+
+    /// `pub use` は `use` と同じ形をすべて受ける。違いは公開フラグ1つだけ
+    #[test]
+    fn pub_useはuseと同じ形を受けて公開フラグだけが変わる() {
+        let p = ok("pub use data::database as db_module\n\
+             pub use services::{\n\
+             \x20 users,\n\
+             \x20 billing as payments,\n\
+             }\n\
+             use private_dep\n\
+             fn main() { db_module::connect() }\n");
+        assert_eq!(p.uses.len(), 3);
+        assert!(p.uses[0].public);
+        assert_eq!(p.uses[0].alias.as_deref(), Some("db_module"));
+        assert!(p.uses[1].public);
+        assert_eq!(
+            p.uses[1].members.as_ref().unwrap()[1].alias.as_deref(),
+            Some("payments")
+        );
+        assert!(!p.uses[2].public);
+    }
+
+    #[test]
+    fn pub_useもトップレベル接頭部にだけ書ける() {
+        let error = parse_src("fn first() { 1 }\npub use services\n").unwrap_err();
+        assert!(error.msg.contains("先頭"), "{}", error.msg);
+    }
+
+    /// `pub` 単体は宣言を始めない。`use` が続かなければ従来どおり識別子
+    #[test]
+    fn pubはuse以外では既存どおり識別子として使える() {
+        ok("fn pub() { 1 }\nfn main() { pub() }\n");
     }
 
     #[test]

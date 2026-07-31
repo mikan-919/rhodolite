@@ -67,6 +67,31 @@ pub struct LoadedProgram {
     pub program: Program,
     pub entry: String,
     pub sources: Vec<SourceFile>,
+    /// エントリーモジュールが `pub use path::{...}` で明示選択した公開束縛を
+    /// 公開名の昇順で持つ。ホストから呼べる関数の候補はここからしか出ない。
+    ///
+    /// モジュール形の `pub use path` は名前空間だけを公開するので、
+    /// 配下の関数は入らない(public-reexports spec)
+    pub public_exports: Vec<PublicExport>,
+}
+
+/// エントリーモジュールの公開名1つと、それが指す宣言の正準名。
+///
+/// 関数とは限らない。struct や enum を明示選択したときも公開名前空間には
+/// 載るので、ホスト関数への絞り込みは HIR 側(CallableId が引けるか)で行う
+#[derive(Clone, Debug)]
+pub struct PublicExport {
+    pub name: String,
+    pub canonical: String,
+    pub span: Span,
+}
+
+/// モジュールが公開しているメンバー1つ。`pub use` だけがここへ名前を載せる。
+#[derive(Clone, Debug)]
+enum PublicMember {
+    /// 宣言の正準名。別名や中継の再エクスポートを経ても宣言の同一性は変わらない
+    Decl(String),
+    Module(ModulePath),
 }
 
 pub fn load(entry_file: &Path) -> Result<LoadedProgram, LoadError> {
@@ -363,6 +388,29 @@ fn exact_spelling(path: &Path) -> bool {
     })
 }
 
+/// `use target::{name}` が指す先を1つ引く。
+///
+/// 子モジュール → `target` の宣言 → `target` の公開再エクスポート、の順。
+/// 最後の一段だけが今回の追加で、先の二段は従来の解決順そのまま
+fn lookup_member(
+    target: &ModulePath,
+    name: &str,
+    declarations: &BTreeMap<ModulePath, BTreeMap<String, String>>,
+    publics: &BTreeMap<ModulePath, BTreeMap<String, PublicMember>>,
+) -> Option<PublicMember> {
+    let child = target.child(name);
+    if declarations.contains_key(&child) {
+        return Some(PublicMember::Module(child));
+    }
+    if let Some(canonical) = declarations.get(target).and_then(|names| names.get(name)) {
+        return Some(PublicMember::Decl(canonical.clone()));
+    }
+    publics
+        .get(target)
+        .and_then(|table| table.get(name))
+        .cloned()
+}
+
 fn resolve(
     modules: BTreeMap<ModulePath, ParsedModule>,
     directories: BTreeSet<ModulePath>,
@@ -412,6 +460,50 @@ fn resolve(
         declarations.insert(module.path.clone(), names);
     }
 
+    // 公開再エクスポートの表。再エクスポートは再エクスポートを選べるので、
+    // 増えなくなるまで回す。名前は足すだけなので循環 use があっても必ず止まる
+    let mut publics: BTreeMap<ModulePath, BTreeMap<String, PublicMember>> = BTreeMap::new();
+    loop {
+        let mut additions = Vec::new();
+        for module in modules.values() {
+            for use_decl in module.uses.iter().filter(|use_decl| use_decl.public) {
+                let target = ModulePath::from_parts(&use_decl.path);
+                match &use_decl.members {
+                    Some(members) => {
+                        for member in members {
+                            let alias = member.alias.as_deref().unwrap_or(&member.name);
+                            if let Some(found) =
+                                lookup_member(&target, &member.name, &declarations, &publics)
+                            {
+                                additions.push((module.path.clone(), alias.to_string(), found));
+                            }
+                        }
+                    }
+                    None if declarations.contains_key(&target) => {
+                        let alias = use_decl.alias.as_deref().unwrap_or_else(|| target.name());
+                        additions.push((
+                            module.path.clone(),
+                            alias.to_string(),
+                            PublicMember::Module(target),
+                        ));
+                    }
+                    None => {}
+                }
+            }
+        }
+        let mut changed = false;
+        for (owner, name, member) in additions {
+            let table = publics.entry(owner).or_default();
+            if !table.contains_key(&name) {
+                table.insert(name, member);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let mut scopes = BTreeMap::new();
     for module in modules.values() {
         let local = declarations.get(&module.path).cloned().unwrap_or_default();
@@ -423,7 +515,6 @@ fn resolve(
             if let Some(members) = &use_decl.members {
                 for member in members {
                     let alias = member.alias.as_deref().unwrap_or(&member.name);
-                    let child = target.child(&member.name);
                     if local.contains_key(alias) {
                         diagnostics.push(Diag::at(
                             use_decl.span,
@@ -436,21 +527,24 @@ fn resolve(
                             use_decl.span,
                             format!("import名 `{alias}` が衝突しています"),
                         ));
-                    } else if declarations.contains_key(&child) {
-                        imported_modules.insert(alias.to_string(), child);
-                    } else if let Some(name) = declarations
-                        .get(&target)
-                        .and_then(|names| names.get(&member.name))
-                    {
-                        imported_declarations.insert(alias.to_string(), name.clone());
                     } else {
-                        diagnostics.push(Diag::at(
-                            use_decl.span,
-                            format!(
-                                "モジュール `{target}` にメンバー `{}` がありません",
-                                member.name
-                            ),
-                        ));
+                        match lookup_member(&target, &member.name, &declarations, &publics) {
+                            Some(PublicMember::Module(child)) => {
+                                imported_modules.insert(alias.to_string(), child);
+                            }
+                            Some(PublicMember::Decl(name)) => {
+                                imported_declarations.insert(alias.to_string(), name);
+                            }
+                            // 再エクスポートの循環がどのモジュールにも行き着かない
+                            // ときもここへ落ちる。公開宣言を捏造せず読み込みを止める
+                            None => diagnostics.push(Diag::at(
+                                use_decl.span,
+                                format!(
+                                    "モジュール `{target}` にメンバー `{}` がありません",
+                                    member.name
+                                ),
+                            )),
+                        }
                     }
                 }
             } else if declarations.contains_key(&target) {
@@ -506,6 +600,31 @@ fn resolve(
         });
     }
 
+    // ホストへ出る候補はエントリーモジュールの明示選択だけ。ここで正準名まで
+    // 落としておけば、後段は宣言の同一性だけを見ればよくなる
+    let mut public_exports = Vec::new();
+    if let Some(entry_module) = modules.get(entry_path) {
+        for use_decl in entry_module.uses.iter().filter(|use_decl| use_decl.public) {
+            let Some(members) = &use_decl.members else {
+                continue;
+            };
+            let target = ModulePath::from_parts(&use_decl.path);
+            for member in members {
+                let alias = member.alias.as_deref().unwrap_or(&member.name);
+                if let Some(PublicMember::Decl(canonical)) =
+                    lookup_member(&target, &member.name, &declarations, &publics)
+                {
+                    public_exports.push(PublicExport {
+                        name: alias.to_string(),
+                        canonical,
+                        span: use_decl.span,
+                    });
+                }
+            }
+        }
+    }
+    public_exports.sort_by(|a, b| a.name.cmp(&b.name));
+
     let mut items = Vec::new();
     for (path, mut module) in modules {
         let (local, imported_declarations, imported_modules) = &scopes[&path];
@@ -542,6 +661,7 @@ fn resolve(
         },
         entry: entry_path.qualified("main"),
         sources,
+        public_exports,
     })
 }
 
@@ -1508,7 +1628,9 @@ pub fn load_files(files: &[(&str, &str)]) -> Result<LoadedProgram, LoadError> {
     ));
     std::fs::create_dir_all(&root).unwrap();
     for (name, source) in files {
-        std::fs::write(root.join(name), source).unwrap();
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
     }
     let loaded = load(&root.join("main.rd"));
     std::fs::remove_dir_all(&root).unwrap();
@@ -2005,5 +2127,257 @@ mod tests {
         assert_eq!(inner.name(), Some("main::User"));
         assert!(outer.optional, "要素の後置 `?` は解決で失われない");
         assert_eq!(fields[1].1.name(), Some("main::User"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 公開再エクスポート (`pub use`)
+    // -----------------------------------------------------------------------
+
+    /// 公開名の一覧。`pub use` が実際に何をホストへ出したかを1本で見る
+    fn exported(loaded: &LoadedProgram) -> Vec<(&str, &str)> {
+        loaded
+            .public_exports
+            .iter()
+            .map(|export| (export.name.as_str(), export.canonical.as_str()))
+            .collect()
+    }
+
+    fn load_err(files: &[(&str, &str)]) -> String {
+        load_files(files)
+            .err()
+            .expect("読み込みは失敗するはず")
+            .diagnostics
+            .into_iter()
+            .map(|d| d.msg)
+            .collect::<Vec<_>>()
+            .join(" / ")
+    }
+
+    /// 普通の `use` は導入したモジュールの中だけ。下流からは選べない
+    #[test]
+    fn 普通のuseは再エクスポートしない() {
+        let message = load_err(&[
+            ("main.rd", "use mid::{find}\nfn main(-> int) { find() }\n"),
+            ("mid.rd", "use users::{find}\n"),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ]);
+        assert!(
+            message.contains("メンバー `find` がありません"),
+            "{message}"
+        );
+    }
+
+    /// `pub use` を挟むと同じ選択が通る。違いは公開フラグ1つだけ
+    #[test]
+    fn pub_useした関数は下流から選べる() {
+        let loaded = load_files(&[
+            ("main.rd", "use mid::{find}\nfn main(-> int) { find() }\n"),
+            ("mid.rd", "pub use users::{find}\n"),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+        // 再エクスポートを経ても宣言の同一性は変わらない
+        assert!(
+            loaded.program.items.iter().any(|item| matches!(
+                item,
+                Item::Fn { sig, .. } if sig.name == "users::find"
+            )),
+            "元の宣言のまま残る"
+        );
+    }
+
+    /// 中継が何段あっても指すのは元の宣言。エントリーの公開名だけが変わる
+    #[test]
+    fn 再エクスポートは何段でも元の宣言を指す() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "pub use mid::{find as find_user}\nfn main(-> int) { find_user() }\n",
+            ),
+            ("mid.rd", "pub use users::{find}\n"),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+        assert_eq!(exported(&loaded), [("find_user", "users::find")]);
+    }
+
+    /// 別名は局所名と公開名の両方を変える。元の綴りは再エクスポートされない
+    #[test]
+    fn 別名が公開名になり元の名前は出ない() {
+        let message = load_err(&[
+            ("main.rd", "use mid::{find}\nfn main(-> int) { find() }\n"),
+            ("mid.rd", "pub use users::{find as lookup}\n"),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ]);
+        assert!(
+            message.contains("メンバー `find` がありません"),
+            "{message}"
+        );
+    }
+
+    /// 型も再エクスポートできる。ただし公開名前空間に載るだけで関数にはならない
+    #[test]
+    fn 型の再エクスポートは公開名前空間だけに載る() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "pub use users::{User}\nfn main() { let u: User? = nil }\n",
+            ),
+            ("users.rd", "struct User { name: str }\n"),
+        ])
+        .expect("読み込めるはず");
+        assert_eq!(exported(&loaded), [("User", "users::User")]);
+    }
+
+    /// モジュール形は名前空間を1つ足すだけ。配下の関数は公開面へ降りてこない
+    #[test]
+    fn モジュール形の再エクスポートは配下の関数を公開面に出さない() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "pub use users\nfn main(-> int) { users::find() }\n",
+            ),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+        assert!(exported(&loaded).is_empty(), "{:?}", exported(&loaded));
+    }
+
+    /// 再エクスポートしたモジュールは下流から名前空間として選べる
+    #[test]
+    fn 再エクスポートしたモジュールは下流から選べる() {
+        load_files(&[
+            (
+                "main.rd",
+                "use mid::{users}\nfn main(-> int) { users::find() }\n",
+            ),
+            ("mid.rd", "pub use users\n"),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+    }
+
+    /// 公開名も既存の1つの名前空間に入る。上書きではなく拒否する
+    #[test]
+    fn 公開名の衝突は拒否する() {
+        let message = load_err(&[
+            (
+                "main.rd",
+                "pub use left::{find}\npub use right::{find}\nfn main(-> int) { find() }\n",
+            ),
+            ("left.rd", "fn find(-> int) { 1 }\n"),
+            ("right.rd", "fn find(-> int) { 2 }\n"),
+        ]);
+        assert!(message.contains("`find` が衝突しています"), "{message}");
+    }
+
+    #[test]
+    fn 公開名とローカル宣言の衝突も拒否する() {
+        let message = load_err(&[
+            (
+                "main.rd",
+                "pub use users::{find}\nfn find(-> int) { 1 }\nfn main(-> int) { find() }\n",
+            ),
+            ("users.rd", "fn find(-> int) { 2 }\n"),
+        ]);
+        assert!(
+            message.contains("`find` がローカル宣言と衝突しています"),
+            "{message}"
+        );
+    }
+
+    /// 別名で分ければ両方が別の公開メンバーとして通る
+    #[test]
+    fn 別名にすれば衝突しない() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "pub use left::{find as left_find}\n\
+                 pub use right::{find as right_find}\n\
+                 fn main(-> int) { left_find() + right_find() }\n",
+            ),
+            ("left.rd", "fn find(-> int) { 1 }\n"),
+            ("right.rd", "fn find(-> int) { 2 }\n"),
+        ])
+        .expect("読み込めるはず");
+        assert_eq!(
+            exported(&loaded),
+            [("left_find", "left::find"), ("right_find", "right::find")]
+        );
+    }
+
+    /// 互いを指すだけの循環にはどこにも元の宣言が無い。公開宣言を捏造せず止める
+    #[test]
+    fn 元の宣言が無い再エクスポートの循環は失敗する() {
+        let message = load_err(&[
+            ("main.rd", "use a::{find}\nfn main(-> int) { find() }\n"),
+            ("a.rd", "pub use b::{find}\n"),
+            ("b.rd", "pub use a::{find}\n"),
+        ]);
+        assert!(
+            message.contains("メンバー `find` がありません"),
+            "{message}"
+        );
+    }
+
+    /// 循環 use そのものは従来どおり通る。元の宣言が1つでもあれば解決する
+    #[test]
+    fn 循環していても元の宣言があれば解決する() {
+        let loaded = load_files(&[
+            ("main.rd", "pub use a::{find}\nfn main(-> int) { find() }\n"),
+            ("a.rd", "pub use b::{find}\n"),
+            ("b.rd", "use a\nfn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+        assert_eq!(exported(&loaded), [("find", "b::find")]);
+    }
+
+    /// 公開名の並びは宣言順ではなく公開名の昇順。決定的な ABI 順の土台になる
+    #[test]
+    fn 公開名は昇順で並ぶ() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "pub use users::{zebra, alpha}\nfn main(-> int) { zebra() + alpha() }\n",
+            ),
+            (
+                "users.rd",
+                "fn zebra(-> int) { 1 }\nfn alpha(-> int) { 2 }\n",
+            ),
+        ])
+        .expect("読み込めるはず");
+        assert_eq!(
+            exported(&loaded),
+            [("alpha", "users::alpha"), ("zebra", "users::zebra")]
+        );
+    }
+
+    /// エントリーの明示選択だけがホスト面。依存モジュールの `pub use` は入らない
+    #[test]
+    fn ホスト面に入るのはエントリーの明示選択だけ() {
+        let loaded = load_files(&[
+            ("main.rd", "use mid::{find}\nfn main(-> int) { find() }\n"),
+            ("mid.rd", "pub use users::{find}\n"),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+        assert!(exported(&loaded).is_empty(), "{:?}", exported(&loaded));
+    }
+
+    /// 公開名は型検査後の HIR の宣言へそのまま引ける。ここが ABI 層の入口になる
+    #[test]
+    fn 公開名から型検査後のcallableを引ける() {
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "pub use users::{find as find_user}\nfn main(-> int) { find_user() }\n",
+            ),
+            ("users.rd", "fn find(-> int) { 1 }\n"),
+        ])
+        .expect("読み込めるはず");
+        let checked = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let export = &loaded.public_exports[0];
+        assert_eq!(export.name, "find_user");
+        assert!(checked.free_callable(&export.canonical).is_some());
     }
 }
