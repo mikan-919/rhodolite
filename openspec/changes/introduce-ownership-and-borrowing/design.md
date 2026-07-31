@@ -260,6 +260,13 @@ its result. A runtime failure does not unwind language scopes. Because this
 version has no user destructor, last-use storage release is permitted later as
 an unobservable optimization, but the reference order is lexical.
 
+A place that is moved on some but not all incoming paths is conditionally
+owned at a scope exit. Phase 3 keeps such a place in the drop plan, so the plan
+alone would drop a moved value on the taken path. Resolving this needs a
+per-place runtime drop flag, which belongs to the interpreter step (phase 7,
+task 7.4); until then "excluding moved places" holds exactly for places that
+are moved on every path.
+
 An invocation-wide arena was rejected as the language contract because it
 would retain dead buffers and would not model Rust-like deterministic resource
 ownership. The future Wasm backend will use an instance-local allocator with

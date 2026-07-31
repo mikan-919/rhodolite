@@ -44,27 +44,27 @@
 
 ## 3. Establish the Ownership Plan and Move Analysis
 
-- [ ] 3.1 Add `ownership::CheckedProgram`, deterministic body plans, `ScopeId`,
+- [x] 3.1 Add `ownership::CheckedProgram`, deterministic body plans, `ScopeId`,
   CFG points/edges, places and projections, classified accesses, and drop-action
   data without exposing unchecked HIR to new normal pipeline entry points
-- [ ] 3.2 Derive scopes from the existing Rhodolite lexical rules, proving that
+- [x] 3.2 Derive scopes from the existing Rhodolite lexical rules, proving that
   second-class blocks reuse their surrounding scope while arms, loops,
   provisions, functions, and tests retain their existing isolation
-- [ ] 3.3 Implement path-sensitive initialization and move dataflow across
+- [x] 3.3 Implement path-sensitive initialization and move dataflow across
   sequences, branches, diverging paths, returns, and loop fixed points
-- [ ] 3.4 Enforce immutable `let`, mutable `let mut`, Copy rebinding, default
+- [x] 3.4 Enforce immutable `let`, mutable `let mut`, Copy rebinding, default
   non-Copy local moves, explicit owned-call moves, fresh temporaries, and
   automatic owned returns
-- [ ] 3.5 Implement whole-struct consuming field projection without partial
+- [x] 3.5 Implement whole-struct consuming field projection without partial
   moves, including dropping the remaining fields and rejecting every later use
   of the consumed root
-- [ ] 3.6 Add diagnostics and related spans for use after move, maybe-moved branch
+- [x] 3.6 Add diagnostics and related spans for use after move, maybe-moved branch
   joins, loop-carried moves, missing call-site `move`, reassignment of immutable
   bindings, and move from borrowed places
-- [ ] 3.7 Add deterministic plan snapshots and compile-fail/pass tests for forward
+- [x] 3.7 Add deterministic plan snapshots and compile-fail/pass tests for forward
   control flow, nested scopes, recursion, branch joins, loop backedges, Copy
   values, struct fields, and implicit return moves
-- [ ] 3.8 Run formatting, the full test suite, ownership-plan snapshots, focused
+- [x] 3.8 Run formatting, the full test suite, ownership-plan snapshots, focused
   move diagnostics, and strict OpenSpec validation, then commit move analysis as
   a stable snapshot
 

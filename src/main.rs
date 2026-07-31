@@ -15,6 +15,12 @@ mod eval;
 mod hir;
 mod lex;
 mod module;
+// ponytail: 所有権計画はまだパイプラインへ繋がない。繋ぐと canonical.rd を
+// はじめ未移行のソースが全部落ちるので、入口の付け替えは移行と同じ段
+// (tasks 8.1/8.2)でまとめてやる。それまでは検査と計画を単体テストから
+// だけ駆動するので、まだ読まれない口が残る
+#[allow(dead_code)]
+mod ownership;
 mod parse;
 mod render;
 mod requirement;
