@@ -2,6 +2,10 @@
 // HIR が持つので、AST 側で使われないままの読み取り口が残る
 #[allow(dead_code)]
 mod ast;
+// ambient を単相化で消す計画。C 生成の入力になる内部表現で、いまの実行経路
+// (インタプリタ)は読まない。CLI の観測できる振る舞いは変えない
+#[allow(dead_code)]
+mod ambient_abi;
 mod diag;
 mod eval;
 // HIR は宣言 span と所属を語彙として全部持つ。診断と次段(C 下ろし)が読むもの、

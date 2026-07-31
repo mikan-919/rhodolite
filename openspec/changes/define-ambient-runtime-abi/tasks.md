@@ -14,18 +14,18 @@
 
 ## 2. Ambient ABI Plan Vocabulary
 
-- [ ] 2.1 Add `src/ambient_abi.rs` with `Plan`, root and instance IDs, `InstanceKey`, provider
+- [x] 2.1 Add `src/ambient_abi.rs` with `Plan`, root and instance IDs, `InstanceKey`, provider
   selections, record layout IDs, record fields, value sources, planned calls, and structured
   planning errors
-- [ ] 2.2 Intern instance keys by `CallableId` plus requirement-restricted, `SlotId`-ordered
+- [x] 2.2 Intern instance keys by `CallableId` plus requirement-restricted, `SlotId`-ordered
   `TraitImplId` selections while excluding provider values and unrelated caller slots
-- [ ] 2.3 Intern record layouts by `SlotId`-ordered value requirements and concrete provider
+- [x] 2.3 Intern record layouts by `SlotId`-ordered value requirements and concrete provider
   `StructId`, omitting type-only requirements and the hidden argument for empty layouts
-- [ ] 2.4 Add deterministic program-aware rendering that translates IDs to names only at the
+- [x] 2.4 Add deterministic program-aware rendering that translates IDs to names only at the
   display boundary
-- [ ] 2.5 Add focused vocabulary tests for key equality, distinct implementation selections,
+- [x] 2.5 Add focused vocabulary tests for key equality, distinct implementation selections,
   record-layout sharing, type-only erasure, value-handle fields, and deterministic ordering
-- [ ] 2.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the plan
+- [x] 2.6 Run formatting, the full test suite, and strict OpenSpec validation, then commit the plan
   vocabulary as a stable snapshot
 
 ## 3. Demand-Driven Callable Planning
