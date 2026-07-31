@@ -34,7 +34,7 @@ close-static-type-checking（完了）
 introduce-typed-hir（完了）
         │
         ▼
-define-ambient-runtime-abi（進行中）
+define-ambient-runtime-abi（完了）
         │
         ▼
 emit-core-c-programs
@@ -57,8 +57,8 @@ compiled v1
 | 0 | 完了 | archived changes | AST インタプリタと v1 正典 |
 | 1 | 完了 | archived `close-static-type-checking` | Unknown のない検査成功 |
 | 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
-| 3 | 進行中 | `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
-| 4 | 未着手 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |
+| 3 | 完了 | archived `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
+| 4 | 次 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |
 | 5 | 未着手 | `compile-data-values` | struct・enum・optional・配列の C 表現 |
 | 6 | 未着手 | `compile-traits-and-ambient` | trait・slot・`with` の C 生成 |
 | 7 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
@@ -113,27 +113,30 @@ HIR に置き場所が無い。
 
 ## 3. ambient の低水準契約を決める
 
-OpenSpec:
-[`define-ambient-runtime-abi`](../openspec/changes/define-ambient-runtime-abi/)
+OpenSpec: archived `define-ambient-runtime-abi` /
+ADR: [`0008`](./adr/0008-ambient-abi-is-a-specialization-plan.md)
 
-この段階も内部設計なので、原則として `skip_specs: true` とする。コード生成より先に、
-要求推論の結果をどの引数とランタイム表現へ落とすかを固定する。
+この段階も内部設計なので `skip_specs: true` のリファクタ change とした。コード生成より
+先に、要求推論の結果をどの引数とランタイム表現へ落とすかを固定した。
 
-最低限決めるもの:
+決まったもの(`src/ambient_abi.rs`):
 
-- 関数へ渡す隠し ambient record
-- `with slot(value)` の値と trait vtable
-- `with slot<Type>` の型側提供
-- 内側の `with` によるスロットの置換
-- 型要求と値要求の違い
-- 再帰・相互再帰で共有できる呼び出し規約
+- 隠し ambient record は**値要求だけ**を欄に持つ不変な値。値要求が無ければ引数が無い
+- `with slot(value)` は具体 struct への同一性を保つ handle を1欄。**vtable は無い**
+- `with slot<Type>` は instance の鍵と呼び先を変えるだけで、実行時に残らない
+- 内側の `with` は外側の record を書き換えず、写した提供文脈を置き換える
+- スロット呼び出しは提供の `TraitImplId` から実装本体への直接呼び出しになる
+- 再帰・相互再帰は、鍵を歩く前に確保することで同じ instance を共有して閉じる
 
-完了条件:
+要求は既存どおり保守的なまま(契約メソッドは全実装の合併)なので、選ばれた実装が
+使わない欄が record に残ることがある。要求を provider 依存にするかは別の change。
 
-- 正典プログラム全体を低水準表現へ機械的に落とせる
-- 各関数が要求する slot だけを引数として運べる
-- 型提供と実体提供を同じものとして誤魔化さない
-- C 側の擬似表現と呼び出し例が設計文書に揃う
+完了条件(すべて達成):
+
+- 正典プログラム全体が決定的な計画へ機械的に落ちる(スナップショットで固定)
+- 各 instance は自分の要求に制限された slot だけを運ぶ
+- 型提供と実体提供を同じものとして誤魔化さない(前者は実行時から消える)
+- C 側の擬似表現と呼び出し例が ADR-0008 に揃っている
 
 ## 4. 最小の C 生成を縦に通す
 

@@ -102,12 +102,13 @@ $ cargo run examples/missing_handler.rd
 | `src/parse.rs` | 再帰下降パーサ | 1774 |
 | `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 2009 |
 | `src/hir.rs` | 型付き・参照解決済みの中間表現。処理系の境界 | 1195 |
+| `src/ambient_abi.rs` | ambient を単相化で消す計画。C 生成の入力 | 1376 |
 | `src/typecheck.rs` | 型検査と HIR への下ろし(同じ1回の走査) | 5913 |
-| `src/requirement.rs` | **要求推論(中核)**。入力は HIR | 1539 |
+| `src/requirement.rs` | **要求推論(中核)**。入力は HIR | 1690 |
 | `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 1932 |
 | `src/diag.rs` | 診断の値。位置・ラベル・help・従属診断。全段が返す | 75 |
 | `src/render.rs` | 診断をソース抜粋付きで描く。miette を知る唯一の場所 | 107 |
-| `src/main.rs` | 繋ぐだけ | 160 |
+| `src/main.rs` | 繋ぐだけ | 164 |
 
 `requirement.rs` の中は6段。手順1〜3が mikan の手書き、4〜6は代筆。
 
@@ -131,6 +132,7 @@ $ cargo run examples/missing_handler.rd
 | 0005 | ブロック形から `:` を外し、ambient 提供を `with` で書く |
 | 0006 | ファイル/ディレクトリをモジュールとし、読み込みを `use` に一本化 |
 | 0007 | 診断の描画に `miette` を1つだけ依存に足す |
+| 0008 | ambient の実行時契約は特殊化計画。vtable 無し、型提供は消える |
 
 文法は `docs/grammar.md`、用語は `CONTEXT.md`、プロジェクトの目的は `README.md`。
 **まだ決まっていない設計は `docs/design-notes/`**（測った結果・却下案・未決の問い）。
@@ -305,10 +307,20 @@ struct Diag {
 
 ## 8. 次の一歩
 
-型付き HIR への移行まで完了した。次は C 生成へ入る前に、要求推論で求めた slot を
-関数間で運ぶ **ambient の低水準契約**を決める。
+ambient の低水準契約まで決まった。`src/ambient_abi.rs` は、`main` と全 test を根に
+到達した本体を**実装の組み合わせごとに単相化する計画**を作る。
 
-隠し ambient 引数、値提供と型提供、内側の `with` による置換、型要求と値要求の違い、
-再帰・相互再帰の呼び出し規約を、正典プログラム全体を機械的に下ろせる粒度まで固定する。
-順序と完了線は [`compiler-roadmap.md`](./compiler-roadmap.md) に置き、個別の設計判断は
-次の OpenSpec change と ADR に残す。
+| 決めたこと | 形 |
+|---|---|
+| 隠し ambient 引数 | 値要求だけを欄に持つ不変な record。値要求が無ければ引数そのものが無い |
+| 値提供 | 具体 struct への handle を1欄。同一性を保つので変更は別名から見える |
+| 型提供 | instance の鍵と呼び先を変えるだけ。実行時には残らない |
+| スロット呼び出し | 提供の `TraitImplId` から実装本体への直接呼び出し。vtable は無い |
+| 内側の `with` | 外側の record を書き換えず、写した文脈を置き換える |
+| 再帰・相互再帰 | 鍵を歩く前に確保するので同じ instance を共有して閉じる |
+
+正典プログラム全体がこの計画へ落ちることは決定的なスナップショットで固定してある。
+判断の理由は [ADR-0008](./adr/0008-ambient-abi-is-a-specialization-plan.md)。
+
+次は、この計画を入力にした C 生成(`emit-core-c-programs`)。順序と完了線は
+[`compiler-roadmap.md`](./compiler-roadmap.md)。

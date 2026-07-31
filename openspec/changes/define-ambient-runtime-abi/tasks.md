@@ -82,17 +82,17 @@
 
 ## 6. Record the ABI Boundary
 
-- [ ] 6.1 Add ADR-0008 documenting whole-program ambient specialization, no vtable fallback,
+- [x] 6.1 Add ADR-0008 documenting whole-program ambient specialization, no vtable fallback,
   implementation-keyed instances, type-provider erasure, immutable by-value records, and
   identity-preserving provider handles
-- [ ] 6.2 Include pseudo-C for production and test provider combinations, nested `with`, type-only
+- [x] 6.2 Include pseudo-C for production and test provider combinations, nested `with`, type-only
   provision, direct trait implementation calls, and recursive record passing
-- [ ] 6.3 Document that concrete handle layout, C symbol spelling, async task inheritance, detached
+- [x] 6.3 Document that concrete handle layout, C symbol spelling, async task inheritance, detached
   lifetime, and cross-thread mutation remain deferred, while ambient records must be capturable as
   values rather than borrowed stack state
-- [ ] 6.4 Update `README.md`, `docs/overview.md`, and `docs/compiler-roadmap.md` to describe the
+- [x] 6.4 Update `README.md`, `docs/overview.md`, and `docs/compiler-roadmap.md` to describe the
   specialization-plan boundary and leave C emission as the next phase
-- [ ] 6.5 Run `cargo fmt --check`, the full test suite, canonical success and missing-provider CLI
+- [x] 6.5 Run `cargo fmt --check`, the full test suite, canonical success and missing-provider CLI
   cases, and `bunx @fission-ai/openspec validate --all --strict`
-- [ ] 6.6 Commit the completed ambient ABI plan and documentation as an archive-ready stable
+- [x] 6.6 Commit the completed ambient ABI plan and documentation as an archive-ready stable
   snapshot
