@@ -1,10 +1,10 @@
 ## 1. Close Integer Runtime Semantics
 
-- [ ] 1.1 Change interpreter addition, subtraction, multiplication, and negation to explicit signed
+- [x] 1.1 Change interpreter addition, subtraction, multiplication, and negation to explicit signed
   64-bit wrapping operations, and change division to explicit checked signed division
-- [ ] 1.2 Add interpreter and CLI regressions for maximum/minimum wraparound, multiplication and
+- [x] 1.2 Add interpreter and CLI regressions for maximum/minimum wraparound, multiplication and
   negation wraparound, truncation toward zero, division by zero, and minimum divided by negative one
-- [ ] 1.3 Run formatting, the full test suite, canonical success and runtime-diagnostic cases, and
+- [x] 1.3 Run formatting, the full test suite, canonical success and runtime-diagnostic cases, and
   strict OpenSpec validation, then commit integer semantics as a stable snapshot
 
 ## 2. Add Public Re-exports

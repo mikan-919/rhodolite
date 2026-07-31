@@ -414,7 +414,7 @@ impl<'p> Interp<'p> {
             }
 
             hir::ExprKind::Neg(inner) => match self.eval(body, *inner, env, ambient)? {
-                Value::Int(n) => Ok(Value::Int(-n)),
+                Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
                 other => fail(format!("`-` は整数だけです ({})", self.show(&other))),
             },
 
@@ -423,11 +423,16 @@ impl<'p> Interp<'p> {
                 let r = self.eval(body, *rhs, env, ambient)?;
                 match (l, r) {
                     (Value::Int(a), Value::Int(b)) => match op {
-                        hir::ArithOp::Add => Ok(Value::Int(a + b)),
-                        hir::ArithOp::Sub => Ok(Value::Int(a - b)),
-                        hir::ArithOp::Mul => Ok(Value::Int(a * b)),
-                        hir::ArithOp::Div if b == 0 => fail("0 で割れません"),
-                        hir::ArithOp::Div => Ok(Value::Int(a / b)),
+                        // int は符号付き64bit。加減乗と単項マイナスはラップし、
+                        // 除算だけが実行時失敗を持つ (0除算 / MIN / -1)
+                        hir::ArithOp::Add => Ok(Value::Int(a.wrapping_add(b))),
+                        hir::ArithOp::Sub => Ok(Value::Int(a.wrapping_sub(b))),
+                        hir::ArithOp::Mul => Ok(Value::Int(a.wrapping_mul(b))),
+                        hir::ArithOp::Div => match a.checked_div(b) {
+                            Some(q) => Ok(Value::Int(q)),
+                            None if b == 0 => fail("0 で割れません"),
+                            None => fail("この割り算は int の範囲を超えます"),
+                        },
                     },
                     (a, b) => fail(format!(
                         "{} を {} と {} には使えません",
@@ -786,6 +791,44 @@ mod tests {
     #[test]
     fn ゼロ除算はエラーになる() {
         assert!(run("fn main(-> int) {\n 1 / 0\n}\n", "main").is_err());
+    }
+
+    /// int は符号付き64bit。加減乗と単項マイナスは 2^64 で回り込む。
+    /// ホスト側のオーバーフロー検査の有無で振る舞いが変わってはいけない
+    #[test]
+    fn 加減乗と符号反転は境界で回り込む() {
+        assert_eq!(
+            int("fn main(-> int) {\n 9223372036854775807 + 1\n}\n"),
+            i64::MIN
+        );
+        assert_eq!(
+            int("fn main(-> int) {\n (-9223372036854775807 - 1) - 1\n}\n"),
+            i64::MAX
+        );
+        assert_eq!(int("fn main(-> int) {\n 9223372036854775807 * 2\n}\n"), -2);
+        assert_eq!(
+            int("fn main(-> int) {\n -(-9223372036854775807 - 1)\n}\n"),
+            i64::MIN
+        );
+    }
+
+    /// 割り算は 0 方向へ切り捨てる。`-7 / 2` は -4 ではなく -3
+    #[test]
+    fn 割り算はゼロ方向へ切り捨てる() {
+        assert_eq!(int("fn main(-> int) {\n -7 / 2\n}\n"), -3);
+        assert_eq!(int("fn main(-> int) {\n 7 / -2\n}\n"), -3);
+    }
+
+    /// 最小値 / -1 は int に収まらない。ラップさせずに実行時失敗にする
+    #[test]
+    fn 最小値をマイナス1で割ると実行時失敗() {
+        assert!(
+            run(
+                "fn main(-> int) {\n (-9223372036854775807 - 1) / -1\n}\n",
+                "main"
+            )
+            .is_err()
+        );
     }
 
     /// 直接失敗した式そのものを指す。

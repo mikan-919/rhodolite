@@ -1629,3 +1629,35 @@ fn 到達経路のホップは宣言元のファイルで描かれる() {
         "{text}"
     );
 }
+
+/// int の境界は実行経路でも保たれる。ラップは失敗ではないので成功のまま出る
+#[test]
+fn 整数の回り込みはCLIでも成功する() {
+    let project = Project::new();
+    project.write("main.rd", "fn main(-> int) { 9223372036854775807 + 1 }\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("  main -> -9223372036854775808"), "{text}");
+}
+
+/// 割り算の失敗2種はどちらも実行時診断として出る。ホスト側の panic ではない
+#[test]
+fn 割り算の失敗は実行時診断として出る() {
+    for (source, expected) in [
+        ("fn main(-> int) { 1 / 0 }\n", "0 で割れません"),
+        (
+            "fn main(-> int) { (-9223372036854775807 - 1) / -1 }\n",
+            "int の範囲を超えます",
+        ),
+    ] {
+        let project = Project::new();
+        project.write("main.rd", source);
+
+        let output = project.run("main.rd");
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{text}");
+        assert!(text.contains(expected), "{text}");
+    }
+}
