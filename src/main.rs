@@ -19,19 +19,228 @@ mod parse;
 mod render;
 mod requirement;
 mod typecheck;
-// Wasm 生成はまだ CLI から呼ばれていない(build コマンドは次の段)
-#[allow(dead_code)]
 mod wasm;
-#[allow(dead_code)]
 mod wasm_abi;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// CLI が受ける形。位置引数だけの従来形は、そのままインタプリタ実行
+/// (design.md 決定10)
+enum Command {
+    Interpret {
+        path: String,
+    },
+    Build {
+        entry: PathBuf,
+        output: Option<PathBuf>,
+    },
+}
+
+const USAGE: &str = "使い方:\n  \
+                     rhodolite [<entry.rd>]\n  \
+                     rhodolite build <entry.rd> --target wasm [-o <output.wasm>]";
+
+/// 引数を1本の形へ畳む。`build` を名乗ったときだけ選択肢を読む
+fn parse_args(args: Vec<String>) -> Result<Command, String> {
+    if args.first().map(String::as_str) != Some("build") {
+        return match args.len() {
+            0 => Ok(Command::Interpret {
+                path: "examples/canonical.rd".to_string(),
+            }),
+            1 => Ok(Command::Interpret {
+                path: args.into_iter().next().unwrap(),
+            }),
+            _ => Err(format!("引数が多すぎます\n{USAGE}")),
+        };
+    }
+
+    let mut rest = args.into_iter().skip(1);
+    let Some(entry) = rest.next() else {
+        return Err(format!("`build` にはエントリーファイルが要ります\n{USAGE}"));
+    };
+    let mut target = None;
+    let mut output: Option<PathBuf> = None;
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--target" => {
+                let Some(value) = rest.next() else {
+                    return Err(format!("`--target` に値がありません\n{USAGE}"));
+                };
+                if target.is_some() {
+                    return Err(format!("`--target` が二度指定されています\n{USAGE}"));
+                }
+                if value != "wasm" {
+                    return Err(format!("知らないターゲット `{value}` です\n{USAGE}"));
+                }
+                target = Some(value);
+            }
+            "-o" => {
+                let Some(value) = rest.next() else {
+                    return Err(format!("`-o` に値がありません\n{USAGE}"));
+                };
+                if output.is_some() {
+                    return Err(format!("`-o` が二度指定されています\n{USAGE}"));
+                }
+                output = Some(PathBuf::from(value));
+            }
+            other => return Err(format!("知らない引数 `{other}` です\n{USAGE}")),
+        }
+    }
+    if target.is_none() {
+        return Err(format!("`build` には `--target wasm` が要ります\n{USAGE}"));
+    }
+    Ok(Command::Build {
+        entry: PathBuf::from(entry),
+        output,
+    })
+}
+
+/// Wasm ビルド。
+///
+/// 読み込み・型検査・要求検査・計画・対応検査・生成・検証を全部通してから、
+/// 最後に一度だけ出力へ触る。途中で失敗したら既にある成果物は変えない
+fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
+    let loaded = match module::load(entry) {
+        Ok(loaded) => loaded,
+        Err(failure) => {
+            render::report(&failure.diagnostics, &failure.sources);
+            return ExitCode::FAILURE;
+        }
+    };
+    let sources = loaded.sources;
+
+    let checked = match typecheck::check_and_lower(&loaded.program) {
+        Ok(checked) => checked,
+        Err(errors) => {
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let Some(entry_callable) = checked.free_callable(&loaded.entry) else {
+        eprintln!("エントリー `{}` がありません", loaded.entry);
+        return ExitCode::FAILURE;
+    };
+
+    // 予約名は `pub use` の綴りで決まるので、原因の位置もその宣言に置く
+    let reserved: Vec<diag::Diag> = loaded
+        .public_exports
+        .iter()
+        .filter(|export| export.name == wasm::ENTRY_EXPORT)
+        .map(|export| {
+            diag::Diag::at(
+                export.span,
+                format!("`{}` は ABI v0 の予約名です", wasm::ENTRY_EXPORT),
+            )
+            .label("この公開名は使えません")
+            .help("`pub use` の別名を変えてください")
+        })
+        .collect();
+    if !reserved.is_empty() {
+        render::report(&reserved, &sources);
+        return ExitCode::FAILURE;
+    }
+
+    // 公開名からホスト呼び出し可能な関数だけを取る。struct や enum を明示選択
+    // していても、それは言語側の公開名前空間に留まる
+    let exports: Vec<(String, hir::CallableId)> = loaded
+        .public_exports
+        .iter()
+        .filter_map(|export| {
+            Some((
+                export.name.clone(),
+                checked.free_callable(&export.canonical)?,
+            ))
+        })
+        .collect();
+
+    // 生産の根は `main` と公開関数。test の要求はここでは見ない
+    let analysis = requirement::analyze(&checked);
+    let mut roots = vec![loaded.entry.clone()];
+    roots.extend(
+        exports
+            .iter()
+            .map(|(_, id)| checked.callables[*id].name.clone()),
+    );
+    let errors = analysis.errors_for_roots(&roots);
+    if !errors.is_empty() {
+        render::report(&errors, &sources);
+        return ExitCode::FAILURE;
+    }
+
+    let production =
+        match ambient_abi::plan_production(&checked, &analysis, entry_callable, &exports) {
+            Ok(production) => production,
+            Err(error) => {
+                eprintln!("{}", error.show(&checked));
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let unsupported = wasm::check_support(&checked, &production.plan);
+    if !unsupported.is_empty() {
+        render::report(&unsupported, &sources);
+        return ExitCode::FAILURE;
+    }
+
+    let bytes = match wasm::emit(&checked, &production) {
+        Ok(bytes) => bytes,
+        Err(errors) => {
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(message) = wasm::validate(&bytes) {
+        eprintln!("生成した Wasm が検証を通りませんでした: {message}");
+        return ExitCode::FAILURE;
+    }
+
+    let destination = match output {
+        Some(path) => path.to_path_buf(),
+        // 依存の隣でもエントリーの親でもなく、起動したディレクトリを基準にする
+        None => {
+            let Some(stem) = entry.file_stem().and_then(|s| s.to_str()) else {
+                eprintln!("エントリーファイル名を UTF-8 として読めません");
+                return ExitCode::FAILURE;
+            };
+            PathBuf::from("target/wasm").join(format!("{stem}.wasm"))
+        }
+    };
+    match publish(&destination, &bytes) {
+        Ok(()) => {
+            println!("{}", destination.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{} を書けませんでした: {error}", destination.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 同じディレクトリの一時ファイルへ書いてから名前を付け替える。
+/// 途中で失敗しても、既にある成果物が半端な中身に置き換わらない
+fn publish(destination: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = destination.with_extension(format!("wasm.tmp{}", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, destination)
+}
+
 fn main() -> ExitCode {
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "examples/canonical.rd".to_string());
+    let path = match parse_args(std::env::args().skip(1).collect()) {
+        Ok(Command::Interpret { path }) => path,
+        Ok(Command::Build { entry, output }) => return build(&entry, output.as_deref()),
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let loaded = match module::load(Path::new(&path)) {
         Ok(program) => program,

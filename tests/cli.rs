@@ -41,6 +41,29 @@ impl Project {
             .output()
             .unwrap()
     }
+
+    /// 起動ディレクトリを基準に走らせる。既定の出力先の解決はここに依る
+    fn cli(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_rhodolite"))
+            .current_dir(&self.root)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn build(&self, args: &[&str]) -> Output {
+        let mut all = vec!["build"];
+        all.extend_from_slice(args);
+        self.cli(&all)
+    }
+
+    fn read(&self, relative: &str) -> Vec<u8> {
+        std::fs::read(self.root.join(relative)).unwrap()
+    }
+
+    fn exists(&self, relative: &str) -> bool {
+        self.root.join(relative).exists()
+    }
 }
 
 impl Drop for Project {
@@ -1692,4 +1715,224 @@ fn 再エクスポートしていないメンバーの選択を報告する() {
     let text = output_text(&output);
     assert!(!output.status.success(), "{text}");
     assert!(text.contains("メンバー `find` がありません"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// Wasm ビルド
+// ---------------------------------------------------------------------------
+
+/// 生成した Wasm を独立したエンジンで呼ぶ。CLI が実際に走る成果物を出したか
+/// は、生成器を通さずに確かめないと言えない
+fn invoke(bytes: &[u8], name: &str, args: &[wasmi::Val]) -> Result<Vec<i64>, String> {
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, bytes).map_err(|e| e.to_string())?;
+    let mut store = wasmi::Store::new(&engine, ());
+    let instance = wasmi::Linker::new(&engine)
+        .instantiate_and_start(&mut store, &module)
+        .map_err(|e| e.to_string())?;
+    let func = instance
+        .get_func(&store, name)
+        .ok_or_else(|| format!("`{name}` という export がない"))?;
+    let mut results = vec![wasmi::Val::I32(0); func.ty(&store).results().len()];
+    func.call(&mut store, args, &mut results)
+        .map_err(|e| e.to_string())?;
+    Ok(results
+        .iter()
+        .map(|value| match value {
+            wasmi::Val::I32(n) => i64::from(*n),
+            wasmi::Val::I64(n) => *n,
+            other => panic!("scalar ではない: {other:?}"),
+        })
+        .collect())
+}
+
+/// scalar だけの2モジュール構成。公開面は `pub use` の明示選択で決まる
+fn scalar_project() -> Project {
+    let project = Project::new();
+    project.write(
+        "app.rd",
+        "pub use lib::{double as twice}\n\
+         fn main(-> int) { twice(21) }\n",
+    );
+    project.write("lib.rd", "fn double(n: int -> int) { n * 2 }\n");
+    project
+}
+
+#[test]
+fn 既定の出力先は起動ディレクトリのtarget_wasm() {
+    let project = scalar_project();
+
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("target/wasm/app.wasm"), "{text}");
+
+    let bytes = project.read("target/wasm/app.wasm");
+    assert_eq!(invoke(&bytes, "__rhodolite_main", &[]).unwrap(), [42]);
+    assert_eq!(
+        invoke(&bytes, "twice", &[wasmi::Val::I64(4)]).unwrap(),
+        [8],
+        "公開名がそのまま export になる"
+    );
+}
+
+#[test]
+fn 明示した出力先だけに書く() {
+    let project = scalar_project();
+
+    let output = project.build(&["app.rd", "--target", "wasm", "-o", "dist/service.wasm"]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(project.exists("dist/service.wasm"));
+    assert!(
+        !project.exists("target/wasm/app.wasm"),
+        "既定の場所には書かない"
+    );
+}
+
+/// 位置引数だけの従来形は今までどおりインタプリタ。Wasm は出ない
+#[test]
+fn 位置引数はインタプリタのまま() {
+    let project = scalar_project();
+
+    let output = project.cli(&["app.rd"]);
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("  main -> 42"), "{text}");
+    assert!(!project.exists("target"), "Wasm 成果物は作らない");
+}
+
+#[test]
+fn 知らないターゲットとオプションを拒否する() {
+    let project = scalar_project();
+
+    for (args, expected) in [
+        (vec!["app.rd", "--target", "c"], "知らないターゲット"),
+        (vec!["app.rd"], "`--target wasm` が要ります"),
+        (vec!["app.rd", "--target"], "`--target` に値がありません"),
+        (
+            vec!["app.rd", "--target", "wasm", "-o"],
+            "`-o` に値がありません",
+        ),
+        (
+            vec!["app.rd", "--target", "wasm", "-o", "a.wasm", "-o", "b.wasm"],
+            "`-o` が二度指定されています",
+        ),
+        (
+            vec!["app.rd", "--target", "wasm", "extra"],
+            "知らない引数 `extra`",
+        ),
+    ] {
+        let output = project.build(&args);
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{args:?}: {text}");
+        assert!(text.contains(expected), "{args:?}: {text}");
+    }
+}
+
+/// 読み込み・型検査・要求・対応検査の失敗はどれも成果物を出さない
+#[test]
+fn 各段の失敗で成果物を出さない() {
+    for (source, expected) in [
+        (
+            "fn main(-> int) { missing() }\n",
+            "呼び出し先が決まりません",
+        ),
+        ("fn main(-> int) { true }\n", "戻り値は `int` ですが"),
+        (
+            "trait Clock { fn now(self -> int) }\n\
+             effect clock: Clock\n\
+             fn main(-> int) { clock.now() }\n",
+            "提供されていません",
+        ),
+        (
+            "struct User { name: str }\n\
+             fn main(-> int) {\n let u = User { name = \"a\" }\n 1\n}\n",
+            "Wasm ターゲットでは扱えません",
+        ),
+    ] {
+        let project = Project::new();
+        project.write("app.rd", source);
+
+        let output = project.build(&["app.rd", "--target", "wasm"]);
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{source}: {text}");
+        assert!(text.contains(expected), "{source}: {text}");
+        assert!(!project.exists("target/wasm/app.wasm"), "{source}");
+    }
+}
+
+/// 失敗しても、既にある成果物は置き換わらない
+#[test]
+fn 失敗しても既存の成果物は変わらない() {
+    let project = scalar_project();
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let before = project.read("target/wasm/app.wasm");
+
+    project.write("app.rd", "fn main(-> int) { missing() }\n");
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert_eq!(project.read("target/wasm/app.wasm"), before);
+}
+
+/// 同じ入力・同じ選択肢からは同じ bytes
+#[test]
+fn 同じ入力を二度ビルドすると同じbytesになる() {
+    let project = scalar_project();
+
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let first = project.read("target/wasm/app.wasm");
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/app.wasm"), first);
+}
+
+/// test だけが scalar の外を使っていても、生産ビルドは通る
+#[test]
+fn test専用の未対応コードはビルドを止めない() {
+    let project = Project::new();
+    project.write(
+        "app.rd",
+        "struct User { name: str }\n\
+         fn name_of(u: User -> str) { u.name }\n\
+         fn main(-> int) { 1 }\n\
+         test \"名前が読める\" { assert name_of(User { name = \"a\" }) == \"a\" }\n",
+    );
+
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    let bytes = project.read("target/wasm/app.wasm");
+    assert_eq!(invoke(&bytes, "__rhodolite_main", &[]).unwrap(), [1]);
+}
+
+/// 予約名は `pub use` の位置で拒否する。原因はその宣言にある
+#[test]
+fn 予約名の公開再エクスポートを拒否する() {
+    let project = Project::new();
+    project.write(
+        "app.rd",
+        "pub use lib::{double as __rhodolite_main}\n\
+         fn main(-> int) { __rhodolite_main(1) }\n",
+    );
+    project.write("lib.rd", "fn double(n: int -> int) { n * 2 }\n");
+
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("予約名"), "{text}");
+    assert!(text.contains("app.rd:1:1"), "{text}");
+    assert!(!project.exists("target/wasm/app.wasm"), "{text}");
 }

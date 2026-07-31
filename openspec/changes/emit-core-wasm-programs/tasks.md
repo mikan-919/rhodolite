@@ -91,19 +91,19 @@
 
 ## 7. Add the Wasm Build Command
 
-- [ ] 7.1 Introduce explicit CLI command parsing for
+- [x] 7.1 Introduce explicit CLI command parsing for
   `build <entry.rd> --target wasm [-o <output.wasm>]` while preserving no-argument and positional
   interpreter behavior byte-for-byte
-- [ ] 7.2 Connect build loading, whole-program checking, named-root requirement validation,
+- [x] 7.2 Connect build loading, whole-program checking, named-root requirement validation,
   production planning, support checking, emission, and binary validation through the existing
   source-aware diagnostic renderer
-- [ ] 7.3 Implement the invocation-relative `target/wasm/<entry-stem>.wasm` default, explicit
+- [x] 7.3 Implement the invocation-relative `target/wasm/<entry-stem>.wasm` default, explicit
   output paths, parent-directory creation, and same-directory temporary publication without
   replacing an existing artifact on pre-publication failure
-- [ ] 7.4 Add CLI tests for default and explicit outputs, invalid target/options, load/type/
+- [x] 7.4 Add CLI tests for default and explicit outputs, invalid target/options, load/type/
   requirement/support failures, unchanged outputs after failure, interpreter compatibility, and
   independently executable generated files
-- [ ] 7.5 Run formatting, the full unit and CLI suites, canonical interpreter success,
+- [x] 7.5 Run formatting, the full unit and CLI suites, canonical interpreter success,
   missing-provider/runtime diagnostics, generated-module validation/execution, determinism, and
   strict OpenSpec validation, then commit the user-visible build path as a stable snapshot
 
