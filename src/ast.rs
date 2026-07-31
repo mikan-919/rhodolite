@@ -40,7 +40,7 @@ pub enum Item {
     /// `struct User { rank: Rank }` — フィールドの宣言
     Struct {
         name: String,
-        fields: Vec<(String, Type)>,
+        fields: Vec<FieldDecl>,
         span: Span,
     },
     /// `enum Lookup { Found(User) Skipped }` — variant ごとに0個以上の
@@ -83,8 +83,26 @@ pub enum Item {
 #[derive(Debug)]
 pub struct EnumVariant {
     pub name: String,
-    /// 宣言順の payload 型
-    pub payload: Vec<Type>,
+    /// 宣言順の payload
+    pub payload: Vec<PayloadDecl>,
+}
+
+/// `indirect next: Node?` — struct の1フィールド。
+///
+/// `indirect` は所有エッジを間接化して再帰型の層を切る。値の見た目の型は
+/// `T` / `T?` のままで、`Box<T>` のような包みは表に出さない(design.md 決定10)
+#[derive(Debug, Clone)]
+pub struct FieldDecl {
+    pub name: String,
+    pub ty: Type,
+    pub indirect: bool,
+}
+
+/// `Cons(int, indirect List)` — enum variant の1 payload 位置。
+#[derive(Debug, Clone)]
+pub struct PayloadDecl {
+    pub ty: Type,
+    pub indirect: bool,
 }
 
 impl Item {
@@ -106,13 +124,31 @@ impl Item {
 #[derive(Debug)]
 pub struct Sig {
     pub name: String,
-    /// 第一引数が `self` か。トレイトのメソッドと関連関数の区別はこれ一つ。
+    /// 第一引数のレシーバ。トレイトのメソッドと関連関数の区別はこれ一つ。
     /// 暗黙にしないのは、`Postgres::new` のようにレシーバを取らないものと
     /// 見た目で区別できなくなるため
-    pub has_self: bool,
+    pub receiver: Option<ReceiverMode>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub span: Span,
+}
+
+impl Sig {
+    /// レシーバを取るか。モードを見ない既存の検査はこれで足りる
+    pub fn has_self(&self) -> bool {
+        self.receiver.is_some()
+    }
+}
+
+/// `self` / `&self` / `&mut self` — レシーバの所有モード(design.md 決定2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverMode {
+    /// `self` — レシーバを消費する
+    Owned,
+    /// `&self`
+    Shared,
+    /// `&mut self`
+    Mutable,
 }
 
 #[derive(Debug)]
@@ -126,9 +162,20 @@ pub struct Param {
 /// 言い分けられる(design.md 決定1)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Type {
+    /// `T` / `&T` / `&mut T`。ライフタイム引数は持たない(design.md 決定2)
+    pub mode: TypeMode,
     pub kind: TypeKind,
     /// `User?` / `[User]?` の後置 `?`
     pub optional: bool,
+}
+
+/// 型に付く所有モード。所有 `T`、共有借用 `&T`、排他借用 `&mut T` は別の静的型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeMode {
+    #[default]
+    Owned,
+    Shared,
+    Mutable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,10 +226,21 @@ pub enum ExprKind {
     },
     Let {
         name: String,
+        /// `let mut x = ...` か。`let` は不変で、再代入・可変フィールド
+        /// アクセス・`&mut` の作成にはこれが要る
+        mutable: bool,
         /// `let name: T = value` の `T`。推論できない初期化子(裸の `nil`、
         /// 空配列)へ期待型を与える唯一の局所注釈(design.md 決定2)
         annotation: Option<Type>,
         value: Box<Expr>,
+    },
+    /// `&place` / `&mut place` / `move place` — 場所に付く所有権修飾。
+    ///
+    /// 低優先度の単項演算子ではない。末尾がメソッド呼び出しならレシーバに、
+    /// そうでなければ射影全体に付く(design.md 決定2)
+    Access {
+        mode: AccessMode,
+        place: Box<Expr>,
     },
     Assign {
         target: Box<Expr>,
@@ -297,6 +355,18 @@ pub enum Head {
     While(Box<Expr>),
     /// `with db(pg), clock<SystemClock>` — ambient 束縛の導入
     Ambient(Vec<Provision>),
+}
+
+/// `ExprKind::Access` の修飾。共有読みは書かずに済むので、ここに現れるのは
+/// 状態・所有・コストが動く3つだけ(design.md 決定2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    /// `&place`
+    Shared,
+    /// `&mut place`
+    Mutable,
+    /// `move place`
+    Move,
 }
 
 #[derive(Debug, Clone, Copy)]

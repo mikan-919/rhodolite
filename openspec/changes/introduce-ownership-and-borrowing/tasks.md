@@ -1,20 +1,20 @@
 ## 1. Parse the Ownership Surface
 
-- [ ] 1.1 Add lexer tokens and source spans for `&`, `mut`, `move`, and `indirect`
+- [x] 1.1 Add lexer tokens and source spans for `&`, `mut`, `move`, and `indirect`
   without changing the meaning of currently valid programs
-- [ ] 1.2 Extend AST types with owned/shared/mutable modes, signatures with
+- [x] 1.2 Extend AST types with owned/shared/mutable modes, signatures with
   `self`/`&self`/`&mut self`, bindings with `let mut`, and fields/payloads with
   `indirect`
-- [ ] 1.3 Parse `&T`, `&mut T`, `let mut`, ownership-qualified values, calls,
+- [x] 1.3 Parse `&T`, `&mut T`, `let mut`, ownership-qualified values, calls,
   receivers, `match`, `for`, `??`, and `with` provisions with the agreed
   place/receiver precedence
-- [ ] 1.4 Reject lifetime spellings, pattern-level moves, malformed ownership
+- [x] 1.4 Reject lifetime spellings, pattern-level moves, malformed ownership
   modifiers, user destructor/finalizer forms, raw pointers, and `unsafe` with
   source-positioned parser diagnostics
-- [ ] 1.5 Update AST dumps and parser tests for every new form, multiline and
+- [x] 1.5 Update AST dumps and parser tests for every new form, multiline and
   postfix interaction, parentheses equivalence, and every retained old grammar
   form
-- [ ] 1.6 Run formatting, the full existing test suite, focused parser fixtures,
+- [x] 1.6 Run formatting, the full existing test suite, focused parser fixtures,
   and strict OpenSpec validation, then commit the syntax surface as a stable
   snapshot
 

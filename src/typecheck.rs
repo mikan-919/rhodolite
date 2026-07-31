@@ -206,7 +206,7 @@ struct FnSig {
 /// 宣言された署名を検査用の形にする。引数名は実装側の局所名なので落とす。
 fn signature(sig: &Sig) -> FnSig {
     FnSig {
-        has_self: sig.has_self,
+        has_self: sig.has_self(),
         params: sig.params.iter().map(|p| known(&p.ty)).collect(),
         ret: effective_ret(sig),
     }
@@ -418,7 +418,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                     check_body(
                         body,
                         Some(sig),
-                        sig.has_self.then(|| plain(type_name)),
+                        sig.has_self().then(|| plain(type_name)),
                         &decls,
                         &ctx,
                         &effective_ret(sig),
@@ -503,7 +503,10 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 ids.structs.insert(name.clone(), owner);
                 let mut declared: BTreeMap<String, KnownType> = BTreeMap::new();
                 let mut duplicates = BTreeSet::new();
-                for (field, ty) in fields {
+                for crate::ast::FieldDecl {
+                    name: field, ty, ..
+                } in fields
+                {
                     let previous = declared.insert(field.clone(), known(ty));
                     if previous.is_some() {
                         duplicates.insert(field.clone());
@@ -542,7 +545,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                         variant.name.clone(),
                         FnSig {
                             has_self: false,
-                            params: variant.payload.iter().map(known).collect(),
+                            params: variant.payload.iter().map(|p| known(&p.ty)).collect(),
                             ret: plain(name),
                         },
                     );
@@ -552,7 +555,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                         payload: variant
                             .payload
                             .iter()
-                            .map(|ty| lower_type(ty, &nominal, out))
+                            .map(|p| lower_type(&p.ty, &nominal, out))
                             .collect(),
                         span: *span,
                     });
@@ -571,7 +574,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                     let id = lowered.trait_methods.alloc(hir::TraitMethodDecl {
                         name: sig.name.clone(),
                         owner,
-                        has_self: sig.has_self,
+                        has_self: sig.has_self(),
                         params: sig
                             .params
                             .iter()
@@ -838,7 +841,7 @@ fn callable_shell(
     hir::Callable {
         name: sig.name.clone(),
         owner,
-        has_self: sig.has_self,
+        has_self: sig.has_self(),
         params: Vec::new(),
         ret: lower_ret(sig, nominal, out),
         body: hir::Body::default(),
@@ -1325,6 +1328,10 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
     let decls = cx.decls;
     let ctx = cx.ctx;
     match &e.kind {
+        // ponytail: 所有権修飾は構文だけ通す。モードを見て検査するのは
+        // introduce-ownership-and-borrowing のフェーズ2以降
+        ExprKind::Access { place, .. } => walk_kind(place, expected, cx, locals, out),
+
         ExprKind::Int(n) => typed(plain("int"), hir::ExprKind::Int(*n)),
         ExprKind::Str(s) => typed(plain("str"), hir::ExprKind::Str(s.clone())),
         ExprKind::Bool(b) => typed(plain("bool"), hir::ExprKind::Bool(*b)),
@@ -1450,6 +1457,7 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
             name,
             annotation,
             value,
+            ..
         } => {
             if let Some(annotation) = annotation {
                 report_unknown(annotation, &decls.nominal, out);
