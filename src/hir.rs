@@ -22,6 +22,9 @@
 //! そこから名前を引くだけで、意味の照合には使わない。**意味を持つ型参照に
 //! 文字列は入らない**(`Type` を見れば分かる)。
 
+/// 所有モードは構文と意味で同じ3択なので、構文木の定義をそのまま使う。
+/// HIR が捨てるのは「どう書かれたか」であって「何を要求したか」ではない
+pub use crate::ast::{AccessMode, ReceiverMode};
 use crate::lex::Span;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -178,15 +181,42 @@ impl Builtin {
     }
 }
 
-/// 値の型。同一性は形と後置 `?` の一致だけ(nominal, design.md 決定2)。
+/// 借用の強さ。所有値は `None` で表すので、ここには借用の2つしか無い
+/// (design.md 決定3)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefKind {
+    /// `&T` — 共有借用。Copy な能力
+    Shared,
+    /// `&mut T` — 排他借用。Copy ではない
+    Mutable,
+}
+
+impl RefKind {
+    pub fn spelling(self) -> &'static str {
+        match self {
+            RefKind::Shared => "&",
+            RefKind::Mutable => "&mut ",
+        }
+    }
+}
+
+/// 値の型。同一性は形と後置 `?` と借用の強さの一致だけ(nominal, design.md 決定2)。
+/// 所有 `T`・共有 `&T`・排他 `&mut T` は別の静的型(design.md 決定3)。
 ///
 /// trait とスロットは値の型ではないのでここに現れない。制御が続かないことは
 /// 型ではなく `ExprResult::Diverges` で言う。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Type {
+    /// `&T` / `&mut T`。所有値は `None`。参照は借用の nominal な形なので
+    /// `TypeKind` の変種ではなく、完成した所有形の外側に1つだけ付く
+    /// (design.md 決定3)
+    pub reference: Option<RefKind>,
     pub kind: TypeKind,
     /// `User?` / `[User]?` の後置 `?`。完成した型に1 bit 付くだけなので
-    /// `[T]?` と `[T?]` を言い分けられる
+    /// `[T]?` と `[T?]` を言い分けられる。
+    ///
+    /// optional が付くのは**所有の形**だけ。検査を通った型では
+    /// `reference.is_some()` と `optional` は両立しない(design.md 決定3)
     pub optional: bool,
 }
 
@@ -204,6 +234,7 @@ pub enum TypeKind {
 impl Type {
     pub fn builtin(builtin: Builtin) -> Self {
         Type {
+            reference: None,
             kind: TypeKind::Builtin(builtin),
             optional: false,
         }
@@ -253,6 +284,9 @@ pub struct FieldDecl {
     pub name: String,
     pub owner: StructId,
     pub ty: Type,
+    /// `indirect next: Node?` — 所有エッジを間接化する。値の見た目の型は `ty` の
+    /// ままで、型の中身の並びからは外れるので再帰の層が切れる(design.md 決定10)
+    pub indirect: bool,
     pub span: Span,
 }
 
@@ -268,9 +302,17 @@ pub struct EnumDecl {
 pub struct VariantDecl {
     pub name: String,
     pub owner: EnumId,
-    /// 宣言順の payload 型。fieldless は空
-    pub payload: Vec<Type>,
+    /// 宣言順の payload。fieldless は空
+    pub payload: Vec<PayloadDecl>,
     pub span: Span,
+}
+
+/// `Cons(int, indirect List)` — variant の payload 1位置。
+#[derive(Debug)]
+pub struct PayloadDecl {
+    pub ty: Type,
+    /// `indirect`。`FieldDecl::indirect` と同じ意味(design.md 決定10)
+    pub indirect: bool,
 }
 
 #[derive(Debug)]
@@ -285,7 +327,8 @@ pub struct TraitDecl {
 pub struct TraitMethodDecl {
     pub name: String,
     pub owner: TraitId,
-    pub has_self: bool,
+    /// 解決済みのレシーバ。取らないなら `None`(design.md 決定2)
+    pub receiver: Option<ReceiverMode>,
     pub params: Vec<Type>,
     /// 実効戻り値型。注釈が無ければ `unit`
     pub ret: Type,
@@ -331,7 +374,9 @@ pub struct Callable {
     /// 正準表示名。トップレベルは関数名、メソッドは短いメソッド名
     pub name: String,
     pub owner: CallableOwner,
-    pub has_self: bool,
+    /// 解決済みのレシーバ。`self` / `&self` / `&mut self` を言い分ける。
+    /// レシーバの局所束縛の型はこのモードから決まる(design.md 決定2)
+    pub receiver: Option<ReceiverMode>,
     /// `self` を含まない宣言順の引数。`self` は `Body::receiver`
     pub params: Vec<LocalId>,
     pub ret: Type,
@@ -369,6 +414,9 @@ pub struct LocalDecl {
     /// 初期化子が値を産まない `let`(`let x = return 1`)だけ `None`。
     /// そのローカルは読めない(読めば検査が落ちる)
     pub ty: Option<Type>,
+    /// `let mut` で宣言されたか。引数・`self`・ループ変数・match payload は
+    /// 構文上 `mut` を持てないので偽(design.md 決定2)
+    pub mutable: bool,
     pub span: Span,
 }
 
@@ -442,6 +490,12 @@ pub enum ExprKind {
         recv: ExprId,
         field: FieldId,
         value: ExprId,
+    },
+    /// `&place` / `&mut place` / `move place` — 解決済みの所有権修飾。
+    /// 結果型は `place` の型にモードを掛けたもの(design.md 決定3)
+    Access {
+        mode: AccessMode,
+        place: ExprId,
     },
     Neg(ExprId),
     Arith {
@@ -624,7 +678,37 @@ impl Program {
         if ty.optional {
             out.push('?');
         }
-        out
+        match ty.reference {
+            Some(kind) => format!("{}{out}", kind.spelling()),
+            None => out,
+        }
+    }
+
+    /// 暗黙に複製してよい型か(design.md 決定4)。
+    ///
+    /// Copy はこの版では意図的に小さい。スカラー・payload を持たない enum・
+    /// 共有借用だけで、`&mut T` と所有の複合値(struct・payload enum・`str`・
+    /// 配列・非 Copy を包む optional)は入らない。`copy struct` の opt-in は
+    /// 後の capability に残してある
+    pub fn is_copy(&self, ty: &Type) -> bool {
+        match ty.reference {
+            // `&T` は複製できる能力、`&mut T` は排他なので複製できない
+            Some(RefKind::Shared) => return true,
+            Some(RefKind::Mutable) => return false,
+            None => {}
+        }
+        match &ty.kind {
+            TypeKind::Builtin(Builtin::Int | Builtin::Bool | Builtin::Unit) => true,
+            TypeKind::Builtin(Builtin::Str) => false,
+            TypeKind::Struct(_) => false,
+            // payload を1つでも持つ enum は所有の複合値
+            TypeKind::Enum(id) => self.enums[*id]
+                .variants
+                .iter()
+                .all(|v| self.variants[*v].payload.is_empty()),
+            TypeKind::Array(_) => false,
+            TypeKind::Poison => false,
+        }
     }
 
     pub fn body(&self, id: BodyId) -> &Body {
@@ -684,7 +768,7 @@ impl Program {
             }
         }
         for (_, variant) in self.variants.iter() {
-            if variant.payload.iter().any(poisoned_type) {
+            if variant.payload.iter().any(|p| poisoned_type(&p.ty)) {
                 return Some(variant.span);
             }
         }
@@ -749,7 +833,8 @@ impl Program {
                 .map(|f| {
                     let field = &self.fields[*f];
                     format!(
-                        "{}#{}: {}",
+                        "{}{}#{}: {}",
+                        if field.indirect { "indirect " } else { "" },
                         field.name,
                         f.index(),
                         self.show_type(&field.ty)
@@ -770,8 +855,17 @@ impl Program {
                 .iter()
                 .map(|v| {
                     let variant = &self.variants[*v];
-                    let payload: Vec<String> =
-                        variant.payload.iter().map(|t| self.show_type(t)).collect();
+                    let payload: Vec<String> = variant
+                        .payload
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{}{}",
+                                if p.indirect { "indirect " } else { "" },
+                                self.show_type(&p.ty)
+                            )
+                        })
+                        .collect();
                     if payload.is_empty() {
                         format!("{}#{}", variant.name, v.index())
                     } else {
@@ -796,7 +890,7 @@ impl Program {
                     "  method#{} {}{}",
                     method.index(),
                     sig.name,
-                    self.show_signature(sig.has_self, &sig.params, &sig.ret)
+                    self.show_signature(sig.receiver, &sig.params, &sig.ret)
                 );
             }
         }
@@ -845,7 +939,7 @@ impl Program {
                 id.index(),
                 owner,
                 decl.name,
-                self.show_signature(decl.has_self, &params, &decl.ret)
+                self.show_signature(decl.receiver, &params, &decl.ret)
             );
             self.dump_body(&decl.body, &mut out);
         }
@@ -856,10 +950,22 @@ impl Program {
         out
     }
 
-    fn show_signature(&self, has_self: bool, params: &[Type], ret: &Type) -> String {
+    fn show_signature(
+        &self,
+        receiver: Option<ReceiverMode>,
+        params: &[Type],
+        ret: &Type,
+    ) -> String {
         let mut shown: Vec<String> = Vec::new();
-        if has_self {
-            shown.push("self".to_string());
+        if let Some(mode) = receiver {
+            shown.push(
+                match mode {
+                    ReceiverMode::Owned => "self",
+                    ReceiverMode::Shared => "&self",
+                    ReceiverMode::Mutable => "&mut self",
+                }
+                .to_string(),
+            );
         }
         shown.extend(params.iter().map(|t| self.show_type(t)));
         format!("({}) -> {}", shown.join(", "), self.show_type(ret))
@@ -871,7 +977,14 @@ impl Program {
                 Some(ty) => self.show_type(ty),
                 None => "?".to_string(),
             };
-            let _ = writeln!(out, "  local#{} {}: {}", id.index(), local.name, ty);
+            let _ = writeln!(
+                out,
+                "  local#{} {}{}: {}",
+                id.index(),
+                if local.mutable { "mut " } else { "" },
+                local.name,
+                ty
+            );
         }
         for (id, expr) in body.exprs() {
             let result = match &expr.result {
@@ -943,6 +1056,15 @@ impl Program {
                 recv.index(),
                 self.fields[*field].name,
                 value.index()
+            ),
+            ExprKind::Access { mode, place } => format!(
+                "{}#{}",
+                match mode {
+                    AccessMode::Shared => "&",
+                    AccessMode::Mutable => "&mut ",
+                    AccessMode::Move => "move ",
+                },
+                place.index()
             ),
             ExprKind::Neg(inner) => format!("neg #{}", inner.index()),
             ExprKind::Arith { op, lhs, rhs } => {
@@ -1117,6 +1239,7 @@ mod tests {
         let local = body.alloc_local(LocalDecl {
             name: "n".to_string(),
             ty: Some(Type::builtin(Builtin::Int)),
+            mutable: false,
             span: span(),
         });
         let value = body.alloc_expr(Expr {
@@ -1128,7 +1251,7 @@ mod tests {
         program.callables.alloc(Callable {
             name: "main".to_string(),
             owner: CallableOwner::Free,
-            has_self: false,
+            receiver: None,
             params: vec![local],
             ret: Type::builtin(Builtin::Int),
             body,
@@ -1165,6 +1288,7 @@ mod tests {
             name: "x".to_string(),
             owner: point,
             ty: Type::builtin(Builtin::Int),
+            indirect: false,
             span: span(),
         });
         program.structs.get_mut(point).fields.push(x);
@@ -1179,7 +1303,7 @@ mod tests {
         program.callables.alloc(Callable {
             name: "main".to_string(),
             owner: CallableOwner::Free,
-            has_self: false,
+            receiver: None,
             params: Vec::new(),
             ret: Type::builtin(Builtin::Int),
             body,

@@ -56,8 +56,8 @@
 //! 違う(あちらは提供集合、こちらはローカル名と分かっている型)ので別に書いている。
 
 use crate::ast::{
-    BinOp, Expr, ExprKind, Head, Item, MatchArm, MatchPattern, PatternBinding, Program, Provision,
-    Sig, Type, TypeKind, UnOp,
+    AccessMode, BinOp, Expr, ExprKind, Head, Item, MatchArm, MatchPattern, PatternBinding, Program,
+    Provision, ReceiverMode, Sig, Type, TypeKind, TypeMode, UnOp,
 };
 use crate::diag::Diag;
 use crate::hir;
@@ -146,10 +146,14 @@ enum Target {
     Discard,
 }
 
-/// 分かっている型。同一性は形と後置 `?` の一致(nominal, design.md 決定1)。
-/// 配列は要素型まで含めて一致しないと同じ型ではない(要素型は不変)。
+/// 分かっている型。同一性は形と後置 `?` と借用の強さの一致
+/// (nominal, design.md 決定1・3)。配列は要素型まで含めて一致しないと同じ型では
+/// ない(要素型は不変)。所有 `T`・共有 `&T`・排他 `&mut T` は別の型。
 #[derive(Clone, PartialEq, Eq)]
 struct KnownType {
+    /// `&T` / `&mut T`。所有値は `None`。`kind` と `optional` は常に
+    /// **借用先の所有の形**を表すので、名前・要素・宣言の索引は借用を通して引ける
+    reference: Option<hir::RefKind>,
     kind: KnownKind,
     optional: bool,
 }
@@ -180,6 +184,9 @@ impl KnownType {
 
 impl std::fmt::Display for KnownType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(kind) = self.reference {
+            write!(f, "{}", kind.spelling())?;
+        }
         match &self.kind {
             KnownKind::Named(name) => write!(f, "{name}")?,
             KnownKind::Array(element) => write!(f, "[{element}]")?,
@@ -198,7 +205,9 @@ impl std::fmt::Display for KnownType {
 /// (design.md 決定1)。「戻り値型が分からない呼び出し」は存在しない
 #[derive(PartialEq, Eq)]
 struct FnSig {
-    has_self: bool,
+    /// `self` / `&self` / `&mut self`。取らないなら `None`(design.md 決定2)。
+    /// trait 実装はここまで含めて契約と一致していなければならない
+    receiver: Option<ReceiverMode>,
     params: Vec<KnownType>,
     ret: KnownType,
 }
@@ -206,9 +215,22 @@ struct FnSig {
 /// 宣言された署名を検査用の形にする。引数名は実装側の局所名なので落とす。
 fn signature(sig: &Sig) -> FnSig {
     FnSig {
-        has_self: sig.has_self(),
+        receiver: sig.receiver,
         params: sig.params.iter().map(|p| known(&p.ty)).collect(),
         ret: effective_ret(sig),
+    }
+}
+
+/// レシーバの局所束縛の型。`&self` は `&T`、`&mut self` は `&mut T`、
+/// `self` は所有の `T`(design.md 決定2)。
+fn receiver_type(mode: ReceiverMode, type_name: &str) -> KnownType {
+    KnownType {
+        reference: match mode {
+            ReceiverMode::Owned => None,
+            ReceiverMode::Shared => Some(hir::RefKind::Shared),
+            ReceiverMode::Mutable => Some(hir::RefKind::Mutable),
+        },
+        ..plain(type_name)
     }
 }
 
@@ -244,22 +266,34 @@ fn known(ty: &Type) -> KnownType {
         TypeKind::Array(element) => KnownKind::Array(Box::new(known(element))),
     };
     KnownType {
+        reference: ref_kind(ty.mode),
         kind,
         optional: ty.optional,
     }
 }
 
-/// 後置 `?` の付かない型。variant / struct リテラル / self に使う。
+/// 注釈の所有モードを借用の強さへ。所有 `T` は借用ではないので `None`。
+fn ref_kind(mode: TypeMode) -> Option<hir::RefKind> {
+    match mode {
+        TypeMode::Owned => None,
+        TypeMode::Shared => Some(hir::RefKind::Shared),
+        TypeMode::Mutable => Some(hir::RefKind::Mutable),
+    }
+}
+
+/// 後置 `?` の付かない所有型。variant / struct リテラル / self に使う。
 fn plain(name: &str) -> KnownType {
     KnownType {
+        reference: None,
         kind: KnownKind::Named(name.to_string()),
         optional: false,
     }
 }
 
-/// 後置 `?` の付かない配列型。
+/// 後置 `?` の付かない所有の配列型。
 fn array_of(element: KnownType) -> KnownType {
     KnownType {
+        reference: None,
         kind: KnownKind::Array(Box::new(element)),
         optional: false,
     }
@@ -370,6 +404,9 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
         body: hir::Body::default(),
     };
     let (decls, mut lowered, targets) = collect(program, &mut out);
+    // 宣言が全部揃ってから所有の内包を見る。無限の大きさの型は本体の検査より
+    // 前に止める(design.md 決定10)
+    check_type_cycles(&lowered, &mut out);
     let out = &mut out;
     let mut targets = targets.into_iter();
 
@@ -418,7 +455,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                     check_body(
                         body,
                         Some(sig),
-                        sig.has_self().then(|| plain(type_name)),
+                        sig.receiver.map(|mode| receiver_type(mode, type_name)),
                         &decls,
                         &ctx,
                         &effective_ret(sig),
@@ -504,18 +541,27 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 let mut declared: BTreeMap<String, KnownType> = BTreeMap::new();
                 let mut duplicates = BTreeSet::new();
                 for crate::ast::FieldDecl {
-                    name: field, ty, ..
+                    name: field,
+                    ty,
+                    indirect,
                 } in fields
                 {
                     let previous = declared.insert(field.clone(), known(ty));
                     if previous.is_some() {
                         duplicates.insert(field.clone());
                     }
+                    check_type_shape(
+                        ty,
+                        &RefSite::Owned,
+                        &format!("struct `{name}` のフィールド `{field}`"),
+                        out,
+                    );
                     // フィールド単体の span は構文木が持たないので宣言全体を指す
                     let id = lowered.fields.alloc(hir::FieldDecl {
                         name: field.clone(),
                         owner,
                         ty: lower_type(ty, &nominal, out),
+                        indirect: *indirect,
                         span: *span,
                     });
                     lowered.structs.get_mut(owner).fields.push(id);
@@ -544,18 +590,33 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                     ctors.insert(
                         variant.name.clone(),
                         FnSig {
-                            has_self: false,
+                            receiver: None,
                             params: variant.payload.iter().map(|p| known(&p.ty)).collect(),
                             ret: plain(name),
                         },
                     );
+                    for (position, payload) in variant.payload.iter().enumerate() {
+                        check_type_shape(
+                            &payload.ty,
+                            &RefSite::Owned,
+                            &format!(
+                                "enum `{name}` の variant `{}` の第 {} payload",
+                                short_name(&variant.name),
+                                position + 1
+                            ),
+                            out,
+                        );
+                    }
                     let id = lowered.variants.alloc(hir::VariantDecl {
                         name: variant.name.clone(),
                         owner,
                         payload: variant
                             .payload
                             .iter()
-                            .map(|p| lower_type(&p.ty, &nominal, out))
+                            .map(|p| hir::PayloadDecl {
+                                ty: lower_type(&p.ty, &nominal, out),
+                                indirect: p.indirect,
+                            })
                             .collect(),
                         span: *span,
                     });
@@ -571,10 +632,11 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 let owner = nominal.traits[name];
                 ids.traits.insert(name.clone(), owner);
                 for sig in methods {
+                    check_signature_shape(sig, &format!("trait {name}::{}", sig.name), out);
                     let id = lowered.trait_methods.alloc(hir::TraitMethodDecl {
                         name: sig.name.clone(),
                         owner,
-                        has_self: sig.has_self(),
+                        receiver: sig.receiver,
                         params: sig
                             .params
                             .iter()
@@ -620,6 +682,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
             Item::Fn { sig, span, .. } => {
                 others.insert(sig.name.clone());
                 fns.insert(sig.name.clone(), signature(sig));
+                check_signature_shape(sig, &sig.name, out);
                 let id = lowered.callables.alloc(callable_shell(
                     sig,
                     hir::CallableOwner::Free,
@@ -805,9 +868,48 @@ fn lower_known(ty: &KnownType, nominal: &Nominal) -> hir::Type {
         },
     };
     hir::Type {
+        reference: ty.reference,
         kind,
         optional: ty.optional,
     }
+}
+
+/// 型注釈のどこに参照を書けるか(design.md 決定3、tasks 2.3)。
+///
+/// この版の参照はローカル・引数・戻り値・射影にだけ現れる。所有の内側
+/// (struct のフィールド・enum の payload・配列の要素)へは置けず、optional も
+/// 付けられない。後で解禁するときに増えるのは受理する位置だけなので、
+/// 判定を1本にまとめてある。
+enum RefSite {
+    /// 引数・戻り値・`let` の注釈。最も外側にだけ参照を書ける
+    Outermost,
+    /// struct のフィールドと enum の payload。所有値しか置けない
+    Owned,
+}
+
+fn check_type_shape(ty: &Type, site: &RefSite, position: &str, out: &mut Out) {
+    if ty.mode != TypeMode::Owned {
+        match site {
+            RefSite::Owned => out.push(format!(
+                "{position}には参照型を書けません。集約の中に借用を置くのはこの版では未対応です"
+            )),
+            RefSite::Outermost if ty.optional => {
+                out.push(format!("{position}の型{}", optional_reference(&known(ty))));
+            }
+            RefSite::Outermost => {}
+        }
+    }
+    // 配列の要素は所有の内側。`&[T]` は書けるが `[&T]` は書けない
+    if let TypeKind::Array(element) = &ty.kind {
+        let inner = format!("{position}の配列要素");
+        check_type_shape(element, &RefSite::Owned, &inner, out);
+    }
+}
+
+/// optional な参照を断る文言(design.md 決定3、tasks 2.3)。注釈から来た型でも
+/// `??` が導いた型でも同じ理由なので1本にしてある。
+fn optional_reference(ty: &KnownType) -> String {
+    format!(" `{ty}` は optional な参照です。参照に後置 `?` は付けられません")
 }
 
 /// 宣言の実効戻り値型を HIR へ。注釈の省略は `unit` を返す宣言と同じ意味。
@@ -841,11 +943,27 @@ fn callable_shell(
     hir::Callable {
         name: sig.name.clone(),
         owner,
-        has_self: sig.has_self(),
+        receiver: sig.receiver,
         params: Vec::new(),
         ret: lower_ret(sig, nominal, out),
         body: hir::Body::default(),
         span,
+    }
+}
+
+/// 署名の引数と戻り値に書かれた参照の位置を見る。参照そのものは受理する位置
+/// なので、見るのは入れ子と optional だけ(tasks 2.3)。
+fn check_signature_shape(sig: &Sig, ctx: &str, out: &mut Out) {
+    for param in &sig.params {
+        check_type_shape(
+            &param.ty,
+            &RefSite::Outermost,
+            &format!("{ctx} の引数 `{}`", param.name),
+            out,
+        );
+    }
+    if let Some(ret) = &sig.ret {
+        check_type_shape(ret, &RefSite::Outermost, &format!("{ctx} の戻り値"), out);
     }
 }
 
@@ -896,6 +1014,7 @@ fn lower_impl(
         (None, _) => None,
     };
     for (sig, _) in methods {
+        check_signature_shape(sig, &format!("impl {type_name}::{}", sig.name), out);
         let Some(owner) = owner else {
             targets.push(Target::Discard);
             continue;
@@ -948,6 +1067,182 @@ fn link_trait_impls(pending: Vec<PendingImpl>, ids: &Ids, lowered: &mut hir::Pro
     }
 }
 
+// ---------------------------------------------------------------------------
+// 所有の内包グラフ(design.md 決定10)
+// ---------------------------------------------------------------------------
+
+/// 型の内包グラフの節点。値の型を持つ宣言だけが節点になる。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Node {
+    Struct(hir::StructId),
+    Enum(hir::EnumId),
+}
+
+/// 「A の中に B の値がそのまま並ぶ」1本の辺。`indirect` な宣言は辺を作らない
+/// ので、間接化された再帰は循環にならない(design.md 決定10)。
+struct Edge {
+    to: Node,
+    /// 宣言を指す位置。`indirect` を足すべき場所でもある
+    span: Span,
+    /// 診断に出す辺の綴り
+    label: String,
+}
+
+/// 内包グラフを作り、`indirect` を1本も含まない循環を全部報告する。
+///
+/// 宣言の並びと辺の並びは宣言順なので、同じプログラムからは常に同じ診断が
+/// 同じ順で出る。
+fn check_type_cycles(lowered: &hir::Program, out: &mut Out) {
+    let mut graph: BTreeMap<Node, Vec<Edge>> = BTreeMap::new();
+    for (id, decl) in lowered.structs.iter() {
+        let edges = graph.entry(Node::Struct(id)).or_default();
+        for field in &decl.fields {
+            let field = &lowered.fields[*field];
+            if field.indirect {
+                continue;
+            }
+            for to in inline_targets(&field.ty) {
+                edges.push(Edge {
+                    to,
+                    span: field.span,
+                    label: format!(
+                        "`{}` のフィールド `{}` が `{}` を直接持っています",
+                        short_name(&decl.name),
+                        field.name,
+                        show_node(lowered, to)
+                    ),
+                });
+            }
+        }
+    }
+    for (id, decl) in lowered.enums.iter() {
+        let edges = graph.entry(Node::Enum(id)).or_default();
+        for variant in &decl.variants {
+            let variant = &lowered.variants[*variant];
+            for (position, payload) in variant.payload.iter().enumerate() {
+                if payload.indirect {
+                    continue;
+                }
+                for to in inline_targets(&payload.ty) {
+                    edges.push(Edge {
+                        to,
+                        span: variant.span,
+                        label: format!(
+                            "`{}` の variant `{}` の第 {} payload が `{}` を直接持っています",
+                            short_name(&decl.name),
+                            short_name(&variant.name),
+                            position + 1,
+                            show_node(lowered, to)
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut visited: BTreeSet<Node> = BTreeSet::new();
+    let mut on_stack: Vec<Node> = Vec::new();
+    let mut path: Vec<&Edge> = Vec::new();
+    let mut reported: BTreeSet<Node> = BTreeSet::new();
+    let nodes: Vec<Node> = graph.keys().copied().collect();
+    for node in nodes {
+        visit_containment(
+            node,
+            &graph,
+            lowered,
+            &mut visited,
+            &mut on_stack,
+            &mut path,
+            &mut reported,
+            out,
+        );
+    }
+}
+
+/// その型の値の中に**そのまま並ぶ**名前付き型。optional と配列は所有の内側
+/// なので辿り、参照は所有ではないので辿らない(design.md 決定10)。
+fn inline_targets(ty: &hir::Type) -> Vec<Node> {
+    if ty.reference.is_some() {
+        return Vec::new();
+    }
+    match &ty.kind {
+        hir::TypeKind::Struct(id) => vec![Node::Struct(*id)],
+        hir::TypeKind::Enum(id) => vec![Node::Enum(*id)],
+        hir::TypeKind::Array(element) => inline_targets(element),
+        hir::TypeKind::Builtin(_) | hir::TypeKind::Poison => Vec::new(),
+    }
+}
+
+fn show_node(lowered: &hir::Program, node: Node) -> String {
+    short_name(match node {
+        Node::Struct(id) => &lowered.structs[id].name,
+        Node::Enum(id) => &lowered.enums[id].name,
+    })
+    .to_string()
+}
+
+fn node_span(lowered: &hir::Program, node: Node) -> Span {
+    match node {
+        Node::Struct(id) => lowered.structs[id].span,
+        Node::Enum(id) => lowered.enums[id].span,
+    }
+}
+
+/// 深さ優先で1節点を訪ねる。いま辿っている経路の上の節点へ戻る辺が循環。
+#[allow(clippy::too_many_arguments)]
+fn visit_containment<'g>(
+    node: Node,
+    graph: &'g BTreeMap<Node, Vec<Edge>>,
+    lowered: &hir::Program,
+    visited: &mut BTreeSet<Node>,
+    on_stack: &mut Vec<Node>,
+    path: &mut Vec<&'g Edge>,
+    reported: &mut BTreeSet<Node>,
+    out: &mut Out,
+) {
+    if !visited.insert(node) {
+        return;
+    }
+    on_stack.push(node);
+    for edge in graph.get(&node).into_iter().flatten() {
+        if let Some(start) = on_stack.iter().position(|n| *n == edge.to) {
+            // 同じ強連結成分は一度だけ報告する
+            if reported.contains(&edge.to) {
+                continue;
+            }
+            let cycle: Vec<&Edge> = path[start..].iter().copied().chain([edge]).collect();
+            report_cycle(lowered, edge.to, &cycle, out);
+            reported.extend(on_stack[start..].iter().copied());
+            continue;
+        }
+        path.push(edge);
+        visit_containment(
+            edge.to, graph, lowered, visited, on_stack, path, reported, out,
+        );
+        path.pop();
+    }
+    on_stack.pop();
+}
+
+fn report_cycle(lowered: &hir::Program, start: Node, cycle: &[&Edge], out: &mut Out) {
+    let related = cycle
+        .iter()
+        .map(|edge| Diag::at(edge.span, edge.label.clone()).label("この所有エッジ"))
+        .collect();
+    out.diagnostics.push(
+        Diag::at(
+            node_span(lowered, start),
+            format!(
+                "型 `{}` の所有が循環しています。値の大きさが決まりません",
+                show_node(lowered, start)
+            ),
+        )
+        .label("ここから始まる循環")
+        .help("循環の辺のどれかに `indirect` を付けて所有を間接化してください(同じ型が別の循環にも入っていれば、それも順に出ます)")
+        .related(related),
+    );
+}
+
 /// trait `impl` を契約と突き合わせる。呼び出しの到達性に依らせないため、
 /// 宣言の時点で見る(design.md 決定2)。
 fn check_impl(
@@ -982,10 +1277,14 @@ fn check_impl(
         };
         // 引数名は実装側の局所名なので同一性に入れない(design.md 決定2)
         let actual = signature(sig);
-        if actual.has_self != declared.has_self {
+        // レシーバの所有モードまで契約と一致していなければならない
+        // (method-call-type-checking spec「Trait receiver mismatch」)
+        if actual.receiver != declared.receiver {
             out.push(format!(
-                "{ctx}: `{}` のレシーバの形が `{trait_name}` の宣言と違います",
-                sig.name
+                "{ctx}: `{}` のレシーバは {} ですが、{} を宣言しています",
+                sig.name,
+                show_receiver(declared.receiver),
+                show_receiver(actual.receiver)
             ));
         }
         if actual.params != declared.params {
@@ -1016,6 +1315,16 @@ fn check_impl(
             "{ctx}: `{trait_name}` のメソッド {} を実装していません",
             quoted(&missing)
         ));
+    }
+}
+
+/// 診断に出すレシーバの綴り。
+fn show_receiver(receiver: Option<ReceiverMode>) -> &'static str {
+    match receiver {
+        None => "レシーバ無し",
+        Some(ReceiverMode::Owned) => "`self`",
+        Some(ReceiverMode::Shared) => "`&self`",
+        Some(ReceiverMode::Mutable) => "`&mut self`",
     }
 }
 
@@ -1063,7 +1372,12 @@ impl Outcome {
 /// 宛先の型へ値の型が収まるか。厳密一致か、同名の非 optional から optional への
 /// 一方向の注入だけ(design.md 決定1)。値の側の推論型は変えない。
 fn fits(actual: &KnownType, expected: &KnownType) -> bool {
-    actual == expected || (actual.kind == expected.kind && !actual.optional && expected.optional)
+    actual == expected
+        || (actual.kind == expected.kind
+            // 借用の強さは注入では変わらない。`T` と `&T` は別の宛先
+            && actual.reference == expected.reference
+            && !actual.optional
+            && expected.optional)
 }
 
 /// 期待型のある位置。どこが期待しているかで診断の文言だけが変わる。
@@ -1167,10 +1481,24 @@ fn alloc_local(
     decls: &Decls,
     out: &mut Out,
 ) -> hir::LocalId {
+    alloc_binding(name, ty, false, span, decls, out)
+}
+
+/// 可変性まで指定して局所束縛を確保する。`let mut` だけが真を渡す
+/// (design.md 決定2)。
+fn alloc_binding(
+    name: &str,
+    ty: Option<&KnownType>,
+    mutable: bool,
+    span: Span,
+    decls: &Decls,
+    out: &mut Out,
+) -> hir::LocalId {
     let ty = ty.map(|ty| lower_known(ty, &decls.nominal));
     out.body.alloc_local(hir::LocalDecl {
         name: name.to_string(),
         ty,
+        mutable,
         span,
     })
 }
@@ -1328,9 +1656,7 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
     let decls = cx.decls;
     let ctx = cx.ctx;
     match &e.kind {
-        // ponytail: 所有権修飾は構文だけ通す。モードを見て検査するのは
-        // introduce-ownership-and-borrowing のフェーズ2以降
-        ExprKind::Access { place, .. } => walk_kind(place, expected, cx, locals, out),
+        ExprKind::Access { mode, place } => access(*mode, place, cx, locals, out),
 
         ExprKind::Int(n) => typed(plain("int"), hir::ExprKind::Int(*n)),
         ExprKind::Str(s) => typed(plain("str"), hir::ExprKind::Str(s.clone())),
@@ -1455,12 +1781,18 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
         // 無ければ初期化子の推論型だけが束縛の型(design.md 決定2)
         ExprKind::Let {
             name,
+            mutable,
             annotation,
             value,
-            ..
         } => {
             if let Some(annotation) = annotation {
                 report_unknown(annotation, &decls.nominal, out);
+                check_type_shape(
+                    annotation,
+                    &RefSite::Outermost,
+                    &format!("{ctx}: 局所束縛 `{name}`"),
+                    out,
+                );
             }
             let (ty, value_id) = match annotation.as_ref().map(known) {
                 Some(declared) => {
@@ -1495,7 +1827,7 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                     (ty, checked.id)
                 }
             };
-            let local = alloc_local(name, ty.as_ref(), e.span, decls, out);
+            let local = alloc_binding(name, ty.as_ref(), *mutable, e.span, decls, out);
             locals.insert(name.clone(), Binding::Value(ty, local));
             produces_unit(hir::ExprKind::Let {
                 local,
@@ -1647,6 +1979,46 @@ fn bare_value(name: &str, decls: &Decls) -> Lowered {
         ),
         _ => poison(),
     }
+}
+
+/// `&place` / `&mut place` / `move place`。
+///
+/// 修飾は完成した場所の型に掛かるので、期待型は場所へ配らずに、作った参照を
+/// `walk` の出口で照合する。借用がいつまで生きるか・移動してよいかはここでは
+/// 見ない。それは所有権解析の仕事(design.md 決定3)。
+fn access(mode: AccessMode, place: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
+    let checked = synth(place, cx, locals, out);
+    let ty = match &checked.outcome {
+        Outcome::Typed(ty) => ty.clone(),
+        // 場所が値を産まないなら修飾も起きない。理由は場所の側にある
+        Outcome::Diverges => return diverged(checked.id),
+        Outcome::Poisoned => return poison(),
+    };
+    let kind = hir::ExprKind::Access {
+        mode,
+        place: checked.id,
+    };
+    let reference = match mode {
+        // `move` は所有をそのまま運ぶので静的型は変わらない
+        AccessMode::Move => return lowered(Outcome::Typed(ty), kind),
+        AccessMode::Shared => hir::RefKind::Shared,
+        AccessMode::Mutable => hir::RefKind::Mutable,
+    };
+    // optional な参照は作れない(design.md 決定3、tasks 2.3)
+    if ty.optional {
+        out.push(format!(
+            "{}: optional な値 `{ty}` への参照は作れません。先に `??` で展開してください",
+            cx.ctx
+        ));
+        return lowered(Outcome::Poisoned, kind);
+    }
+    typed(
+        KnownType {
+            reference: Some(reference),
+            ..ty
+        },
+        kind,
+    )
 }
 
 /// 普通のフィールドの読みと optional field access。レシーバに要求する optional
@@ -2189,9 +2561,18 @@ fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
             Outcome::Diverges => return diverged(right.id),
             Outcome::Poisoned => return poison(),
         };
-        // 左辺の `nil` は結果型の optional 版。右辺を見てからでないと型が出ない
-        let site = Site::What("`??` の左辺");
+        // 左辺の `nil` は結果型の optional 版。右辺が借用ならそれは optional な
+        // 参照なので、注釈で書いたときと同じ理由で断る(tasks 2.3)。
+        // `optional_of` が `&T?` を作れる唯一の経路がここ
         let optional = optional_of(&ty);
+        if ty.reference.is_some() {
+            out.push(format!(
+                "{ctx}: `??` の左辺{}",
+                optional_reference(&optional)
+            ));
+            return poison();
+        }
+        let site = Site::What("`??` の左辺");
         let bare = walk(lhs, Some((&optional, &site)), cx, locals, out);
         return typed(
             ty,
@@ -2225,6 +2606,7 @@ fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
         return poison();
     }
     let inner = KnownType {
+        reference: ty.reference,
         kind: ty.kind,
         optional: false,
     };
@@ -2244,6 +2626,7 @@ fn coalesce(lhs: &Expr, rhs: &Expr, cx: &Cx, locals: &mut Locals, out: &mut Out)
 /// 後置 `?` を付けた同じ形。
 fn optional_of(ty: &KnownType) -> KnownType {
     KnownType {
+        reference: ty.reference,
         kind: ty.kind.clone(),
         optional: true,
     }
@@ -2874,7 +3257,7 @@ fn receiver_form<'d>(
     name: &str,
     dot: bool,
 ) -> Result<Option<&'d FnSig>, String> {
-    match (sig.has_self, dot) {
+    match (sig.receiver.is_some(), dot) {
         (false, true) => Err(format!(
             "`{owner}::{name}` は self を取りません。`{owner}::{name}()` で呼びます"
         )),
@@ -4628,7 +5011,7 @@ rank: Rank }
     // ---- 11. optional field access ----
 
     const OPTIONAL_FIELDS: &str = "struct Profile { name: str\nalias: str? }\n\
-                                   struct User { profile: Profile\nmanager: User? }\n";
+                                   struct User { profile: Profile\nindirect manager: User? }\n";
 
     #[test]
     fn optional_fieldは結果にoptionalを付けて既存optionalを平坦化する() {
@@ -5263,7 +5646,10 @@ rank: Rank }
     #[test]
     fn 契約と食い違う実装署名を報告する() {
         for (method, expected) in [
-            ("fn find(id: int -> User?) { nil }", "レシーバの形"),
+            (
+                "fn find(id: int -> User?) { nil }",
+                "レシーバは `self` ですが、レシーバ無し",
+            ),
             ("fn find(self, id: str -> User?) { nil }", "引数は (`int`)"),
             ("fn find(self -> User?) { nil }", "引数は (`int`)"),
             ("fn find(self, id: int -> User) { nil }", "戻り値は `User?`"),
@@ -5787,6 +6173,7 @@ rank: Rank }
             Let { .. } => "let",
             AssignLocal { .. } => "assign-local",
             AssignField { .. } => "assign-field",
+            Access { .. } => "access",
             Neg(_) => "neg",
             Arith { .. } => "arith",
             Eq { .. } => "eq",
@@ -5865,6 +6252,7 @@ rank: Rank }
 
         assert_eq!(program.structs.len(), 1, "宣言は1つだけ");
         let user = hir::Type {
+            reference: None,
             kind: hir::TypeKind::Struct(program.structs.ids().next().unwrap()),
             optional: false,
         };
@@ -5917,5 +6305,422 @@ rank: Rank }
         let e = only(&broken);
         assert!(e.contains("`User`"), "{e}");
         assert!(e.contains("`nope`"), "{e}");
+    }
+
+    // ---- 18. 所有と借用の型(tasks 2.1〜2.6) ----
+
+    /// 所有の宣言だけで書いた小さなプログラム。配列・文字列・struct・enum・
+    /// optional が下がった形と、Copy の分類までを1枚で固定する
+    #[test]
+    fn 所有の宣言の下ろしを固定する() {
+        let dumped = lowered(
+            "struct Tag { text: str }\n\
+             struct Bag { tags: [Tag]\nlead: Tag?\nsize: int }\n\
+             enum Rank { Bronze Gold }\n\
+             enum Lookup { Found(Tag) Missing }\n\
+             fn main() { assert true }\n",
+        )
+        .dump();
+        assert_eq!(
+            dumped,
+            "struct#0 Tag { text#0: str }\n\
+             struct#1 Bag { tags#1: [Tag], lead#2: Tag?, size#3: int }\n\
+             enum#0 Rank { Bronze#0, Gold#1 }\n\
+             enum#1 Lookup { Found#2(Tag), Missing#3 }\n\
+             callable#0 fn main() -> unit\n\
+             \x20 expr#0 : bool = bool true\n\
+             \x20 expr#1 : unit = assert #0\n\
+             \x20 root [#1]\n",
+            "{dumped}"
+        );
+    }
+
+    /// Copy はこの版では意図的に小さい(design.md 決定4)。
+    /// 引数の宣言型をそのまま分類にかけて、所有の複合値が入らないことを見る
+    #[test]
+    fn copyの分類はスカラーとfieldless_enumと共有参照だけ() {
+        let program = lowered(
+            "struct User { id: int }\n\
+             enum Rank { Bronze Gold }\n\
+             enum Lookup { Found(User) Missing }\n\
+             fn probe(a: int, b: bool, c: unit, d: str, e: Rank, f: Lookup, g: User,\n\
+             \x20 h: [int], i: int?, j: User?, k: &User, l: &mut User) { assert true }\n\
+             fn main() { assert true }\n",
+        );
+        let probe = program.free_callable("probe").expect("`probe` がある");
+        let callable = &program.callables[probe];
+        let copies: Vec<bool> = callable
+            .params
+            .iter()
+            .map(|p| {
+                let ty = callable.body.local(*p).ty.as_ref().expect("注釈がある");
+                program.is_copy(ty)
+            })
+            .collect();
+        assert_eq!(
+            copies,
+            [
+                true,  // int
+                true,  // bool
+                true,  // unit
+                false, // str は所有の複合値
+                true,  // payload を持たない enum
+                false, // payload enum
+                false, // struct
+                false, // 配列
+                true,  // Copy を包む optional
+                false, // 非 Copy を包む optional
+                true,  // `&T` は複製できる能力
+                false, // `&mut T` は排他なので複製できない
+            ],
+            "{copies:?}"
+        );
+    }
+
+    /// 参照が書けるのはローカル・引数・戻り値・射影(tasks 2.3)。
+    /// 所有と2つの借用が別の静的型として下がることまで見る
+    #[test]
+    fn 参照はローカル引数戻り値射影に書ける() {
+        let dumped = lowered(
+            "struct User { name: str }\n\
+             fn look(u: &User -> &str) { &u.name }\n\
+             fn edit(u: &mut User) { assert true }\n\
+             impl User {\n\
+             \x20 fn peek(&self -> str) { self.name }\n\
+             \x20 fn touch(&mut self) { assert true }\n\
+             \x20 fn eat(self -> str) { move self.name }\n\
+             }\n\
+             fn main() { let u = User { name = \"a\" }\n let view = &u\n look(view)\n assert true }\n",
+        )
+        .dump();
+        for expected in [
+            "callable#0 fn look(&User) -> &str",
+            "callable#1 fn edit(&mut User) -> unit",
+            "callable#2 inherent User peek(&self) -> str",
+            "callable#3 inherent User touch(&mut self) -> unit",
+            "callable#4 inherent User eat(self) -> str",
+            "local#0 self: &User",
+            "local#0 self: &mut User",
+            "local#0 self: User",
+            "local#1 view: &User",
+            // `&u.name` は射影全体に付くので `&str`
+            "expr#2 : &str = &#1",
+            // `move self.name` は所有をそのまま運ぶ
+            "expr#2 : str = move #1",
+        ] {
+            assert!(dumped.contains(expected), "{expected} が無い:\n{dumped}");
+        }
+    }
+
+    /// 束縛の可変性は下ろしまで届く。`let` と `let mut` は別の宣言なので、
+    /// 所有権解析が読む前に HIR がそれを持っている(tasks 2.1)
+    #[test]
+    fn 束縛の可変性は下ろしに残る() {
+        let dumped = lowered("fn main() { let mut n = 1\n let k = 2\n assert n == k }\n").dump();
+        assert!(dumped.contains("local#0 mut n: int"), "{dumped}");
+        assert!(dumped.contains("local#1 k: int"), "{dumped}");
+    }
+
+    /// 期待型は借用でもそのまま枝の中へ配られる(tasks 2.2)
+    #[test]
+    fn 期待型は借用のまま枝へ配られる() {
+        const DECL: &str = "struct User { name: str }\n";
+        let errors = errors(&format!(
+            "{DECL}fn pick(a: &User, b: &User, c: bool -> &User) {{ if c: a\n else: b }}\n\
+             fn main() {{ assert true }}\n"
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+        // 片方の枝だけ所有なら、その枝を指して落ちる
+        let e = only(&format!(
+            "{DECL}fn pick(a: &User, b: User, c: bool -> &User) {{ if c: a\n else: b }}\n\
+             fn main() {{ assert true }}\n"
+        ));
+        assert_eq!(e, "pick: 戻り値は `&User` ですが、`User` を返しています");
+    }
+
+    /// 所有 `T`・共有 `&T`・排他 `&mut T` は別の静的型
+    /// (ownership-and-borrowing spec)。この版では自動借用をまだ入れないので、
+    /// 食い違いは宛先の照合でそのまま出る
+    #[test]
+    fn 所有と共有と排他は別の型() {
+        const DECL: &str = "struct User { name: str }\n\
+                            fn shared(u: &User) { assert true }\n\
+                            fn owned(u: User) { assert true }\n";
+        let e = only(&format!(
+            "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n shared(u) }}\n"
+        ));
+        assert_eq!(
+            e,
+            "main: `shared` の第 1 引数は `&User` ですが、`User` を渡しています"
+        );
+        let e = only(&format!(
+            "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n owned(&u) }}\n"
+        ));
+        assert_eq!(
+            e,
+            "main: `owned` の第 1 引数は `User` ですが、`&User` を渡しています"
+        );
+        let e = only(&format!(
+            "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n shared(&mut u) }}\n"
+        ));
+        assert_eq!(
+            e,
+            "main: `shared` の第 1 引数は `&User` ですが、`&mut User` を渡しています"
+        );
+    }
+
+    /// 参照を所有の中に置く形は全部断る(tasks 2.3)
+    #[test]
+    fn 集約の中の参照を報告する() {
+        const USER: &str = "struct User { name: str }\n";
+        for (decl, expected) in [
+            (
+                "struct Holder { r: &User }\n",
+                "struct `Holder` のフィールド `r`には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+            (
+                "struct Holder { rs: [&User] }\n",
+                "struct `Holder` のフィールド `rs`の配列要素には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+            (
+                "enum Held { One(&mut User) }\n",
+                "enum `Held` の variant `One` の第 1 payloadには参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+            (
+                "fn take(rs: [&User]) { assert true }\n",
+                "take の引数 `rs`の配列要素には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+            (
+                "fn give(-> [&User]) { [] }\n",
+                "give の戻り値の配列要素には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+        ] {
+            let errors = errors(&format!("{USER}{decl}fn main() {{ assert true }}\n"));
+            assert!(errors.iter().any(|e| e == expected), "{decl}: {errors:?}");
+        }
+    }
+
+    /// optional な参照はこの版では作れない。注釈でも式でも、注釈に書けない
+    /// 経路(`nil ?? 借用` が導く `&T?`)でも同じ理由で断る(tasks 2.3)。
+    ///
+    /// ここが閉じていないと、`hir::Type` が約束している
+    /// 「`reference` と `optional` は両立しない」が後段で破れる
+    #[test]
+    fn optionalな参照を報告する() {
+        const USER: &str = "struct User { name: str }\n";
+        for (src, expected) in [
+            (
+                format!(
+                    "{USER}fn take(u: &User?) {{ assert true }}\nfn main() {{ assert true }}\n"
+                ),
+                "take の引数 `u`の型 `&User?` は optional な参照です。参照に後置 `?` は付けられません",
+            ),
+            (
+                format!("{USER}fn take(-> &mut User?) {{ nil }}\nfn main() {{ assert true }}\n"),
+                "take の戻り値の型 `&mut User?` は optional な参照です。参照に後置 `?` は付けられません",
+            ),
+            (
+                format!("{USER}fn main() {{ let v: &mut User? = nil }}\n"),
+                "main: 局所束縛 `v`の型 `&mut User?` は optional な参照です。参照に後置 `?` は付けられません",
+            ),
+            (
+                format!("{USER}fn main(u: User?) {{ let v = &u\n assert true }}\n"),
+                "main: optional な値 `User?` への参照は作れません。先に `??` で展開してください",
+            ),
+            // 注釈を通らない唯一の経路。`nil ?? &u` の左辺は `&User?` になる
+            (
+                format!(
+                    "{USER}fn pick(u: &User -> &User) {{ nil ?? u }}\nfn main() {{ assert true }}\n"
+                ),
+                "pick: `??` の左辺 `&User?` は optional な参照です。参照に後置 `?` は付けられません",
+            ),
+            (
+                format!(
+                    "{USER}fn pick(u: &mut User -> &mut User) {{ nil ?? u }}\nfn main() {{ assert true }}\n"
+                ),
+                "pick: `??` の左辺 `&mut User?` は optional な参照です。参照に後置 `?` は付けられません",
+            ),
+        ] {
+            assert_eq!(only(&src), expected, "{src}");
+        }
+    }
+
+    /// 参照を所有の中に置く形は、契約・実装・注釈のどの署名でも同じ規則で断る。
+    /// `check_type_shape` を呼ぶ位置に抜けがないことを固定する(tasks 2.3)
+    #[test]
+    fn 全ての署名位置で入れ子の参照を報告する() {
+        const USER: &str = "struct User { name: str }\nstruct Store { n: int }\n";
+        for (decl, expected) in [
+            (
+                "trait Peek { fn peek(&self, us: [&User] -> int) }\n".to_string(),
+                "trait Peek::peek の引数 `us`の配列要素には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+            (
+                "impl Store { fn peek(&self, us: [&mut User] -> int) { 1 } }\n".to_string(),
+                "impl Store::peek の引数 `us`の配列要素には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+            (
+                "fn peek(-> &User?) { nil }\n".to_string(),
+                "peek の戻り値の型 `&User?` は optional な参照です。参照に後置 `?` は付けられません",
+            ),
+            (
+                "fn peek() { let xs: [&User] = []\n assert true }\n".to_string(),
+                "peek: 局所束縛 `xs`の配列要素には参照型を書けません。集約の中に借用を置くのはこの版では未対応です",
+            ),
+        ] {
+            let errors = errors(&format!("{USER}{decl}fn main() {{ assert true }}\n"));
+            assert!(errors.iter().any(|e| e == expected), "{decl}: {errors:?}");
+        }
+    }
+
+    /// trait のレシーバは所有モードまで含めて契約(method-call-type-checking spec)
+    #[test]
+    fn 契約と食い違うレシーバのモードを報告する() {
+        const CONTRACT: &str = "struct Store { n: int }\n\
+                                trait Peek { fn peek(&self -> int) }\n";
+        for (method, expected) in [
+            (
+                "fn peek(self -> int) { 1 }",
+                "impl Peek for Store: `peek` のレシーバは `&self` ですが、`self` を宣言しています",
+            ),
+            (
+                "fn peek(&mut self -> int) { 1 }",
+                "impl Peek for Store: `peek` のレシーバは `&self` ですが、`&mut self` を宣言しています",
+            ),
+            (
+                "fn peek(-> int) { 1 }",
+                "impl Peek for Store: `peek` のレシーバは `&self` ですが、レシーバ無し を宣言しています",
+            ),
+        ] {
+            let errors = errors(&format!(
+                "{CONTRACT}impl Peek for Store {{ {method} }}\nfn main() {{ assert true }}\n"
+            ));
+            assert!(errors.iter().any(|e| e == expected), "{method}: {errors:?}");
+        }
+        // 宣言どおりなら診断は出ない
+        let errors = errors(&format!(
+            "{CONTRACT}impl Peek for Store {{ fn peek(&self -> int) {{ self.n }} }}\n\
+             fn main() {{ assert true }}\n"
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// 所有の内包に `indirect` の無い循環があれば、循環の辺を related で示して落とす
+    /// (design.md 決定10、tasks 2.5)
+    #[test]
+    fn 所有の循環を報告する() {
+        for (decl, main_msg, edges) in [
+            (
+                "struct Node { next: Node }\n",
+                "型 `Node` の所有が循環しています。値の大きさが決まりません",
+                vec!["`Node` のフィールド `next` が `Node` を直接持っています"],
+            ),
+            (
+                "struct Left { r: Right }\nstruct Right { l: Left }\n",
+                "型 `Left` の所有が循環しています。値の大きさが決まりません",
+                vec![
+                    "`Left` のフィールド `r` が `Right` を直接持っています",
+                    "`Right` のフィールド `l` が `Left` を直接持っています",
+                ],
+            ),
+            (
+                "struct Node { next: Node? }\n",
+                "型 `Node` の所有が循環しています。値の大きさが決まりません",
+                vec!["`Node` のフィールド `next` が `Node` を直接持っています"],
+            ),
+            (
+                "struct Node { kids: [Node] }\n",
+                "型 `Node` の所有が循環しています。値の大きさが決まりません",
+                vec!["`Node` のフィールド `kids` が `Node` を直接持っています"],
+            ),
+            (
+                "enum List { Cons(int, List) Empty }\n",
+                "型 `List` の所有が循環しています。値の大きさが決まりません",
+                vec!["`List` の variant `Cons` の第 2 payload が `List` を直接持っています"],
+            ),
+        ] {
+            let diagnostics = diagnostics(&format!("{decl}fn main() {{ assert true }}\n"));
+            let cycle = diagnostics
+                .iter()
+                .find(|d| d.msg == main_msg)
+                .unwrap_or_else(|| panic!("{decl}: {diagnostics:?}"));
+            assert!(cycle.span.is_some(), "{decl}: 循環の診断は宣言を指す");
+            let related: Vec<&str> = cycle.related.iter().map(|d| d.msg.as_str()).collect();
+            assert_eq!(related, edges, "{decl}");
+            assert!(
+                cycle.related.iter().all(|d| d.span.is_some()),
+                "{decl}: 辺も位置を持つ"
+            );
+        }
+    }
+
+    /// `indirect` が1本でもあれば層が切れるので受理する。同じ形が
+    /// `indirect` 無しなら落ちることまで見て、効いているのが修飾だと示す
+    #[test]
+    fn indirectは所有の循環を切る() {
+        for decl in [
+            "struct Node { indirect next: Node? }\n",
+            "enum List { Cons(int, indirect List) Empty }\n",
+            "struct Left { indirect r: Right }\nstruct Right { l: Left }\n",
+        ] {
+            let src = format!("{decl}fn main() {{ assert true }}\n");
+            let accepted = errors(&src);
+            assert!(accepted.is_empty(), "{decl}: {accepted:?}");
+            let without = src.replace("indirect ", "");
+            assert_ne!(without, src);
+            assert!(
+                errors(&without).iter().any(|e| e.contains("所有が循環")),
+                "{decl}: `indirect` を外せば落ちる"
+            );
+        }
+    }
+
+    /// `indirect` と参照の注釈はモジュールを跨いでも同じ宣言を指す。
+    /// 正準名まで解決してから内包グラフを作るので、他モジュールの型を
+    /// 間接に持つ再帰も1つの ID で閉じる
+    #[test]
+    fn indirectと参照はモジュールを跨いでも同じ宣言を指す() {
+        let loaded = crate::module::load_files(&[
+            (
+                "main.rd",
+                "use dep\n\
+                 fn head(n: &dep::Node -> &int) { &n.id }\n\
+                 fn main() { assert true }\n",
+            ),
+            ("dep.rd", "struct Node { id: int\nindirect next: Node? }\n"),
+        ])
+        .expect("ロードできる");
+        let program = check_and_lower(&loaded.program).expect("診断なしで下がるはず");
+
+        assert_eq!(program.structs.len(), 1, "宣言は1つだけ");
+        let node = program.structs.ids().next().unwrap();
+        let next = program.structs[node].fields[1];
+        assert!(program.fields[next].indirect, "`indirect` が下がっている");
+        assert_eq!(
+            program.fields[next].ty,
+            hir::Type {
+                reference: None,
+                kind: hir::TypeKind::Struct(node),
+                optional: true,
+            },
+            "間接でも見た目の型は `Node?` のまま"
+        );
+
+        // 別モジュールの型を名指した `&dep::Node` も同じ ID を指す
+        let head = program.free_callable("main::head").expect("`head` がある");
+        let param = program.callables[head].params[0];
+        assert_eq!(
+            program.callables[head].body.local(param).ty,
+            Some(hir::Type {
+                reference: Some(hir::RefKind::Shared),
+                kind: hir::TypeKind::Struct(node),
+                optional: false,
+            })
+        );
+        assert_eq!(
+            program.show_type(&program.callables[head].ret),
+            "&int",
+            "戻り値の綴りも借用を出す"
+        );
     }
 }

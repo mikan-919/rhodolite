@@ -302,8 +302,11 @@ fn scan(
             walk!(recv);
             walk!(value);
         }
+        // ponytail: 修飾は要求を変えない(場所を辿るだけ)。提供のモードを
+        // 要求解析へ載せるのは introduce-ownership-and-borrowing のフェーズ5
         hir::ExprKind::Neg(inner)
         | hir::ExprKind::Assert(inner)
+        | hir::ExprKind::Access { place: inner, .. }
         | hir::ExprKind::Return(Some(inner)) => walk!(inner),
         hir::ExprKind::Arith { lhs, rhs, .. }
         | hir::ExprKind::Eq { lhs, rhs }

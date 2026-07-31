@@ -20,25 +20,25 @@
 
 ## 2. Resolve Owned and Reference Types
 
-- [ ] 2.1 Replace the HIR `has_self` Boolean with a resolved receiver mode and
+- [x] 2.1 Replace the HIR `has_self` Boolean with a resolved receiver mode and
   carry reference kinds, binding mutability, ownership modifiers, and indirect
   declaration edges through type lowering
-- [ ] 2.2 Extend type display, equality, destination compatibility, expected-type
+- [x] 2.2 Extend type display, equality, destination compatibility, expected-type
   propagation, module-qualified annotations, diagnostics, and deterministic HIR
   dumps for `T`, `&T`, and `&mut T`
-- [ ] 2.3 Reject optional references and references nested in struct fields, enum
+- [x] 2.3 Reject optional references and references nested in struct fields, enum
   payloads, optionals, or arrays while allowing reference locals, parameters,
   results, and projections
-- [ ] 2.4 Implement the initial Copy classification for scalar values, fieldless
+- [x] 2.4 Implement the initial Copy classification for scalar values, fieldless
   enums, shared references, and non-copyable mutable references, keeping all
   owned compound values non-Copy by default
-- [ ] 2.5 Build the owned type-containment graph, validate every recursive cycle
+- [x] 2.5 Build the owned type-containment graph, validate every recursive cycle
   has an `indirect` edge, and add direct, mutual, optional, array, enum, and valid
   indirect-cycle diagnostics with related spans
-- [ ] 2.6 Add resolved declaration tests for owned arrays/strings/structs/enums/
+- [x] 2.6 Add resolved declaration tests for owned arrays/strings/structs/enums/
   optionals, receiver conformance, nested-reference rejection, Copy status, and
   indirect identities across modules
-- [ ] 2.7 Run formatting, the full test suite, HIR snapshots, type-cycle fixtures,
+- [x] 2.7 Run formatting, the full test suite, HIR snapshots, type-cycle fixtures,
   and strict OpenSpec validation, then commit resolved ownership types as a
   stable snapshot
 

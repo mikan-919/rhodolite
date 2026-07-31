@@ -62,7 +62,10 @@ impl Scalar {
 
 /// scalar として扱える型か。`int?` のような optional は v0 の外
 pub fn scalar_of(ty: &hir::Type) -> Option<Scalar> {
-    if ty.optional {
+    // ponytail: 参照は v0 の公開 ABI にも局所表現にも無いので scalar から外す。
+    // 公開署名に借用が出たことを名指す診断は
+    // introduce-ownership-and-borrowing のフェーズ8(task 8.4)
+    if ty.optional || ty.reference.is_some() {
         return None;
     }
     match &ty.kind {
@@ -115,7 +118,7 @@ pub fn check_support(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
                 "実行時に provider を運ぶ ambient 要求",
             ));
         }
-        if callable.has_self {
+        if callable.receiver.is_some() {
             diagnostics.push(unsupported(callable.span, "メソッド"));
         }
         if scalar_of(&callable.ret).is_none() {
@@ -195,6 +198,11 @@ fn check_expr(
             children.extend(args.iter().copied())
         }
 
+        // ponytail: 借用も移動も v0 では下ろせない。所有付きの Wasm 表現は
+        // compile-wasm-owned-data-values の仕事
+        hir::ExprKind::Access { .. } => {
+            diagnostics.push(unsupported(expr.span, "所有権修飾された場所"))
+        }
         hir::ExprKind::Str(_) => diagnostics.push(unsupported(expr.span, "文字列")),
         hir::ExprKind::Nil => diagnostics.push(unsupported(expr.span, "optional の `nil`")),
         hir::ExprKind::UnitStruct(_) | hir::ExprKind::StructLit { .. } => {

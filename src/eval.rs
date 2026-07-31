@@ -583,6 +583,12 @@ impl<'p> Interp<'p> {
 
             hir::ExprKind::Call(call) => self.call_expr(body, call, env, ambient),
 
+            // ponytail: 修飾は場所をそのまま評価する。所有・借用・移動を
+            // 意味として実装するのは introduce-ownership-and-borrowing の
+            // フェーズ7(いまの評価器は複合値を共有したままなので、
+            // `&` も `move` も観測できる違いを持たない)
+            hir::ExprKind::Access { place, .. } => self.eval(body, *place, env, ambient),
+
             // 型検査を通った HIR に `Poison` は残らない(design.md 決定7)
             hir::ExprKind::Poison => fail("型が決まらない式を実行しようとしました"),
         }
@@ -1907,7 +1913,7 @@ mod tests {
     /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと
     #[test]
     fn 自己参照structを比較しても落ちない() {
-        let src = "struct Node { x: Node? }\n\
+        let src = "struct Node { indirect x: Node? }\n\
                    fn main(-> bool) {\n\
                    \x20 let u = Node { x = nil }\n\
                    \x20 u.x = u\n\
@@ -1920,7 +1926,7 @@ mod tests {
     /// 相互に参照し合う2つを比べる。上限に当たってエラーになる(落ちない)
     #[test]
     fn 相互循環の比較はエラーになる() {
-        let src = "struct Node { x: Node? }\n\
+        let src = "struct Node { indirect x: Node? }\n\
                    fn main(-> bool) {\n\
                    \x20 let a = Node { x = nil }\n\
                    \x20 let b = Node { x = nil }\n\

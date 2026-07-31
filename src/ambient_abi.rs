@@ -437,6 +437,10 @@ impl<'a> Planner<'a> {
             };
         }
         match &expr.kind {
+            // ponytail: 所有権修飾は場所を包むだけ。提供の運び方をモードで
+            // 変えるのは introduce-ownership-and-borrowing のフェーズ5
+            hir::ExprKind::Access { place, .. } => walk!(place),
+
             hir::ExprKind::With {
                 provisions,
                 body: inner,
