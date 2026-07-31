@@ -48,20 +48,20 @@
 
 ## 4. Providers, Slot Calls, and `with`
 
-- [ ] 4.1 Track each current provider as a concrete `TraitImplId` plus no value, an incoming record
+- [x] 4.1 Track each current provider as a concrete `TraitImplId` plus no value, an incoming record
   field, or a provision value expression
-- [ ] 4.2 Resolve every slot type/value call through `TraitImplId + TraitMethodId` to the concrete
+- [x] 4.2 Resolve every slot type/value call through `TraitImplId + TraitMethodId` to the concrete
   implementing `CallableId`, with no vtable, switch dispatch, or source-name lookup
-- [ ] 4.3 Pass the current concrete provider handle as `self` for value slot calls, omit it for type
+- [x] 4.3 Pass the current concrete provider handle as `self` for value slot calls, omit it for type
   slot calls, and plan the concrete implementation callable's own ambient projection
-- [ ] 4.4 Plan all value provision expressions in source order under the unchanged outer context,
+- [x] 4.4 Plan all value provision expressions in source order under the unchanged outer context,
   then apply all provisions together to an immutable inner snapshot
-- [ ] 4.5 Represent nested replacement and callee projection without mutating or borrowing a
+- [x] 4.5 Represent nested replacement and callee projection without mutating or borrowing a
   caller's ambient record, while preserving provider identity across copied records
-- [ ] 4.6 Add tests for type-only providers, value providers, value-satisfies-type projection,
+- [x] 4.6 Add tests for type-only providers, value providers, value-satisfies-type projection,
   nested replacement, simultaneous provisions, provision expressions that use outer providers,
   slot receiver passing, and direct implementation targets
-- [ ] 4.7 Run formatting, the full test suite, canonical success and missing-provider CLI cases, and
+- [x] 4.7 Run formatting, the full test suite, canonical success and missing-provider CLI cases, and
   strict OpenSpec validation, then commit provider and `with` planning as a stable snapshot
 
 ## 5. Recursion and Complete Program Evidence

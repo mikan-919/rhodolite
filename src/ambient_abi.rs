@@ -1008,4 +1008,193 @@ mod tests {
             "壊れた文脈で instance を作らない"
         );
     }
+
+    // ---- 提供・スロット呼び出し・`with` ----
+
+    /// instance の実装選択を読める形で
+    fn providers_of(program: &hir::Program, plan: &Plan, id: InstanceId) -> Vec<String> {
+        plan.instance(id)
+            .key
+            .providers
+            .iter()
+            .map(|(slot, implementation)| {
+                format!(
+                    "{}={}",
+                    program.slots[*slot].name,
+                    program.structs[program.trait_impls[*implementation].type_].name
+                )
+            })
+            .collect()
+    }
+
+    fn only(program: &hir::Program, plan: &Plan, name: &str) -> InstanceId {
+        let found = instances_named(program, plan, name);
+        assert_eq!(found.len(), 1, "{name} の instance が1つではない");
+        found[0]
+    }
+
+    /// 型提供は鍵と呼び先を変えるが、実行時の欄は作らない(決定6)
+    #[test]
+    fn 型提供は隠し引数を作らない() {
+        let (program, plan) = plan_of(
+            "fn zeroed(-> int) { clock::zero() }\n\
+             fn main(-> int) { with clock<Frozen> { zeroed() } }\n",
+        );
+
+        let zeroed = only(&program, &plan, "zeroed");
+        assert_eq!(providers_of(&program, &plan, zeroed), vec!["clock=Frozen"]);
+        assert_eq!(plan.instance(zeroed).layout, None, "型提供は運ばない");
+
+        // 型射影の呼び出しはレシーバを渡さず、実装本体を直接指す
+        let call = plan
+            .instance(zeroed)
+            .calls
+            .values()
+            .next()
+            .expect("呼び出し");
+        assert_eq!(call.receiver, None);
+        assert_eq!(
+            program.show_body(plan.instance(call.target).key.body),
+            "impl Frozen::zero"
+        );
+    }
+
+    /// 値提供は具体型の handle を1欄だけ載せ、値射影はそれを `self` に渡す
+    #[test]
+    fn 値提供はhandleの欄を作りselfに渡す() {
+        let (program, plan) = plan_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { ticks() } }\n",
+        );
+
+        let ticks = only(&program, &plan, "ticks");
+        let layout = plan.layout(plan.instance(ticks).layout.expect("record を持つ"));
+        assert_eq!(
+            layout.fields,
+            vec![(slot(&program, "clock"), struct_(&program, "Frozen"))]
+        );
+
+        let call = plan
+            .instance(ticks)
+            .calls
+            .values()
+            .next()
+            .expect("呼び出し");
+        assert_eq!(
+            call.receiver,
+            Some(ValueSource::Incoming(slot(&program, "clock"))),
+            "provider の実体をレシーバとして渡す"
+        );
+        assert_eq!(
+            program.show_body(plan.instance(call.target).key.body),
+            "impl Frozen::now",
+            "vtable ではなく実装本体への直接呼び出し"
+        );
+    }
+
+    /// 値提供は型要求も満たす。ただし型要求は欄にならないので射影は空になる
+    #[test]
+    fn 値提供は型要求を満たすが欄にはならない() {
+        let (program, plan) = plan_of(
+            "fn zeroed(-> int) { clock::zero() }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { zeroed() } }\n",
+        );
+
+        let zeroed = only(&program, &plan, "zeroed");
+        assert_eq!(providers_of(&program, &plan, zeroed), vec!["clock=Frozen"]);
+        assert_eq!(plan.instance(zeroed).layout, None);
+
+        let root = plan.instance(plan.roots[0].1);
+        let call = root.calls.values().next().expect("呼び出し");
+        assert!(call.projection.is_empty(), "型要求に record は要らない");
+    }
+
+    /// 内側の `with` は外側の record を書き換えずに置き換える。ブロックを抜ければ
+    /// 外側の選択が戻る(決定9)
+    #[test]
+    fn 入れ子のwithは置換であって書き換えではない() {
+        let (program, plan) = plan_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) {\n\
+             \x20 with clock(Frozen { t = 1 }) {\n\
+             \x20   let inner = with clock(Zero {}) { ticks() }\n\
+             \x20   inner + ticks()\n\
+             \x20 }\n\
+             }\n",
+        );
+
+        let mut selections: Vec<Vec<String>> = instances_named(&program, &plan, "ticks")
+            .into_iter()
+            .map(|id| providers_of(&program, &plan, id))
+            .collect();
+        selections.sort();
+        assert_eq!(
+            selections,
+            vec![
+                vec!["clock=Frozen".to_string()],
+                vec!["clock=Zero".to_string()]
+            ],
+            "内側と外側で別の instance になる"
+        );
+    }
+
+    /// 同じ `with` の提供は互いを見ない。提供式は全て外側の文脈で評価する
+    #[test]
+    fn 提供式は外側の提供で計画される() {
+        let (program, plan) = plan_of(
+            "fn make(-> InMemoryDb) {\n\
+             \x20 let at = clock.now()\n\
+             \x20 InMemoryDb {}\n\
+             }\n\
+             fn saves(-> unit) { db.save(1) }\n\
+             fn main(-> unit) {\n\
+             \x20 with clock(Frozen { t = 1 }) {\n\
+             \x20   with clock(Zero {}), db(make()) { saves() }\n\
+             \x20 }\n\
+             }\n",
+        );
+
+        let make = only(&program, &plan, "make");
+        assert_eq!(
+            providers_of(&program, &plan, make),
+            vec!["clock=Frozen"],
+            "同じ with の clock(Zero) も、内側の提供も見えない"
+        );
+
+        let saves = only(&program, &plan, "saves");
+        assert_eq!(
+            providers_of(&program, &plan, saves),
+            vec!["db=InMemoryDb"],
+            "提供は全部まとめて内側に効く"
+        );
+    }
+
+    /// 提供された値の handle は、`with` の提供式から呼び先の record へ渡る
+    #[test]
+    fn 提供値のhandleは提供式から呼び先の欄へ渡る() {
+        let (program, plan) = plan_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { ticks() } }\n",
+        );
+
+        let root = plan.instance(plan.roots[0].1);
+        let call = root
+            .calls
+            .values()
+            .find(|call| program.show_body(plan.instance(call.target).key.body) == "ticks")
+            .expect("ticks の呼び出し");
+        assert_eq!(call.projection.len(), 1);
+        assert!(
+            matches!(call.projection[0].1, ValueSource::Provision(_)),
+            "根は提供式から取る"
+        );
+
+        // 呼び先の中では、同じ handle が自分の record の欄から来る
+        let ticks = plan.instance(only(&program, &plan, "ticks"));
+        let inner = ticks.calls.values().next().expect("呼び出し");
+        assert_eq!(
+            inner.receiver,
+            Some(ValueSource::Incoming(slot(&program, "clock")))
+        );
+    }
 }
