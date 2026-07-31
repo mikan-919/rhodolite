@@ -242,6 +242,325 @@ impl PlanError {
 }
 
 // ---------------------------------------------------------------------------
+// 需要駆動の計画
+// ---------------------------------------------------------------------------
+
+/// いま何がどの実装で提供されているか。`with` の本体へ入るときだけ差し替える。
+pub type ProviderContext = BTreeMap<hir::SlotId, ProviderBinding>;
+
+/// エントリと全 test を根に、到達した本体を実装の組み合わせごとに単相化する。
+///
+/// 根は空の提供文脈から始まる。要求が残っていれば提供忘れだが、それは前段の
+/// 診断が先に止めるので、ここへ来たら不変条件の破れとして返す。
+pub fn plan(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    entry: hir::CallableId,
+) -> Result<Plan, PlanError> {
+    let mut planner = Planner {
+        program,
+        analysis,
+        plan: Plan::default(),
+        pending: std::collections::VecDeque::new(),
+    };
+
+    let roots = std::iter::once(hir::BodyId::Callable(entry))
+        .chain(program.tests.ids().map(hir::BodyId::Test));
+    for root in roots {
+        let empty = ProviderContext::new();
+        let (instance, _) = planner.request(root, &empty, root)?;
+        planner.plan.roots.push((root, instance));
+    }
+
+    // 確保だけして中身が空の instance を、確保順に片づける
+    while let Some((instance, context)) = planner.pending.pop_front() {
+        let body_id = planner.plan.instance(instance).key.body;
+        let body = planner.program.body(body_id);
+        for root in &body.root {
+            planner.walk(instance, body, *root, &context)?;
+        }
+    }
+
+    Ok(planner.plan)
+}
+
+struct Planner<'a> {
+    program: &'a hir::Program,
+    analysis: &'a crate::requirement::Analysis,
+    plan: Plan,
+    /// まだ本体を歩いていない instance と、その中での提供文脈
+    pending: std::collections::VecDeque<(InstanceId, ProviderContext)>,
+}
+
+impl<'a> Planner<'a> {
+    /// 呼び先の instance を要求する。
+    ///
+    /// 呼び先の**既存の要求**に文脈を制限してから鍵にする(design.md 決定4)。
+    /// 選ばれた実装ならもっと少ないスロットで足りる場合でも、要求は保守的な
+    /// ままにするので、使わない欄が record に残ることがある。
+    ///
+    /// 返る射影は呼び出し**元**から見た handle の出どころで、並びは呼び先の
+    /// layout と同じ。
+    fn request(
+        &mut self,
+        callee: hir::BodyId,
+        caller: &ProviderContext,
+        caller_body: hir::BodyId,
+    ) -> Result<(InstanceId, Vec<(hir::SlotId, ValueSource)>), PlanError> {
+        let mut providers = Vec::new();
+        let mut fields = Vec::new();
+        let mut projection = Vec::new();
+        let mut inner = ProviderContext::new();
+
+        // 要求は `SlotId` 順。layout・鍵・射影の並びはここで一度に決まる
+        for (slot, requirement) in self.analysis.requirements(callee) {
+            let Some(binding) = caller.get(slot) else {
+                return Err(PlanError::MissingProvider {
+                    body: caller_body,
+                    slot: *slot,
+                });
+            };
+            providers.push((*slot, binding.implementation));
+            let value = match requirement.level {
+                // 型要求は鍵と呼び先を変えるだけ。実行時の欄は作らない
+                crate::requirement::SlotLevel::Type => None,
+                crate::requirement::SlotLevel::Value => {
+                    let Some(source) = binding.value else {
+                        return Err(PlanError::TypeOnlyProvider {
+                            body: caller_body,
+                            slot: *slot,
+                        });
+                    };
+                    projection.push((*slot, source));
+                    fields.push((
+                        *slot,
+                        self.program.trait_impls[binding.implementation].type_,
+                    ));
+                    // 呼び先の中では、その handle は自分の record の欄から来る
+                    Some(ValueSource::Incoming(*slot))
+                }
+            };
+            inner.insert(
+                *slot,
+                ProviderBinding {
+                    implementation: binding.implementation,
+                    value,
+                },
+            );
+        }
+
+        let layout = self.plan.intern_layout(fields);
+        let (instance, fresh) = self.plan.intern(
+            InstanceKey {
+                body: callee,
+                providers,
+            },
+            layout,
+        );
+        if fresh {
+            self.pending.push_back((instance, inner));
+        }
+        Ok((instance, projection))
+    }
+
+    /// 式を1つ歩く。分岐・ループ・guard・arm・提供式は**全部**通る。
+    /// 実行時にどれが選ばれるかは計画に関係しない(design.md 決定2)。
+    fn walk(
+        &mut self,
+        instance: InstanceId,
+        body: &'a hir::Body,
+        id: hir::ExprId,
+        context: &ProviderContext,
+    ) -> Result<(), PlanError> {
+        let expr = body.expr(id);
+        macro_rules! walk {
+            ($child:expr) => {
+                self.walk(instance, body, *$child, context)?
+            };
+        }
+        match &expr.kind {
+            hir::ExprKind::With {
+                provisions,
+                body: inner,
+            } => {
+                // 提供値は全て外側の文脈で評価してから、まとめて内側の写しへ
+                // 置く。同じ `with` の提供は互いを見ない(design.md 決定9)
+                for provision in provisions {
+                    if let Some(value) = &provision.value {
+                        walk!(value);
+                    }
+                }
+                let mut replaced = context.clone();
+                for provision in provisions {
+                    replaced.insert(
+                        provision.slot,
+                        ProviderBinding {
+                            implementation: provision.implementation,
+                            value: provision.value.map(ValueSource::Provision),
+                        },
+                    );
+                }
+                self.walk(instance, body, *inner, &replaced)?;
+            }
+
+            hir::ExprKind::Call(call) => {
+                self.plan_call(instance, id, call, context)?;
+                if let hir::Call::Method { recv, .. } = call {
+                    walk!(recv);
+                }
+                for arg in call_args(call) {
+                    walk!(arg);
+                }
+            }
+
+            hir::ExprKind::Match { subject, arms } => {
+                walk!(subject);
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        walk!(guard);
+                    }
+                    walk!(&arm.body);
+                }
+            }
+
+            hir::ExprKind::Int(_)
+            | hir::ExprKind::Str(_)
+            | hir::ExprKind::Bool(_)
+            | hir::ExprKind::Nil
+            | hir::ExprKind::Local(_)
+            | hir::ExprKind::UnitStruct(_)
+            | hir::ExprKind::Variant(_)
+            | hir::ExprKind::Return(None)
+            | hir::ExprKind::Poison => {}
+
+            hir::ExprKind::Field { recv, .. } => walk!(recv),
+            hir::ExprKind::StructLit { fields, .. } => {
+                for (_, value) in fields {
+                    walk!(value);
+                }
+            }
+            hir::ExprKind::Array(items) | hir::ExprKind::Block(items) => {
+                for item in items {
+                    walk!(item);
+                }
+            }
+            hir::ExprKind::Let { value, .. } | hir::ExprKind::AssignLocal { value, .. } => {
+                walk!(value)
+            }
+            hir::ExprKind::AssignField { recv, value, .. } => {
+                walk!(recv);
+                walk!(value);
+            }
+            hir::ExprKind::Neg(inner)
+            | hir::ExprKind::Assert(inner)
+            | hir::ExprKind::Return(Some(inner)) => walk!(inner),
+            hir::ExprKind::Arith { lhs, rhs, .. }
+            | hir::ExprKind::Eq { lhs, rhs }
+            | hir::ExprKind::Coalesce { lhs, rhs } => {
+                walk!(lhs);
+                walk!(rhs);
+            }
+            hir::ExprKind::If { cond, then, orelse } => {
+                walk!(cond);
+                walk!(then);
+                if let Some(orelse) = orelse {
+                    walk!(orelse);
+                }
+            }
+            hir::ExprKind::While { cond, body: inner } => {
+                walk!(cond);
+                walk!(inner);
+            }
+            hir::ExprKind::For {
+                iter, body: inner, ..
+            } => {
+                walk!(iter);
+                walk!(inner);
+            }
+        }
+        Ok(())
+    }
+
+    /// 呼び出し1つを、具体的な `CallableId` の instance への辺にする。
+    ///
+    /// スロット呼び出しも例外ではない。提供が持つ `TraitImplId` から実装本体を
+    /// 引くので、実行時の分岐表は要らない(design.md 決定8)。
+    fn plan_call(
+        &mut self,
+        instance: InstanceId,
+        id: hir::ExprId,
+        call: &hir::Call,
+        context: &ProviderContext,
+    ) -> Result<(), PlanError> {
+        let caller = self.plan.instance(instance).key.body;
+        let (callee, receiver) = match call {
+            hir::Call::Direct { callable, .. }
+            | hir::Call::Associated { callable, .. }
+            | hir::Call::Method { callable, .. } => (*callable, None),
+            hir::Call::Slot {
+                slot,
+                method,
+                receiver,
+                ..
+            } => {
+                let Some(binding) = context.get(slot) else {
+                    return Err(PlanError::MissingProvider {
+                        body: caller,
+                        slot: *slot,
+                    });
+                };
+                let Some(callable) = self
+                    .program
+                    .implementation_of(binding.implementation, *method)
+                else {
+                    return Err(PlanError::UnimplementedMethod {
+                        implementation: binding.implementation,
+                        method: *method,
+                    });
+                };
+                // 値射影は provider の実体を `self` に渡す。型射影は渡さない
+                let receiver = match receiver {
+                    hir::SlotReceiver::Value => match binding.value {
+                        Some(source) => Some(source),
+                        None => {
+                            return Err(PlanError::TypeOnlyProvider {
+                                body: caller,
+                                slot: *slot,
+                            });
+                        }
+                    },
+                    hir::SlotReceiver::Type => None,
+                };
+                (callable, receiver)
+            }
+            // 構築は本体を持たない
+            hir::Call::Ctor { .. } => return Ok(()),
+        };
+
+        let (target, projection) = self.request(hir::BodyId::Callable(callee), context, caller)?;
+        self.plan.instances[instance.index()].calls.insert(
+            id,
+            PlannedCall {
+                target,
+                receiver,
+                projection,
+            },
+        );
+        Ok(())
+    }
+}
+
+fn call_args(call: &hir::Call) -> &[hir::ExprId] {
+    match call {
+        hir::Call::Direct { args, .. }
+        | hir::Call::Associated { args, .. }
+        | hir::Call::Method { args, .. }
+        | hir::Call::Slot { args, .. }
+        | hir::Call::Ctor { args, .. } => args,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 決定的な描画
 // ---------------------------------------------------------------------------
 
@@ -393,6 +712,28 @@ mod tests {
             .expect("その型がない")
     }
 
+    /// 前置き付きで下ろして計画する。エントリは `main`
+    pub(super) fn plan_of(src: &str) -> (hir::Program, Plan) {
+        let program = lowered_of(src);
+        let plan = plan_program(&program);
+        (program, plan)
+    }
+
+    fn plan_program(program: &hir::Program) -> Plan {
+        let analysis = crate::requirement::analyze(program);
+        let entry = program.free_callable("main").expect("main がない");
+        plan(program, &analysis, entry).expect("計画できるはず")
+    }
+
+    /// 前置きを付けずに下ろして計画する(正典など完結したソース用)
+    pub(super) fn plan_source(src: &str) -> (hir::Program, Plan) {
+        let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap()))
+            .expect("パースできるはず");
+        let program = crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず");
+        let plan = plan_program(&program);
+        (program, plan)
+    }
+
     fn body(program: &hir::Program, name: &str) -> hir::BodyId {
         hir::BodyId::Callable(program.free_callable(name).expect("その関数がない"))
     }
@@ -497,6 +838,174 @@ mod tests {
              \x20 expr#3 -> instance#1 { clock <- provision expr#1 }\n\
              instance#1 used [clock=Frozen] ambient layout#0\n\
              \x20 expr#0 -> instance#1 self=field clock {}\n"
+        );
+    }
+
+    // ---- 需要駆動の計画 ----
+
+    /// 表示名で instance を数える。特殊化されていれば同じ名前が複数出る
+    fn instances_named(program: &hir::Program, plan: &Plan, name: &str) -> Vec<InstanceId> {
+        plan.instances()
+            .filter(|(_, instance)| program.show_body(instance.key.body) == name)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// 根はエントリと全 test。どれも空の提供文脈から始まるので隠し引数を持たない
+    #[test]
+    fn 根はエントリと全testになる() {
+        let (program, plan) = plan_of(
+            "fn main(-> int) { 0 }\n\
+             test \"a\" { assert true }\n\
+             test \"b\" { assert true }\n",
+        );
+
+        assert_eq!(plan.roots.len(), 3);
+        assert_eq!(program.show_body(plan.roots[0].0), "main");
+        for (_, instance) in &plan.roots {
+            assert_eq!(
+                plan.instance(*instance).layout,
+                None,
+                "根は record を持たない"
+            );
+        }
+    }
+
+    /// 到達しない宣言は型検査を通るが instance を持たない
+    #[test]
+    fn 到達しない関数は計画に出ない() {
+        let (program, plan) = plan_of(
+            "fn reached(-> int) { 1 }\n\
+             fn unreached(-> int) { clock.now() }\n\
+             fn main(-> int) { reached() }\n",
+        );
+
+        assert_eq!(instances_named(&program, &plan, "reached").len(), 1);
+        assert!(instances_named(&program, &plan, "unreached").is_empty());
+    }
+
+    /// 呼び出し元が持っていても、呼び先の要求に無いスロットは鍵に入らない。
+    /// 無関係なスロットで instance が増えないのはこの制限のため
+    #[test]
+    fn 呼び出し元の無関係なスロットは鍵に入らない() {
+        let (program, plan) = plan_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) {\n\
+             \x20 with clock(Frozen { t = 1 }), db(InMemoryDb {}) { ticks() }\n\
+             }\n",
+        );
+
+        let ticks = instances_named(&program, &plan, "ticks");
+        assert_eq!(ticks.len(), 1);
+        let key = &plan.instance(ticks[0]).key;
+        assert_eq!(key.providers.len(), 1, "clock だけが鍵に入る");
+        assert_eq!(key.providers[0].0, slot(&program, "clock"));
+    }
+
+    /// 実行時の値が違っても実装が同じなら同じコードを共有する。
+    /// 違うのは record に載る handle だけ(design.md 決定3)
+    #[test]
+    fn 実行時の値が違っても同じinstanceを共有する() {
+        let (program, plan) = plan_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) {\n\
+             \x20 let first = with clock(Frozen { t = 1 }) { ticks() }\n\
+             \x20 let second = with clock(Frozen { t = 2 }) { ticks() }\n\
+             \x20 first + second\n\
+             }\n",
+        );
+
+        assert_eq!(instances_named(&program, &plan, "ticks").len(), 1);
+        let root = plan.instance(plan.roots[0].1);
+        let sources: Vec<ValueSource> = root
+            .calls
+            .values()
+            .map(|call| call.projection[0].1)
+            .collect();
+        assert_eq!(sources.len(), 2);
+        assert_ne!(
+            sources[0], sources[1],
+            "handle の出どころは呼び出しごとに違う"
+        );
+    }
+
+    /// 実行時にどの枝が走るかは計画に関係しない。分岐・guard・arm・ループの
+    /// 中の呼び出しも全部 instance を作る
+    #[test]
+    fn 全ての枝を保守的に歩く() {
+        let (program, plan) = plan_of(
+            "enum Pick { A B }\n\
+             fn in_then(-> int) { 1 }\n\
+             fn in_else(-> int) { 2 }\n\
+             fn in_guard(-> bool) { true }\n\
+             fn in_arm(-> int) { 3 }\n\
+             fn in_loop(-> int) { 4 }\n\
+             fn main(p: Pick -> int) {\n\
+             \x20 let n = if true: in_then() else: in_else()\n\
+             \x20 while false { in_loop() }\n\
+             \x20 match p {\n\
+             \x20   Pick::A if in_guard(): in_arm()\n\
+             \x20   _: n\n\
+             \x20 }\n\
+             }\n",
+        );
+
+        for name in ["in_then", "in_else", "in_guard", "in_arm", "in_loop"] {
+            assert_eq!(
+                instances_named(&program, &plan, name).len(),
+                1,
+                "{name} が計画に出ていない"
+            );
+        }
+    }
+
+    /// 合成した提供文脈が壊れていたら、部分的な計画を作らずに構造化して返す
+    #[test]
+    fn 要求を満たさない合成文脈は構造化エラーになる() {
+        let program = lowered_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) { 0 }\n",
+        );
+        let analysis = crate::requirement::analyze(&program);
+        let ticks = hir::BodyId::Callable(program.free_callable("ticks").unwrap());
+        let clock = slot(&program, "clock");
+
+        let mut planner = Planner {
+            program: &program,
+            analysis: &analysis,
+            plan: Plan::default(),
+            pending: std::collections::VecDeque::new(),
+        };
+
+        let empty = ProviderContext::new();
+        assert_eq!(
+            planner.request(ticks, &empty, ticks),
+            Err(PlanError::MissingProvider {
+                body: ticks,
+                slot: clock
+            })
+        );
+
+        // 型提供だけでは値要求を満たせない。逆は満たせる(決定5)
+        let mut type_only = ProviderContext::new();
+        type_only.insert(
+            clock,
+            ProviderBinding {
+                implementation: implementation(&program, "Frozen"),
+                value: None,
+            },
+        );
+        assert_eq!(
+            planner.request(ticks, &type_only, ticks),
+            Err(PlanError::TypeOnlyProvider {
+                body: ticks,
+                slot: clock
+            })
+        );
+        assert_eq!(
+            planner.plan.instances().count(),
+            0,
+            "壊れた文脈で instance を作らない"
         );
     }
 }

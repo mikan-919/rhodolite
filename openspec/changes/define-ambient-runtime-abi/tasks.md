@@ -30,20 +30,20 @@
 
 ## 3. Demand-Driven Callable Planning
 
-- [ ] 3.1 Add a planning entry point that accepts typed HIR, semantic requirements, the selected
+- [x] 3.1 Add a planning entry point that accepts typed HIR, semantic requirements, the selected
   entry callable, and all test roots under empty provider contexts
-- [ ] 3.2 Walk every structured HIR expression conservatively, including branches, loops, match
+- [x] 3.2 Walk every structured HIR expression conservatively, including branches, loops, match
   guards and arms, provision expressions, and nested bodies, without consulting the AST
-- [ ] 3.3 Plan direct functions, concrete methods, and concrete associated calls as edges to
+- [x] 3.3 Plan direct functions, concrete methods, and concrete associated calls as edges to
   requirement-restricted specialized instances with canonical callee record projections
-- [ ] 3.4 Generate only root-reachable instances, deduplicate identical keys reached from different
+- [x] 3.4 Generate only root-reachable instances, deduplicate identical keys reached from different
   call sites and roots, and omit unreachable declarations
-- [ ] 3.5 Return structured invariant errors when a synthetic provider context lacks a required
+- [x] 3.5 Return structured invariant errors when a synthetic provider context lacks a required
   slot or supplies only a type binding for a value requirement
-- [ ] 3.6 Add tests for multiple roots, unreachable functions, unrelated caller slots, shared
+- [x] 3.6 Add tests for multiple roots, unreachable functions, unrelated caller slots, shared
   instances with different runtime provider values, conservative branch traversal, and invalid
   synthetic contexts
-- [ ] 3.7 Run formatting, the full test suite, and strict OpenSpec validation, then commit
+- [x] 3.7 Run formatting, the full test suite, and strict OpenSpec validation, then commit
   demand-driven callable planning as a stable snapshot
 
 ## 4. Providers, Slot Calls, and `with`
