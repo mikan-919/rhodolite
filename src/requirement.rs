@@ -582,6 +582,14 @@ impl Analysis {
         errors
     }
 
+    /// 名前で指した根だけを見る版。生産ビルドの根は `main` と test の綴りでは
+    /// 決まらないので、呼び出し側が根の一覧を渡す
+    pub fn errors_for_roots(&self, roots: &[String]) -> Vec<Diag> {
+        let mut errors = self.diagnostics.clone();
+        errors.extend(self.unsatisfied_where(|name| roots.iter().any(|root| root == name)));
+        errors
+    }
+
     /// 推論結果の一覧。IDE がゴーストテキストで見せるものの、テキスト版。
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -612,11 +620,16 @@ impl Analysis {
     }
 
     pub fn unsatisfied_for(&self, entry: &str) -> Vec<Diag> {
+        self.unsatisfied_where(|name| name == entry || name.starts_with("test \""))
+    }
+
+    /// どの本体を根と見るかだけを差し替える。文言・経路・ラベル・span の
+    /// 作り方は根の選び方に依らず1本
+    fn unsatisfied_where(&self, is_root: impl Fn(&str) -> bool) -> Vec<Diag> {
         let mut errors = Vec::new();
 
         for name in &self.order {
-            let is_entry = name == entry || name.starts_with("test \"");
-            if !is_entry {
+            if !is_root(name) {
                 continue;
             }
 

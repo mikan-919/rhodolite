@@ -17,7 +17,7 @@
 
 use crate::hir;
 use crate::hir::Id as _;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 // ---------------------------------------------------------------------------
@@ -257,6 +257,67 @@ pub fn plan(
     analysis: &crate::requirement::Analysis,
     entry: hir::CallableId,
 ) -> Result<Plan, PlanError> {
+    let roots: Vec<_> = std::iter::once(hir::BodyId::Callable(entry))
+        .chain(program.tests.ids().map(hir::BodyId::Test))
+        .map(|body| (body, ProviderContext::new()))
+        .collect();
+    plan_roots(program, analysis, &roots)
+}
+
+/// 生産ビルドの計画。根は `main` と、公開された関数だけ。
+///
+/// test は根に入らない。宣言されているだけの test が生産物を膨らませたり、
+/// scalar 外の機能で生産ビルドを止めたりしないため(core-wasm-build spec)
+#[derive(Debug)]
+pub struct ProductionPlan {
+    pub plan: Plan,
+    /// エントリの instance
+    pub entry: InstanceId,
+    /// 公開名 → その根の instance。公開名の昇順。別名が同じ関数を指した
+    /// ときは同じ instance が並ぶ(ラッパは名前ごと、実装は1つ)
+    pub exports: Vec<(String, InstanceId)>,
+}
+
+/// `main` と公開関数それぞれを、空の提供文脈から独立に計画する。
+///
+/// `exports` は公開名の昇順で渡す。`main` の提供状態が後続の公開呼び出しへ
+/// 引き継がれることはない
+pub fn plan_production(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    entry: hir::CallableId,
+    exports: &[(String, hir::CallableId)],
+) -> Result<ProductionPlan, PlanError> {
+    let mut seen = BTreeSet::from([entry]);
+    let mut roots = vec![(hir::BodyId::Callable(entry), ProviderContext::new())];
+    for (_, callable) in exports {
+        if seen.insert(*callable) {
+            roots.push((hir::BodyId::Callable(*callable), ProviderContext::new()));
+        }
+    }
+
+    let plan = plan_roots(program, analysis, &roots)?;
+    let instance_of: BTreeMap<hir::BodyId, InstanceId> = plan.roots.iter().copied().collect();
+    Ok(ProductionPlan {
+        entry: instance_of[&hir::BodyId::Callable(entry)],
+        exports: exports
+            .iter()
+            .map(|(name, callable)| (name.clone(), instance_of[&hir::BodyId::Callable(*callable)]))
+            .collect(),
+        plan,
+    })
+}
+
+/// 根の並びを呼び出し側が決める計画。
+///
+/// 根は与えられた順に確保されるので、instance の番号もその順で決まる。
+/// 同じ本体を指す根が複数あっても intern が1つに寄せる(別名の再エクスポートが
+/// 同じ実装を共有するのはこの性質)
+pub fn plan_roots(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    roots: &[(hir::BodyId, ProviderContext)],
+) -> Result<Plan, PlanError> {
     let mut planner = Planner {
         program,
         analysis,
@@ -264,12 +325,9 @@ pub fn plan(
         pending: std::collections::VecDeque::new(),
     };
 
-    let roots = std::iter::once(hir::BodyId::Callable(entry))
-        .chain(program.tests.ids().map(hir::BodyId::Test));
-    for root in roots {
-        let empty = ProviderContext::new();
-        let (instance, _) = planner.request(root, &empty, root)?;
-        planner.plan.roots.push((root, instance));
+    for (root, context) in roots {
+        let (instance, _) = planner.request(*root, context, *root)?;
+        planner.plan.roots.push((*root, instance));
     }
 
     // 確保だけして中身が空の instance を、確保順に片づける
@@ -1372,5 +1430,122 @@ mod tests {
              instance#16 impl Frozen::now [] ambient -\n\
              instance#17 impl InMemoryDb::save [] ambient -\n"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 生産の根 (`main` + 公開関数)
+    // -----------------------------------------------------------------------
+
+    /// `公開名=関数名` で別名を書ける。別名を書かなければ両方同じ綴り
+    fn production(src: &str, exports: &[&str]) -> (hir::Program, ProductionPlan) {
+        let program = lowered_of(src);
+        let analysis = crate::requirement::analyze(&program);
+        let entry = program.free_callable("main").expect("main がない");
+        let exports: Vec<(String, hir::CallableId)> = exports
+            .iter()
+            .map(|spelling| {
+                let (public, target) = spelling.split_once('=').unwrap_or((spelling, spelling));
+                (
+                    public.to_string(),
+                    program.free_callable(target).expect("その関数がない"),
+                )
+            })
+            .collect();
+        let planned =
+            plan_production(&program, &analysis, entry, &exports).expect("計画できるはず");
+        (program, planned)
+    }
+
+    /// 宣言されているだけの test は生産物に入らない。scalar 外の機能を使う
+    /// test があっても生産ビルドは進める
+    #[test]
+    fn 生産の根にtestは入らない() {
+        let (program, planned) = production(
+            "fn only_in_test(-> int) { 1 }\n\
+             fn main(-> int) { 0 }\n\
+             test \"t\" { assert only_in_test() == 1 }\n",
+            &[],
+        );
+
+        assert_eq!(planned.plan.roots.len(), 1, "根は main だけ");
+        assert!(
+            instances_named(&program, &planned.plan, "only_in_test").is_empty(),
+            "test からしか届かない本体は計画に入らない"
+        );
+    }
+
+    /// 別名は公開名を増やすだけ。実装は1つに寄る
+    #[test]
+    fn 別名の根は同じinstanceを共有する() {
+        let (_, planned) = production(
+            "fn find(-> int) { 1 }\n\
+             fn main(-> int) { 0 }\n",
+            &["alpha=find", "zebra=find"],
+        );
+
+        assert_eq!(planned.exports.len(), 2, "ラッパは公開名ごと");
+        assert_eq!(planned.exports[0].1, planned.exports[1].1, "実装は1つ");
+        assert_eq!(planned.plan.roots.len(), 2, "根は main と find の2つ");
+    }
+
+    /// 別の根から同じ本体へ届いたときも instance は1つ
+    #[test]
+    fn 根を跨いで同じinstanceに寄る() {
+        let (program, planned) = production(
+            "fn shared(-> int) { 1 }\n\
+             fn left(-> int) { shared() }\n\
+             fn main(-> int) { shared() }\n",
+            &["left"],
+        );
+
+        assert_eq!(
+            instances_named(&program, &planned.plan, "shared").len(),
+            1,
+            "共有された本体の実装は1つ"
+        );
+    }
+
+    /// 公開関数はそれぞれ空の提供文脈から始まる。`main` の提供は引き継がない
+    #[test]
+    fn 公開関数の要求は自分で閉じる() {
+        let program = lowered_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { ticks() } }\n",
+        );
+        let analysis = crate::requirement::analyze(&program);
+        let entry = program.free_callable("main").expect("main がない");
+        let ticks = program.free_callable("ticks").expect("ticks がない");
+
+        // main からは提供されているので閉じる
+        assert!(analysis.errors_for_roots(&["main".to_string()]).is_empty());
+        // 同じ本体でも、公開の根として単体で立てば要求が残る
+        assert_eq!(analysis.errors_for_roots(&["ticks".to_string()]).len(), 1);
+        assert_eq!(
+            plan_production(&program, &analysis, entry, &[("ticks".to_string(), ticks)]).err(),
+            Some(PlanError::MissingProvider {
+                body: hir::BodyId::Callable(ticks),
+                slot: slot(&program, "clock"),
+            })
+        );
+    }
+
+    /// 根の並びは渡された公開名の順そのまま。instance 番号もそれで決まる
+    #[test]
+    fn 根の順は決定的() {
+        let (program, planned) = production(
+            "fn alpha(-> int) { 1 }\n\
+             fn zebra(-> int) { 2 }\n\
+             fn main(-> int) { 0 }\n",
+            &["alpha", "zebra"],
+        );
+
+        let names: Vec<String> = planned
+            .plan
+            .roots
+            .iter()
+            .map(|(body, _)| program.show_body(*body))
+            .collect();
+        assert_eq!(names, ["main", "alpha", "zebra"]);
+        assert_eq!(planned.entry, planned.plan.roots[0].1);
     }
 }

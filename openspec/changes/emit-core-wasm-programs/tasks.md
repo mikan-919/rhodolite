@@ -27,16 +27,16 @@
 
 ## 3. Generalize Specialization Roots
 
-- [ ] 3.1 Refactor the ambient planner to accept an ordered explicit root set and provider context
+- [x] 3.1 Refactor the ambient planner to accept an ordered explicit root set and provider context
   while retaining a compatibility entry point for the existing `main + all tests` plan
-- [ ] 3.2 Generalize unsatisfied-requirement reporting to named production roots and preserve the
+- [x] 3.2 Generalize unsatisfied-requirement reporting to named production roots and preserve the
   existing main/test rendering, paths, labels, and related spans
-- [ ] 3.3 Build the production root set from `main` plus distinct entry-module public callables,
+- [x] 3.3 Build the production root set from `main` plus distinct entry-module public callables,
   start each from an empty provider context, and retain each ABI name-to-instance mapping
-- [ ] 3.4 Add tests for production/test separation, aliased roots sharing one instance,
+- [x] 3.4 Add tests for production/test separation, aliased roots sharing one instance,
   cross-root instance deduplication, closed and unclosed public requirements, deterministic root
   order, and an unchanged legacy canonical plan snapshot
-- [ ] 3.5 Run formatting, the full test suite, canonical and missing-provider CLI cases, and strict
+- [x] 3.5 Run formatting, the full test suite, canonical and missing-provider CLI cases, and strict
   OpenSpec validation, then commit generalized root planning as a stable snapshot
 
 ## 4. Establish Core Wasm Emission
