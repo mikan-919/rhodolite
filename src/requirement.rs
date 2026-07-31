@@ -106,14 +106,35 @@ impl Requirement {
 
 pub type Reqs = BTreeMap<String, Requirement>;
 
+/// 本体1つ分の要求を ID で引く形。表示名を経由しないので、後段の単相化は
+/// 文字列へ戻らずに提供文脈を制限できる(design.md 決定1)。
+pub type BodyReqs = BTreeMap<hir::SlotId, Requirement>;
+
 #[derive(Debug)]
 pub struct Analysis {
     pub slots: Slots,
-    /// 本体名 → その本体が外へ要求するもの
+    /// 本体名 → その本体が外へ要求するもの。`semantic` から表示の境界で作る
     pub reqs: BTreeMap<String, Reqs>,
     /// 出力の並び順(宣言順)。BTreeMap の辞書順だと読みにくいため
     pub order: Vec<String>,
+    /// 具体的な本体 → その本体が外へ要求するもの。契約メソッドの仮想本体は
+    /// 不動点の内部鍵なのでここには出さない
+    semantic: BTreeMap<hir::BodyId, BodyReqs>,
     diagnostics: Vec<Diag>,
+}
+
+impl Analysis {
+    /// 本体1つ分の意味の結果。全ての本体が表を持つ(要求が無ければ空)。
+    pub fn requirements(&self, body: hir::BodyId) -> &BodyReqs {
+        self.semantic
+            .get(&body)
+            .expect("全ての本体に要求の表がある")
+    }
+
+    /// 全本体を決定的な順で。並びは `BodyId` の順(callable が先、各々宣言順)
+    pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, &BodyReqs)> {
+        self.semantic.iter().map(|(id, reqs)| (*id, reqs))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,14 +373,6 @@ fn merge_facts(into: &mut Facts, from: Facts) {
     into.calls.extend(from.calls);
 }
 
-/// スロット名 → その要求がどこから来たか。位置と経路の意味は従来どおり。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Req {
-    level: SlotLevel,
-    span: Span,
-    path: Vec<Hop>,
-}
-
 /// 型検査を通った HIR から要求を推論する。
 pub fn analyze(program: &hir::Program) -> Analysis {
     let mut diagnostics = duplicate_slot_diagnostics(program);
@@ -399,12 +412,12 @@ pub fn analyze(program: &hir::Program) -> Analysis {
     // ponytail: 素朴な不動点反復。呼び出しグラフを Tarjan で SCC 縮約して
     // 逆位相順に舐めれば反復を減らせる(docs/adr/0003)。プログラムが
     // 大きくなって遅くなったら、そのときに入れ替える。
-    let mut reqs: BTreeMap<BodyKey, BTreeMap<hir::SlotId, Req>> =
+    let mut reqs: BTreeMap<BodyKey, BodyReqs> =
         facts.keys().map(|key| (*key, BTreeMap::new())).collect();
 
     loop {
         let mut changed = false;
-        let mut updated: BTreeMap<BodyKey, BTreeMap<hir::SlotId, Req>> = BTreeMap::new();
+        let mut updated: BTreeMap<BodyKey, BodyReqs> = BTreeMap::new();
 
         for (key, body) in &facts {
             let mut next = reqs[key].clone();
@@ -454,7 +467,20 @@ pub fn analyze(program: &hir::Program) -> Analysis {
         }
     }
 
-    // 表示の境界で名前へ戻す。並びは宣言順の本体と、スロット名の順
+    // 意味の結果。契約メソッドの仮想本体は不動点の内部鍵なので落とす
+    let semantic: BTreeMap<hir::BodyId, BodyReqs> = program
+        .bodies
+        .iter()
+        .map(|id| {
+            let found = reqs
+                .remove(&BodyKey::Body(*id))
+                .expect("全ての本体に要求の表がある");
+            (*id, found)
+        })
+        .collect();
+
+    // 表示の境界で名前へ戻す。並びは宣言順の本体と、スロット名の順。
+    // 名前で引く一覧も提供忘れの診断も、この1つの意味の結果から作る
     let mut order = Vec::new();
     let mut public: BTreeMap<String, Reqs> = BTreeMap::new();
     for id in &program.bodies {
@@ -465,23 +491,11 @@ pub fn analyze(program: &hir::Program) -> Analysis {
             continue;
         }
         let name = program.show_body(*id);
-        let found = reqs
-            .get(&BodyKey::Body(*id))
-            .expect("全ての本体に要求の表がある");
         public.insert(
             name.clone(),
-            found
+            semantic[id]
                 .iter()
-                .map(|(slot, req)| {
-                    (
-                        program.slots[*slot].name.clone(),
-                        Requirement {
-                            level: req.level,
-                            span: req.span,
-                            path: req.path.clone(),
-                        },
-                    )
-                })
+                .map(|(slot, req)| (program.slots[*slot].name.clone(), req.clone()))
                 .collect(),
         );
         order.push(name);
@@ -491,6 +505,7 @@ pub fn analyze(program: &hir::Program) -> Analysis {
         slots: slots_of(program),
         reqs: public,
         order,
+        semantic,
         diagnostics,
     }
 }
@@ -531,7 +546,7 @@ fn duplicate_slot_diagnostics(program: &hir::Program) -> Vec<Diag> {
 }
 
 fn merge_requirement(
-    reqs: &mut BTreeMap<hir::SlotId, Req>,
+    reqs: &mut BodyReqs,
     slot: hir::SlotId,
     level: SlotLevel,
     span: Span,
@@ -546,7 +561,7 @@ fn merge_requirement(
         }
         Some(_) => false,
         None => {
-            reqs.insert(slot, Req { level, span, path });
+            reqs.insert(slot, Requirement { level, span, path });
             true
         }
     }
@@ -922,6 +937,142 @@ mod tests {
             0,
             "{:?}",
             error.related
+        );
+    }
+
+    // ---- 意味の結果(ID で引く形) ----
+
+    /// ID で引いた結果を、本体・スロットとも ID を添えて書き出す。表示名は
+    /// 読むためだけに付ける。ID が動けばここが落ちる
+    fn semantic_report(program: &hir::Program, analysis: &Analysis) -> String {
+        use crate::hir::Id as _;
+        let mut out = String::new();
+        for (body, reqs) in analysis.bodies() {
+            let shown: Vec<String> = reqs
+                .iter()
+                .map(|(slot, requirement)| {
+                    let level = match requirement.level {
+                        SlotLevel::Type => "型",
+                        SlotLevel::Value => "値",
+                    };
+                    format!(
+                        "slot#{} {} ({level})",
+                        slot.index(),
+                        program.slots[*slot].name
+                    )
+                })
+                .collect();
+            let key = match body {
+                hir::BodyId::Callable(id) => format!("callable#{}", id.index()),
+                hir::BodyId::Test(id) => format!("test#{}", id.index()),
+            };
+            out.push_str(&format!(
+                "{key} {} / {}\n",
+                program.show_body(body),
+                if shown.is_empty() {
+                    "-".to_string()
+                } else {
+                    shown.join(", ")
+                }
+            ));
+        }
+        out
+    }
+
+    /// 正典は自由関数・`impl` のメソッド・test を全部含む。名前で引く一覧が
+    /// 落とす `impl` のメソッドも、ID の側には全部ある
+    #[test]
+    fn 意味の結果は全ての本体をidで引ける() {
+        let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
+        let lowered = crate::typecheck::check_and_lower(&program(&src)).expect("型検査を通る");
+        let analysis = analyze(&lowered);
+
+        assert_eq!(
+            semantic_report(&lowered, &analysis),
+            "callable#0 stamp / slot#0 db (値), slot#1 clock (値)\n\
+             callable#1 promote / slot#0 db (値), slot#1 clock (値)\n\
+             callable#2 handle / slot#0 db (値), slot#1 clock (値)\n\
+             callable#3 impl Postgres::new / -\n\
+             callable#4 impl Postgres::find / -\n\
+             callable#5 impl Postgres::save / -\n\
+             callable#6 impl SystemClock::now / -\n\
+             callable#7 main / -\n\
+             callable#8 impl InMemoryDb::new / -\n\
+             callable#9 impl InMemoryDb::get / -\n\
+             callable#10 impl InMemoryDb::find / -\n\
+             callable#11 impl InMemoryDb::save / -\n\
+             callable#12 impl Frozen::at / -\n\
+             callable#13 impl Frozen::now / -\n\
+             test#0 test \"昇格すると Gold になり時刻が刻まれる\" / -\n"
+        );
+    }
+
+    /// 型射影と値射影の違いは ID の側にもそのまま残る
+    #[test]
+    fn 意味の結果は型要求と値要求を言い分ける() {
+        let lowered = lowered_of(
+            "fn make(-> int) { clock::zero() }\n\
+             fn used(-> int) { clock.now() }\n",
+        );
+        let analysis = analyze(&lowered);
+        let clock = slot_id(&lowered, "clock");
+
+        let make = hir::BodyId::Callable(lowered.free_callable("make").unwrap());
+        let used = hir::BodyId::Callable(lowered.free_callable("used").unwrap());
+        assert_eq!(analysis.requirements(make)[&clock].level, SlotLevel::Type);
+        assert_eq!(analysis.requirements(used)[&clock].level, SlotLevel::Value);
+    }
+
+    /// 同名スロットを持つ別モジュールでも、ID なら取り違えない
+    #[test]
+    fn 意味の結果は同名スロットをモジュールで取り違えない() {
+        let loaded = crate::module::load_files(&[
+            (
+                "main.rd",
+                "use left\nuse right\n\
+                 fn both(-> int) { left::read() + right::read() }\n\
+                 fn main(-> int) { both() }\n",
+            ),
+            (
+                "left.rd",
+                "trait Api { fn read(self -> int) }\n\
+                 struct Store {}\n\
+                 impl Api for Store { fn read(self -> int) { 1 } }\n\
+                 effect db: Api\n\
+                 fn read(-> int) { db.read() }\n",
+            ),
+            (
+                "right.rd",
+                "trait Api { fn read(self -> int) }\n\
+                 struct Store {}\n\
+                 impl Api for Store { fn read(self -> int) { 2 } }\n\
+                 effect db: Api\n\
+                 fn read(-> int) { db.read() }\n",
+            ),
+        ])
+        .expect("ロードできる");
+        let lowered = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let analysis = analyze(&lowered);
+
+        let both = hir::BodyId::Callable(lowered.free_callable("main::both").unwrap());
+        let reqs = analysis.requirements(both);
+        assert_eq!(reqs.len(), 2, "同名でも別のスロット");
+        let names: Vec<&str> = reqs
+            .keys()
+            .map(|slot| lowered.slots[*slot].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["left::db", "right::db"]);
+    }
+
+    /// 契約メソッドの仮想本体は不動点の内部鍵。意味の結果には出さない
+    #[test]
+    fn 意味の結果に契約メソッドの仮想本体は出ない() {
+        let lowered = lowered_of("fn main(u: User) { db.save(u) }\n");
+        let analysis = analyze(&lowered);
+        assert_eq!(
+            analysis.bodies().count(),
+            lowered.bodies.len(),
+            "本体の数と一致する"
         );
     }
 

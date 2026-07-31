@@ -1,15 +1,15 @@
 ## 1. Preserve Semantic Requirements
 
-- [ ] 1.1 Add an ID-keyed requirement result for every concrete `BodyId`, retaining `SlotId`,
+- [x] 1.1 Add an ID-keyed requirement result for every concrete `BodyId`, retaining `SlotId`,
   `SlotLevel`, use span, and propagation path from the existing fixed-point computation
-- [ ] 1.2 Expose read-only lookup and deterministic iteration needed by later lowering without
+- [x] 1.2 Expose read-only lookup and deterministic iteration needed by later lowering without
   exposing private trait-method virtual keys
-- [ ] 1.3 Derive the existing name-keyed render and missing-provider diagnostics from the same
+- [x] 1.3 Derive the existing name-keyed render and missing-provider diagnostics from the same
   semantic result, preserving text, ordering, labels, help, and related spans
-- [ ] 1.4 Add tests for free functions, implementation methods, tests, type/value levels, and
+- [x] 1.4 Add tests for free functions, implementation methods, tests, type/value levels, and
   multi-module IDs, plus regression tests proving current provider-conservative requirements remain
   unchanged
-- [ ] 1.5 Run formatting, the full test suite, canonical success and missing-provider CLI cases, and
+- [x] 1.5 Run formatting, the full test suite, canonical success and missing-provider CLI cases, and
   strict OpenSpec validation, then commit the semantic requirement API as a stable snapshot
 
 ## 2. Ambient ABI Plan Vocabulary
