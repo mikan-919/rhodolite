@@ -1197,4 +1197,180 @@ mod tests {
             Some(ValueSource::Incoming(slot(&program, "clock")))
         );
     }
+
+    // ---- 再帰と完全な計画 ----
+
+    /// 直接再帰は自分自身を指す。鍵を歩く前に確保しているので止まる(決定10)
+    #[test]
+    fn 直接再帰は同じinstanceを指す() {
+        let (program, plan) = plan_of(
+            "fn ping(n: int -> int) { if n == 0: clock.now() else: ping(n - 1) }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { ping(1) } }\n",
+        );
+
+        let ping = only(&program, &plan, "ping");
+        let recursive = plan
+            .instance(ping)
+            .calls
+            .values()
+            .find(|call| call.target == ping)
+            .expect("自分自身への辺");
+        assert_eq!(
+            recursive.projection,
+            vec![(
+                slot(&program, "clock"),
+                ValueSource::Incoming(slot(&program, "clock"))
+            )],
+            "受け取った record をそのまま渡す"
+        );
+    }
+
+    /// 相互再帰も同じ仕掛けで閉じる。別の呼び出し規約は要らない
+    #[test]
+    fn 相互再帰は有限で閉じる() {
+        let (program, plan) = plan_of(
+            "fn ping(n: int -> int) { if n == 0: clock.now() else: pong(n - 1) }\n\
+             fn pong(n: int -> int) { ping(n) }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { ping(2) } }\n",
+        );
+
+        let ping = only(&program, &plan, "ping");
+        let pong = only(&program, &plan, "pong");
+        assert!(plan.instance(ping).calls.values().any(|c| c.target == pong));
+        assert!(plan.instance(pong).calls.values().any(|c| c.target == ping));
+    }
+
+    /// 入れ子の提供が実装を変えると別の instance になるが、組み合わせは有限
+    #[test]
+    fn 提供が変わる再帰も有限のinstanceに収束する() {
+        let (program, plan) = plan_of(
+            "fn spin(n: int -> int) {\n\
+             \x20 if n == 0: clock.now() else: with clock(Zero {}) { spin(n - 1) }\n\
+             }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { spin(3) } }\n",
+        );
+
+        let mut selections: Vec<Vec<String>> = instances_named(&program, &plan, "spin")
+            .into_iter()
+            .map(|id| providers_of(&program, &plan, id))
+            .collect();
+        selections.sort();
+        assert_eq!(
+            selections,
+            vec![
+                vec!["clock=Frozen".to_string()],
+                vec!["clock=Zero".to_string()]
+            ],
+            "Zero の中の Zero は同じ鍵なので増えない"
+        );
+    }
+
+    /// 別の根から同じ組み合わせで届いた本体は1つに寄る
+    #[test]
+    fn 根をまたいでも同じ鍵は共有する() {
+        let (program, plan) = plan_of(
+            "fn ticks(-> int) { clock.now() }\n\
+             fn main(-> int) { with clock(Frozen { t = 1 }) { ticks() } }\n\
+             test \"同じ提供\" { with clock(Frozen { t = 2 }) { assert ticks() == 2 } }\n",
+        );
+
+        assert_eq!(plan.roots.len(), 2);
+        assert_eq!(
+            instances_named(&program, &plan, "ticks").len(),
+            1,
+            "実装が同じなら値が違っても共有する"
+        );
+    }
+
+    /// 要求は保守的なまま(決定4)。選ばれた実装が使わないスロットでも、
+    /// 呼び出し元の record には欄が残る。ここを勝手に削ると言語の振る舞いが変わる
+    #[test]
+    fn 選ばれた実装が使わない欄も残る() {
+        let (program, plan) = plan_of(
+            "struct Logged {}\n\
+             impl Database for Logged {\n\
+             \x20 fn save(self, n: int -> unit) { let at = clock.now() }\n\
+             }\n\
+             fn saves(-> unit) { db.save(1) }\n\
+             fn main(-> unit) {\n\
+             \x20 with db(InMemoryDb {}), clock(Frozen { t = 1 }) { saves() }\n\
+             }\n",
+        );
+
+        let saves = only(&program, &plan, "saves");
+        let layout = plan.layout(plan.instance(saves).layout.expect("record を持つ"));
+        assert_eq!(
+            layout.fields,
+            vec![
+                (slot(&program, "clock"), struct_(&program, "Frozen")),
+                (slot(&program, "db"), struct_(&program, "InMemoryDb")),
+            ],
+            "clock を使わない InMemoryDb を選んでも欄は残る"
+        );
+
+        // 呼び先の具体実装は clock を要求しないので、その record は空になる
+        let call = plan
+            .instance(saves)
+            .calls
+            .values()
+            .next()
+            .expect("呼び出し");
+        assert_eq!(
+            program.show_body(plan.instance(call.target).key.body),
+            "impl InMemoryDb::save"
+        );
+        assert_eq!(plan.instance(call.target).layout, None);
+        assert!(call.projection.is_empty());
+    }
+
+    /// 正典プログラム全体の計画。本番とテストの提供の組み合わせ、具体的な
+    /// スロット呼び出し先、record layout、射影、型消去が1枚に出る
+    #[test]
+    fn 正典の計画は決定的な全体像になる() {
+        let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
+        let (program, plan) = plan_source(&src);
+
+        assert_eq!(
+            plan.render(&program),
+            "root main -> instance#0\n\
+             root test \"昇格すると Gold になり時刻が刻まれる\" -> instance#1\n\
+             layout#0 { db: Postgres, clock: SystemClock }\n\
+             layout#1 { db: InMemoryDb, clock: Frozen }\n\
+             instance#0 main [] ambient -\n\
+             \x20 expr#3 -> instance#2 {}\n\
+             \x20 expr#6 -> instance#3 { db <- provision expr#3, clock <- provision expr#4 }\n\
+             instance#1 test \"昇格すると Gold になり時刻が刻まれる\" [] ambient -\n\
+             \x20 expr#7 -> instance#4 {}\n\
+             \x20 expr#11 -> instance#5 {}\n\
+             \x20 expr#14 -> instance#6 { db <- provision expr#9, clock <- provision expr#11 }\n\
+             \x20 expr#19 -> instance#7 {}\n\
+             instance#2 impl Postgres::new [] ambient -\n\
+             instance#3 handle [db=Postgres, clock=SystemClock] ambient layout#0\n\
+             \x20 expr#1 -> instance#8 { db <- field db, clock <- field clock }\n\
+             instance#4 impl InMemoryDb::new [] ambient -\n\
+             instance#5 impl Frozen::at [] ambient -\n\
+             instance#6 handle [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#1 -> instance#9 { db <- field db, clock <- field clock }\n\
+             instance#7 impl InMemoryDb::get [] ambient -\n\
+             \x20 expr#2 -> instance#10 {}\n\
+             instance#8 promote [db=Postgres, clock=SystemClock] ambient layout#0\n\
+             \x20 expr#1 -> instance#11 self=field db {}\n\
+             \x20 expr#10 -> instance#12 { db <- field db, clock <- field clock }\n\
+             instance#9 promote [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#1 -> instance#10 self=field db {}\n\
+             \x20 expr#10 -> instance#13 { db <- field db, clock <- field clock }\n\
+             instance#10 impl InMemoryDb::find [] ambient -\n\
+             instance#11 impl Postgres::find [] ambient -\n\
+             instance#12 stamp [db=Postgres, clock=SystemClock] ambient layout#0\n\
+             \x20 expr#1 -> instance#14 self=field clock {}\n\
+             \x20 expr#4 -> instance#15 self=field db {}\n\
+             instance#13 stamp [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#1 -> instance#16 self=field clock {}\n\
+             \x20 expr#4 -> instance#17 self=field db {}\n\
+             instance#14 impl SystemClock::now [] ambient -\n\
+             instance#15 impl Postgres::save [] ambient -\n\
+             instance#16 impl Frozen::now [] ambient -\n\
+             instance#17 impl InMemoryDb::save [] ambient -\n"
+        );
+    }
 }

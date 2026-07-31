@@ -66,18 +66,18 @@
 
 ## 5. Recursion and Complete Program Evidence
 
-- [ ] 5.1 Allocate and mark each new instance pending before walking its body, then complete pending
+- [x] 5.1 Allocate and mark each new instance pending before walking its body, then complete pending
   instances through a deterministic worklist
-- [ ] 5.2 Reuse the same instance for direct recursion and same-context mutual recursion, and create
+- [x] 5.2 Reuse the same instance for direct recursion and same-context mutual recursion, and create
   finite distinct instances when nested providers change the implementation combination
-- [ ] 5.3 Add recursive, mutually recursive, nested-provider-cycle, and cross-root deduplication
+- [x] 5.3 Add recursive, mutually recursive, nested-provider-cycle, and cross-root deduplication
   tests that pin instance counts and call edges
-- [ ] 5.4 Add a complete canonical plan snapshot covering `main`, every test, production and test
+- [x] 5.4 Add a complete canonical plan snapshot covering `main`, every test, production and test
   provider combinations, concrete slot-call targets, record layouts, projections, and type erasure
-- [ ] 5.5 Add a focused example proving conservative requirements may retain an unused record field
+- [x] 5.5 Add a focused example proving conservative requirements may retain an unused record field
   after concrete implementation selection, so provider-sensitive pruning is not introduced
   accidentally
-- [ ] 5.6 Run formatting, the full test suite, canonical success and missing-provider CLI cases, and
+- [x] 5.6 Run formatting, the full test suite, canonical success and missing-provider CLI cases, and
   strict OpenSpec validation, then commit the complete deterministic planner as a stable snapshot
 
 ## 6. Record the ABI Boundary
