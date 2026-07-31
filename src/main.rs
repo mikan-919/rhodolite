@@ -19,6 +19,11 @@ mod parse;
 mod render;
 mod requirement;
 mod typecheck;
+// Wasm 生成はまだ CLI から呼ばれていない(build コマンドは次の段)
+#[allow(dead_code)]
+mod wasm;
+#[allow(dead_code)]
+mod wasm_abi;
 
 use std::path::Path;
 use std::process::ExitCode;
