@@ -1,8 +1,12 @@
 # コンパイラへのロードマップ
 
 Rhodolite は、言語の意味をインタプリタで固め、型付き HIR を共通の境界にしてから
-C バックエンドを追加する。インタプリタは捨てず、生成コードの振る舞いを照合する
-参照実装として残す。
+**Core WebAssembly** バックエンドを追加する。インタプリタは捨てず、生成コードの
+振る舞いを照合する参照実装として残す。
+
+成果物を Core Wasm にした理由と、その上のホスト契約(Rhodolite ABI v0)は
+[ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。Component Model・
+WIT・WASI・JavaScript は言語の契約に入れず、必要なフレームワークが下流で包む。
 
 この文書は**順序と完了線の地図**であり、個々の機能仕様ではない。OpenSpec change は
 各段階へ着手する直前に作り、その時点までに判明した制約を反映する。状態が「未着手」の
@@ -12,11 +16,11 @@ change 名は予約名であり、まだ作成済みであることを意味し�
 
 最初のコンパイル版（compiled v1）は、次をすべて満たした状態とする。
 
-- `examples/canonical.rd` を C へ変換できる
-- 生成した C をシステムの C コンパイラで実行ファイルにできる
-- 生成バイナリで正典テストが成功する
-- 同じプログラムについて HIR インタプリタと生成バイナリの結果が一致する
-- 提供忘れ・型エラー・未解決呼び出しは C 生成前に拒否される
+- `examples/canonical.rd` を Core Wasm へ変換できる
+- 生成した `.wasm` を独立した Core Wasm ランタイムが検証・実行できる
+- 生成モジュールで正典テストが成功する
+- 同じプログラムについて HIR インタプリタと生成モジュールの結果が一致する
+- 提供忘れ・型エラー・未解決呼び出しは Wasm 生成前に拒否される
 - 複数モジュールからなるプログラムをコンパイルできる
 
 compiled v1 は汎用言語としての完成ではない。外部パッケージ、最適化、async、
@@ -37,13 +41,13 @@ introduce-typed-hir（完了）
 define-ambient-runtime-abi（完了）
         │
         ▼
-emit-core-c-programs
+emit-core-wasm-programs（完了）
         │
         ▼
-compile-data-values
+compile-wasm-data-values
         │
         ▼
-compile-traits-and-ambient
+compile-wasm-traits-and-ambient
         │
         ▼
 add-differential-execution
@@ -58,9 +62,9 @@ compiled v1
 | 1 | 完了 | archived `close-static-type-checking` | Unknown のない検査成功 |
 | 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
 | 3 | 完了 | archived `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
-| 4 | 次 | `emit-core-c-programs` | スカラーと制御フローの C 生成 |
-| 5 | 未着手 | `compile-data-values` | struct・enum・optional・配列の C 表現 |
-| 6 | 未着手 | `compile-traits-and-ambient` | trait・slot・`with` の C 生成 |
+| 4 | 完了 | archived `emit-core-wasm-programs` | スカラーと制御フローの Core Wasm 生成 |
+| 5 | 次 | `compile-wasm-data-values` | struct・enum・optional・配列の Wasm 表現 |
+| 6 | 未着手 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
 | 7 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
 
 同時に進行中にするのは原則として一段階だけとする。前段の完了線を満たし、change を
@@ -138,53 +142,62 @@ ADR: [`0008`](./adr/0008-ambient-abi-is-a-specialization-plan.md)
 - 型提供と実体提供を同じものとして誤魔化さない(前者は実行時から消える)
 - C 側の擬似表現と呼び出し例が ADR-0008 に揃っている
 
-## 4. 最小の C 生成を縦に通す
+## 4. 最小の Core Wasm 生成を縦に通す
 
-想定 change: `emit-core-c-programs`
+OpenSpec: archived `emit-core-wasm-programs` /
+ADR: [`0009`](./adr/0009-core-wasm-is-the-compiler-artifact.md)
 
-ここから利用者が観測できるコンパイル機能になるため、CLI、生成、失敗条件を
-OpenSpec capability として定義する。
+ここから利用者が観測できるコンパイル機能になるので、CLI、生成、失敗条件を
+OpenSpec capability として定義した。
 
-最初に扱う範囲:
+扱う範囲(v0 の scalar 部分言語):
 
 - `int`、`bool`、`unit`
 - ローカル束縛と代入
 - 算術と比較
 - `if`、`while`
-- 直接関数呼び出しと `return`
-- エントリ関数
+- 直接関数呼び出しと `return`、`assert`
+- エントリ関数と、`pub use` で明示選択した公開関数
 
-完了条件:
+一緒に決まったもの:
 
-- `.rd` から `.c` を生成できる
-- 生成 C をビルドして実行できる
-- 小さなプログラムでインタプリタと終了結果が一致する
-- C コンパイラ失敗を Rhodolite CLI が明確に報告する
-- 生成 C が決定的で、人間が読める
+- `int` は符号付き64bit。加減乗と単項マイナスは回り込み、割り算だけが失敗を持つ
+- `pub use` が言語の公開再エクスポート。エントリーの明示選択がホスト面になる
+- 計画の根は呼び出し側が決める。生産の根は `main` + 公開関数で、test は入らない
+- 対応範囲の検査は**到達した instance だけ**。使わない豊かな宣言は止めない
+
+完了条件(すべて達成):
+
+- `.rd` から `.wasm` を生成できる(`rhodolite build <entry.rd> --target wasm`)
+- 生成物を独立した Core Wasm の validator と engine が受け付ける
+- 小さなプログラムでインタプリタと結果が一致する
+- 各段の失敗が既存の診断描画で位置付きで出て、成果物を置き換えない
+- 同じ入力・同じ選択肢からは byte 単位で同じモジュールが出る
 
 ## 5. データ値と小さなランタイムを作る
 
-想定 change: `compile-data-values`
+想定 change: `compile-wasm-data-values`
 
 追加する順序は、`str`、struct、enum payload、optional、`match`、配列、共有された
 可変値、`for` とする。
 
-compiled v1 のメモリ管理は短命な CLI を対象にしたプロセス寿命の arena を第一候補とする。
-本格 GC は最初の C 生成を遮らないよう後段へ送る。この選択は change 作成時に改めて
-実測し、設計判断として記録する。
+線形メモリに自前で置くか WasmGC に載せるかはここで決める。短命な CLI を対象にした
+プロセス寿命の arena を第一候補とし、本格 GC は最初のデータ生成を遮らないよう後段へ
+送る。この選択は change 作成時に改めて実測し、設計判断として記録する。
 
 完了条件:
 
-- 現在のデータ型と値操作を C 側で表現できる
+- 現在のデータ型と値操作を Wasm 側で表現できる
 - 共有された struct と配列の変更が参照実装と一致する
 - enum、optional、`match` の結果が参照実装と一致する
-- sanitizer 付き生成バイナリで不正アクセスが出ない
+- 公開 ABI が scalar 以外の値を運べるようになる
 
 ## 6. trait と ambient をコンパイルする
 
-想定 change: `compile-traits-and-ambient`
+想定 change: `compile-wasm-traits-and-ambient`
 
-Rhodolite 固有の意味を C バックエンドへ接続する段階。
+Rhodolite 固有の意味を Wasm バックエンドへ接続する段階。ADR-0008 の隠し ambient
+record を、空でない layout も運べる実行時表現として初めて実装する。
 
 実装順:
 
@@ -199,8 +212,8 @@ Rhodolite 固有の意味を C バックエンドへ接続する段階。
 
 完了条件:
 
-- `examples/canonical.rd` の C を生成できる
-- 生成バイナリで正典テストが成功する
+- `examples/canonical.rd` の Wasm を生成できる
+- 生成モジュールで正典テストが成功する
 - 差し替え先を変えても呼ばれる側の関数を変更しない
 - 提供忘れがコード生成より前に到達経路付きで失敗する
 - 生成関数が不要な slot を引数に持たない
@@ -210,9 +223,9 @@ Rhodolite 固有の意味を C バックエンドへ接続する段階。
 想定 change: `add-differential-execution`
 
 ```text
-               ┌─ HIR interpreter ───────── result A
+               ┌─ HIR interpreter ──────────── result A
 source → HIR ──┤
-               └─ C → C compiler → binary ─ result B
+               └─ Core Wasm → Wasm engine ──── result B
 
                          result A == result B
 ```
@@ -223,15 +236,15 @@ source → HIR ──┤
 完了条件:
 
 - 維持されたプログラム群を両方の実行系で自動実行する
-- C 生成の snapshot test がある
+- Wasm 生成の snapshot test がある
 - 小さな生成プログラムによる差分試験がある
-- sanitizer を CI 相当の検証手順で実行する
+- 生成モジュールの再ビルドが byte 単位で一致することを検証手順に含める
 - compiled v1 の到達点を正典プログラムで再現できる
 
 ## compiled v1 より後
 
 [ADR-0003](./adr/0003-whole-program-monomorphization.md) の本丸である高階関数の
-エフェクト多相は、最初の C バックエンドを通した後に進める。
+エフェクト多相は、最初の Wasm バックエンドを通した後に進める。
 
 ```text
 関数値・クロージャ
@@ -245,8 +258,9 @@ source → HIR ──┤
 関数単位キャッシュと増分ビルド
 ```
 
-LLVM／Cranelift、最適化、セルフホスト、パッケージマネージャ、LSP、async、
-所有権・借用、本格 GC、安定 ABI は、必要な実プログラムが現れてから別の地図を作る。
+Component Model／WIT の生成、LLVM／Cranelift、ネイティブ生成、最適化、セルフホスト、
+パッケージマネージャ、LSP、async、所有権・借用、本格 GC、安定 ABI は、必要な実
+プログラムが現れてから別の地図を作る。
 
 ## この文書の更新規則
 

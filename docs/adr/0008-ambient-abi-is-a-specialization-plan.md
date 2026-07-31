@@ -11,7 +11,9 @@ ambient は実行時に**存在しない**。到達した本体を「どの実�
 (`src/ambient_abi.rs`)として固定する。
 
 [ADR-0003](./0003-whole-program-monomorphization.md) が「エフェクト変数を単相化で
-消す」と決めたことの、ambient 部分の具体化にあたる。C 生成そのものは次段。
+消す」と決めたことの、ambient 部分の具体化にあたる。生成そのものは次段で、
+実際に選ばれたバックエンドは Core Wasm
+([ADR-0009](./0009-core-wasm-is-the-compiler-artifact.md))。
 
 ## Decision
 
@@ -108,10 +110,11 @@ with db(make()), clock<Frozen> { body }
 入れ子の提供が実装の組み合わせを変えれば別の instance になるが、callable・slot・
 `TraitImplId` はいずれも有限で、提供値は鍵に入らないので状態空間は有限。
 
-## 擬似 C
+## 擬似コード(C の綴りで書く)
 
-綴りは説明のためのもの。**規範なのは**欄の順・具体的な provider 型・値渡しで不変な
-record・同一性を保つ handle・直接の呼び先の5つだけで、C の型名や記号名ではない。
+綴りは説明のためのもので、バックエンドの選択とは無関係。**規範なのは**欄の順・
+具体的な provider 型・値渡しで不変な record・同一性を保つ handle・直接の呼び先の
+5つだけで、下の型名や記号名ではない。
 
 ### 本番とテストの提供の組み合わせ
 
@@ -197,10 +200,10 @@ int64_t ping__clock_Frozen(Ambient_clock_Frozen ambient, int64_t n) {
 
 この段では決めない。決めるときに前提を壊さないことだけを要求する。
 
-- **handle の物理表現** … `compile-data-values` へ。ここで前提にしているのは
+- **handle の物理表現** … `compile-wasm-data-values` へ。ここで前提にしているのは
   「安定した同一性」だけ
-- **C の型名と記号名の綴り** … emitter へ。計画の ID から決定的に導き、公開 ABI に
-  しない
+- **生成される型名と記号名の綴り** … emitter へ。計画の ID から決定的に導き、
+  公開 ABI にしない
 - **async のタスク継承と provider の寿命** … async が言語のロードマップに入るまで。
   ただし ambient record は**値として捕捉できる**必要があり、`with` のスタック枠が
   provider の記憶域を所有すると書いてはいけない

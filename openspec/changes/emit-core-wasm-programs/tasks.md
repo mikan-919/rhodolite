@@ -109,15 +109,15 @@
 
 ## 8. Record and Verify the Backend Boundary
 
-- [ ] 8.1 Add an ADR for Core Wasm plus Rhodolite ABI v0, public re-exports, embedded metadata,
+- [x] 8.1 Add an ADR for Core Wasm plus Rhodolite ABI v0, public re-exports, embedded metadata,
   trap transport, and Component/WIT as optional framework adapters
-- [ ] 8.2 Update `README.md`, `docs/overview.md`, and `docs/compiler-roadmap.md` from the C plan to
+- [x] 8.2 Update `README.md`, `docs/overview.md`, and `docs/compiler-roadmap.md` from the C plan to
   the Wasm sequence, documenting the current scalar completion line and the next data/provider
   stages without rewriting archived changes
-- [ ] 8.3 Run `cargo fmt --check`, the full test suite, every maintained CLI success/failure case,
+- [x] 8.3 Run `cargo fmt --check`, the full test suite, every maintained CLI success/failure case,
   independent Wasm validation and execution, deterministic rebuild comparison, and
   `bunx @fission-ai/openspec validate --all --strict`
-- [ ] 8.4 Review generated dependency lockfile changes and the complete diff for accidental
+- [x] 8.4 Review generated dependency lockfile changes and the complete diff for accidental
   Component/WIT, WASI, JavaScript, host-framework, rich-data, or non-empty-record scope
-- [ ] 8.5 Commit the completed Core Wasm build and documentation as an archive-ready stable
+- [x] 8.5 Commit the completed Core Wasm build and documentation as an archive-ready stable
   snapshot

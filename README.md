@@ -110,9 +110,16 @@ ambient の低水準契約も決まった。到達した本体を**実装の組�
 不変な record の欄になる。型提供は実行時から消え、値要求が無い関数は隠し引数を持たない。
 正典プログラム全体がこの計画へ機械的に落ちることをスナップショットで固定している
 (`src/ambient_abi.rs`、[ADR-0008](./docs/adr/0008-ambient-abi-is-a-specialization-plan.md))。
-計画はまだ CLI から見えず、実行はインタプリタが担う。
+この計画を入力にした **Core WebAssembly 生成**が動くようになった。
+`rhodolite build app.rd --target wasm` は、`main` と `pub use` で明示選択した
+公開関数を根に、到達した instance だけを決定的な `.wasm` へ落とす。成果物は
+import も start section も持たず、`__rhodolite_main` と公開名を export し、
+インタフェース記述を `rhodolite.abi` custom section に埋め込む。v0 が扱うのは
+`unit` / `bool` / `int` の部分言語で、到達しない豊かな宣言はビルドを止めない
+(`src/wasm.rs`、[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md))。
+インタプリタは参照実装として残る。
 
-次の一歩は、この計画を入力にした C 生成
+次の一歩は、データ値の Wasm 表現
 ([docs/compiler-roadmap.md](./docs/compiler-roadmap.md))。
 
 所有権・借用・`'a` 推論の柱はv1スコープ外として棚上げ中

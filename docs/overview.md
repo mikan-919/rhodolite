@@ -102,7 +102,9 @@ $ cargo run examples/missing_handler.rd
 | `src/parse.rs` | 再帰下降パーサ | 1774 |
 | `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 2009 |
 | `src/hir.rs` | 型付き・参照解決済みの中間表現。処理系の境界 | 1195 |
-| `src/ambient_abi.rs` | ambient を単相化で消す計画。C 生成の入力 | 1376 |
+| `src/ambient_abi.rs` | ambient を単相化で消す計画。Wasm 生成の入力 | 1376 |
+| `src/wasm.rs` | 計画から Core Wasm を生成。対応範囲の検査もここ | 1200 |
+| `src/wasm_abi.rs` | Rhodolite Wasm ABI v0。公開署名と埋め込みメタデータ | 200 |
 | `src/typecheck.rs` | 型検査と HIR への下ろし(同じ1回の走査) | 5913 |
 | `src/requirement.rs` | **要求推論(中核)**。入力は HIR | 1690 |
 | `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 1932 |
@@ -133,10 +135,11 @@ $ cargo run examples/missing_handler.rd
 | 0006 | ファイル/ディレクトリをモジュールとし、読み込みを `use` に一本化 |
 | 0007 | 診断の描画に `miette` を1つだけ依存に足す |
 | 0008 | ambient の実行時契約は特殊化計画。vtable 無し、型提供は消える |
+| 0009 | 成果物は Core Wasm + ABI v0。Component/WIT は下流のアダプタ |
 
 文法は `docs/grammar.md`、用語は `CONTEXT.md`、プロジェクトの目的は `README.md`。
 **まだ決まっていない設計は `docs/design-notes/`**（測った結果・却下案・未決の問い）。
-インタプリタを参照実装として残し、型付き HIR から C 生成へ進む順序と各段階の完了線は
+インタプリタを参照実装として残し、型付き HIR から Wasm 生成へ進む順序と各段階の完了線は
 [`docs/compiler-roadmap.md`](./compiler-roadmap.md)。
 
 ## 6. 検査がいま保証すること
@@ -151,7 +154,7 @@ ADR-0006 のモジュール分割、struct の形の検査、enum の宣言、
 `src/typecheck.rs` を通ったプログラムでは、**値を産む式はすべて具体的な型を持ち、
 すべての呼び出しは一意の宣言へ解決されている**。「型が分からないので実行時へ委ねる」
 経路は残っていない。分類できない式が1つでもあれば、その式を指して実行前に落ちる
-(呼ばれない宣言の中でも同じ)。これは型付き HIR と C バックエンドへ検査結果を
+(呼ばれない宣言の中でも同じ)。これは型付き HIR と Wasm バックエンドへ検査結果を
 そのまま引き渡すための契約で、`docs/compiler-roadmap.md` の次の一歩の前提になる。
 
 形の保証はそのまま残る。struct リテラルは宣言済み struct を指し、宣言フィールドを
@@ -322,5 +325,11 @@ ambient の低水準契約まで決まった。`src/ambient_abi.rs` は、`main`
 正典プログラム全体がこの計画へ落ちることは決定的なスナップショットで固定してある。
 判断の理由は [ADR-0008](./adr/0008-ambient-abi-is-a-specialization-plan.md)。
 
-次は、この計画を入力にした C 生成(`emit-core-c-programs`)。順序と完了線は
+この計画を入力にした Core Wasm 生成 (`emit-core-wasm-programs`) は動いている。
+`rhodolite build <entry.rd> --target wasm` が、`main` と `pub use` で明示選択した
+公開関数を根に、到達した instance ごとに1つの Wasm 関数を出す。呼び先は計画が持つ
+`InstanceId` を関数番号へ引き直すだけで、名前解決をやり直さない。ホスト面の
+取り決めは [ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。
+
+次は、データ値の Wasm 表現(`compile-wasm-data-values`)。順序と完了線は
 [`compiler-roadmap.md`](./compiler-roadmap.md)。
