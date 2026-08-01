@@ -18,7 +18,9 @@ use crate::ambient_abi::{Plan, ProductionPlan};
 use crate::diag::Diag;
 use crate::hir;
 use crate::ownership::CheckedProgram;
-use crate::wasm_layout::Layouts;
+use crate::wasm_data::{self, Indices};
+use crate::wasm_layout::{LayoutId, Layouts, ReprKind};
+use crate::wasm_runtime::{self, Runtime};
 use std::collections::BTreeMap;
 use wasm_encoder::{
     BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
@@ -101,7 +103,23 @@ fn borrowed_signature(
 fn unsupported(span: crate::lex::Span, what: &str) -> Diag {
     Diag::at(span, format!("{what} は現在の Wasm ターゲットでは扱えません"))
         .label("ここが未対応")
-        .help("v0 の Wasm は unit / bool / int と、束縛・算術・比較・if・while・直接呼び出し・return・assert だけを扱います")
+        .help("いまの Wasm は unit / bool / int / str と、束縛・代入・算術・比較・`clone()`・所有権修飾・if・while・直接呼び出し・return・assert を扱います")
+}
+
+/// この backend が下ろせる型か。
+///
+/// 借用は検査済みの場所を指すアドレス1つなので、指す先が扱えるなら運べる。
+/// optional・struct・enum・配列は後続スライス
+fn supported(ty: &hir::Type) -> bool {
+    if ty.optional {
+        return false;
+    }
+    matches!(
+        ty.kind,
+        hir::TypeKind::Builtin(
+            hir::Builtin::Unit | hir::Builtin::Bool | hir::Builtin::Int | hir::Builtin::Str
+        )
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +162,7 @@ fn check_support_impl(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
                 "戻り値",
                 &callable.ret,
             ));
-        } else if scalar_of(&callable.ret).is_none() {
+        } else if !supported(&callable.ret) {
             diagnostics.push(unsupported(
                 callable.span,
                 &format!("戻り値の型 `{}`", program.show_type(&callable.ret)),
@@ -180,7 +198,7 @@ fn check_local(
     let decl = body.local(local);
     // `ty` が無いのは初期化子が発散した束縛。読めないので実行時表現も要らない
     if let Some(ty) = &decl.ty
-        && scalar_of(ty).is_none()
+        && !supported(ty)
     {
         diagnostics.push(unsupported(
             decl.span,
@@ -197,7 +215,7 @@ fn check_expr(
 ) {
     let expr = body.expr(id);
     if let hir::ExprResult::Value(ty) = &expr.result
-        && scalar_of(ty).is_none()
+        && !supported(ty)
     {
         diagnostics.push(unsupported(
             expr.span,
@@ -230,12 +248,9 @@ fn check_expr(
             children.extend(args.iter().copied())
         }
 
-        // ponytail: 借用も移動も v0 では下ろせない。所有付きの Wasm 表現は
-        // compile-wasm-owned-data-values の仕事
-        hir::ExprKind::Access { .. } => {
-            diagnostics.push(unsupported(expr.span, "所有権修飾された場所"))
-        }
-        hir::ExprKind::Str(_) => diagnostics.push(unsupported(expr.span, "文字列")),
+        hir::ExprKind::Str(_) => {}
+        hir::ExprKind::Access { place, .. } => children.push(*place),
+        hir::ExprKind::Clone(inner) => children.push(*inner),
         hir::ExprKind::Nil => diagnostics.push(unsupported(expr.span, "optional の `nil`")),
         hir::ExprKind::UnitStruct(_) | hir::ExprKind::StructLit { .. } => {
             diagnostics.push(unsupported(expr.span, "struct の値"))
@@ -248,7 +263,6 @@ fn check_expr(
         }
         hir::ExprKind::Array(_) => diagnostics.push(unsupported(expr.span, "配列")),
         hir::ExprKind::Coalesce { .. } => diagnostics.push(unsupported(expr.span, "`??`")),
-        hir::ExprKind::Clone(_) => diagnostics.push(unsupported(expr.span, "`clone()`")),
         hir::ExprKind::For { .. } => diagnostics.push(unsupported(expr.span, "`for`")),
         hir::ExprKind::With { .. } => diagnostics.push(unsupported(expr.span, "`with` の提供")),
         hir::ExprKind::Match { .. } => diagnostics.push(unsupported(expr.span, "`match`")),
@@ -317,6 +331,12 @@ struct Lowered {
     slots: BTreeMap<hir::LocalId, Vec<u32>>,
     /// 引数の後ろに並ぶ宣言ローカルの型
     extra_locals: Vec<ValType>,
+    /// 所有する非 Copy の束縛 → その並び。掃除の glue をここから引く
+    owned: BTreeMap<hir::LocalId, LayoutId>,
+    /// 所有する束縛 → 初期化フラグの局所番号(tasks 3.4)
+    flags: BTreeMap<hir::LocalId, u32>,
+    /// 作業用 `i32` の先頭番号。所有データを組み立てない本体は取らない
+    scratch: u32,
 }
 
 /// 引数と宣言ローカルへ Wasm のローカル番号を振る。
@@ -361,13 +381,100 @@ fn lower_signature(
         slots.insert(id, seats);
     }
 
+    // 所有する束縛は、アドレスの席とは別に「持っているか」の 1 bit を要る。
+    // 計画は「持っていれば落とす」までしか言えないので(design.md 決定6)
+    let mut owned = BTreeMap::new();
+    let mut flags = BTreeMap::new();
+    for (id, decl) in body.locals() {
+        let Some(ty) = &decl.ty else { continue };
+        let repr = layouts
+            .repr(program, ty)
+            .expect("対応検査を通った型は 32bit に収まる");
+        if let ReprKind::Owned(layout) = repr.kind {
+            owned.insert(id, layout);
+            flags.insert(id, (params.len() + extra_locals.len()) as u32);
+            extra_locals.push(ValType::I32);
+        }
+    }
+
+    // 作業用の席は、所有データを組み立てる本体だけが取る。scalar だけの
+    // 本体のバイト列を動かさないため(tasks 1.1)
+    let builds_data = !owned.is_empty()
+        || body
+            .exprs()
+            .any(|(_, expr)| matches!(expr.kind, hir::ExprKind::Str(_)));
+    let scratch = (params.len() + extra_locals.len()) as u32;
+    if builds_data {
+        extra_locals.extend(std::iter::repeat_n(
+            ValType::I32,
+            wasm_data::SCRATCH as usize,
+        ));
+    }
+
     Lowered {
         callable: callable_id,
         params,
         results: values_of(layouts, program, &callable.ret),
         slots,
         extra_locals,
+        owned,
+        flags,
+        scratch,
     }
+}
+
+/// 到達した本体が触る型を、glue の番号を決める前に全部計画しておく。
+///
+/// 本体を出す途中で新しい並びが増えると、予約済みの番号と食い違う
+/// (design.md 決定5)
+fn plan_reachable(layouts: &mut Layouts, program: &hir::Program, plan: &Plan) {
+    for (_, instance) in plan.instances() {
+        let hir::BodyId::Callable(id) = instance.key.body else {
+            continue;
+        };
+        let callable = &program.callables[id];
+        let _ = layouts.repr(program, &callable.ret);
+        for (_, decl) in callable.body.locals() {
+            if let Some(ty) = &decl.ty {
+                let _ = layouts.repr(program, ty);
+            }
+        }
+        for (_, expr) in callable.body.exprs() {
+            if let hir::ExprResult::Value(ty) = &expr.result {
+                let _ = layouts.repr(program, ty);
+            }
+        }
+    }
+}
+
+/// 文字列リテラルを静的データへ決定的に並べる(tasks 4.1)。
+///
+/// 同じ綴りは1つにまとめる。走査は instance の計画順、その中は式の番号順
+#[derive(Default)]
+struct Statics {
+    bytes: Vec<u8>,
+    at: BTreeMap<String, (u32, u32)>,
+}
+
+fn collect_literals(program: &hir::Program, plan: &Plan) -> Statics {
+    let mut statics = Statics::default();
+    for (_, instance) in plan.instances() {
+        let hir::BodyId::Callable(id) = instance.key.body else {
+            continue;
+        };
+        for (_, expr) in program.callables[id].body.exprs() {
+            let hir::ExprKind::Str(text) = &expr.kind else {
+                continue;
+            };
+            if statics.at.contains_key(text) {
+                continue;
+            }
+            let offset = wasm_runtime::PREFIX_END + statics.bytes.len() as u32;
+            statics.bytes.extend_from_slice(text.as_bytes());
+            statics.at.insert(text.clone(), (offset, text.len() as u32));
+        }
+    }
+    statics
 }
 
 /// 同じ形の関数型を1つに寄せる。並びは最初に要求された順
@@ -400,8 +507,12 @@ struct Emitter<'a> {
     program: &'a hir::Program,
     instance: &'a crate::ambient_abi::Instance,
     lowered: &'a Lowered,
+    /// 所有権検査が確定した掃除。ここを読むだけで、順を組み直さない
+    plan: &'a crate::ownership::BodyPlan,
     layouts: &'a mut Layouts,
     types: &'a mut Types,
+    indices: &'a Indices,
+    statics: &'a BTreeMap<String, (u32, u32)>,
     function: Function,
 }
 
@@ -465,7 +576,7 @@ impl Emitter<'_> {
                 }
             }
 
-            hir::ExprKind::Let { local, value } | hir::ExprKind::AssignLocal { local, value } => {
+            hir::ExprKind::Let { local, value } => {
                 let (local, value) = (*local, *value);
                 let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
                 let want = self.local_want(local);
@@ -474,6 +585,64 @@ impl Emitter<'_> {
                 for seat in seats.iter().rev() {
                     self.push(Instruction::LocalSet(*seat));
                 }
+                if let Some(flag) = self.lowered.flags.get(&local).copied() {
+                    wasm_data::mark_initialized(&mut self.function, flag);
+                }
+            }
+
+            hir::ExprKind::AssignLocal { local, value } => {
+                let (local, value) = (*local, *value);
+                let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
+                let want = self.local_want(local);
+                self.expr(value, &want);
+                match self.lowered.owned.get(&local).copied() {
+                    // 新しい値が出来上がってから古い値を落とす。先に落とすと、
+                    // 途中で trap したときに落ちた値をもう一度落としてしまう
+                    Some(layout) => {
+                        let flag = self.lowered.flags[&local];
+                        let scratch = self.lowered.scratch;
+                        let glue = self.indices.of(layout);
+                        self.push(Instruction::LocalSet(scratch));
+                        wasm_data::drop_guarded(&mut self.function, glue, seats[0], flag);
+                        self.push(Instruction::LocalGet(scratch));
+                        self.push(Instruction::LocalSet(seats[0]));
+                        wasm_data::mark_initialized(&mut self.function, flag);
+                    }
+                    None => {
+                        for seat in seats.iter().rev() {
+                            self.push(Instruction::LocalSet(*seat));
+                        }
+                    }
+                }
+            }
+
+            hir::ExprKind::Str(text) => {
+                let (offset, len) = self.statics[text];
+                let scratch = self.lowered.scratch;
+                wasm_data::literal_str(&mut self.function, self.indices, scratch, offset, len);
+            }
+
+            // 借用は所有を取らずにアドレスを写すだけ。move はそれに加えて
+            // 持ち出し元のフラグを落とす(design.md 決定2)
+            hir::ExprKind::Access { mode, place } => {
+                let (mode, place) = (*mode, *place);
+                let want = self.produced(place);
+                self.expr(place, &want);
+                if mode == hir::AccessMode::Move
+                    && let Some(root) = self.moved_root(place)
+                    && let Some(flag) = self.lowered.flags.get(&root).copied()
+                {
+                    wasm_data::mark_moved(&mut self.function, flag);
+                }
+            }
+
+            hir::ExprKind::Clone(inner) => {
+                let inner = *inner;
+                let want = self.produced(inner);
+                self.expr(inner, &want);
+                let layout = self.owned_layout(id).expect("`clone()` は所有を産む");
+                let glue = self.indices.of(layout);
+                self.push(Instruction::Call(glue.clone));
             }
 
             // Wasm に単項マイナスは無い。`0 - n` は MIN でも仕様どおり回り込む
@@ -499,6 +668,14 @@ impl Emitter<'_> {
 
             hir::ExprKind::Eq { lhs, rhs } => {
                 let (lhs, rhs) = (*lhs, *rhs);
+                // 所有の複合値の等値は、並びごとに生成した glue が受ける
+                if let Some(layout) = self.compound_operand(lhs, rhs) {
+                    let glue = self.indices.of(layout);
+                    self.expr(lhs, &[ValType::I32]);
+                    self.expr(rhs, &[ValType::I32]);
+                    self.push(Instruction::Call(glue.eq));
+                    return;
+                }
                 let mut operand = self.produced(lhs);
                 if operand.is_empty() {
                     operand = self.produced(rhs);
@@ -510,7 +687,6 @@ impl Emitter<'_> {
                     [ValType::I32] => self.push(Instruction::I32Eq),
                     // unit は値を持たないので常に等しい。両辺の効果だけ走らせた
                     [] => self.push(Instruction::I32Const(1)),
-                    // 所有の複合値の等値は生成した glue が受ける(tasks 4.2)
                     other => unreachable!("等値を下ろせない表現です: {other:?}"),
                 }
             }
@@ -522,6 +698,7 @@ impl Emitter<'_> {
                 if let Some(value) = value {
                     self.expr(value, &results);
                 }
+                self.cleanup(crate::ownership::Exit::Return(id));
                 self.push(Instruction::Return);
             }
 
@@ -547,9 +724,17 @@ impl Emitter<'_> {
                 let block = self.block_type(&want);
                 self.push(Instruction::If(block));
                 self.expr(then, &want);
+                self.cleanup(crate::ownership::Exit::Join {
+                    branch: id,
+                    taken: true,
+                });
                 if let Some(orelse) = orelse {
                     self.push(Instruction::Else);
                     self.expr(orelse, &want);
+                    self.cleanup(crate::ownership::Exit::Join {
+                        branch: id,
+                        taken: false,
+                    });
                 }
                 self.push(Instruction::End);
             }
@@ -562,9 +747,11 @@ impl Emitter<'_> {
                 self.push(Instruction::I32Eqz);
                 self.push(Instruction::BrIf(1));
                 self.expr(inner, &[]);
+                self.cleanup(crate::ownership::Exit::LoopBack(id));
                 self.push(Instruction::Br(0));
                 self.push(Instruction::End);
                 self.push(Instruction::End);
+                self.cleanup(crate::ownership::Exit::LoopExit(id));
             }
 
             // 呼び先は計画が持っている。名前で引き直さない(design.md 決定5)
@@ -583,6 +770,77 @@ impl Emitter<'_> {
 
             // 対応範囲の検査が先に止めているので、ここへ来たら検査の抜け
             other => unreachable!("Wasm へ下ろせない式が検査を抜けました: {other:?}"),
+        }
+    }
+
+    /// 式の結果の実行時表現の種別
+    fn kind_of(&mut self, id: hir::ExprId) -> Option<ReprKind> {
+        let program = self.program;
+        let expr = program.callables[self.lowered.callable].body.expr(id);
+        let ty = expr.result.ty()?;
+        Some(
+            self.layouts
+                .repr(program, ty)
+                .expect("対応検査を通った型は 32bit に収まる")
+                .kind,
+        )
+    }
+
+    /// その式が所有する複合値を産むなら、その並び
+    fn owned_layout(&mut self, id: hir::ExprId) -> Option<LayoutId> {
+        match self.kind_of(id) {
+            Some(ReprKind::Owned(layout)) => Some(layout),
+            _ => None,
+        }
+    }
+
+    /// 両辺のどちらかが所有・借用する複合値なら、その並び。
+    ///
+    /// 表現はどちらも `i32` なので、値の型だけでは `bool` と言い分けられない。
+    /// 種別まで見て決める
+    fn compound_operand(&mut self, lhs: hir::ExprId, rhs: hir::ExprId) -> Option<LayoutId> {
+        for side in [lhs, rhs] {
+            let layout = match self.kind_of(side) {
+                Some(ReprKind::Owned(layout) | ReprKind::Borrowed(layout)) => layout,
+                _ => continue,
+            };
+            if !self.layouts.get(layout).copy {
+                return Some(layout);
+            }
+        }
+        None
+    }
+
+    /// 所有を持ち出した場所の根。いまは局所束縛そのものだけ(射影は tasks 5.4)
+    fn moved_root(&self, place: hir::ExprId) -> Option<hir::LocalId> {
+        match self.body().expr(place).kind {
+            hir::ExprKind::Local(local) => Some(local),
+            _ => None,
+        }
+    }
+
+    /// その出口を通るときの掃除を、計画の順に出す(tasks 3.6)。
+    ///
+    /// glue はアドレスを引数に取るだけなので、stack に載っている値を
+    /// またいでも釣り合いは崩れない
+    fn cleanup(&mut self, exit: crate::ownership::Exit) {
+        let drops: Vec<crate::ownership::Drop> = self.plan.cleanup(exit).to_vec();
+        for drop in drops {
+            match drop {
+                crate::ownership::Drop::Local(local) => {
+                    let (Some(flag), Some(layout)) = (
+                        self.lowered.flags.get(&local).copied(),
+                        self.lowered.owned.get(&local).copied(),
+                    ) else {
+                        continue;
+                    };
+                    let address = self.lowered.slots[&local][0];
+                    let glue = self.indices.of(layout);
+                    wasm_data::drop_guarded(&mut self.function, glue, address, flag);
+                }
+                // 射影を消費した残余は struct スライスの仕事(tasks 3.5)
+                crate::ownership::Drop::Remaining { .. } => {}
+            }
         }
     }
 
@@ -622,38 +880,19 @@ pub struct Signature {
 /// 「通った計画を決定的な bytes にする」ことだけを受け持つ
 pub fn emit(checked: &CheckedProgram, production: &ProductionPlan) -> Result<Vec<u8>, Vec<Diag>> {
     let signatures = crate::wasm_abi::signatures(checked, production)?;
-    Ok(build(&checked.hir, production, &signatures))
-}
-
-#[cfg(test)]
-fn emit_impl(program: &hir::Program, production: &ProductionPlan) -> Result<Vec<u8>, Vec<Diag>> {
-    let signatures = crate::wasm_abi::signatures_hir_for_test(program, production)?;
-    Ok(build(program, production, &signatures))
-}
-
-/// Wasm 下ろし単体テストだけが HIR を直接渡す入口。
-#[cfg(test)]
-pub(crate) fn check_support_hir_for_test(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
-    check_support_impl(program, plan)
-}
-
-/// Wasm 下ろし単体テストだけが HIR を直接渡す入口。
-#[cfg(test)]
-pub(crate) fn emit_hir_for_test(
-    program: &hir::Program,
-    production: &ProductionPlan,
-) -> Result<Vec<u8>, Vec<Diag>> {
-    emit_impl(program, production)
+    Ok(build(checked, production, &signatures))
 }
 
 fn build(
-    program: &hir::Program,
+    checked: &CheckedProgram,
     production: &ProductionPlan,
     signatures: &crate::wasm_abi::Signatures,
 ) -> Vec<u8> {
+    let program = &checked.hir;
     let plan = &production.plan;
     // 到達した型の並びはここで1つの表に溜める。番号は要求順なので決定的
     let mut layouts = Layouts::default();
+    plan_reachable(&mut layouts, program, plan);
     let lowered: Vec<Lowered> = plan
         .instances()
         .map(|(_, instance)| match instance.key.body {
@@ -661,6 +900,16 @@ fn build(
             hir::BodyId::Test(_) => unreachable!("test は生産の根に入らない"),
         })
         .collect();
+
+    // 所有データが1つも到達していないなら、ランタイムも glue も載せない。
+    // scalar だけのモジュールのバイト列はこの change の前と変わらない
+    let owned_data = layouts.planned().any(|(_, layout)| !layout.copy);
+    let statics = collect_literals(program, plan);
+    let wrappers = signatures.wrappers().count() as u32;
+    let runtime_base = lowered.len() as u32 + wrappers;
+    let mut indices = Indices::reserve(&layouts, runtime_base + wasm_runtime::COUNT);
+    indices.alloc = runtime_base + wasm_runtime::ALLOC;
+    indices.free = runtime_base + wasm_runtime::FREE;
 
     let mut types = Types::default();
     let mut functions = FunctionSection::new();
@@ -679,13 +928,24 @@ fn build(
             program,
             instance,
             lowered,
+            plan: checked.plan.body(hir::BodyId::Callable(lowered.callable)),
             layouts: &mut layouts,
             types: &mut types,
+            indices: &indices,
+            statics: &statics.at,
             function: Function::new(locals),
         };
+        // 引数は呼ばれた時点で所有を得ている。局所の初期値は 0 なので、
+        // 持っていることを明示的に立てる(tasks 3.4)
+        for local in &program.callables[lowered.callable].params {
+            if let Some(flag) = lowered.flags.get(local).copied() {
+                wasm_data::mark_initialized(&mut emitter.function, flag);
+            }
+        }
         let root = program.callables[lowered.callable].body.root.clone();
         let want = lowered.results.clone();
         emitter.sequence(&root, &want);
+        emitter.cleanup(crate::ownership::Exit::Fallthrough);
         emitter.push(Instruction::End);
         code.function(&emitter.function);
     }
@@ -706,11 +966,30 @@ fn build(
         next_index += 1;
     }
 
+    // ランタイムと glue は公開しない実装の後ろ。番号は `indices` の予約と同じ順
+    let runtime =
+        owned_data.then(|| Runtime::new(&statics.bytes).expect("静的データは 32bit に収まる"));
+    if runtime.is_some() {
+        for helper in Runtime::helpers(runtime_base)
+            .into_iter()
+            .chain(wasm_data::glue_functions(&layouts, &indices))
+        {
+            functions.function(types.intern(&helper.params, &helper.results));
+            code.function(&helper.body);
+        }
+    }
+
     let mut module = Module::new();
     module.section(&types.section);
     module.section(&functions);
+    if let Some(runtime) = &runtime {
+        module.section(&runtime.memory_section());
+    }
     module.section(&exports);
     module.section(&code);
+    if let Some(runtime) = &runtime {
+        module.section(&runtime.data_section());
+    }
     module.section(&CustomSection {
         name: ABI_SECTION.into(),
         data: signatures.metadata().into_bytes().into(),
@@ -770,34 +1049,35 @@ pub(crate) mod tests {
 
     /// ソース1本を生産ビルドと同じ順で通す。`exports` は `公開名=関数名`
     pub(crate) fn compile(src: &str, exports: &[&str]) -> Result<Vec<u8>, Vec<Diag>> {
-        let (program, production) = plan_of(src, exports);
-        let unsupported = check_support_hir_for_test(&program, &production.plan);
+        let (checked, production) = plan_of(src, exports);
+        let unsupported = check_support(&checked, &production.plan);
         if !unsupported.is_empty() {
             return Err(unsupported);
         }
-        emit_hir_for_test(&program, &production)
+        emit(&checked, &production)
     }
 
-    pub(crate) fn plan_of(src: &str, exports: &[&str]) -> (hir::Program, ProductionPlan) {
+    /// 所有権検査まで通した本物の入力。掃除の計画が要るので HIR だけでは足りない
+    pub(crate) fn plan_of(src: &str, exports: &[&str]) -> (CheckedProgram, ProductionPlan) {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap()))
             .expect("パースできるはず");
         let program = crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず");
-        let analysis = crate::requirement::analyze_hir_for_test(&program);
-        let entry = program.free_callable("main").expect("main がない");
+        let checked = crate::ownership::check(program).expect("所有権検査を通るはず");
+        let analysis = crate::requirement::analyze(&checked);
+        let entry = checked.hir.free_callable("main").expect("main がない");
         let exports: Vec<(String, hir::CallableId)> = exports
             .iter()
             .map(|spelling| {
                 let (public, target) = spelling.split_once('=').unwrap_or((spelling, spelling));
                 (
                     public.to_string(),
-                    program.free_callable(target).expect("その関数がない"),
+                    checked.hir.free_callable(target).expect("その関数がない"),
                 )
             })
             .collect();
-        let production =
-            crate::ambient_abi::plan_production_hir_for_test(&program, &analysis, entry, &exports)
-                .expect("計画できるはず");
-        (program, production)
+        let production = crate::ambient_abi::plan_production(&checked, &analysis, entry, &exports)
+            .expect("計画できるはず");
+        (checked, production)
     }
 
     /// 生成した bytes を独立した Core Wasm エンジンで走らせる。
@@ -853,9 +1133,7 @@ pub(crate) mod tests {
     /// インタプリタと Wasm の結果を突き合わせる。両方が同じ値を出して初めて
     /// 「同じ意味」と言える
     pub(crate) fn same_as_interpreter(src: &str) -> i64 {
-        let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap())).unwrap();
-        let hir = crate::typecheck::check_and_lower(&parsed).unwrap();
-        let checked = crate::ownership::check(hir).unwrap();
+        let (checked, _) = plan_of(src, &[]);
         let interpreted = match crate::eval::Interp::new_checked(&checked)
             .run("main")
             .expect("インタプリタでも走るはず")
@@ -957,7 +1235,7 @@ pub(crate) mod tests {
     /// 共有された instance の実装は1つ。呼び出しは全部そこを指す
     #[test]
     fn 共有された実装は1つだけ出る() {
-        let (program, production) = plan_of(
+        let (checked, production) = plan_of(
             "fn shared(-> int) { 1 }\n\
              fn other(-> int) { shared() }\n\
              fn main(-> int) { shared() + other() }\n",
@@ -968,7 +1246,7 @@ pub(crate) mod tests {
             .instances()
             .map(|(_, instance)| instance.key.body)
             .collect();
-        let shared = hir::BodyId::Callable(program.free_callable("shared").unwrap());
+        let shared = hir::BodyId::Callable(checked.hir.free_callable("shared").unwrap());
         assert_eq!(bodies.iter().filter(|body| **body == shared).count(), 1);
     }
 
@@ -1186,11 +1464,8 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------
 
     fn abi_error(src: &str, exports: &[&str]) -> String {
-        let (program, production) = plan_of(src, exports);
-        messages(
-            &crate::wasm_abi::signatures_hir_for_test(&program, &production)
-                .expect_err("止まるはず"),
-        )
+        let (checked, production) = plan_of(src, exports);
+        messages(&crate::wasm_abi::signatures(&checked, &production).expect_err("止まるはず"))
     }
 
     fn export_names(bytes: &[u8]) -> Vec<String> {
@@ -1378,6 +1653,248 @@ pub(crate) mod tests {
              {\"name\":\"alpha\",\"params\":[\"int\",\"bool\"],\"result\":\"bool\"},\
              {\"name\":\"zebra\",\"params\":[\"int\"],\"result\":\"unit\"}]}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 所有する文字列(tasks 4.1〜4.4)
+    // -----------------------------------------------------------------------
+
+    /// 線形メモリの上限を決めて走らせる。
+    ///
+    /// 掃除が漏れていれば有界なループでもメモリを伸ばし続けるので、上限に
+    /// ぶつかって trap する。「解放した記憶を使い回している」の直接の証拠
+    fn invoke_capped(bytes: &[u8], name: &str, max_pages: u32) -> Result<Vec<i64>, String> {
+        struct Cap(u32);
+        impl wasmi::ResourceLimiter for Cap {
+            fn memory_growing(
+                &mut self,
+                _current: usize,
+                desired: usize,
+                _maximum: Option<usize>,
+            ) -> Result<bool, wasmi_core::LimiterError> {
+                Ok(desired <= self.0 as usize * 65536)
+            }
+
+            fn table_growing(
+                &mut self,
+                _current: usize,
+                _desired: usize,
+                _maximum: Option<usize>,
+            ) -> Result<bool, wasmi_core::LimiterError> {
+                Ok(true)
+            }
+
+            fn instances(&self) -> usize {
+                1
+            }
+
+            fn tables(&self) -> usize {
+                0
+            }
+
+            fn memories(&self) -> usize {
+                1
+            }
+        }
+
+        let engine = wasmi::Engine::default();
+        let module = wasmi::Module::new(&engine, bytes).map_err(|e| e.to_string())?;
+        let mut store = wasmi::Store::new(&engine, Cap(max_pages));
+        store.limiter(|cap| cap);
+        let instance = wasmi::Linker::new(&engine)
+            .instantiate_and_start(&mut store, &module)
+            .map_err(|e| e.to_string())?;
+        let func = instance
+            .get_func(&store, name)
+            .ok_or_else(|| format!("`{name}` という export がない"))?;
+        let mut results = vec![wasmi::Val::I32(0); func.ty(&store).results().len()];
+        func.call(&mut store, &[], &mut results)
+            .map_err(|e| e.to_string())?;
+        Ok(scalars(&results))
+    }
+
+    /// 所有データを載せたモジュールも、import も start section も持たない
+    #[test]
+    fn 文字列を載せてもimportもstartも増えない() {
+        let bytes =
+            compile("fn main(-> int) {\n let s = \"hi\"\n 1\n}\n", &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            match payload.expect("読めるはず") {
+                wasmparser::Payload::ImportSection(_) => panic!("import がある"),
+                wasmparser::Payload::StartSection { .. } => panic!("start section がある"),
+                _ => {}
+            }
+        }
+    }
+
+    /// リテラルから作った文字列は、綴りが同じなら等しい
+    #[test]
+    fn 文字列の等値はインタプリタと一致する() {
+        for (src, expected) in [
+            ("let a = \"hi\"\n let b = \"hi\"\n if a == b: 1 else: 0", 1),
+            ("let a = \"hi\"\n let b = \"ho\"\n if a == b: 1 else: 0", 0),
+            // 長さが違えばそこで打ち切る
+            ("let a = \"hi\"\n let b = \"hit\"\n if a == b: 1 else: 0", 0),
+            ("let a = \"\"\n let b = \"\"\n if a == b: 1 else: 0", 1),
+            // 多バイト文字も byte 列として比べる
+            (
+                "let a = \"あい\"\n let b = \"あい\"\n if a == b: 1 else: 0",
+                1,
+            ),
+            (
+                "let a = \"あい\"\n let b = \"あう\"\n if a == b: 1 else: 0",
+                0,
+            ),
+        ] {
+            assert_eq!(
+                same_as_interpreter(&format!("fn main(-> int) {{\n {src}\n}}\n")),
+                expected,
+                "{src}"
+            );
+        }
+    }
+
+    /// `clone()` は中身まで写す。元と複製は同じ記憶を共有しない
+    #[test]
+    fn cloneは独立した文字列を作る() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let a = \"hi\"\n\
+                 \x20 let b = a.clone()\n\
+                 \x20 if a == b: 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 所有は関数の境界を越えて渡り、渡した先で落ちる
+    #[test]
+    fn 文字列は引数と戻り値で渡せる() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn matches(left: str, right: str -> bool) { left == right }\n\
+                 fn main(-> int) {\n\
+                 \x20 let a = \"hi\"\n\
+                 \x20 let b = \"hi\"\n\
+                 \x20 if matches(move a, move b): 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+        assert_eq!(
+            same_as_interpreter(
+                "fn greeting(-> str) { \"hi\" }\n\
+                 fn main(-> int) {\n\
+                 \x20 let s = greeting()\n\
+                 \x20 if s == \"hi\": 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 代入は新しい値が出来てから古い値を落とす
+    #[test]
+    fn 代入は古い文字列を落として差し替える() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let mut s = \"one\"\n\
+                 \x20 s = \"two\"\n\
+                 \x20 if s == \"two\": 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 経路によって持っているかが変わる束縛でも、二度落とさない
+    #[test]
+    fn 分岐をまたいだ所有でも掃除は一度だけ() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn take(s: str -> int) { 1 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let s = \"hi\"\n\
+                 \x20 if true { return take(move s) }\n\
+                 \x20 0\n\
+                 }\n"
+            ),
+            1
+        );
+        // 分岐の中だけで作った文字列は、合流の手前で落ちる
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 if true {\n\
+                 \x20   let inner = \"hi\"\n\
+                 \x20   1\n\
+                 \x20 } else {\n\
+                 \x20   let other = \"ho\"\n\
+                 \x20   2\n\
+                 \x20 }\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 有界なループは、解放した記憶を使い回すのでメモリを伸ばさない。
+    ///
+    /// 1ページに縛って走らせる。掃除が漏れていれば伸ばそうとして trap する
+    #[test]
+    fn ループで作った文字列は使い回される() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 5000) == false {\n\
+                   \x20   let each = \"repeated\"\n\
+                   \x20   n = n + 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![5000]));
+    }
+
+    /// 同時に生きる所有値が上限を越えれば、伸ばせずに trap する。
+    ///
+    /// 上限を広げれば同じプログラムが通ることも見る。stack を使い切ったのでは
+    /// なく、記憶が足りなかったのだと言い分けるため
+    #[test]
+    fn 記憶が足りなければtrapする() {
+        // 1回の呼び出しで 200 byte 強を握る。500 段で1ページを越える
+        let wide = "x".repeat(200);
+        let src = format!(
+            "fn deep(n: int -> int) {{\n\
+             \x20 let held = \"{wide}\"\n\
+             \x20 if n == 0: 0 else: deep(n - 1)\n\
+             }}\n\
+             fn main(-> int) {{ deep(500) }}\n"
+        );
+        let bytes = compile(&src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert!(
+            invoke_capped(&bytes, ENTRY_EXPORT, 1).is_err(),
+            "1ページには収まらない"
+        );
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 8), Ok(vec![0]));
+    }
+
+    /// 所有データを使わないモジュールには、メモリも allocator も載らない
+    #[test]
+    fn scalarだけのモジュールにはランタイムが載らない() {
+        let bytes = compile("fn main(-> int) { 1 }\n", &[]).expect("生成できるはず");
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            match payload.expect("読めるはず") {
+                wasmparser::Payload::MemorySection(_) => panic!("メモリがある"),
+                wasmparser::Payload::DataSection(_) => panic!("データがある"),
+                _ => {}
+            }
+        }
     }
 
     /// メタデータを知らないエンジンでも検証・実行できる

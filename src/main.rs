@@ -22,6 +22,7 @@ mod requirement;
 mod typecheck;
 mod wasm;
 mod wasm_abi;
+mod wasm_data;
 mod wasm_layout;
 mod wasm_runtime;
 

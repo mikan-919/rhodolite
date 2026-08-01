@@ -230,6 +230,7 @@ dependencies = [
  "miette",
  "wasm-encoder",
  "wasmi",
+ "wasmi_core",
  "wasmparser 0.255.0",
 ]
 

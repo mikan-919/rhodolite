@@ -19,17 +19,17 @@
 - [x] 3.1 Add the flat Copy/owned-address/borrowed-address representation planner and expand function params, results, block types, and locals to deterministic Wasm value sequences
 - [x] 3.2 Expose a narrow read-only backend cleanup view from `ownership::BodyPlan`, with snapshots proving it preserves the existing access modes and edge drop order
 - [ ] 3.3 Add `wasm_data.rs` interfaces for emitting values and places, moving, assigning, discarding, loading/storing Copy layouts, and relocating inline owned layouts
-- [ ] 3.4 Give every non-Copy owner an address slot and initialization flag, and lower checked `Drop::Local` plus move flag transitions
+- [x] 3.4 Give every non-Copy owner an address slot and initialization flag, and lower checked `Drop::Local` plus move flag transitions
 - [ ] 3.5 Lower `Drop::Remaining` for consuming nested projections without double-dropping the selected path
-- [ ] 3.6 Route fallthrough, return, branch exit, and loop exit through plan-ordered cleanup while leaving traps non-unwinding
+- [x] 3.6 Route fallthrough, return, branch exit, and loop exit through plan-ordered cleanup while leaving traps non-unwinding
 - [ ] 3.7 Add engine tests for conditional initialization, move across branches, nested early return, loop cleanup, reverse declaration order, and consuming field projection
 
 ## 4. String vertical slice
 
-- [ ] 4.1 Emit deterministic UTF-8 literal data and construct owned `str` roots with independent heap buffers
-- [ ] 4.2 Generate and intern string drop, deep-clone, and short-circuit equality glue
-- [ ] 4.3 Lower string locals, assignment, function arguments/results, shared reads, explicit move, and `clone()` through the checked representations
-- [ ] 4.4 Add standalone-engine tests comparing string construction, calls, moves, clones, equality, cleanup, and OOM traps with the interpreter
+- [x] 4.1 Emit deterministic UTF-8 literal data and construct owned `str` roots with independent heap buffers
+- [x] 4.2 Generate and intern string drop, deep-clone, and short-circuit equality glue
+- [x] 4.3 Lower string locals, assignment, function arguments/results, shared reads, explicit move, and `clone()` through the checked representations
+- [x] 4.4 Add standalone-engine tests comparing string construction, calls, moves, clones, equality, cleanup, and OOM traps with the interpreter
 
 ## 5. Owned struct vertical slice
 
