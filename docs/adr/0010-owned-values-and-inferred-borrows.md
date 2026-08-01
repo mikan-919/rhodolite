@@ -76,9 +76,11 @@ GC、reference count、runtime borrow counter、raw pointer、`unsafe` はこの
 検査済みの reference place だけを辿る。これは意味論の共有所有ではなく、参照実装の
 実装詳細である。
 
-Wasm は現在も到達した `unit` / `bool` / `int` だけを生成する。非 scalar 値、borrow、
-public borrowed ABI は build 前に拒否する。owned data の allocator と layout、rich ABI
-は後続 change で決める。
+Wasm は当初、到達した `unit` / `bool` / `int` だけを生成し、非 scalar 値と borrow を
+build 前に拒否していた。その owned data の allocator・layout・rich ABI は
+[ADR-0011](./0011-owned-data-layout-and-abi-v1.md) が決めた。公開署名に出た borrow を
+拒否することは変わらない。ここで決めた所有・借用・`indirect` の意味論そのものは
+ADR-0011 でも動かない。
 
 ## Consequences
 

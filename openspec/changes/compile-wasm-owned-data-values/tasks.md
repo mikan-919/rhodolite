@@ -1,10 +1,10 @@
 ## 1. Baseline and layout contract
 
-- [ ] 1.1 Add scalar Wasm byte snapshots and standalone-engine fixtures that lock the pre-change ABI v0 output before refactoring the emitter
-- [ ] 1.2 Add `wasm_layout.rs` with checked size/alignment arithmetic and deterministic layout identities for scalars, fieldless enums, and Copy optionals
-- [ ] 1.3 Extend layout planning to direct structs, payload enums, owned optionals, strings, arrays, and declared indirect edges, including recursive-ID reservation
-- [ ] 1.4 Add layout unit tests for padding, declaration order, nested optionals, recursive indirection, deterministic traversal, and 32-bit overflow diagnostics
-- [ ] 1.5 Record the internal layout, allocator, and serialized ABI v1 decisions in a new ADR that supersedes only the affected ABI-v0 limits in ADR-0009 and ADR-0010
+- [x] 1.1 Add scalar Wasm byte snapshots and standalone-engine fixtures that lock the pre-change ABI v0 output before refactoring the emitter
+- [x] 1.2 Add `wasm_layout.rs` with checked size/alignment arithmetic and deterministic layout identities for scalars, fieldless enums, and Copy optionals
+- [x] 1.3 Extend layout planning to direct structs, payload enums, owned optionals, strings, arrays, and declared indirect edges, including recursive-ID reservation
+- [x] 1.4 Add layout unit tests for padding, declaration order, nested optionals, recursive indirection, deterministic traversal, and 32-bit overflow diagnostics
+- [x] 1.5 Record the internal layout, allocator, and serialized ABI v1 decisions in a new ADR that supersedes only the affected ABI-v0 limits in ADR-0009 and ADR-0010
 
 ## 2. Import-free ownership runtime
 

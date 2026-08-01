@@ -1335,4 +1335,73 @@ pub(crate) mod tests {
         validate(&bytes).expect("検証を通るはず");
         assert_eq!(scalars(&invoke(&bytes, ENTRY_EXPORT, &[]).unwrap()), [3]);
     }
+
+    // -----------------------------------------------------------------------
+    // ABI v0 の出力固定(tasks 1.1)
+    // -----------------------------------------------------------------------
+
+    /// バイト列の指紋。所有データ対応で emitter を作り替えるあいだ、scalar だけの
+    /// プログラムの出力が動いていないことを見張る。
+    ///
+    /// FNV-1a を自前で持つのは、`DefaultHasher` が Rust の版をまたいで同じ値を
+    /// 約束しないから。ここで欲しいのは「今日と明日で同じ」ではなく
+    /// 「このバイト列なら常にこの値」
+    fn fingerprint(bytes: &[u8]) -> String {
+        let digest = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        format!("{}:{digest:016x}", bytes.len())
+    }
+
+    /// scalar だけのプログラムの bytes は、この変更の前後で1バイトも動かない。
+    ///
+    /// 指紋が変わったら、それは ABI v0 の出力が変わったということ。意図した
+    /// 変更なら期待値を更新し、そうでないなら退行
+    #[test]
+    fn scalarのみのモジュールはバイト列が変わらない() {
+        for (src, exports, expected) in [
+            (
+                "fn main(-> int) { 41 + 1 }\n",
+                &[][..],
+                "163:a3ccb6c701f0c33f",
+            ),
+            (
+                "fn main() { assert true }\n",
+                &[][..],
+                "165:b2df3b8ed5689f47",
+            ),
+            (
+                SURFACE,
+                &["find_user=find", "touch"][..],
+                "361:f7afc53c69601b08",
+            ),
+        ] {
+            let bytes = compile(src, exports).expect("生成できるはず");
+            validate(&bytes).expect("検証を通るはず");
+            assert_eq!(fingerprint(&bytes), expected, "{src}");
+        }
+    }
+
+    /// 固定した bytes は独立エンジンでも同じ観測を返す。指紋だけでは
+    /// 「壊れたまま固定した」を捕まえられない
+    #[test]
+    fn 固定したモジュールは独立エンジンで同じ結果を返す() {
+        let bytes = compile(SURFACE, &["find_user=find", "touch"]).expect("生成できるはず");
+        assert_eq!(scalars(&invoke(&bytes, ENTRY_EXPORT, &[]).unwrap()), [3]);
+        assert_eq!(
+            scalars(
+                &invoke(
+                    &bytes,
+                    "find_user",
+                    &[wasmi::Val::I64(1), wasmi::Val::I32(1)]
+                )
+                .unwrap()
+            ),
+            [1]
+        );
+        assert_eq!(
+            scalars(&invoke(&bytes, "touch", &[wasmi::Val::I64(7)]).unwrap()),
+            []
+        );
+    }
 }

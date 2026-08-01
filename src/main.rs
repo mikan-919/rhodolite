@@ -22,6 +22,7 @@ mod requirement;
 mod typecheck;
 mod wasm;
 mod wasm_abi;
+mod wasm_layout;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
