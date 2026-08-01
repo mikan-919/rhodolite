@@ -90,3 +90,18 @@ Every diagnostic introduced to close a previously deferred type or call resoluti
 #### Scenario: Unknown expression in another module
 - **WHEN** an unresolved expression occurs in a loaded dependency module
 - **THEN** the diagnostic renders against that module and spans the unresolved expression
+
+### Requirement: Successful checking closes ownership safety
+After ordinary name and type resolution, the checker SHALL successfully classify
+every value access as Copy, move, shared borrow, mutable borrow, or owned
+construction and SHALL close all move, provenance, and exclusivity obligations
+in every loaded body before requirement analysis, interpretation, or Wasm
+support checking begins.
+
+#### Scenario: Uncalled body violates ownership
+- **WHEN** an uncalled loaded function contains a use after move
+- **THEN** whole-program checking fails before execution
+
+#### Scenario: Later stages receive checked ownership
+- **WHEN** checking succeeds
+- **THEN** requirement analysis, interpretation, and Wasm support checking may assume every access has a resolved ownership mode
