@@ -8,11 +8,11 @@
 
 ## 2. Import-free ownership runtime
 
-- [ ] 2.1 Add `wasm_runtime.rs` and deterministic function/index plumbing for memory operations and private runtime helpers
-- [ ] 2.2 Emit the reserved memory prefix, nonzero heap base, block headers, and aligned first-fit allocation with checked split behavior
-- [ ] 2.3 Emit address-ordered free insertion and adjacent-block coalescing, then cover allocation reuse and fragmentation with model and engine tests
-- [ ] 2.4 Emit minimum-page `memory.grow` retry and trap paths for arithmetic overflow, failed growth, and exhausted 32-bit address space
-- [ ] 2.5 Validate that owned-runtime modules remain import-free, deterministic, independently valid, and bounded allocation/drop loops reuse memory
+- [x] 2.1 Add `wasm_runtime.rs` and deterministic function/index plumbing for memory operations and private runtime helpers
+- [x] 2.2 Emit the reserved memory prefix, nonzero heap base, block headers, and aligned first-fit allocation with checked split behavior
+- [x] 2.3 Emit address-ordered free insertion and adjacent-block coalescing, then cover allocation reuse and fragmentation with model and engine tests
+- [x] 2.4 Emit minimum-page `memory.grow` retry and trap paths for arithmetic overflow, failed growth, and exhausted 32-bit address space
+- [x] 2.5 Validate that owned-runtime modules remain import-free, deterministic, independently valid, and bounded allocation/drop loops reuse memory
 
 ## 3. Typed data lowering and checked cleanup
 
