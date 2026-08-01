@@ -118,6 +118,7 @@ fn supported(ty: &hir::Type) -> bool {
             hir::Builtin::Unit | hir::Builtin::Bool | hir::Builtin::Int | hir::Builtin::Str
         ) | hir::TypeKind::Struct(_)
             | hir::TypeKind::Enum(_)
+            | hir::TypeKind::Array(_)
     )
 }
 
@@ -271,8 +272,15 @@ fn check_expr(
         }
         hir::ExprKind::Field { recv, .. } => children.push(*recv),
         hir::ExprKind::AssignField { recv, value, .. } => children.extend([*recv, *value]),
-        hir::ExprKind::Array(_) => diagnostics.push(unsupported(expr.span, "配列")),
-        hir::ExprKind::For { .. } => diagnostics.push(unsupported(expr.span, "`for`")),
+        hir::ExprKind::Array(elements) => children.extend(elements.iter().copied()),
+        hir::ExprKind::For {
+            var,
+            iter,
+            body: inner,
+        } => {
+            check_local(program, body, *var, diagnostics);
+            children.extend([*iter, *inner]);
+        }
         hir::ExprKind::With { .. } => diagnostics.push(unsupported(expr.span, "`with` の提供")),
         hir::ExprKind::Call(hir::Call::Method { .. }) => {
             diagnostics.push(unsupported(expr.span, "メソッド呼び出し"))
@@ -499,6 +507,19 @@ fn stash_sites(
                     sites.push((*value, values_of(layouts, program, &ty)));
                 }
             }
+            // 要素は宣言された要素型で受ける。optional 注入で幅が変わる
+            hir::ExprKind::Array(elements) => {
+                let element = expr.result.ty().and_then(|ty| match &ty.kind {
+                    hir::TypeKind::Array(element) => Some((**element).clone()),
+                    _ => None,
+                });
+                if let Some(element) = element {
+                    let values = values_of(layouts, program, &element);
+                    for value in elements {
+                        sites.push((*value, values.clone()));
+                    }
+                }
+            }
             hir::ExprKind::Coalesce { lhs, .. } => {
                 if let Some(ty) = body.expr(*lhs).result.ty().cloned() {
                     sites.push((*lhs, values_of(layouts, program, &ty)));
@@ -550,7 +571,9 @@ fn needs_scratch(
         | hir::ExprKind::Field {
             optional: false, ..
         }
-        | hir::ExprKind::Match { .. } => true,
+        | hir::ExprKind::Match { .. }
+        // 対象・buffer・長さ・添字・要素・取り出した根を持ち回す
+        | hir::ExprKind::For { .. } => true,
         hir::ExprKind::AssignLocal { value, .. } => owned(layouts, *value),
         hir::ExprKind::Eq { lhs, rhs } => owned(layouts, *lhs) || owned(layouts, *rhs),
         // `??` は左辺の optional を受け直してから枝を選ぶ
@@ -658,6 +681,9 @@ struct Emitter<'a> {
     types: &'a mut Types,
     indices: &'a Indices,
     statics: &'a BTreeMap<String, (u32, u32)>,
+    /// いま一時値を握っている構文の入れ子(内側が後ろ)。所有権検査は束縛だけを
+    /// 追うので、`for` が抱えた対象のような持ち主のない値はここで覚える
+    live: Vec<(LayoutId, u32)>,
     out: Body,
 }
 
@@ -886,6 +912,20 @@ impl Emitter<'_> {
 
             hir::ExprKind::Nil => self.nil(id),
 
+            hir::ExprKind::Array(elements) => {
+                let elements = elements.clone();
+                self.array_literal(id, &elements);
+            }
+
+            hir::ExprKind::For {
+                var,
+                iter,
+                body: inner,
+            } => {
+                let (var, iter, inner) = (*var, *iter, *inner);
+                self.for_expr(id, var, iter, inner);
+            }
+
             hir::ExprKind::Coalesce { lhs, rhs } => {
                 let (lhs, rhs) = (*lhs, *rhs);
                 self.coalesce(id, lhs, rhs);
@@ -1059,6 +1099,8 @@ impl Emitter<'_> {
                     let want = self.program.callables[self.lowered.callable].ret.clone();
                     self.value(value, Some(&want));
                 }
+                // 掃除は束縛のぶん。握ったままの一時値は内側から返す
+                self.release_live();
                 self.cleanup(crate::ownership::Exit::Return(id));
                 self.push(Instruction::Return);
             }
@@ -1644,6 +1686,199 @@ impl Emitter<'_> {
         self.out.get(root);
     }
 
+    /// 握ったままの一時値を、内側から順に返す。
+    ///
+    /// 消費する `for` の途中で `return` すると、渡し終えていない要素と buffer と
+    /// 根が宙に浮く。渡した区画は 0 埋めしてあるので、ここで落としても二度には
+    /// ならない
+    fn release_live(&mut self) {
+        for (layout, slot) in self.live.clone().into_iter().rev() {
+            let (indices, glue) = (self.indices, self.indices.of(layout));
+            wasm_data::drop_root(&mut self.out, indices, glue, slot);
+        }
+    }
+
+    /// 配列リテラル(tasks 7.1)。
+    ///
+    /// 帳簿と要素の buffer は別の割り当て。値はソースの順に評価して、要素の
+    /// 刻み幅で並べる
+    fn array_literal(&mut self, id: hir::ExprId, elements: &[hir::ExprId]) {
+        let layout = self.owned_layout(id).expect("配列は所有を産む");
+        let (element, stride) = self.array_parts(layout);
+        let element_ty = self.element_type(id);
+        let scratch = self.scratch(id);
+        let (root, data, temporary) = (scratch, scratch + 1, scratch + 2);
+
+        // 要素数はソースに書かれた個数。刻みを掛けても 32bit を越えようが無い
+        let count = elements.len() as u32;
+        let bytes = wasm_layout::checked_mul(count, stride).expect("リテラルの長さは収まる");
+
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::alloc_root(&mut self.out, indices, layouts, layout);
+        self.out.set(root);
+        self.out.num(bytes).ins(Instruction::Call(indices.alloc));
+        self.out.set(data);
+        self.out
+            .get(root)
+            .get(data)
+            .ins(Instruction::I32Store(wasm_data::buffer_data()));
+        for at in [wasm_data::buffer_len(), wasm_data::buffer_capacity()] {
+            self.out.get(root).num(count).ins(Instruction::I32Store(at));
+        }
+
+        for (position, value) in elements.iter().enumerate() {
+            let slot = wasm_layout::Slot {
+                offset: position as u32 * stride,
+                layout: element,
+                indirect: false,
+                nullable: false,
+            };
+            self.install_slot(&slot, *value, &element_ty, data, temporary);
+        }
+        self.out.get(root);
+    }
+
+    /// 配列の並びから、要素の並びと刻み幅
+    fn array_parts(&mut self, layout: LayoutId) -> (LayoutId, u32) {
+        match self.layouts.get(layout).shape {
+            wasm_layout::Shape::Array { element, stride } => (element, stride),
+            ref other => unreachable!("配列ではない並びです: {other:?}"),
+        }
+    }
+
+    /// 宣言された要素型。optional 注入があるので、書いた値の型では足りない
+    fn element_type(&self, id: hir::ExprId) -> hir::Type {
+        match self.body().expr(id).result.ty().map(|ty| &ty.kind) {
+            Some(hir::TypeKind::Array(element)) => (**element).clone(),
+            other => unreachable!("配列ではない型です: {other:?}"),
+        }
+    }
+
+    /// `for`(tasks 7.3〜7.5)。
+    ///
+    /// 対象は一度だけ評価して局所に置く。借りて回す周回は要素の場所をそのまま
+    /// 束ね、消費する周回は要素を独立した根へ移して跡を空にする — 空にした
+    /// 区画は配列の drop が何もしないので、途中で抜けても二度落ちない
+    fn for_expr(
+        &mut self,
+        id: hir::ExprId,
+        var: hir::LocalId,
+        iter: hir::ExprId,
+        inner: hir::ExprId,
+    ) {
+        let scratch = self.scratch(id);
+        let (arr, data, len, index, elem, fresh) = (
+            scratch,
+            scratch + 1,
+            scratch + 2,
+            scratch + 3,
+            scratch + 4,
+            scratch + 5,
+        );
+
+        self.expr(iter, &[ValType::I32]);
+        self.out.set(arr);
+        let layout = self.compound_layout(iter).expect("配列はアドレスで運ぶ");
+        let (element, stride) = self.array_parts(layout);
+        // 一時値なら歩き終えたあとに返す。借りているだけなら持ち主は元のまま
+        let holds = self.temporary(iter).is_some();
+        // 所有を周回へ渡すのは `move` を書いたときだけ(design.md 決定7)。
+        // 一時値の配列でも、素で回せば要素は借りたまま
+        let consuming = matches!(
+            self.plan.access(iter).map(|access| access.mode),
+            Some(crate::ownership::Mode::Move)
+        );
+
+        self.out
+            .get(arr)
+            .ins(Instruction::I32Load(wasm_data::buffer_data()))
+            .set(data);
+        self.out
+            .get(arr)
+            .ins(Instruction::I32Load(wasm_data::buffer_len()))
+            .set(len);
+        self.out.num(0).set(index);
+
+        if holds {
+            self.live.push((layout, arr));
+        }
+        self.push(Instruction::Block(BlockType::Empty));
+        self.push(Instruction::Loop(BlockType::Empty));
+        self.out.get(index).get(len).ins(Instruction::I32GeU);
+        self.push(Instruction::BrIf(1));
+
+        wasm_data::element_address(&mut self.out, data, index, stride);
+        self.out.set(elem);
+        self.bind_element(var, element, elem, fresh, consuming);
+
+        self.expr(inner, &[]);
+        self.cleanup(crate::ownership::Exit::LoopBack(id));
+        self.out
+            .get(index)
+            .num(1)
+            .ins(Instruction::I32Add)
+            .set(index);
+        self.push(Instruction::Br(0));
+        self.push(Instruction::End);
+        self.push(Instruction::End);
+        self.cleanup(crate::ownership::Exit::LoopExit(id));
+
+        if holds {
+            self.live.pop();
+            let (indices, glue) = (self.indices, self.indices.of(layout));
+            wasm_data::drop_root(&mut self.out, indices, glue, arr);
+        }
+    }
+
+    /// 周回変数へ要素を置く。
+    ///
+    /// Copy は読み出し、借りて回すなら要素の場所そのもの、消費するなら独立
+    /// させた根。消費した区画は 0 で埋めるので、配列の drop がそこを飛ばす
+    fn bind_element(
+        &mut self,
+        var: hir::LocalId,
+        element: LayoutId,
+        elem: u32,
+        fresh: u32,
+        consuming: bool,
+    ) {
+        let seats = self.lowered.slots.get(&var).cloned().unwrap_or_default();
+        if self.layouts.get(element).copy {
+            if seats.is_empty() {
+                return;
+            }
+            let layouts = &*self.layouts;
+            wasm_data::load_copy(&mut self.out, layouts, element, elem, 0);
+            for seat in seats.iter().rev() {
+                self.out.set(*seat);
+            }
+            return;
+        }
+        if seats.is_empty() {
+            return;
+        }
+        if !consuming {
+            self.out.get(elem).set(seats[0]);
+            return;
+        }
+        let size = self.layouts.extent(element).size;
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::alloc_root(&mut self.out, indices, layouts, element);
+        self.out.set(fresh);
+        self.out.get(fresh).get(elem).num(size);
+        self.out.ins(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+        // 渡した跡を空にする。0 埋めの区画は drop が何も解放しない
+        self.out.get(elem).num(0).num(size);
+        self.out.ins(Instruction::MemoryFill(0));
+        self.out.get(fresh).set(seats[0]);
+        if let Some(flag) = self.lowered.flags.get(&var).copied() {
+            wasm_data::mark_initialized(&mut self.out, flag);
+        }
+    }
+
     /// `lhs ?? rhs`(tasks 6.4)。
     ///
     /// 左辺が空のときだけ右辺が走る。結果は必ず**持ち主のこちらにある値**に
@@ -2065,6 +2300,7 @@ fn build(
             types: &mut types,
             indices: &indices,
             statics: &statics.at,
+            live: Vec::new(),
             out: Body::with_locals(locals),
         };
         // 引数は呼ばれた時点で所有を得ている。局所の初期値は 0 なので、
@@ -2334,7 +2570,12 @@ pub(crate) mod tests {
     #[test]
     fn 到達した未対応の構文はビルドを止める() {
         let errors = compile(
-            "fn reached(-> int) {\n let xs = [1, 2]\n 1\n}\n\
+            "struct User { rank: int }\n\
+             fn reached(-> int) {\n\
+             \x20 let u: User? = User { rank = 1 }\n\
+             \x20 let n = u.?rank\n\
+             \x20 1\n\
+             }\n\
              fn main(-> int) { reached() }\n",
             &[],
         )
@@ -3809,6 +4050,231 @@ pub(crate) mod tests {
         let bytes = compile(src, &[]).expect("生成できるはず");
         validate(&bytes).expect("検証を通るはず");
         assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![1000]));
+    }
+
+    // -----------------------------------------------------------------------
+    // 配列と `for`(tasks 7.1〜7.6)
+    // -----------------------------------------------------------------------
+
+    /// 共有 `for` は配列を消費しない。同じ配列を二度歩ける
+    #[test]
+    fn 共有forは配列を残す() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let xs = [1, 2, 3]\n\
+                 \x20 let mut total = 0\n\
+                 \x20 for x in xs { total = total + x }\n\
+                 \x20 for x in xs { total = total + x }\n\
+                 \x20 total\n\
+                 }\n"
+            ),
+            12
+        );
+    }
+
+    /// 一時値の配列を素で回しても、要素は借りたまま。配列だけが後で返る
+    #[test]
+    fn 一時値の配列を素で回せる() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let mut hits = 0\n\
+                 \x20 for s in [\"a\", \"b\", \"a\"] { if s == \"a\" { hits = hits + 1 } }\n\
+                 \x20 hits\n\
+                 }\n"
+            ),
+            2
+        );
+    }
+
+    /// 空の配列は一周も回らない
+    #[test]
+    fn 空の配列は一周も回らない() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let xs: [int] = []\n\
+                 \x20 let mut total = 7\n\
+                 \x20 for x in xs { total = total + x }\n\
+                 \x20 total\n\
+                 }\n"
+            ),
+            7
+        );
+    }
+
+    /// 借りた非 Copy 要素は場所のまま。配列も要素もそのまま残る
+    #[test]
+    fn 借りた要素は配列を残す() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let xs = [\"a\", \"b\", \"a\"]\n\
+                 \x20 let mut hits = 0\n\
+                 \x20 for s in xs { if s == \"a\" { hits = hits + 1 } }\n\
+                 \x20 if xs == [\"a\", \"b\", \"a\"]: hits else: 0\n\
+                 }\n"
+            ),
+            2
+        );
+    }
+
+    /// 排他 `for` は要素をその場で書き換える。構造は変わらない
+    #[test]
+    fn 排他forは要素を書き換える() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Cell { n: int }\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut xs = [Cell { n = 1 }, Cell { n = 2 }]\n\
+                 \x20 let mut k = 10\n\
+                 \x20 for c in &mut xs { c.n = k\n k = k + 1 }\n\
+                 \x20 let mut total = 0\n\
+                 \x20 for c in xs { total = total + c.n }\n\
+                 \x20 total\n\
+                 }\n"
+            ),
+            21
+        );
+    }
+
+    /// 消費 `for` は要素の所有を周回へ渡す。使い切った配列は一度だけ返る
+    #[test]
+    fn 消費forは要素の所有を渡す() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let xs = [\"a\", \"b\", \"a\"]\n\
+                 \x20 let mut hits = 0\n\
+                 \x20 for s in move xs { hits = hits + take(move s) }\n\
+                 \x20 hits\n\
+                 }\n"
+            ),
+            2
+        );
+    }
+
+    /// 途中で抜けても、渡し終えた要素は二度落ちない
+    #[test]
+    fn 消費forを途中で抜けても二度落ちない() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn take(s: str -> int) { if s == \"stop\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let xs = [\"go\", \"stop\", \"go\"]\n\
+                 \x20 for s in move xs {\n\
+                 \x20   if take(move s) == 1 { return 5 }\n\
+                 \x20 }\n\
+                 \x20 0\n\
+                 }\n"
+            ),
+            5
+        );
+    }
+
+    /// 入れ子の配列と optional の要素も、深く複製・比較できる
+    #[test]
+    fn 入れ子とoptionalの要素を扱える() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let xs = [[\"a\"], [\"b\", \"c\"]]\n\
+                 \x20 let ys = xs.clone()\n\
+                 \x20 if (xs == ys) == false { return 0 }\n\
+                 \x20 let os: [str?] = [\"a\", nil]\n\
+                 \x20 let ps = os.clone()\n\
+                 \x20 if os == ps: 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 配列の等値は長さから決まり、違う要素を見つけたところで打ち切る
+    #[test]
+    fn 配列の等値は長さと要素で決まる() {
+        for (other, expected) in [("[1, 2, 3]", 1), ("[1, 2]", 0), ("[1, 2, 4]", 0), ("[]", 0)] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "fn main(-> int) {{\n\
+                     \x20 let xs = [1, 2, 3]\n\
+                     \x20 let ys: [int] = {other}\n\
+                     \x20 if xs == ys: 1 else: 0\n\
+                     }}\n"
+                )),
+                expected,
+                "{other}"
+            );
+        }
+    }
+
+    /// 深い複製は元と記憶を共有しない
+    #[test]
+    fn 配列のcloneは中身まで独立する() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Cell { n: int }\n\
+                 fn main(-> int) {\n\
+                 \x20 let xs = [Cell { n = 1 }]\n\
+                 \x20 let mut ys = xs.clone()\n\
+                 \x20 for c in &mut ys { c.n = 9 }\n\
+                 \x20 let mut total = 0\n\
+                 \x20 for c in xs { total = total + c.n }\n\
+                 \x20 for c in ys { total = total + c.n }\n\
+                 \x20 total\n\
+                 }\n"
+            ),
+            10
+        );
+    }
+
+    /// 有界なループなら、3つの反復モードのどれでも記憶を使い回す
+    #[test]
+    fn 配列のループは記憶を使い回す() {
+        for src in [
+            // 共有
+            "fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 1000) == false {\n\
+             \x20   let xs = [\"a\", \"b\"]\n\
+             \x20   for s in xs { n = n + 0 }\n\
+             \x20   n = n + 1\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+            // 消費。要素も配列も毎周回で返る
+            "fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 1000) == false {\n\
+             \x20   let xs = [\"a\", \"b\"]\n\
+             \x20   for s in move xs { n = n + take(move s) }\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+            // 途中で抜ける消費。残りの要素も配列も返る
+            "fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+             fn stopped(-> int) {\n\
+             \x20 let xs = [\"a\", \"b\", \"c\"]\n\
+             \x20 for s in move xs { return take(move s) }\n\
+             \x20 0\n\
+             }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 1000) == false { n = n + stopped() }\n\
+             \x20 n\n\
+             }\n",
+        ] {
+            let bytes = compile(src, &[]).expect("生成できるはず");
+            validate(&bytes).expect("検証を通るはず");
+            assert_eq!(
+                invoke_capped(&bytes, ENTRY_EXPORT, 1),
+                Ok(vec![1000]),
+                "{src}"
+            );
+        }
     }
 
     /// メタデータを知らないエンジンでも検証・実行できる

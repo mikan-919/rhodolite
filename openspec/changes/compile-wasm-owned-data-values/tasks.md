@@ -50,12 +50,12 @@
 
 ## 7. Array and iteration slice
 
-- [ ] 7.1 Lower empty and populated array literals with checked length/capacity arithmetic, element stride, and source-order initialization
-- [ ] 7.2 Generate array drop, deep-clone, and short-circuit equality glue for Copy and owned element layouts
-- [ ] 7.3 Lower shared `for` iteration over Copy and borrowed non-Copy elements without consuming the array
-- [ ] 7.4 Lower mutable `for` iteration with exclusive element places and no structural mutation during iteration
-- [ ] 7.5 Lower consuming `for` iteration by clearing yielded elements, running per-iteration cleanup, and releasing the exhausted buffer/root once
-- [ ] 7.6 Add bounded-loop reuse and interpreter-comparison engine tests for nested arrays, optional elements, all iteration modes, clone, equality, move, and cleanup
+- [x] 7.1 Lower empty and populated array literals with checked length/capacity arithmetic, element stride, and source-order initialization
+- [x] 7.2 Generate array drop, deep-clone, and short-circuit equality glue for Copy and owned element layouts
+- [x] 7.3 Lower shared `for` iteration over Copy and borrowed non-Copy elements without consuming the array
+- [x] 7.4 Lower mutable `for` iteration with exclusive element places and no structural mutation during iteration
+- [x] 7.5 Lower consuming `for` iteration by clearing yielded elements, running per-iteration cleanup, and releasing the exhausted buffer/root once
+- [x] 7.6 Add bounded-loop reuse and interpreter-comparison engine tests for nested arrays, optional elements, all iteration modes, clone, equality, move, and cleanup
 
 ## 8. Serialized Rhodolite ABI v1
 

@@ -1863,7 +1863,12 @@ fn 各段の失敗で成果物を出さない() {
             "提供されていません",
         ),
         (
-            "fn main(-> int) {\n let xs = [1, 2]\n 1\n}\n",
+            "struct User { rank: int }\n\
+             fn main(-> int) {\n\
+             \x20 let u: User? = User { rank = 1 }\n\
+             \x20 let n = u.?rank\n\
+             \x20 1\n\
+             }\n",
             "Wasm ターゲットでは扱えません",
         ),
     ] {

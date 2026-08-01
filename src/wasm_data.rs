@@ -98,9 +98,23 @@ fn wide(offset: u32) -> MemArg {
     }
 }
 
+/// 配列と `str` の帳簿の場所
+pub fn buffer_data() -> MemArg {
+    word(BUFFER_DATA)
+}
+
+pub fn buffer_len() -> MemArg {
+    word(BUFFER_LEN)
+}
+
+pub fn buffer_capacity() -> MemArg {
+    word(BUFFER_CAPACITY)
+}
+
 /// 式1つが使える作業用の局所の数。入れ子になっても踏まないよう、要る式ごとに
-/// 別の区画を配る
-pub const SCRATCH: u32 = 3;
+/// 別の区画を配る。いちばん多く要るのは `for`(対象・buffer・長さ・添字・
+/// 要素・取り出した根)
+pub const SCRATCH: u32 = 6;
 
 /// enum と optional の tag はどちらも先頭に置く
 pub const TAG: u32 = 0;
@@ -452,6 +466,12 @@ pub fn glue_functions(layouts: &Layouts, indices: &Indices) -> Vec<Helper> {
                     tagged_eq(indices, layouts, &arms, false),
                 )
             }
+            // 配列は `str` と同じ帳簿。違うのは中身が刻み幅で並ぶことだけ
+            Shape::Array { element, stride } => (
+                array_drop(indices, layouts, *element, *stride),
+                array_clone(indices, layouts, *element, *stride),
+                array_eq(indices, layouts, *element, *stride),
+            ),
             // 対応検査が先に止めるので、ここへ来たら検査の抜け
             other => unreachable!("glue を出せない並びです: {other:?} ({id:?})"),
         };
@@ -786,6 +806,127 @@ fn tagged_eq(
         eq_slots(&mut b, indices, layouts, slots, 0, 1, 2, 3);
         b.ins(Instruction::End);
     }
+    b.num(1);
+    b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// 配列(tasks 7.2)
+// ---------------------------------------------------------------------------
+
+/// 要素を先頭から歩く。`emit` は1要素ぶんの命令を出す
+fn walk_elements(b: &mut Body, len: u32, index: u32, emit: impl FnOnce(&mut Body)) {
+    b.num(0).set(index);
+    b.ins(Instruction::Block(BlockType::Empty));
+    b.ins(Instruction::Loop(BlockType::Empty));
+    b.get(index).get(len).ins(Instruction::I32GeU);
+    b.ins(Instruction::BrIf(1));
+    emit(b);
+    b.get(index).num(1).ins(Instruction::I32Add).set(index);
+    b.ins(Instruction::Br(0));
+    b.ins(Instruction::End);
+    b.ins(Instruction::End);
+}
+
+/// `data + index * stride`。刻みが 0 の要素(`unit` など)でも同じ式で通る
+pub fn element_address(b: &mut Body, data: u32, index: u32, stride: u32) {
+    b.get(data);
+    b.get(index);
+    if stride != 1 {
+        b.num(stride).ins(Instruction::I32Mul);
+    }
+    b.ins(Instruction::I32Add);
+}
+
+/// `drop_array(ptr)`。所有する要素を順に落としてから buffer を返す
+fn array_drop(indices: &Indices, layouts: &Layouts, element: LayoutId, stride: u32) -> Function {
+    // 1: data, 2: len, 3: index
+    let mut b = Body::new(3);
+    if !layouts.get(element).copy {
+        b.get(0).ins(Instruction::I32Load(word(BUFFER_DATA))).set(1);
+        b.get(0).ins(Instruction::I32Load(word(BUFFER_LEN))).set(2);
+        let drop = indices.of(element).drop;
+        walk_elements(&mut b, 2, 3, |b| {
+            element_address(b, 1, 3, stride);
+            b.ins(Instruction::Call(drop));
+        });
+    }
+    b.get(0)
+        .ins(Instruction::I32Load(word(BUFFER_DATA)))
+        .ins(Instruction::Call(indices.free));
+    b.finish()
+}
+
+/// `clone_array(src, dst)`。buffer ごと浅く写してから、所有する要素を作り直す
+fn array_clone(indices: &Indices, layouts: &Layouts, element: LayoutId, stride: u32) -> Function {
+    // 2: len, 3: 新しい buffer, 4: index, 5: 元の buffer
+    let mut b = Body::new(4);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_LEN))).set(2);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_DATA))).set(5);
+
+    // 元の割り当てが通っている以上、同じ `len * stride` は 32bit に収まる
+    b.get(2).num(stride).ins(Instruction::I32Mul);
+    b.ins(Instruction::Call(indices.alloc)).set(3);
+    b.get(3).get(5).get(2).num(stride).ins(Instruction::I32Mul);
+    b.ins(Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+
+    b.get(1)
+        .get(3)
+        .ins(Instruction::I32Store(word(BUFFER_DATA)));
+    b.get(1).get(2).ins(Instruction::I32Store(word(BUFFER_LEN)));
+    b.get(1)
+        .get(2)
+        .ins(Instruction::I32Store(word(BUFFER_CAPACITY)));
+
+    if !layouts.get(element).copy {
+        let clone = indices.of(element).clone;
+        walk_elements(&mut b, 2, 4, |b| {
+            element_address(b, 5, 4, stride);
+            element_address(b, 3, 4, stride);
+            b.ins(Instruction::Call(clone));
+        });
+    }
+    b.finish()
+}
+
+/// `eq_array(a, b) -> i32`。長さが違えばそこで、違う要素を見つけたらそこで打ち切る
+fn array_eq(indices: &Indices, layouts: &Layouts, element: LayoutId, stride: u32) -> Function {
+    // 2: len, 3: index, 4: 左の要素, 5: 右の要素
+    let mut b = Body::new(4);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_LEN))).set(2);
+    b.get(2)
+        .get(1)
+        .ins(Instruction::I32Load(word(BUFFER_LEN)))
+        .ins(Instruction::I32Ne);
+    b.ins(Instruction::If(BlockType::Empty));
+    b.num(0).ins(Instruction::Return);
+    b.ins(Instruction::End);
+
+    let copy = layouts.get(element).copy;
+    let eq = (!copy).then(|| indices.of(element).eq);
+    walk_elements(&mut b, 2, 3, |b| {
+        for (side, slot) in [(0, 4), (1, 5)] {
+            b.get(side).ins(Instruction::I32Load(word(BUFFER_DATA)));
+            b.get(3);
+            if stride != 1 {
+                b.num(stride).ins(Instruction::I32Mul);
+            }
+            b.ins(Instruction::I32Add).set(slot);
+        }
+        match eq {
+            Some(eq) => {
+                b.get(4).get(5).ins(Instruction::Call(eq));
+            }
+            None => equal_copy(b, layouts, element, 4, 5, 0),
+        }
+        b.ins(Instruction::I32Eqz);
+        b.ins(Instruction::If(BlockType::Empty));
+        b.num(0).ins(Instruction::Return);
+        b.ins(Instruction::End);
+    });
     b.num(1);
     b.finish()
 }
