@@ -34,7 +34,7 @@
 ## 5. Owned struct vertical slice
 
 - [x] 5.1 Lower zero-field and field-bearing struct construction while preserving source evaluation order and declaration-order storage
-- [x] 5.2 Lower Copy field reads, shared/mutable owned-field places, optional-field propagation, and field assignment with drop-before-install semantics
+- [ ] 5.2 Lower Copy field reads, shared/mutable owned-field places, optional-field propagation, and field assignment with drop-before-install semantics
 - [x] 5.3 Generate recursive struct drop, clone, and equality glue for direct and `indirect` fields
 - [x] 5.4 Lower whole-struct moves and consuming direct/indirect field projections using the checked remainder plan
 - [x] 5.5 Add engine tests for nested mutation, deep clone independence, structural equality, recursive `indirect` chains, moves, and exact cleanup
