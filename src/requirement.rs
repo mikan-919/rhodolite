@@ -133,6 +133,7 @@ impl Analysis {
     }
 
     /// 全本体を決定的な順で。並びは `BodyId` の順(callable が先、各々宣言順)
+    #[cfg(test)]
     pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, &BodyReqs)> {
         self.semantic.iter().map(|(id, reqs)| (*id, reqs))
     }

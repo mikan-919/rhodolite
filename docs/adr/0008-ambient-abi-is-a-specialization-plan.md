@@ -59,18 +59,21 @@ RecordLayoutKey = [(SlotId, StructId)]   // SlotId 順、値要求のみ
 nullable な欄も置かない。実装も要求の強さも静的に分かっているため、実行時に
 言い分ける必要がない。
 
-### 4. record は不変な値で、欄は同一性を保つ handle
+### 4. record は不変な値で、欄は provider への handle
 
 呼び先の record は値として渡す。欄は `with` が置いた provider そのものへの handle で、
-record を作る・写す・渡す操作は provider を複製しない。provider 経由の変更は全ての
-別名から見え、これは HIR インタプリタの共有 struct 意味論と一致する。
+record を作る・写す・渡す操作は provider の所有権規則を決めない。この ADR が固定する
+のは特殊化された呼び先と欄の対応だけである。`with` に渡す値が shared borrow、mutable
+borrow、move、temporary のどれかは ownership-checked HIR が検査する
+([ADR-0010](./0010-owned-values-and-inferred-borrows.md))。record はその検査済みの
+provider access を運ぶので、provider を暗黙に複製も共有所有も作らない。
 
 物理表現はこの段では抽象のまま置く。compiled v1 の第一候補はプロセス寿命の arena への
 ポインタだが、安定した同一性さえ保てば後段の data layout が別の handle を選んでよい。
 
-呼び出し元のスタック上 record への借用ポインタを意味論にする案は却下した。寿命が再帰と
-将来の async 下ろしへ漏れる。provider の実体を record へ複製する案も却下した。同一性が
-壊れ、正典の共有変更テストが落ちる。
+呼び出し元のスタック上 record への借用ポインタを ambient の意味論にする案は却下した。
+寿命が再帰と将来の async 下ろしへ漏れる。provider の実体を record へ暗黙に複製する案も
+却下した。所有権の transfer と clone は source で可視でなければならない。
 
 ### 5. `with` は外で評価してから、内側の写しを1つ作る
 
@@ -113,7 +116,7 @@ with db(make()), clock<Frozen> { body }
 ## 擬似コード(C の綴りで書く)
 
 綴りは説明のためのもので、バックエンドの選択とは無関係。**規範なのは**欄の順・
-具体的な provider 型・値渡しで不変な record・同一性を保つ handle・直接の呼び先の
+具体的な provider 型・値渡しで不変な record・検査済み provider access・直接の呼び先の
 5つだけで、下の型名や記号名ではない。
 
 ### 本番とテストの提供の組み合わせ
@@ -200,8 +203,8 @@ int64_t ping__clock_Frozen(Ambient_clock_Frozen ambient, int64_t n) {
 
 この段では決めない。決めるときに前提を壊さないことだけを要求する。
 
-- **handle の物理表現** … `compile-wasm-data-values` へ。ここで前提にしているのは
-  「安定した同一性」だけ
+- **handle の物理表現** … `compile-wasm-owned-data-values` へ。ここで前提にしているのは
+  ownership pass が確定した provider access だけ
 - **生成される型名と記号名の綴り** … emitter へ。計画の ID から決定的に導き、
   公開 ABI にしない
 - **async のタスク継承と provider の寿命** … async が言語のロードマップに入るまで。

@@ -94,6 +94,11 @@ users.filter(active)
 - `else` の要否は**型規則**であって文法規則ではない。値として使われた `if` に
   `else` がなければ型が合わない、というだけ
 
+すべての `{ ... }` が local scope を作るわけではない。通常の second-class block は
+外側の local scope を再利用する。一方、function/test body、match arm、loop binding、
+`with` body は独自の scope を持つ。ownership の borrow region と drop もこの境界に
+従うため、裸の block を足して borrow を短くすることはできない。
+
 ## struct 生成
 
 ```rhodolite
@@ -120,6 +125,64 @@ let users: [User] = []
 
 注釈を省略した束縛は初期化子の型をそのまま取る。初期化子から型が決まらなければ
 実行前に落ちて、注釈を促す(→ `local-binding-type-annotations`)。
+
+## 所有・借用・移動
+
+非 Copy の値には所有者が一つだけある。`let` は不変、書き換える束縛は `let mut` と
+書く。`int` / `bool` / `unit` / fieldless enum は Copy なので通常の束縛や引数渡しで
+元の値を使い続けられる。struct、payload enum、`str`、配列などの非 Copy 値は、別の
+local への束縛で move される。
+
+```rhodolite
+let original = User { id = 1 }
+let moved = original             // 以後 original は使えない
+let copy = moved.clone()         // 深い複製。両方を独立して使える
+
+let mut user = copy
+user.id = 2
+```
+
+型と関数の所有モードは `T`、`&T`、`&mut T`。寿命名は書かない。共有引数 `&T` への
+呼び出しだけは自動借用する。可変アクセス、既存 local の所有引数への移譲、clone は
+それぞれ可視に書く。
+
+```rhodolite
+fn inspect(user: &User -> int) { user.id }
+fn stamp(user: &mut User) { user.id = 2 }
+fn consume(user: User) { let ignored = user }
+
+inspect(user)          // `&User` は shared auto-borrow
+stamp(&mut user)       // mutation は明示
+consume(move user)     // owned parameter への移譲は明示
+```
+
+`&place`、`&mut place`、`move place` は field/method chain の receiver にもそのまま
+付く。例えば `&mut account.user.rename(name)` は `account.user` を可変 receiver として
+渡し、`move value.finish()` は `value` を consuming receiver として渡す。`&mut` の
+参照は clone できない。borrow の終了位置と borrowed return の出どころは全読み込み済み
+プログラムから推論されるため、use-after-move、共有中の変更、重なる可変借用、owner を
+越える借用は実行前に span と競合箇所付きで診断される。詳細な判断は
+[ADR-0010](./adr/0010-owned-values-and-inferred-borrows.md)。
+
+借用は local・引数・戻り値にだけ置ける。この版では struct field、enum payload、
+optional、配列の中に `&T` / `&mut T` を格納できない。公開 Wasm 関数の borrowed
+引数・戻り値も build で拒否される。
+
+## `indirect` な再帰値
+
+所有する型の再帰閉路には `indirect` な field または enum payload が少なくとも一つ
+要る。`indirect` は有限な配置を明示するだけで、値を共有所有にはしない。
+
+```rhodolite
+struct Node {
+    value: int
+    indirect next: Node?
+}
+```
+
+`struct Bad { next: Bad }` のように `indirect` を含まない型宣言上の再帰閉路は実行前に
+拒否される。一方、上の `Node` は `next` が `indirect` なので、有限な `Node` 値を
+構築できる。
 
 Head の条件では裸のstructリテラルを読まない。条件に置く場合だけ括弧で囲む。
 
@@ -212,13 +275,16 @@ struct Store {
   後の代入から遡らないので、その場で要素型を要求する(`let xs: [T] = []`)
 
 既に型の分かっている配列**値**の適合は要素型について不変で、`[T]` は `[T?]` へ
-渡せない(配列は参照として共有されるため)。外側の optional への注入
+渡せない(配列は要素を所有するため)。外側の optional への注入
 `[T] -> [T]?` だけは他の型と同じく一方向に通る。
 
 `for x in xs` の `xs` は非 optional な配列でなければならない。`x` はその要素型に
 束縛され、ループ本体の field の読みや代入は他の型の分かる値と同じに検査される。
 `xs` が optional な配列なら先に `??` で展開する。`xs` の型が分からないときは
 従来どおり `x` も型を持たない。
+
+`for x in xs` は共有借用、`for x in &mut xs` は各要素への可変借用、`for x in move xs`
+は配列を消費して所有要素を順に渡す。loop variable と loop body は scope を作る。
 
 ## enum
 
@@ -278,8 +344,8 @@ ambient の型射影として解決される。
 
 variant は struct ではない。フィールドアクセスもメソッド解決もできない。
 等しいのは**同じ enum の同じ variant で、payload が対応ごとに等しい**ときだけで、
-payload の比較には既存の値の等値規則(struct と配列は中身、複合値は参照の共有を
-含む)がそのまま効く。表示は payload を含めて `Enum.Variant(値, ...)` になる。
+payload の比較には既存の構造的な等値規則がそのまま効く。表示は payload を含めて
+`Enum.Variant(値, ...)` になる。
 
 ### match
 
@@ -380,7 +446,7 @@ trait Database { fn save(self, u: User -> unit) }  // 契約
 effect db: Database                            // スロット宣言
 with db(Postgres::new(url)) { handle(id) }     // 実体の提供
 with db<Postgres> { db::new(url) }              // 実装型の提供
-db.save(u)                                     // 使用
+db.save(move u)                                // 所有値を渡す使用
 ```
 
 経由するだけの関数は**無記述**。要求は推論する(→ ADR-0002)。
@@ -390,18 +456,22 @@ db.save(u)                                     // 使用
 
 ## メソッドと関連関数
 
-シグネチャの第一引数が `self` かどうかだけが両者の区別。暗黙にしない。
+シグネチャの第一引数が `self`、`&self`、`&mut self` のいずれかかどうかだけが
+メソッドと関連関数の区別。receiver は暗黙にしない。
+
+次の本体の `...` は receiver と呼び出し構文だけを示す省略である。
 
 ```rhodolite
 impl Database for Postgres {
-    fn save(self, u: User -> unit) { ... }   // メソッド。`pg.save(u)` で呼ぶ
+    fn find(&self, id: int -> User?) { ... }       // shared receiver
+    fn save(&mut self, u: User -> unit) { ... }    // `&mut pg.save(move u)`
     fn new(url: str -> Postgres) { ... }     // 関連関数。`Postgres::new(url)` で呼ぶ
 }
 ```
 
-`self` を暗黙にすると `new` にもレシーバがあることになり、トップレベルの `fn` と
+receiver を暗黙にすると `new` にもレシーバがあることになり、トップレベルの `fn` と
 trait の中の `fn` が同じ見た目で違う意味になる。宣言に出す方を採った。
-`self` は ambient と違って**関数呼び出しで切れる**普通の束縛。
+`self` / `&self` / `&mut self` は ambient と違って**関数呼び出しで切れる**普通の束縛。
 
 呼び出しは実行前に解決される。`trait` を実装する `impl` は宣言の時点で契約と
 突き合わされ、メソッドの過不足・レシーバの形・引数型・戻り値型が合わなければ

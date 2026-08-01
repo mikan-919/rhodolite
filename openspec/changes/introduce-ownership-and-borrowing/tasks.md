@@ -194,21 +194,21 @@
 
 ## 9. Record the Ownership Contract
 
-- [ ] 9.1 Add an ADR for owned values, implicit shared calls, explicit `&mut`/
+- [x] 9.1 Add an ADR for owned values, implicit shared calls, explicit `&mut`/
   `move`/`clone`/`indirect`, whole-program lifetime inference, deterministic
   drop, and the explicit rejection of GC, runtime borrow checks, and `unsafe`
-- [ ] 9.2 Update `docs/grammar.md`, `README.md`, and `docs/overview.md` with the
+- [x] 9.2 Update `docs/grammar.md`, `README.md`, and `docs/overview.md` with the
   exact syntax, examples, scoping caveat for second-class blocks, diagnostics,
   and interpreter/Wasm support boundary
-- [ ] 9.3 Update `docs/compiler-roadmap.md` to place
+- [x] 9.3 Update `docs/compiler-roadmap.md` to place
   `introduce-ownership-and-borrowing` before
   `compile-wasm-owned-data-values`, and record aggregate borrows, explicit shared
   ownership, allocator/data layout, async, and rich ABI work as later stages
-- [ ] 9.4 Run `cargo fmt --check`, the full test suite, canonical interpreter and
+- [x] 9.4 Run `cargo fmt --check`, the full test suite, canonical interpreter and
   CLI cases, ownership compile-pass/fail corpus, plan determinism, scalar Wasm
   engine fixtures, and `bunx @fission-ai/openspec validate --all --strict`
-- [ ] 9.5 Review the complete diff for accidental allocator, WasmGC, RC/GC,
+- [x] 9.5 Review the complete diff for accidental allocator, WasmGC, RC/GC,
   `unsafe`, raw pointer, partial-move, aggregate-borrow, rich-ABI, or legacy-mode
   scope and resolve every warning introduced by this change
-- [ ] 9.6 Commit the completed ownership implementation and documentation as an
+- [x] 9.6 Commit the completed ownership implementation and documentation as an
   archive-ready stable snapshot

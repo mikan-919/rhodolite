@@ -24,7 +24,8 @@ change 名は予約名であり、まだ作成済みであることを意味し�
 - 複数モジュールからなるプログラムをコンパイルできる
 
 compiled v1 は汎用言語としての完成ではない。外部パッケージ、最適化、async、
-所有権、セルフホスト、本格 GC は含まない。
+セルフホスト、本格 GC は含まない。所有権・借用の静的契約はデータ値の Wasm 表現より
+先に固める。
 
 ## 全体の順序
 
@@ -44,7 +45,10 @@ define-ambient-runtime-abi（完了）
 emit-core-wasm-programs（完了）
         │
         ▼
-compile-wasm-data-values
+introduce-ownership-and-borrowing（完了）
+        │
+        ▼
+compile-wasm-owned-data-values
         │
         ▼
 compile-wasm-traits-and-ambient
@@ -63,9 +67,10 @@ compiled v1
 | 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
 | 3 | 完了 | archived `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 完了 | archived `emit-core-wasm-programs` | スカラーと制御フローの Core Wasm 生成 |
-| 5 | 次 | `compile-wasm-data-values` | struct・enum・optional・配列の Wasm 表現 |
-| 6 | 未着手 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
-| 7 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
+| 5 | 完了 | `introduce-ownership-and-borrowing` | 単独所有、借用推論、決定的 drop、checked HIR 境界 |
+| 6 | 次 | `compile-wasm-owned-data-values` | owned struct・enum・optional・配列の Wasm 表現 |
+| 7 | 未着手 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
+| 8 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
 
 同時に進行中にするのは原則として一段階だけとする。前段の完了線を満たし、change を
 archive してから次段の提案を作る。
@@ -107,9 +112,10 @@ span を持つ。
 - 既存の診断位置と要求表示が変わらない
 - AST 直接評価を正式な実行経路から外せる
 
-結果として、パイプラインは
+当時の型付き HIR 導入段階では、パイプラインは
 `load AST → check/lower HIR → analyze HIR → eval HIR` になった。
-`typecheck::check_and_lower` が唯一の境界で、診断が1件でもあれば HIR は渡らない。
+`typecheck::check_and_lower` が唯一の境界で、診断が1件でもあれば HIR は渡らなかった。
+現行パイプラインは次の ownership 段階で `CheckedProgram` 境界を追加している。
 下ろしを全域にするために、型注釈・`effect` の対象・inherent `impl` の対象は
 宣言済みの名前でなければならず、代入の左辺は局所束縛か宣言フィールドで
 なければならない。どれも以前は実行時に失敗するか黙って通っていた形で、
@@ -174,25 +180,46 @@ OpenSpec capability として定義した。
 - 各段の失敗が既存の診断描画で位置付きで出て、成果物を置き換えない
 - 同じ入力・同じ選択肢からは byte 単位で同じモジュールが出る
 
-## 5. データ値と小さなランタイムを作る
+## 5. 所有・借用を Wasm より先に閉じる
 
-想定 change: `compile-wasm-data-values`
+OpenSpec: `introduce-ownership-and-borrowing` /
+ADR: [0010](./adr/0010-owned-values-and-inferred-borrows.md)
 
-追加する順序は、`str`、struct、enum payload、optional、`match`、配列、共有された
-可変値、`for` とする。
+型付き HIR のあとに ownership pass を置く。非 Copy 値は単独所有、`&T` は共有 read、
+`&mut T` は排他的 mutation、`move` は明示 transfer、`clone()` は明示 deep clone と
+する。borrow の領域と borrowed return の provenance は全プログラムから推論し、
+drop は lexical scope exit で決定的に計画する。
 
-線形メモリに自前で置くか WasmGC に載せるかはここで決める。短命な CLI を対象にした
-プロセス寿命の arena を第一候補とし、本格 GC は最初のデータ生成を遮らないよう後段へ
-送る。この選択は change 作成時に改めて実測し、設計判断として記録する。
+この段階は Wasm memory layout を決めない。interpreter が store と検査済み place で
+参照意味を実行し、Wasm v0 は引き続き到達した scalar だけを生成する。borrowed public
+ABI と reachable non-scalar data は build 前に拒否する。
+
+後続へ意図的に残すもの:
+
+- aggregate に格納する borrow とその region model
+- explicit shared ownership（RC / GC を含むかは concrete use case で決める）
+- owned data の allocator、memory layout、drop flag、rich public ABI
+- async / closure / separate compilation での ownership と provider lifetime
+
+## 6. owned data の Wasm 表現と小さなランタイムを作る
+
+想定 change: `compile-wasm-owned-data-values`
+
+追加する順序は、`str`、owned struct、enum payload、optional、`match`、配列、`for` と
+する。aggregate borrow と shared ownership はこの段階の前提にしない。
+
+線形メモリの allocator、データ layout、drop flag、OOM の扱いをここで決める。WasmGC、
+RC、tracing GC は既定解にせず、所有権契約と実測を踏まえて change の ADR で選ぶ。
+rich public ABI も owned layout が定まった後にだけ広げる。
 
 完了条件:
 
 - 現在のデータ型と値操作を Wasm 側で表現できる
-- 共有された struct と配列の変更が参照実装と一致する
+- owned struct と配列の変更が参照実装と一致する
 - enum、optional、`match` の結果が参照実装と一致する
 - 公開 ABI が scalar 以外の値を運べるようになる
 
-## 6. trait と ambient をコンパイルする
+## 7. trait と ambient をコンパイルする
 
 想定 change: `compile-wasm-traits-and-ambient`
 
@@ -218,7 +245,7 @@ record を、空でない layout も運べる実行時表現として初めて�
 - 提供忘れがコード生成より前に到達経路付きで失敗する
 - 生成関数が不要な slot を引数に持たない
 
-## 7. 二つの実行系を継続的に照合する
+## 8. 二つの実行系を継続的に照合する
 
 想定 change: `add-differential-execution`
 
@@ -231,7 +258,7 @@ source → HIR ──┤
 ```
 
 比較対象は、戻り値、終了コード、標準出力、テスト結果、実行時エラーの分類、
-共有値の最終状態とする。
+owned 値と明示 borrow を経た最終状態とする。
 
 完了条件:
 
@@ -259,8 +286,9 @@ source → HIR ──┤
 ```
 
 Component Model／WIT の生成、LLVM／Cranelift、ネイティブ生成、最適化、セルフホスト、
-パッケージマネージャ、LSP、async、所有権・借用、本格 GC、安定 ABI は、必要な実
-プログラムが現れてから別の地図を作る。
+パッケージマネージャ、LSP、本格 GC、安定 ABI は、必要な実プログラムが現れてから
+別の地図を作る。ownership の後続としては、aggregate borrow、explicit shared
+ownership、allocator/data layout、async、rich ABI を別 change で扱う。
 
 ## この文書の更新規則
 

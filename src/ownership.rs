@@ -57,7 +57,9 @@
 //! 評価器の所有(phase 7)、ソースの移行(phase 8)。
 
 use crate::diag::Diag;
-use crate::hir::{self, AccessMode, Id as _, ReceiverMode};
+#[cfg(test)]
+use crate::hir::Id as _;
+use crate::hir::{self, AccessMode, ReceiverMode};
 use crate::lex::Span;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -280,6 +282,7 @@ pub struct BodyPlan {
 }
 
 impl BodyPlan {
+    #[cfg(test)]
     pub fn scopes(&self) -> impl Iterator<Item = (ScopeId, &Scope)> {
         self.scopes
             .iter()
@@ -287,6 +290,7 @@ impl BodyPlan {
             .map(|(i, s)| (ScopeId(i as u32), s))
     }
 
+    #[cfg(test)]
     pub fn points(&self) -> impl Iterator<Item = (PointId, &Point)> {
         self.points
             .iter()
@@ -294,6 +298,7 @@ impl BodyPlan {
             .map(|(i, p)| (PointId(i as u32), p))
     }
 
+    #[cfg(test)]
     pub fn edges(&self) -> &[Edge] {
         &self.edges
     }
@@ -307,17 +312,7 @@ impl BodyPlan {
         }
     }
 
-    /// 式に対応する CFG 点。ownership-aware evaluator の debug assertion と
-    /// 計画スナップショットが、分類済み access に点があることを照合する。
-    pub fn point_of(&self, expr: hir::ExprId) -> Option<PointId> {
-        self.accesses.get(&expr).copied().or_else(|| {
-            self.points
-                .iter()
-                .position(|point| point.expr == Some(expr))
-                .map(|index| PointId(index as u32))
-        })
-    }
-
+    #[cfg(test)]
     pub fn loans(&self) -> impl Iterator<Item = (LoanId, &Loan)> {
         self.loans
             .iter()
@@ -326,6 +321,7 @@ impl BodyPlan {
     }
 
     /// その借用が生きている点。最後の使用より先には伸びない(design.md 決定6)
+    #[cfg(test)]
     pub fn region(&self, loan: LoanId) -> &BTreeSet<PointId> {
         &self.regions[loan.index()]
     }
@@ -344,6 +340,7 @@ impl Plan {
     }
 
     /// 参照を返す callable の要約。所有を返す callable は持たない
+    #[cfg(test)]
     pub fn provenance(&self, id: hir::CallableId) -> Option<&ReturnProvenance> {
         self.provenance.get(&id)
     }
@@ -2444,6 +2441,7 @@ impl Build<'_> {
 // 決定的な描画
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 impl Plan {
     /// 宣言順に全本体の計画を書き出す。同じプログラムからは常に同じ文字列が
     /// 出るので、計画のスナップショットテストはこれを比べる(tasks 3.7)。
@@ -2546,6 +2544,7 @@ impl Plan {
     }
 }
 
+#[cfg(test)]
 fn show_input(program: &hir::Program, place: &InputPlace) -> String {
     let root = match place.input {
         Input::Receiver => "self".to_string(),
@@ -2554,6 +2553,7 @@ fn show_input(program: &hir::Program, place: &InputPlace) -> String {
     format!("{root}{}", show_path(program, &place.path))
 }
 
+#[cfg(test)]
 fn show_effect(program: &hir::Program, body: &hir::Body, effect: &Effect) -> String {
     match effect {
         Effect::Nop => "nop".to_string(),
@@ -2610,6 +2610,7 @@ fn show_path(program: &hir::Program, path: &[Projection]) -> String {
     out
 }
 
+#[cfg(test)]
 fn show_drop(program: &hir::Program, drop: &Drop) -> String {
     match drop {
         Drop::Local(local) => format!("local#{}", local.index()),

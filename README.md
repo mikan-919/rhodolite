@@ -8,14 +8,14 @@
 effect db: Database                       // スロット宣言
 effect clock: Clock
 
-fn stamp(u: User) {                       // 使用
+fn stamp(u: &mut User) {                  // 使用
     u.promoted_at = clock.now()
-    db.save(u)
 }
 
 fn promote(id: int -> bool) {             // 経由するだけ = 無記述
-    let u = db.find(id) ?? return false
-    stamp(u)
+    let mut u = db.find(id) ?? return false
+    stamp(&mut u)
+    db.save(move u)
     true
 }
 
@@ -65,7 +65,7 @@ v1 の到達目標は [examples/canonical.rd](./examples/canonical.rd)。
 | 設計相談 / レビュー / 調査 | AI |
 
 語れる部分と手を動かす部分を一致させるための規則。実装言語は Rust、
-まずインタプリタから始める(バックエンドは未決のまま後ろに倒す)。
+まずインタプリタで意味を固めてからバックエンドへ進む。
 
 ## 現状
 
@@ -73,11 +73,11 @@ v1 の到達目標は達成済み。lexer、parser、要求推論、インタプ
 `cargo run`で正典プログラムのテストが完走する。現在の地図と次の作業は
 [docs/overview.md](./docs/overview.md)。
 
-処理系の境界は型付き HIR になった。パイプラインは
-`load AST → check/lower HIR → analyze HIR → eval HIR` で、型検査を通った後は
-構文木を見ない。HIR は全ての式の具体型と、呼び出し先・フィールド・variant・
-局所束縛・提供する実装をプログラム内の ID で持つので、要求解析も評価器も
-名前で引き直さない(`src/hir.rs`)。
+処理系の境界は ownership 検査済み HIR になった。パイプラインは
+`load AST → check/lower HIR → ownership check → CheckedProgram → analyze / eval / Wasm`。
+型検査・所有権検査を通った後は構文木を見ない。HIR は全ての式の具体型と、呼び出し先・
+フィールド・variant・局所束縛・提供する実装をプログラム内の ID で持つので、要求解析も
+評価器も名前で引き直さない(`src/hir.rs`)。
 
 型検査は全域化した。**値を産む式はすべて具体的な型を持ち、すべての呼び出しは
 一意の宣言へ解決される**。分類できない式が1つでもあれば、呼ばれない宣言の中でも
@@ -119,8 +119,24 @@ import も start section も持たず、`__rhodolite_main` と公開名を expor
 (`src/wasm.rs`、[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md))。
 インタプリタは参照実装として残る。
 
-次の一歩は、データ値の Wasm 表現
-([docs/compiler-roadmap.md](./docs/compiler-roadmap.md))。
+所有権検査も型付き HIR の次の境界として動いている。非 Copy 値は単独所有、`&T` の
+読み取り呼び出しだけは自動借用、変更は `&mut`、既存 local の移譲は `move`、複製は
+`clone()` と明示する。寿命名は書かず、全モジュールグラフの使用から借用領域と
+borrowed return の出どころを推論する。
 
-所有権・借用・`'a` 推論の柱はv1スコープ外として棚上げ中
-（[ADR-0001](./docs/adr/0001-v1-scope-effects-only.md)）。
+```rhodolite
+fn stamp(user: &mut User) { user.promoted_at = 1000 }
+fn persist(user: User) { let ignored = user }
+
+let mut user = User { id = 1, rank = Bronze, promoted_at = 0 }
+stamp(&mut user)
+let backup = user.clone()
+persist(move user)
+```
+
+この時点のインタプリタは所有 compound value を store で実行し、検査済みの borrow
+だけを使う。逆に Wasm v0 は到達した `unit` / `bool` / `int` だけで、非 scalar 値、
+borrow、public borrowed signature を拒否する。データの Wasm layout と allocator は
+次段で決める。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
+[ADR-0010](./docs/adr/0010-owned-values-and-inferred-borrows.md)、順序は
+[docs/compiler-roadmap.md](./docs/compiler-roadmap.md)。

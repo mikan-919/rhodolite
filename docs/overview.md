@@ -14,16 +14,17 @@
 ```rhodolite
 effect clock: Clock            // ← 宣言
 
-fn stamp(u: User) {
+fn stamp(u: &mut User) {
     u.at = clock.now()         // ← 使用
 }
-fn promote(id: int) {
-    stamp(id)                  // ← 何も書いていない
+fn promote(u: &mut User) {
+    stamp(u)                   // ← 何も書いていない
 }
 
 fn main() {
+    let mut user = User { at = 0 }
     with clock(system_clock) { // ← 提供
-        promote(1)
+        promote(&mut user)
     }
 }
 ```
@@ -42,11 +43,12 @@ fn main() {
       ├─ parse    トークン → 構文木           src/parse.rs → src/ast.rs
       ├─ load     use を辿って名前解決         src/module.rs
       ├─ check    構文木 → 型付き HIR         src/typecheck.rs → src/hir.rs
-      ├─ analyze  HIR → 要求と経路           src/requirement.rs
-      └─ eval     HIR を走らせる              src/eval.rs
+      ├─ ownership HIR → CheckedProgram        src/ownership.rs
+      ├─ analyze  CheckedProgram → 要求と経路  src/requirement.rs
+      └─ eval     CheckedProgram を走らせる    src/eval.rs
                                              ↑ 全部つながっている
 
-  `check` を通った後は構文木を見ない。HIR は全ての式の具体型と、
+  `check` と ownership 検査を通った後は構文木を見ない。CheckedProgram の HIR は全ての式の具体型と、
   呼び出し先・フィールド・variant・局所束縛・提供する実装をプログラム内 ID で
   持っているので、要求解析も評価も名前で引き直さない
 
@@ -60,7 +62,7 @@ test が緑になる。
 
 ```
 推論された要求:
-  stamp / clock, db
+  stamp / clock
   promote / clock, db      ← 誰も書いていない
   main / (要求なし)
 ```
@@ -70,20 +72,37 @@ $ cargo run examples/missing_handler.rd
 
   × missing_handler::main: `missing_handler::clock` が提供されていません
     ╭─[examples/missing_handler.rd:17:12]
- 16 │ fn stamp(u: User) {
+ 16 │ fn stamp(u: &mut User) {
  17 │     u.at = clock.now()
     ·            ────┬────
     ·                ╰── `missing_handler::clock` がここで要る
  18 │ }
     ╰────
-  help: missing_handler::clock が要る ← missing_handler::stamp ← ... ← missing_handler::main
+  help: missing_handler::clock が要る ← missing_handler::stamp ← missing_handler::promote ← missing_handler::handle ← missing_handler::main
   ├─▶   × `missing_handler::stamp` を呼んでいます
   │       ╭─[examples/missing_handler.rd:21:5]
+  │    20 │ fn promote(u: &mut User) {
   │    21 │     stamp(u)
   │       ·     ────┬───
   │       ·         ╰── ここが要求を運ぶ
+  │    22 │ }
   │       ╰────
-  ╰─▶ (以下、経路のホップごとに1件)
+  ├─▶   × `missing_handler::promote` を呼んでいます
+  │       ╭─[examples/missing_handler.rd:25:5]
+  │    24 │ fn handle(u: &mut User) {
+  │    25 │     promote(u)
+  │       ·     ─────┬────
+  │       ·          ╰── ここが要求を運ぶ
+  │    26 │ }
+  │       ╰────
+  ╰─▶   × `missing_handler::handle` を呼んでいます
+          ╭─[examples/missing_handler.rd:30:5]
+       29 │     let mut user = User { at = 0 }
+       30 │     handle(&mut user)
+          ·     ────────┬────────
+          ·             ╰── ここが要求を運ぶ
+       31 │ }
+          ╰────
 ```
 
 ```
@@ -101,13 +120,14 @@ $ cargo run examples/missing_handler.rd
 | `src/ast.rs` | 構文木の型定義。ここを読めば言語の形が分かる | 313 |
 | `src/parse.rs` | 再帰下降パーサ | 1774 |
 | `src/module.rs` | `use` を辿るモジュール読み込みと名前解決 | 2009 |
-| `src/hir.rs` | 型付き・参照解決済みの中間表現。処理系の境界 | 1195 |
+| `src/hir.rs` | 型付き・参照解決済みの中間表現。ownership pass の入力 | 1195 |
+| `src/ownership.rs` | borrow / move / drop を検査・計画し `CheckedProgram` を作る | 5823 |
 | `src/ambient_abi.rs` | ambient を単相化で消す計画。Wasm 生成の入力 | 1376 |
 | `src/wasm.rs` | 計画から Core Wasm を生成。対応範囲の検査もここ | 1200 |
 | `src/wasm_abi.rs` | Rhodolite Wasm ABI v0。公開署名と埋め込みメタデータ | 200 |
 | `src/typecheck.rs` | 型検査と HIR への下ろし(同じ1回の走査) | 5913 |
-| `src/requirement.rs` | **要求推論(中核)**。入力は HIR | 1690 |
-| `src/eval.rs` | **評価。`Env` は切れて `Ambient` は切れない** | 1932 |
+| `src/requirement.rs` | **要求推論(中核)**。入力は `ownership::CheckedProgram` | 1690 |
+| `src/eval.rs` | **所有権検査済み HIR を評価**。compound value は store、borrow は検査済み place | 1932 |
 | `src/diag.rs` | 診断の値。位置・ラベル・help・従属診断。全段が返す | 75 |
 | `src/render.rs` | 診断をソース抜粋付きで描く。miette を知る唯一の場所 | 107 |
 | `src/main.rs` | 繋ぐだけ | 164 |
@@ -127,7 +147,7 @@ $ cargo run examples/missing_handler.rd
 
 | | |
 |---|---|
-| 0001 | v1 はエフェクト1本。所有権と `'a` は棚上げ |
+| 0001 | v1 はエフェクト1本から始める（所有権の棚上げは [0010](./adr/0010-owned-values-and-inferred-borrows.md) で後続実装） |
 | 0002 | `effect` は**スロット宣言**。契約は trait。記述は4箇所だけ |
 | 0003 | whole-program 単相化でエフェクト変数を型から消す |
 | 0004 | 構造の追加は mikan が決める(申告制)。それ以外は代筆 |
@@ -136,13 +156,51 @@ $ cargo run examples/missing_handler.rd
 | 0007 | 診断の描画に `miette` を1つだけ依存に足す |
 | 0008 | ambient の実行時契約は特殊化計画。vtable 無し、型提供は消える |
 | 0009 | 成果物は Core Wasm + ABI v0。Component/WIT は下流のアダプタ |
+| 0010 | 値は単独所有。借用領域と return provenance は全プログラムから推論 |
 
 文法は `docs/grammar.md`、用語は `CONTEXT.md`、プロジェクトの目的は `README.md`。
 **まだ決まっていない設計は `docs/design-notes/`**（測った結果・却下案・未決の問い）。
 インタプリタを参照実装として残し、型付き HIR から Wasm 生成へ進む順序と各段階の完了線は
 [`docs/compiler-roadmap.md`](./compiler-roadmap.md)。
 
-## 6. 検査がいま保証すること
+## 6. 所有権の契約
+
+型検査のあとに ownership pass が走る。ここを通った `CheckedProgram` だけが要求解析、
+インタプリタ、ambient 計画、Wasm build へ渡る。したがって、後段が未検査 HIR を
+実行する通常経路はない。
+
+非 Copy 値は一つの owner を持つ。`&T` の read-only call は自動借用だが、変更は
+`&mut`、既存 local の所有引数・consuming receiver への引き渡しは `move`、独立した
+値の作成は `clone()` と書く。借用の最終使用と borrowed return の起点は読み込んだ
+プログラム全体で推論し、move 後の使用、共有中の変更、重なる可変借用、owner を越える
+borrow は実行前に診断する。
+
+```rhodolite
+fn read(user: &User -> int) { user.id }
+fn change(user: &mut User) { user.id = 2 }
+
+let mut user = User { id = 1 }
+read(user)
+change(&mut user)
+```
+
+波括弧が常に local scope を作るわけではない。Rhodolite の second-class block は外側の
+local scope を再利用する。match arm、loop variable、`with` の body、callable/test body
+は隔離される。ownership の scope と drop もこの既存の境界に従うので、借用を短くする
+ためだけの裸 block は意味を変えない。
+
+owned local は scope exit で逆宣言順に drop され、move 済みの source は drop しない。
+`return`・分岐・loop exit も cleanup を通る。runtime failure は language-level
+unwinding をしない。`indirect` は有限な再帰所有 edge を明示する構文で、shared ownership、
+aggregate に格納した borrow、GC、runtime borrow check、raw pointer、`unsafe` はまだない。
+理由と境界は [ADR-0010](./adr/0010-owned-values-and-inferred-borrows.md)。
+
+現在の interpreter はこの契約を実行する参照実装である。一方、Core Wasm v0 は到達した
+scalar (`unit` / `bool` / `int`) だけを生成し、non-scalar data、borrow、public borrowed
+signature は source span 付きで build 前に拒否する。owned data の layout は次段まで
+意図的に未実装である。
+
+## 7. 検査がいま保証すること
 
 v1 完了線は越えた。未定義の直接関数呼び出し、重複スロットの検査、
 ADR-0006 のモジュール分割、struct の形の検査、enum の宣言、
@@ -254,7 +312,7 @@ enum 値の等値は enum・variant の同一性と payload
 型の同一性は形と後置 `?` の一致だけで、部分型も暗黙の optional 展開も無い。
 上記の期待型境界に限り、present な値を optional 宛先へ注入する。
 
-## 7. 診断の形
+## 8. 診断の形
 
 実行前の段(`lex` / `parse` / `load` / `check` / `analyze`)と評価器
 (`eval`)は、すべて `diag::Diag` を返す。
@@ -283,6 +341,7 @@ struct Diag {
 | import 名の衝突・メンバー不在 | その `use` 宣言 |
 | 宣言名の重複・組み込み型名の宣言 | その宣言 |
 | 型検査の式に関する診断 | その式(引数・戻り値・フィールド値は部分式そのもの) |
+| ownership の move / borrow conflict | 問題の access。元の move / loan は `related` |
 | `match` の重複・別 enum・未知 variant・pattern の個数と重複束縛 | その arm |
 | `_` の重複 | 2つ目以降の `_` の arm |
 | `_` が最後でない | 先頭の `_` の arm |
@@ -298,7 +357,7 @@ struct Diag {
 ファイルを読めない。これらは素のテキストのまま出る。評価器では、式を1つも
 評価する前に失敗する経路(未知のエントリ名を直接呼ぶ)だけが位置を持たない。
 
-実行時エラーは `Flow::Error(Diag)` で運ぶ。span を入れるのは `Interp::eval` の
+実行時エラーは `Flow::Error(Diag)` で運ぶ。span を入れるのは `CheckedInterp::eval` の
 1か所だけで、まだ位置を持たない失敗にいま評価中の式の span を入れる。再帰も
 呼び出し先の本体もこの境界を通るので、最初に失敗を見た内側の式が埋め、外側
 (ブロック・呼び出し元・別モジュール)は上書きしない。`return` は制御フローで
@@ -308,7 +367,7 @@ struct Diag {
 素の構造体で、CLI 境界でだけ `miette::Report` へ変換する。依存を外すか
 差し替える判断がこの1ファイルで済む(ADR-0007)。
 
-## 8. 次の一歩
+## 9. 次の一歩
 
 ambient の低水準契約まで決まった。`src/ambient_abi.rs` は、`main` と全 test を根に
 到達した本体を**実装の組み合わせごとに単相化する計画**を作る。
@@ -316,7 +375,7 @@ ambient の低水準契約まで決まった。`src/ambient_abi.rs` は、`main`
 | 決めたこと | 形 |
 |---|---|
 | 隠し ambient 引数 | 値要求だけを欄に持つ不変な record。値要求が無ければ引数そのものが無い |
-| 値提供 | 具体 struct への handle を1欄。同一性を保つので変更は別名から見える |
+| 値提供 | 具体 provider への access を1欄。`&` / `&mut` / `move` / temporary は ownership pass が検査 |
 | 型提供 | instance の鍵と呼び先を変えるだけ。実行時には残らない |
 | スロット呼び出し | 提供の `TraitImplId` から実装本体への直接呼び出し。vtable は無い |
 | 内側の `with` | 外側の record を書き換えず、写した文脈を置き換える |
@@ -331,5 +390,5 @@ ambient の低水準契約まで決まった。`src/ambient_abi.rs` は、`main`
 `InstanceId` を関数番号へ引き直すだけで、名前解決をやり直さない。ホスト面の
 取り決めは [ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。
 
-次は、データ値の Wasm 表現(`compile-wasm-data-values`)。順序と完了線は
+次は、owned data の Wasm 表現(`compile-wasm-owned-data-values`)。順序と完了線は
 [`compiler-roadmap.md`](./compiler-roadmap.md)。
