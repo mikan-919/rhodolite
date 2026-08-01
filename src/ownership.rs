@@ -34,9 +34,27 @@
 //! 点・戻り値に載るなら出口。だから `let v = &u` の後で `v` を使わなくなれば、
 //! そこから先は `u` を排他的に触れる。
 //!
+//! # 破棄計画が言うこと・言わないこと
+//!
+//! 辺に載る `Drop` は**場所**の破棄だけ(design.md 決定8)。局所束縛と、
+//! 射影を消費した根の残りがそれで、抜けるスコープの宣言の逆順に並ぶ。落ちる
+//! 辺は素通し・枝の合流・周回の背辺と脱出・提供本体の脱出・`return`(抜ける
+//! 全スコープぶん)・本体末尾の6つで、`return` だけが複数スコープを積む。
+//!
+//! 場所を持たない値 — 一時値、`with` が提供した実体、消費する `match` の
+//! 選ばれなかった中身、消費する `for` が使い終わった buffer、上書きされた
+//! 古い値 — は計画に並ばない。それらを手放すのは**それを作った構文**で、
+//! 対応する HIR ノードと、その構文の所有モード(`BodyPlan::access` で引ける
+//! 対象のアクセス)から一意に決まる。所有の移動を場所の間で追うのが計画の
+//! 仕事で、寿命の一覧を作るのは仕事ではない。
+//!
+//! 実行時に要るもの(phase 7、tasks 7.4):経路によっては move 済みの場所は
+//! 計画に残るので、場所ごとの実行時 drop フラグが要る(design.md 決定8)。
+//! 実行時失敗は言語のスコープを巻き戻さない。
+//!
 //! # まだやらないこと
 //!
-//! `match`/`for`/`??` の所有モード(phase 6)、評価器の所有(phase 7)。
+//! 評価器の所有(phase 7)、ソースの移行(phase 8)。
 
 use crate::diag::Diag;
 use crate::hir::{self, AccessMode, Id as _, ReceiverMode};
@@ -78,12 +96,11 @@ pub struct Place {
     pub path: Vec<Projection>,
 }
 
-/// 場所の射影1段。
+/// 場所の射影1段(design.md 決定5)。
 ///
-/// ponytail: phase 3/4 が作るのは `Field` だけ。optional の中身・enum payload・
-/// 配列要素の射影は `match`/`for`/`??` の所有モードと一緒に phase 6 が入れる。
-/// 変種をここに書いておくのは、重なり判定(`overlaps`)がこの形を前提に
-/// 書かれているため(design.md 決定5)。
+/// 4つとも作られる。`Field` はフィールド射影、`OptionalPayload` は `.?` の
+/// optional 射影、`EnumPayload` は `match` が束ねた payload、`ArrayElement` は
+/// `for` が束ねた要素。後ろ3つは重なり判定で保守的に容器全体と重なる。
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Projection {
     Field(hir::FieldId),
@@ -196,8 +213,10 @@ pub enum Effect {
     /// 局所束縛が所有を得る(引数・`self`・`let`・ループ変数・payload 束縛)
     Init(hir::LocalId),
     /// 初期化済みの局所束縛への再代入。古い値はここで落ちる。
-    /// ponytail: 上書きの破棄はこの効果そのものが表すので、辺には別の
-    /// `Drop` を積まない。破棄経路を全部並べ切るのは phase 6(6.6)
+    ///
+    /// 上書きの破棄はこの効果そのものが表すので、辺には別の `Drop` を積まない。
+    /// フィールドの差し替え(`u.name = ...`)も同じで、そこは
+    /// `Effect::Access(Mutable)` と `ExprKind::AssignField` が表す(tasks 6.6)
     Assign(hir::LocalId),
     /// 分岐・合流・入口・出口
     Nop,
@@ -436,9 +455,20 @@ enum Bound {
     Let,
     /// 引数と `self`
     Param,
-    /// 素の `for` のループ変数と素の match の payload。対象を借用しているので
-    /// 所有者ではない(design.md 決定7)
-    Borrowed,
+    /// `for` のループ変数と match の payload が、対象を借りて束ねた名前
+    /// (design.md 決定7)。所有者ではないので破棄もされない。`Mutable` なら
+    /// 中身は変えられるが、名前そのものから所有を持ち出すことはできない
+    Borrowed(hir::RefKind),
+    /// 消費する `for` / `match` が所有ごと束ねた名前。周回・arm のスコープが
+    /// 所有者になるので、抜けるときに落ちる(design.md 決定7)
+    Owned,
+}
+
+impl Bound {
+    /// 破棄の対象になる束縛か。借用で束ねた名前は所有者ではない
+    fn owns(self) -> bool {
+        !matches!(self, Bound::Borrowed(_))
+    }
 }
 
 /// 値を要求している側が何を要るか。場所式の分類はここで決まる。
@@ -558,8 +588,15 @@ struct Build<'a> {
     /// 作った書き込み専用の束縛で、代入は初期化として扱う
     bindings: BTreeMap<hir::LocalId, Bound>,
     /// いま効いている提供のスタック。内側が外側を隠すので後ろから引く
-    /// (tasks 5.4 の入れ子の提供)
-    provided: Vec<(hir::SlotId, Option<hir::ExprId>)>,
+    /// (tasks 5.4 の入れ子の提供)。第3要素は提供を積んだ時点の周回の深さで、
+    /// 「その提供を周回のたびに消費していないか」を見るのに使う(tasks 6.6)
+    provided: Vec<(hir::SlotId, Option<hir::ExprId>, u32)>,
+    /// 消費レシーバで手放した提供と、手放した呼び出し。提供された実体には
+    /// 局所束縛が無いので、move 済みを覚える場所がここになる(tasks 6.6)
+    consumed: Vec<(hir::SlotId, hir::ExprId, hir::ExprId)>,
+    /// いま入っているループの深さ。提供を消費する呼び出しが周回の中にあるかを
+    /// 言うためだけに持つ
+    depth: u32,
     /// いま解決中の呼び出し先の表示名(`Need::Argument` の診断に使う)
     callee: Option<String>,
     /// 所有を要求されたのに `move` が書かれていなかった場所式と、その位置の綴り
@@ -590,6 +627,8 @@ impl<'a> Build<'a> {
             unrooted: BTreeMap::new(),
             bindings: BTreeMap::new(),
             provided: Vec::new(),
+            consumed: Vec::new(),
+            depth: 0,
             callee: None,
             demanded: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -667,19 +706,23 @@ impl<'a> Build<'a> {
         }
     }
 
-    /// `mark` 以降に作った借用を、`from` 以降に作った点**すべて**で生かす。
+    /// `mark..held` の借用を、`from` 以降に作った点**すべて**で生かす。
     ///
     /// `for` / `match` / `with` は構文の区間そのものが借用の区間なので、合流点や
     /// 背辺の行き先を1つだけ要求点にすると、その区間を `return` で抜ける経路を
     /// 取りこぼす(合流点が生まれず、背辺も張られない)。区間の点は `alloc` の順に
     /// 連続しているので、区間を丸ごと要求点にできる。到達しない点はリージョンの
     /// 交わり(生誕から到達できる)で落ちるので、要求点を増やす側は**必ず拒否が
-    /// 増える**だけになる
-    fn hold_through(&mut self, mark: usize, from: usize) {
+    /// 増える**だけになる。
+    ///
+    /// 伸ばすのは**区間に入る前に生まれた**借用だけ(`held` が上限)。区間の
+    /// 中で生まれた借用まで伸ばすと、その借用元も区間の中で落ちるので、
+    /// 「所有者より長生きする借用」を自分で作ってしまう
+    fn hold_through(&mut self, mark: usize, held: usize, from: usize) {
         let through: Vec<PointId> = (from..self.plan.points.len())
             .map(|p| PointId(p as u32))
             .collect();
-        for loan in mark..self.plan.loans.len() {
+        for loan in mark..held {
             self.loan_uses[loan].extend(through.iter().copied());
         }
     }
@@ -711,7 +754,7 @@ impl<'a> Build<'a> {
     fn declare(&mut self, local: hir::LocalId, scope: ScopeId, bound: Bound) {
         self.plan.scopes[scope.index()].locals.push(local);
         self.bindings.insert(local, bound);
-        if bound != Bound::Borrowed && self.owning(self.body.local(local).ty.as_ref()) {
+        if bound.owns() && self.owning(self.body.local(local).ty.as_ref()) {
             self.plan.owners.insert(local);
         }
     }
@@ -731,18 +774,133 @@ impl<'a> Build<'a> {
                 root: *local,
                 path: Vec::new(),
             }),
+            // `u.name` はフィールド射影、`u.?name` は optional の中身を1段
+            // 挟んだフィールド射影(optional-field-access)
             hir::ExprKind::Field {
                 recv,
                 field,
-                optional: false,
+                optional,
             } => {
                 let mut place = self.place_of(*recv)?;
+                if *optional {
+                    place.path.push(Projection::OptionalPayload);
+                }
                 place.path.push(Projection::Field(*field));
                 Some(place)
             }
-            // ponytail: `.?` は optional の中身への射影。`OptionalPayload` を
-            // 作るのは `??`/`match` の所有モードと同じ phase 6
             _ => None,
+        }
+    }
+
+    /// 修飾を剥がした場所。`&mut xs` / `move l` の下にある場所を指す
+    fn qualified_place(&self, expr: hir::ExprId) -> Option<Place> {
+        match &self.body.expr(expr).kind {
+            hir::ExprKind::Access { place, .. } => self.place_of(*place),
+            _ => self.place_of(expr),
+        }
+    }
+
+    /// 制御構文が**対象全体**に持つ所有モード(design.md 決定7、tasks 6.2〜6.4)。
+    ///
+    /// `Some(kind)` は借用、`None` は明示された消費。arm も周回も1つのモードを受け継ぐので、
+    /// pattern ごと・要素ごとの部分 move は表現そのものが存在しない。
+    ///
+    /// 参照を先に見るのは、参照は所有を運ばないから。`match move r` の `r` が
+    /// `&mut T` なら、動くのは参照であって借用先ではない。
+    fn whole_mode(&self, subject: hir::ExprId) -> Option<hir::RefKind> {
+        let expr = self.body.expr(subject);
+        if let Some(kind) = expr.result.ty().and_then(|ty| ty.reference) {
+            return Some(kind);
+        }
+        match &expr.kind {
+            hir::ExprKind::Access { mode, .. } => match mode {
+                AccessMode::Move => None,
+                AccessMode::Mutable => Some(hir::RefKind::Mutable),
+                AccessMode::Shared => Some(hir::RefKind::Shared),
+            },
+            // 修飾なしは、場所か一時値かにかかわらず共有借用。一時値が既に
+            // 所有者であることは、消費を暗黙に選ぶ理由にはならない。所有を
+            // arm/周回へ渡すのは `move` だけ(design.md 決定7)。
+            _ => Some(hir::RefKind::Shared),
+        }
+    }
+
+    /// `??` が所有を産むか(optional-core-type-checking、tasks 6.2)。
+    ///
+    /// 束縛済みの非 Copy な optional を素で開くと、取れるのは中身の借用だけで
+    /// 所有は元の場所に残る。`move` を書いた場所と、そもそも所有者である一時値
+    /// だけが所有を産む。Copy は複製なので所有が動かなくても値として渡せる。
+    fn coalesce_owns(&self, lhs: hir::ExprId) -> bool {
+        let expr = self.body.expr(lhs);
+        if let hir::ExprKind::Access {
+            mode: AccessMode::Move,
+            ..
+        } = expr.kind
+        {
+            return true;
+        }
+        self.place_of(lhs).is_none() || expr.result.ty().is_some_and(|ty| self.program.is_copy(ty))
+    }
+
+    /// 借用しか産まない `??` を所有の要る位置で使っている
+    fn report_borrowed_coalesce(&mut self, lhs: hir::ExprId) {
+        let Some(place) = self.place_of(lhs) else {
+            return;
+        };
+        let shown = self.show_place(&place);
+        let owner = self.body.local(place.root);
+        self.diagnostics.push(
+            Diag::at(
+                self.body.expr(lhs).span,
+                format!(
+                    "{}: 束縛済みの `{shown}` を素の `??` で開いても取れるのは借用で、所有は動きません",
+                    self.ctx
+                ),
+            )
+            .label("借用しか産まない `??`")
+            .help(format!("`move {shown} ?? ...` と書いてください"))
+            .related(vec![Diag::at(
+                owner.span,
+                format!("`{}` はここで束縛されています", owner.name),
+            )]),
+        );
+    }
+
+    /// `match` の payload / `for` の要素を束ねる。モードは構文全体から来る。
+    ///
+    /// 借用のモードでは、束縛は対象の**射影**への借用になる。射影は容器全体と
+    /// 保守的に重なる(`projections_overlap`)ので、対象そのものを触る式とは
+    /// これまでどおり衝突する。消費のモードでは、束縛がその値の所有者になり、
+    /// スコープを抜けるときに落ちる。
+    fn bind_content(
+        &mut self,
+        at: hir::ExprId,
+        local: hir::LocalId,
+        scope: ScopeId,
+        mode: Option<hir::RefKind>,
+        subject: hir::ExprId,
+        step: Projection,
+    ) {
+        let bound = match mode {
+            Some(kind) => Bound::Borrowed(kind),
+            None => Bound::Owned,
+        };
+        self.declare(local, scope, bound);
+        if mode.is_some() {
+            // 対象が運んでいた借用もそのまま引き継ぐ(参照越しの `match` など)
+            self.flow(local, subject);
+        }
+        let point = self.point(Some(at), scope, Effect::Init(local));
+        if let Some(kind) = mode
+            && let Some(mut place) = self.qualified_place(subject)
+        {
+            place.path.push(step);
+            let span = self.body.expr(subject).span;
+            let loan = self.loan_at(place, kind, point, span);
+            self.flows
+                .entry(local)
+                .or_default()
+                .insert(Carrier::Loan(loan));
         }
     }
 
@@ -780,22 +938,26 @@ impl<'a> Build<'a> {
         let borrowed = kind.map(|kind| (kind, place.clone()));
         let point = self.point(Some(expr), scope, Effect::Access(Access { place, mode }));
         self.plan.accesses.insert(expr, point);
-        let loan = borrowed.map(|(kind, place)| {
-            let id = LoanId(self.plan.loans.len() as u32);
-            self.plan.loans.push(Loan {
-                place,
-                kind,
-                point,
-                span: self.body.expr(expr).span,
-            });
-            self.plan.regions.push(BTreeSet::new());
-            self.loan_uses.push(BTreeSet::from([point]));
-            id
-        });
+        let span = self.body.expr(expr).span;
+        let loan = borrowed.map(|(kind, place)| self.loan_at(place, kind, point, span));
         if let Some(residue) = residue {
             self.residue.insert(point, vec![residue]);
         }
         loan
+    }
+
+    /// 借用を1つ作る。生誕点は既にある点で、生存区間は `regions` が決める
+    fn loan_at(&mut self, place: Place, kind: hir::RefKind, point: PointId, span: Span) -> LoanId {
+        let id = LoanId(self.plan.loans.len() as u32);
+        self.plan.loans.push(Loan {
+            place,
+            kind,
+            point,
+            span,
+        });
+        self.plan.regions.push(BTreeSet::new());
+        self.loan_uses.push(BTreeSet::from([point]));
+        id
     }
 
     // ---- 走査 ----
@@ -896,15 +1058,17 @@ impl<'a> Build<'a> {
             | hir::ExprKind::Access { .. }
             | hir::ExprKind::Poison => {}
 
-            // 場所として畳めなかった読み(一時値のフィールド、`.?`)
+            // 場所として畳めなかった読み(レシーバが一時値のフィールド)
             hir::ExprKind::Field { recv, .. } => self.value(*recv, scope, Need::Read),
 
-            // ponytail: 構築(struct リテラル・配列リテラル・enum 構築)は所有を
-            // 暗黙に受け取る。仕様が `move` を要求しているのは「所有の引数」と
-            // 「消費レシーバ」だけなので、構築位置は3つとも揃えて暗黙にしてある。
-            // 構築にも要求するなら phase 6(6.1/6.3/6.4)で一緒に変える。
-            // `with` の提供値は所有モードを持つようになったので、ここには居ない
-            // (tasks 5.4)
+            // 構築(struct リテラル・配列リテラル・enum 構築)は所有を暗黙に
+            // 受け取る。`move` を要求している仕様の文は「所有の**引数**」と
+            // 「消費レシーバ」だけ(ownership-and-borrowing「Transfer and copying
+            // remain visible」)で、構築は所有が値の中へ**入る**位置なので、
+            // 枝の末尾や戻り値と同じく境界がそれを言っている
+            // (struct-shape-checking「Structs are owned values」、
+            // data-bearing-enums「Payload ownership」、tasks 6.1 / 6.3 / 6.4)。
+            // `with` の提供値は所有モードを持つのでここには居ない(tasks 5.4)
             hir::ExprKind::StructLit { fields, .. } => {
                 for (_, value) in fields {
                     self.value(*value, scope, Need::Take);
@@ -944,17 +1108,31 @@ impl<'a> Build<'a> {
             hir::ExprKind::Neg(inner) | hir::ExprKind::Assert(inner) => {
                 self.value(*inner, scope, Need::Read)
             }
+
+            // `clone()` はレシーバを共有借用で読んで**新しい所有**を産む。
+            // 借用は結果へ引き継がない — そこが借用を運ぶ他の全ての式との
+            // 違いで、`carry_from` を呼ばないことがそのまま所有の独立性になる
+            // (design.md 決定4、tasks 6.5)
+            hir::ExprKind::Clone(inner) => self.value(*inner, scope, Need::Read),
             hir::ExprKind::Arith { lhs, rhs, .. } | hir::ExprKind::Eq { lhs, rhs } => {
                 self.value(*lhs, scope, Need::Read);
                 self.value(*rhs, scope, Need::Read);
             }
 
-            // 右辺は左辺が `nil` のときだけ走る。
-            // ponytail: `??` の所有モード(借用・複製・消費)は phase 6(6.2)
+            // 右辺は左辺が `nil` のときだけ走る。所有モードは左辺が決める
+            // (optional-core-type-checking「Coalescing follows its ownership
+            // mode」、tasks 6.2)。Copy は複製、束縛済みの非 Copy を素で開くと
+            // 借用、`move` と一時値は所有。結果が所有なら右辺の値も所有で要る
             hir::ExprKind::Coalesce { lhs, rhs } => {
                 self.value(*lhs, scope, Need::Read);
+                let owning = self.coalesce_owns(*lhs);
+                if !owning && matches!(need, Need::Take | Need::Argument(..)) {
+                    self.report_borrowed_coalesce(*lhs);
+                }
                 let branch = self.point(Some(id), scope, Effect::Nop);
-                self.value(*rhs, scope, need);
+                // 右辺は左辺が空のときだけ評価され、そのときだけ所有が動く。
+                // 辺が `branch` から合流点へ直行するので、その経路は計画にある
+                self.value(*rhs, scope, if owning { Need::Take } else { Need::Read });
                 self.carry_from(id, *lhs);
                 self.carry_from(id, *rhs);
                 let fallback = self.cur;
@@ -1036,7 +1214,9 @@ impl<'a> Build<'a> {
                 if let Some(test) = test {
                     let inner_scope = self.scope(Some(scope));
                     self.cur = Some(test);
+                    self.depth += 1;
                     self.value(*inner, inner_scope, Need::Read);
+                    self.depth -= 1;
                     if let Some(from) = self.cur {
                         self.edge(from, head, vec![inner_scope]);
                     }
@@ -1045,8 +1225,11 @@ impl<'a> Build<'a> {
                 self.cur = Some(after);
             }
 
-            // ponytail: 素の `for` は配列を借用し、要素も借用で束縛する
-            // (design.md 決定7)。`&mut`/`move` の反復は phase 6(6.4)
+            // 反復のモードは対象全体に1つ(design.md 決定7、tasks 6.4)。
+            // 素の `for` は配列を共有借用して要素も借用で束ね、`&mut` は排他、
+            // `move` は配列を消費して要素の所有を周回へ渡す。配列そのものの
+            // 借用は周回のあいだずっと生きているので、反復中の構造変更は
+            // そこで衝突する
             hir::ExprKind::For {
                 var,
                 iter,
@@ -1054,24 +1237,30 @@ impl<'a> Build<'a> {
             } => {
                 let mark = self.plan.loans.len();
                 self.value(*iter, scope, Need::Read);
+                let mode = self.whole_mode(*iter);
                 let head = self.point(Some(id), scope, Effect::Nop);
                 let after = self.alloc(Some(id), scope, Effect::Nop);
                 let inner_scope = self.scope(Some(scope));
-                self.declare(*var, inner_scope, Bound::Borrowed);
-                // ループ変数は要素の借用。対象の借用を持ち回るので、周回中は
-                // 対象を排他的に触れない
-                self.flow(*var, *iter);
                 self.cur = Some(head);
-                let opened = self.plan.points.len();
-                self.point(Some(id), inner_scope, Effect::Init(*var));
+                let (opened, held) = (self.plan.points.len(), self.plan.loans.len());
+                self.bind_content(
+                    id,
+                    *var,
+                    inner_scope,
+                    mode,
+                    *iter,
+                    Projection::ArrayElement(None),
+                );
+                self.depth += 1;
                 self.value(*inner, inner_scope, Need::Read);
+                self.depth -= 1;
                 if let Some(from) = self.cur {
                     self.edge(from, head, vec![inner_scope]);
                 }
                 self.edge(head, after, Vec::new());
                 // 対象は周回中ずっと借りられている。`head` だけを要求点にすると
                 // 背辺の張られない本体(全経路が抜ける)を取りこぼす
-                self.hold_through(mark, opened);
+                self.hold_through(mark, held, opened);
                 self.cur = Some(after);
             }
 
@@ -1089,11 +1278,12 @@ impl<'a> Build<'a> {
                         self.value(value, scope, Need::Read);
                     }
                 }
-                let opened = self.plan.points.len();
+                let (opened, held) = (self.plan.points.len(), self.plan.loans.len());
                 // 同じ `with` の提供は互いを見ない。全部評価してから積む
                 let depth = self.provided.len();
                 for provision in provisions {
-                    self.provided.push((provision.slot, provision.value));
+                    self.provided
+                        .push((provision.slot, provision.value, self.depth));
                 }
                 let inner_scope = self.scope(Some(scope));
                 self.value(*inner, inner_scope, need);
@@ -1105,20 +1295,24 @@ impl<'a> Build<'a> {
                     self.cur = Some(join);
                 }
                 // 提供の借用は提供本体の間ずっと生きている(tasks 5.4)
-                self.hold_through(mark, opened);
+                self.hold_through(mark, held, opened);
             }
 
             // arm は上から順に試される。pattern が外れても guard が偽でも次の
             // arm へ進むので、その連鎖をそのまま辺にする。畳んで「合流点へ抜ける」
             // にすると、guard が動かした所有が後続 arm に見えなくなる。
             //
-            // ponytail: 素の `match` は対象全体を借用し、payload も借用で
-            // 束縛する(design.md 決定7)。`&mut`/`move` は phase 6(6.3)
+            // モードは対象全体に1つ(design.md 決定7、tasks 6.3)。素の `match`
+            // は対象を共有借用して payload も借用で束ね、`&mut` は排他、`move`
+            // は enum ごと消費して選ばれた payload の所有を arm へ渡す。選ばれ
+            // なかった中身は消費した `match` そのものが手放すので、根が部分的に
+            // move された状態は現れない
             hir::ExprKind::Match { subject, arms } => {
                 let mark = self.plan.loans.len();
                 self.value(*subject, scope, Need::Read);
+                let mode = self.whole_mode(*subject);
                 let branch = self.point(Some(id), scope, Effect::Nop);
-                let opened = self.plan.points.len();
+                let (opened, held) = (self.plan.points.len(), self.plan.loans.len());
                 // 「ここまでの arm がどれも取らなかった」点
                 let mut fallthrough = branch;
                 let mut ends: Vec<(PointId, Vec<ScopeId>)> = Vec::new();
@@ -1128,13 +1322,17 @@ impl<'a> Build<'a> {
                     // pattern が合わなければ、この arm には入らずに次を試す
                     self.edge(fallthrough, next, Vec::new());
                     self.cur = Some(fallthrough);
-                    if let hir::Pattern::Variant { bindings, .. } = &arm.pattern {
-                        for bound in bindings.iter().flatten() {
-                            self.declare(*bound, arm_scope, Bound::Borrowed);
-                            // payload 束縛は対象の借用。arm の間、対象は
-                            // 借りられたまま(design.md 決定7)
-                            self.flow(*bound, *subject);
-                            self.point(Some(id), arm_scope, Effect::Init(*bound));
+                    if let hir::Pattern::Variant { variant, bindings } = &arm.pattern {
+                        for (index, bound) in bindings.iter().enumerate() {
+                            let Some(bound) = bound else { continue };
+                            self.bind_content(
+                                id,
+                                *bound,
+                                arm_scope,
+                                mode,
+                                *subject,
+                                Projection::EnumPayload(*variant, index),
+                            );
                         }
                     }
                     if let Some(guard) = arm.guard {
@@ -1161,7 +1359,7 @@ impl<'a> Build<'a> {
                 if ends.is_empty() {
                     // どの arm も抜ける。合流点は生まれないが、対象は arm の
                     // 間ずっと借りられている
-                    self.hold_through(mark, opened);
+                    self.hold_through(mark, held, opened);
                     self.cur = None;
                     return;
                 }
@@ -1170,7 +1368,7 @@ impl<'a> Build<'a> {
                     self.edge(from, join, exits);
                 }
                 // 対象は match の間ずっと借りられている(design.md 決定7)
-                self.hold_through(mark, opened);
+                self.hold_through(mark, held, opened);
                 self.cur = Some(join);
             }
 
@@ -1230,7 +1428,7 @@ impl<'a> Build<'a> {
                             // レシーバは提供が持つ実体。この本体の `with` が
                             // 置いたものなら、その提供値がそのまま借用元になる
                             // (tasks 5.4)
-                            recv: self.provision(*slot).flatten(),
+                            recv: self.provision(*slot).and_then(|(value, _)| value),
                             args: args.clone(),
                         })
                     }
@@ -1265,12 +1463,12 @@ impl<'a> Build<'a> {
 
     /// このスロットへいま効いている提供。内側の `with` が外側を隠す。
     /// 外側の `Option` は「この本体が提供しているか」、内側は「実体を運ぶか」
-    fn provision(&self, slot: hir::SlotId) -> Option<Option<hir::ExprId>> {
+    fn provision(&self, slot: hir::SlotId) -> Option<(Option<hir::ExprId>, u32)> {
         self.provided
             .iter()
             .rev()
-            .find(|(s, _)| *s == slot)
-            .map(|(_, value)| *value)
+            .find(|(s, _, _)| *s == slot)
+            .map(|(_, value, depth)| (*value, *depth))
     }
 
     /// 実体を運ぶ提供の運び方。
@@ -1320,19 +1518,63 @@ impl<'a> Build<'a> {
     /// 提供がこの本体に無ければ、強さを決めたのは呼び出し元の `with` なので
     /// そちらで見る。型だけの提供に値レシーバを呼ぶ食い違いは要求解析が報告する。
     ///
-    /// ponytail: 所有を握る提供を消費レシーバ(`self`)で消費した**後の使用**を
-    /// 一切検出しない。二度目の消費も、消費後の `&self` / `&mut self` も通る。
-    /// 提供された実体に局所束縛が無く、move 済みを覚える場所が無いため。これは
-    /// 現状(何も見ていない)より受理を狭めることはないが、狭め切ってもいない。
-    /// 提供の実体に場所を与えるのは提供の破棄計画と同じ phase 6(6.6)
+    /// 消費レシーバ(`self`)は提供の実体を手放すので、その後の使用も見る
+    /// (tasks 6.6)。提供された実体には局所束縛が無いので、move 済みは
+    /// `consumed` が覚える。
+    ///
+    /// ponytail: `consumed` は経路を区別しない。枝ごとに1度ずつ消費する形も
+    /// 2件目として断る。消費が**1本の経路で二度**起きないことだけを保証すれば
+    /// よいので、経路を畳んで見る側は必ず拒否が増えるだけになる。周回は経路の
+    /// 畳み込みで消えてしまうため、深さで別に見る
     fn check_provider(&mut self, at: hir::ExprId, slot: hir::SlotId, method: hir::TraitMethodId) {
-        let Some(Some(value)) = self.provision(slot) else {
+        let Some((Some(value), provided_at)) = self.provision(slot) else {
             return;
         };
         let Some(receiver) = self.program.trait_methods[method].receiver else {
             return;
         };
+        if let Some((_, _, consumer)) = self
+            .consumed
+            .iter()
+            .find(|(s, v, _)| *s == slot && *v == value)
+        {
+            let name = &self.program.slots[slot].name;
+            let consumer = self.body.expr(*consumer).span;
+            self.diagnostics.push(
+                Diag::at(
+                    self.body.expr(at).span,
+                    format!(
+                        "{}: `{name}` へ提供された実体は既に消費されているので使えません",
+                        self.ctx
+                    ),
+                )
+                .label("消費済みの提供の使用")
+                .related(vec![Diag::at(consumer, "ここで消費されました")]),
+            );
+            return;
+        }
         let mode = self.provider_mode(value);
+        if receiver == ReceiverMode::Owned && mode.owns() {
+            if self.depth > provided_at {
+                let name = &self.program.slots[slot].name;
+                self.diagnostics.push(
+                    Diag::at(
+                        self.body.expr(at).span,
+                        format!(
+                            "{}: `{name}` へ提供された実体を周回のたびに消費しています",
+                            self.ctx
+                        ),
+                    )
+                    .label("周回の中の消費レシーバ")
+                    .help("`with` をループの中へ入れて、周回ごとに提供し直してください")
+                    .related(vec![Diag::at(
+                        self.body.expr(value).span,
+                        format!("`{name}` はループの外で提供されています"),
+                    )]),
+                );
+            }
+            self.consumed.push((slot, value, at));
+        }
         let (enough, want, fix) = match receiver {
             // 所有からも排他からも共有は取れる
             ReceiverMode::Shared => (true, "&self", "&"),
@@ -1711,10 +1953,12 @@ impl Build<'_> {
         input
     }
 
-    /// 可変に触れる場所か。`let mut` の束縛か、既に `&mut` である参照だけ
+    /// 可変に触れる場所か。`let mut` の束縛、既に `&mut` である参照、そして
+    /// `&mut` で反復・match した中身の束縛(design.md 決定7)
     fn mutable_root(&self, root: hir::LocalId) -> bool {
         let local = self.body.local(root);
         local.mutable
+            || self.bindings.get(&root) == Some(&Bound::Borrowed(hir::RefKind::Mutable))
             || local
                 .ty
                 .as_ref()
@@ -1954,9 +2198,10 @@ impl Build<'_> {
             };
             found.push(diagnostic);
         }
-        // 素の `for`/`match` は対象を借用するので、要素や payload の所有は
-        // 取り出せない。部分 move は受け付けない(design.md 決定7)
-        if access.mode == Mode::Move && self.bindings.get(&root) == Some(&Bound::Borrowed) {
+        // 借用で反復・match した対象からは、要素や payload の所有を取り出せない。
+        // 部分 move は受け付けない(design.md 決定7)
+        if access.mode == Mode::Move && matches!(self.bindings.get(&root), Some(Bound::Borrowed(_)))
+        {
             let local = self.body.local(root);
             found.push(
                 Diag::from_span(
@@ -1964,10 +2209,27 @@ impl Build<'_> {
                     format!("{ctx}: `{shown}` は借用で束ねた名前なので move できません"),
                 )
                 .label("借用された束縛の move")
-                .help("素の `for` と `match` は対象を借用します。要素や payload だけを取り出すことはできません")
+                .help("要素や payload の所有が要るなら、対象そのものに `move` を付けて反復・match してください")
                 .related(vec![Diag::at(
                     local.span,
                     format!("`{}` はここで束ねられています", local.name),
+                )]),
+            );
+        }
+        // optional の中身は「あるかもしれない」場所なので、そこから所有を
+        // 持ち出す形は無い(optional-field-access)。所有が要るなら先に `??`
+        if access.mode == Mode::Move && access.place.path.contains(&Projection::OptionalPayload) {
+            let local = self.body.local(root);
+            found.push(
+                Diag::from_span(
+                    span,
+                    format!("{ctx}: `{shown}` は optional の中身への射影なので move できません"),
+                )
+                .label("optional 射影からの move")
+                .help("`??` で中身を取り出してから所有を動かしてください")
+                .related(vec![Diag::at(
+                    local.span,
+                    format!("`{}` はここで束縛されています", local.name),
                 )]),
             );
         }
@@ -1998,6 +2260,14 @@ impl Build<'_> {
                     Some(Bound::Param) => {
                         base.help(format!("`{}` を `&mut` で受け取ってください", local.name))
                     }
+                    // 共有で束ねた要素・payload は、対象の側のモードで決まる
+                    Some(Bound::Borrowed(hir::RefKind::Shared)) => {
+                        base.help("対象に `&mut` を付けて反復・match してください")
+                    }
+                    // ponytail: 消費で束ねた名前(`for u in move xs`)は不変。
+                    // 所有はあるので変えてよい値だが、`mut` を書ける構文が無い。
+                    // 拒否が増えるだけなので、要ると分かったら `for mut u in ...`
+                    // を足す
                     _ => base,
                 }
             };
@@ -2071,9 +2341,11 @@ impl Build<'_> {
                         .locals
                         .iter()
                         .rev()
-                        // ponytail: 経路によっては move 済み(`owned` は真だが
-                        // `moved` も付いている)でも計画には残す。実行時の
-                        // drop フラグは phase 7 が持つ
+                        // 経路によっては move 済み(`owned` は真だが `moved` も
+                        // 付いている)場所も計画には残す(design.md 決定8)。
+                        // 計画だけでは取った経路で move 済みの値を落とすので、
+                        // 場所ごとの実行時 drop フラグが要る — それは評価器の
+                        // 持ち物(phase 7、tasks 7.4)
                         .filter(|local| self.plan.owners.contains(local) && owns(&after, **local))
                         .map(|local| Drop::Local(*local)),
                 );
@@ -2296,20 +2568,33 @@ fn show_effect(program: &hir::Program, body: &hir::Body, effect: &Effect) -> Str
 /// 射影の列の綴り。診断も dump もここだけを共有する
 fn show_path(program: &hir::Program, path: &[Projection]) -> String {
     let mut out = String::new();
+    // optional の射影は**次の1段に掛かる印**。ソースの `u.?name` と同じ綴りに
+    // なるよう、単独では出さずに次の射影へ畳む
+    let mut optional = false;
     for step in path {
+        let marker = if std::mem::take(&mut optional) {
+            "?"
+        } else {
+            ""
+        };
         match step {
             Projection::Field(field) => {
-                let _ = write!(out, ".{}", program.fields[*field].name);
+                let _ = write!(out, ".{marker}{}", program.fields[*field].name);
             }
-            Projection::OptionalPayload => out.push_str(".?"),
+            Projection::OptionalPayload => optional = true,
             Projection::EnumPayload(_, n) => {
-                let _ = write!(out, ".{n}");
+                let _ = write!(out, ".{marker}{n}");
             }
             Projection::ArrayElement(Some(n)) => {
-                let _ = write!(out, "[{n}]");
+                let _ = write!(out, "{marker}[{n}]");
             }
-            Projection::ArrayElement(None) => out.push_str("[_]"),
+            Projection::ArrayElement(None) => {
+                let _ = write!(out, "{marker}[_]");
+            }
         }
+    }
+    if optional {
+        out.push_str(".?");
     }
     out
 }
@@ -4722,6 +5007,800 @@ fn main(-> int) {{
         assert_eq!(first, dump(&fingerprint_source()));
         assert!(first.contains("provenance & [param#0 param#1]"), "{first}");
         assert!(first.contains("loan#"), "{first}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 6.1 所有 struct の構築とフィールドの射影
+    // -----------------------------------------------------------------------
+
+    /// 所有のデータ4形(struct・optional・payload enum・配列)の道具立て
+    const DATA: &str = "struct User { id: int, name: str }
+enum Lookup { Found(User) Missing }
+fn peek(u: &User -> int) { u.id }
+fn edit(u: &mut User -> int) { u.id = u.id + 1
+  u.id }
+fn take(u: User -> int) { u.id }
+fn make(-> User) { User { id = 1, name = \"a\" } }
+";
+
+    /// `main` に包む。末尾は常に `0`
+    fn with_data(body: &str) -> String {
+        format!("{DATA}fn main(-> int) {{\n{body}\n  0\n}}\n")
+    }
+
+    /// 本体1つ分の計画から、効果の行だけを取り出す
+    fn effects(dumped: &str, body: &str) -> Vec<String> {
+        dumped
+            .split(&format!("body {body}\n"))
+            .nth(1)
+            .expect("その本体の計画がある")
+            .lines()
+            .take_while(|line| line.starts_with("  "))
+            .filter(|line| line.trim_start().starts_with("point#"))
+            .filter_map(|line| line.split_once(" scope#"))
+            .map(|(_, rest)| rest.split_once(' ').expect("効果がある").1.to_string())
+            .collect()
+    }
+
+    /// struct リテラルは所有を作り、その所有はスコープの終わりで落ちる
+    #[test]
+    fn 構築したstructは所有される() {
+        let checked = accepted(&with_data("  let u = make()\n  assert peek(u) == 1"));
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert!(main.contains("scope#0 [local#0*"), "{dumped}");
+        assert!(main.contains("drops [local#0]"), "{dumped}");
+    }
+
+    /// フィールドの射影は要求されたものでモードが決まる。Copy は複製、素の
+    /// 読みは共有借用、`&mut` は排他、`move` は根ごと消費
+    /// (struct-shape-checking「Field access follows value mode」)
+    #[test]
+    fn フィールドの射影はモードごとに分かれる() {
+        let src = with_data(
+            "  let mut u = make()\n  \
+             let a = u.id\n  \
+             let b = &u.name\n  \
+             let c = &mut u.name\n  \
+             let d = move u.name\n  \
+             assert a == 1",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let modes: Vec<String> = effects(&dumped, "main")
+            .into_iter()
+            .filter(|effect| effect.contains("local#0(u)"))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                "read local#0(u).id",
+                "& local#0(u).name",
+                "&mut local#0(u).name",
+                "move local#0(u).name",
+            ],
+            "{dumped}"
+        );
+        // 消費した射影の残りはその場で落ちる。根は二度落ちない
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert!(main.contains("drops [rest(local#0 - .name)]"), "{dumped}");
+        assert!(
+            !main.contains("drops [local#0]"),
+            "消費した根は落とさない: {dumped}"
+        );
+    }
+
+    /// フィールドの差し替えは排他アクセスで、右辺の非 Copy な所有は move する
+    /// (struct-shape-checking「Field assignment preserves ownership」)
+    #[test]
+    fn フィールドの差し替えは右辺を消費する() {
+        let src = with_data(
+            "  let mut u = make()\n  let v = make()\n  u.name = v.name\n  assert peek(u) == 1",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let modes: Vec<String> = effects(&dumped, "main")
+            .into_iter()
+            .filter(|effect| effect.contains(".name"))
+            .collect();
+        assert_eq!(
+            modes,
+            vec!["&mut local#0(u).name", "move local#1(v).name"],
+            "{dumped}"
+        );
+    }
+
+    /// `indirect` な所有エッジも計画では普通の所有。落ちるのは根1つで、
+    /// 中身を辿るのは破棄そのものの仕事(indirect-recursive-values)
+    #[test]
+    fn indirectなフィールドを持つ値も所有として落ちる() {
+        let src = "struct Node { id: int, indirect next: Node? }
+fn main(-> int) {
+  let leaf = Node { id = 2, next = nil }
+  let root = Node { id = 1, next = leaf }
+  root.id
+}
+";
+        let checked = accepted(src);
+        let dumped = checked.plan.dump(&checked.hir);
+        // `leaf` は `root` の中へ move したので、落ちるのは `root` だけ
+        assert!(dumped.contains("drops [local#1]"), "{dumped}");
+        assert!(
+            !dumped.contains("drops [local#1 local#0]"),
+            "move した値は落とさない: {dumped}"
+        );
+    }
+
+    /// 構築の評価順はソース順。点の並びがそのまま評価順なので、要素と
+    /// フィールドの所有はソースに書いた順に動く
+    #[test]
+    fn 構築の評価順はソース順() {
+        for build in [
+            "[a, b]",
+            "User { id = take(move a), name = name_of(move b) }",
+        ] {
+            let src = format!(
+                "{DATA}fn name_of(u: User -> str) {{ u.name }}
+fn main(-> int) {{
+  let a = make()
+  let b = make()
+  let v = {build}
+  0
+}}
+"
+            );
+            let checked = accepted(&src);
+            let dumped = checked.plan.dump(&checked.hir);
+            let moves: Vec<String> = effects(&dumped, "main")
+                .into_iter()
+                .filter(|effect| effect.starts_with("move "))
+                .collect();
+            assert_eq!(
+                moves,
+                vec!["move local#0(a)", "move local#1(b)"],
+                "{build}: {dumped}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 6.2 optional の注入・射影・`??`
+    // -----------------------------------------------------------------------
+
+    /// `.?` は optional の中身への射影。場所として畳めるので、借用は
+    /// フィールドまで指す(optional-field-access)
+    #[test]
+    fn optional射影は場所になる() {
+        let src = with_data("  let u: User? = make()\n  assert u.?name == nil");
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(dumped.contains("& local#0(u).?name @"), "{dumped}");
+    }
+
+    /// optional 射影は所有者を消費しない。読んだ後も所有者はそのまま残り、
+    /// 差し替えも通る(借用は最後の使用で終わるため、optional-field-access)
+    #[test]
+    fn optional射影は所有者を消費しない() {
+        accepted(&with_data(
+            "  let mut u: User? = make()\n  \
+             let seen = u.?name == nil\n  \
+             u = make()\n  \
+             assert seen == false",
+        ));
+    }
+
+    /// optional の中身から所有は持ち出せない。所有が要るなら先に `??`
+    #[test]
+    fn optional射影からはmoveできない() {
+        let src = with_data("  let u: User? = make()\n  let s = u.?name\n  assert s == nil");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u.?name` は optional の中身への射影なので move できません"
+        );
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("`??` で中身を取り出してから所有を動かしてください")
+        );
+    }
+
+    /// Copy な `??` は複製。左辺の束縛はそのまま残る
+    #[test]
+    fn copyのcoalesceは複製する() {
+        accepted(&with_data(
+            "  let n: int? = 1\n  let a = n ?? 0\n  let b = n ?? 0\n  assert a == b",
+        ));
+    }
+
+    /// 束縛済みの非 Copy を素の `??` で開いても、取れるのは借用だけ
+    #[test]
+    fn 素のcoalesceは所有を産まない() {
+        let src =
+            with_data("  let u: User? = make()\n  let v = u ?? make()\n  assert peek(v) == 1");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: 束縛済みの `u` を素の `??` で開いても取れるのは借用で、所有は動きません"
+        );
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("`move u ?? ...` と書いてください")
+        );
+    }
+
+    /// `move` を書けば所有が動く。動かした後の左辺はもう使えない
+    #[test]
+    fn 消費するcoalesceは所有を産む() {
+        accepted(&with_data(
+            "  let u: User? = make()\n  let v = move u ?? make()\n  assert take(move v) == 1",
+        ));
+        let src = with_data(
+            "  let u: User? = make()\n  \
+             let v = move u ?? make()\n  \
+             let w = move u ?? make()\n  \
+             assert take(move v) + take(move w) == 2",
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u` は既に move されているので使えません"
+        );
+    }
+
+    /// 一時値の左辺は既に所有者なので `move` は要らない
+    #[test]
+    fn 一時値のcoalesceは修飾を要らない() {
+        accepted(&format!(
+            "{DATA}fn find(-> User?) {{ make() }}
+fn main(-> int) {{ take(find() ?? make()) }}
+"
+        ));
+    }
+
+    /// 右辺は左辺が空のときだけ走る。だから右辺の move は「経路によっては」
+    /// にしかならない(optional-core-type-checking「Fallback remains
+    /// short-circuited」)
+    #[test]
+    fn coalesceの右辺は経路が分かれる() {
+        let src = with_data(
+            "  let o: User? = make()\n  \
+             let fallback = make()\n  \
+             let v = move o ?? fallback\n  \
+             assert take(move fallback) + take(move v) == 2",
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `fallback` は move される経路があるのでここでは使えません"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 6.3 payload enum の構築と match の3モード
+    // -----------------------------------------------------------------------
+
+    /// 構築は payload の所有を受け取る。渡した束縛はもう使えない
+    #[test]
+    fn payloadの構築は所有を受け取る() {
+        let src =
+            with_data("  let u = make()\n  let l = Lookup::Found(u)\n  assert take(move u) == 1");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u` は既に move されているので使えません"
+        );
+    }
+
+    /// 素の `match` は対象を共有借用し、payload も対象の射影への借用で束ねる。
+    /// 抜けた後も対象はそのまま使える
+    #[test]
+    fn 素のmatchは対象を借用する() {
+        let src = with_data(
+            "  let l = Lookup::Found(make())\n  \
+             let n = match l {\n    \
+             Lookup::Found(u): peek(u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n == 1",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(dumped.contains("& local#0(l).0 @"), "{dumped}");
+        assert!(dumped.contains("drops [local#0]"), "{dumped}");
+    }
+
+    /// 一時値にも素の `match` は共有モードを選ぶ。既に所有されていることは
+    /// payload を暗黙に arm へ move する根拠にならない。
+    #[test]
+    fn 一時値への素のmatchはpayloadを借用する() {
+        let src = with_data(
+            "  let n = match Lookup::Found(make()) {\n    \
+             Lookup::Found(u): take(move u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n == 1",
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u` は借用で束ねた名前なので move できません"
+        );
+    }
+
+    /// `&mut` の `match` は payload を排他で束ねるので、中身を変えられる
+    #[test]
+    fn 排他のmatchはpayloadを変更できる() {
+        let src = with_data(
+            "  let mut l = Lookup::Found(make())\n  \
+             let n = match &mut l {\n    \
+             Lookup::Found(u): edit(&mut u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n == 2",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(dumped.contains("&mut local#0(l).0 @"), "{dumped}");
+        // payload の束縛は借用なので所有者ではない
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert!(main.contains("scope#1 < scope#0 [local#1]"), "{dumped}");
+    }
+
+    /// 素の `match` の payload は借用なので、そこから所有は取り出せない
+    #[test]
+    fn 借用のmatchのpayloadからはmoveできない() {
+        let src = with_data(
+            "  let l = Lookup::Found(make())\n  \
+             let n = match l {\n    \
+             Lookup::Found(u): take(move u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n == 1",
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u` は借用で束ねた名前なので move できません"
+        );
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some(
+                "要素や payload の所有が要るなら、対象そのものに `move` を付けて反復・match してください"
+            )
+        );
+        assert_eq!(
+            related(&src, &diagnostic),
+            vec![(
+                "`u` はここで束ねられています".to_string(),
+                "Lookup::Found(u): take(move u)"
+            )]
+        );
+    }
+
+    /// `move` の `match` は enum ごと消費し、選ばれた payload の所有を arm へ
+    /// 渡す。対象はもう使えない
+    #[test]
+    fn 消費するmatchはpayloadを所有する() {
+        accepted(&with_data(
+            "  let l = Lookup::Found(make())\n  \
+             let n = match move l {\n    \
+             Lookup::Found(u): take(move u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n == 1",
+        ));
+        let src = with_data(
+            "  let l = Lookup::Found(make())\n  \
+             let n = match move l {\n    \
+             Lookup::Found(u): take(move u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             let m = match move l {\n    \
+             Lookup::Found(u): take(move u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n + m == 1",
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `l` は既に move されているので使えません"
+        );
+    }
+
+    /// arm が payload を持ち出さなければ、その中身は arm を抜けるときに落ちる。
+    /// 対象は既に丸ごと消費されているので、根が部分的に move された状態は
+    /// 現れない(design.md 決定7)
+    #[test]
+    fn 消費するmatchは持ち出さなかった中身を落とす() {
+        let src = with_data(
+            "  let l = Lookup::Found(make())\n  \
+             let n = match move l {\n    \
+             Lookup::Found(u): peek(u)\n    \
+             Lookup::Missing: 0\n  \
+             }\n  \
+             assert n == 1",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        // payload の束縛は arm スコープの所有者で、arm を抜ける辺で落ちる
+        assert!(main.contains("scope#1 < scope#0 [local#1*]"), "{dumped}");
+        assert_eq!(
+            main.lines()
+                .filter(|line| line.contains("drops [local#1]"))
+                .count(),
+            1,
+            "落ちるのはちょうど1回: {dumped}"
+        );
+        // 対象そのものは消費済みなので落ちない
+        assert!(!main.contains("drops [local#0]"), "{dumped}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 6.4 配列の構築と `for` の3モード
+    // -----------------------------------------------------------------------
+
+    /// 素の `for` は配列を共有借用する。抜けた後も配列は使える
+    #[test]
+    fn 素のforは配列を借用する() {
+        let src = with_data(
+            "  let xs = [make()]\n  \
+             let mut t = 0\n  \
+             for u in xs { t = t + peek(u) }\n  \
+             assert t == 1",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(dumped.contains("& local#0(xs)[_] @"), "{dumped}");
+        assert!(dumped.contains("drops [local#0]"), "{dumped}");
+    }
+
+    /// 一時配列も素の `for` では共有モードになる。要素の所有を取るには、
+    /// 既存の `for u in move xs` のように束縛済みの対象を明示して消費する。
+    #[test]
+    fn 一時値への素のforは要素を借用する() {
+        let src = with_data("  for u in [make()] { assert take(move u) == 1 }");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u` は借用で束ねた名前なので move できません"
+        );
+    }
+
+    /// `&mut` の `for` は要素を排他で束ねるので、要素を変えられる
+    #[test]
+    fn 排他のforは要素を変更できる() {
+        let src = with_data(
+            "  let mut xs = [make()]\n  \
+             let mut t = 0\n  \
+             for u in &mut xs { t = t + edit(&mut u) }\n  \
+             assert t == 2",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(dumped.contains("&mut local#0(xs)[_] @"), "{dumped}");
+    }
+
+    /// `move` の `for` は配列を消費し、要素の所有を周回へ渡す。周回を抜ける
+    /// 辺で落ちるので、持ち出さなかった要素も1度だけ落ちる
+    #[test]
+    fn 消費するforは要素を所有する() {
+        let src = with_data(
+            "  let xs = [make()]\n  \
+             let mut t = 0\n  \
+             for u in move xs { t = t + take(move u) }\n  \
+             assert t == 1",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert!(main.contains("move local#0(xs)"), "{dumped}");
+        // 要素を持ち出したので周回の背辺では落ちない
+        assert!(!main.contains("drops [local#2]"), "{dumped}");
+
+        let kept = with_data(
+            "  let xs = [make()]\n  \
+             let mut t = 0\n  \
+             for u in move xs { t = t + peek(u) }\n  \
+             assert t == 1",
+        );
+        let checked = accepted(&kept);
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert_eq!(
+            main.lines()
+                .filter(|line| line.contains("drops [local#2]"))
+                .count(),
+            1,
+            "持ち出さなかった要素は周回ごとに1度落ちる: {dumped}"
+        );
+    }
+
+    /// 消費した配列はもう使えない
+    #[test]
+    fn 消費した配列は後で使えない() {
+        let src = with_data(
+            "  let xs = [make()]\n  \
+             for u in move xs { assert peek(u) == 1 }\n  \
+             for u in xs { assert peek(u) == 1 }",
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `xs` は既に move されているので使えません"
+        );
+    }
+
+    /// 反復のあいだ配列は借りられたままなので、構造を変える操作は衝突する
+    #[test]
+    fn 反復中の構造変更を拒否する() {
+        let src = with_data(
+            "  let mut xs = [make()]\n  \
+             for u in xs { xs = [make()] }",
+        );
+        let messages: Vec<String> = rejected(&src).into_iter().map(|d| d.msg).collect();
+        assert!(
+            messages.contains(&"main: `xs` は共有借用されている間は排他的に触れません".to_string()),
+            "{messages:?}"
+        );
+    }
+
+    /// 借用で束ねた要素からは所有を取り出せない
+    #[test]
+    fn 借用のforのループ変数からはmoveできない() {
+        let src = with_data("  let xs = [make()]\n  for u in xs { assert take(move u) == 1 }");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u` は借用で束ねた名前なので move できません"
+        );
+    }
+
+    /// 借用で束ねた要素・payload は変更できない。直し方は対象の側のモード
+    #[test]
+    fn 借用で束ねた中身は変更できない() {
+        let src = with_data("  let xs = [make()]\n  for u in xs { u.id = 2 }");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u.id` は可変な束縛ではないので変更できません"
+        );
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("対象に `&mut` を付けて反復・match してください")
+        );
+        // 消費で束ねた名前も同じく不変。`mut` を書ける構文が無い
+        let src = with_data("  let xs = [make()]\n  for u in move xs { u.id = 2 }");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u.id` は可変な束縛ではないので変更できません"
+        );
+        assert_eq!(diagnostic.help, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6.5 構造的な等値と明示の深い複製
+    // -----------------------------------------------------------------------
+
+    /// `==` は両辺を共有借用で読む。比べた後もどちらも所有されたまま
+    #[test]
+    fn 等値は両辺を借用する() {
+        let src = with_data(
+            "  let a = make()\n  let b = make()\n  \
+             let same = a == b\n  \
+             assert take(move a) + take(move b) == 2\n  assert same",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let modes: Vec<String> = effects(&dumped, "main")
+            .into_iter()
+            .filter(|effect| effect.starts_with("& local"))
+            .collect();
+        assert_eq!(modes, vec!["& local#0(a)", "& local#1(b)"], "{dumped}");
+    }
+
+    /// `clone()` は所有を産む。元の束縛は共有借用されるだけで残る
+    #[test]
+    fn cloneは所有を産んで元を残す() {
+        let src = with_data(
+            "  let mut u = make()\n  \
+             let c = u.clone()\n  \
+             u.id = 2\n  \
+             assert take(move c) + take(move u) == 3",
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        // レシーバは共有借用。複製の結果は元の借用を運ばないので、直後の
+        // 排他アクセスが通る
+        assert!(main.contains("& local#0(u)\n"), "{dumped}");
+        assert!(main.contains("&mut local#0(u).id"), "{dumped}");
+    }
+
+    /// 共有借用からの `clone()` は借用先を所有の値へ複製する
+    #[test]
+    fn 共有借用からのcloneは所有になる() {
+        accepted(&format!(
+            "{DATA}fn copy_of(u: &User -> User) {{ u.clone() }}
+fn main(-> int) {{ let u = make()\n take(copy_of(u)) + take(move u) }}
+"
+        ));
+    }
+
+    /// 型が `clone` を自分で宣言していればそちらが勝つ
+    #[test]
+    fn 宣言されたcloneが組み込みより優先する() {
+        accepted(&format!(
+            "{DATA}impl User {{ fn clone(&self -> int) {{ self.id }} }}
+fn main(-> int) {{ let u = make()\n u.clone() }}
+"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // 6.6 破棄計画
+    // -----------------------------------------------------------------------
+
+    /// 提供本体の中の束縛も、提供を抜ける辺で落ちる
+    #[test]
+    fn 提供本体を抜ける辺で束縛が落ちる() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let s = make()
+  with store(s) {{ let inner = make()\n peek(&inner) }}
+}}
+"
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert!(
+            main.lines()
+                .any(|line| line.contains("exits [scope#1] drops [local#1]")),
+            "{dumped}"
+        );
+    }
+
+    /// 提供された実体を消費レシーバで手放したら、その後は使えない
+    #[test]
+    fn 消費した提供の再使用を拒否する() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  with store(make()) {{ store.finish() + store.look() }}
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `store` へ提供された実体は既に消費されているので使えません"
+        );
+        assert_eq!(
+            related(&src, &diagnostic),
+            vec![("ここで消費されました".to_string(), "store.finish()")]
+        );
+    }
+
+    /// 周回のたびに提供を消費する形も断る。経路を畳んだ `consumed` では
+    /// 見えないので、提供を積んだときの周回の深さと突き合わせる
+    #[test]
+    fn 周回のたびに提供を消費する形を拒否する() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let mut n = 0
+  with store(make()) {{ while true {{ n = n + store.finish() }} }}
+  n
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `store` へ提供された実体を周回のたびに消費しています"
+        );
+    }
+
+    /// 破棄経路の全文。素通し・枝・周回の背辺と脱出・`return`・提供の脱出・
+    /// 消費した射影の残りを1本に詰めて、どこで何がちょうど1度落ちるかを固定する
+    #[test]
+    fn 破棄経路の全文を固定する() {
+        let src = "struct User { id: int, name: str }
+fn make(-> User) { User { id = 1, name = \"a\" } }
+fn drops(flag: bool -> int) {
+  let a = make()
+  if flag { let b = make()
+    return b.id }
+  let c = move a.name
+  0
+}
+";
+        assert_eq!(
+            dump(src).split("body drops\n").nth(1).expect("計画がある"),
+            "  scope#0 [local#0 local#1* local#3*]
+  scope#1 < scope#0 [local#2*]
+  point#0 - scope#0 nop
+  point#1 - scope#0 nop
+  point#2 - scope#0 init local#0
+  point#3 expr#0 scope#0 nop
+  point#4 expr#1 scope#0 init local#1
+  point#5 expr#2 scope#0 read local#0(flag)
+  point#6 expr#9 scope#0 nop
+  point#7 expr#3 scope#1 nop
+  point#8 expr#4 scope#1 init local#2
+  point#9 expr#6 scope#1 read local#2(b).id
+  point#10 expr#9 scope#0 nop
+  point#11 expr#12 scope#0 move local#1(a).name
+  point#12 expr#13 scope#0 init local#3
+  edge #0 -> #2
+  edge #2 -> #3
+  edge #3 -> #4
+  edge #4 -> #5
+  edge #5 -> #6
+  edge #6 -> #7
+  edge #7 -> #8
+  edge #8 -> #9
+  edge #9 -> #1 exits [scope#1 scope#0] drops [local#2 local#1]
+  edge #6 -> #10
+  edge #10 -> #11
+  edge #11 -> #12 drops [rest(local#1 - .name)]
+  edge #12 -> #1 exits [scope#0] drops [local#3]
+  entry #0 exit #1
+"
+        );
+    }
+
+    /// 6.1〜6.5 の形を1本に詰めた受理側。データの4形・3つの所有モード・
+    /// 複製・等値・消費の取り出しが同じプログラムの中で噛み合うこと
+    #[test]
+    fn 所有データの形は一本にまとめても通る() {
+        accepted(&format!(
+            "{DATA}fn consuming_match(-> int) {{
+  let l = Lookup::Found(make())
+  match move l {{ Lookup::Found(u): take(move u)
+    Lookup::Missing: 0 }}
+}}
+fn mutable_match(-> int) {{
+  let mut l = Lookup::Found(make())
+  match &mut l {{ Lookup::Found(u): edit(&mut u)
+    Lookup::Missing: 0 }}
+}}
+fn consuming_for(-> int) {{
+  let xs = [make(), make()]
+  let mut t = 0
+  for u in move xs {{ t = t + take(move u) }}
+  t
+}}
+fn mutable_for(-> int) {{
+  let mut xs = [make()]
+  let mut t = 0
+  for u in &mut xs {{ t = t + edit(&mut u) }}
+  t
+}}
+fn consuming_coalesce(-> int) {{
+  let o: User? = make()
+  take(move o ?? make())
+}}
+fn cloning(-> int) {{
+  let u = make()
+  let c = u.clone()
+  peek(u) + take(move c) + take(move u)
+}}
+fn equality(-> bool) {{
+  let a = make()
+  let b = make()
+  let same = a == b
+  assert take(move a) + take(move b) == 2
+  same
+}}
+fn main(-> int) {{
+  consuming_match() + mutable_match() + consuming_for() + mutable_for()
+    + consuming_coalesce() + cloning() + rank(equality())
+}}
+fn rank(b: bool -> int) {{ if b {{ 1 }} else {{ 0 }} }}
+"
+        ));
     }
 
     /// 未移行の実例。落ちるのは移行項目だけで、余計な診断は出ない

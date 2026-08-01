@@ -583,6 +583,11 @@ impl<'p> Interp<'p> {
 
             hir::ExprKind::Call(call) => self.call_expr(body, call, env, ambient),
 
+            hir::ExprKind::Clone(inner) => {
+                let value = self.eval(body, *inner, env, ambient)?;
+                deep_clone(&value, 0)
+            }
+
             // ponytail: 修飾は場所をそのまま評価する。所有・借用・移動を
             // 意味として実装するのは introduce-ownership-and-borrowing の
             // フェーズ7(いまの評価器は複合値を共有したままなので、
@@ -720,6 +725,49 @@ fn new_obj(type_: hir::StructId, fields: BTreeMap<hir::FieldId, Value>) -> Value
     Value::Struct(Rc::new(RefCell::new(Obj { type_, fields })))
 }
 
+/// `value.clone()` の中身。struct・enum payload・optional の中身・配列を辿って
+/// **独立した実体**を作る(design.md 決定4)。
+///
+/// ponytail: 深さ上限は `eq_at` と同じ理由。いまの値は `u.x = u` で循環を作れる
+/// ので、辿り切る前に落ちるのを診断に変えている。所有の場所へ置き換わる phase 7
+/// (tasks 7.4)では循環そのものが作れなくなるので、上限も消える
+fn deep_clone(value: &Value, depth: u32) -> Eval {
+    const MAX_DEPTH: u32 = 100;
+    if depth > MAX_DEPTH {
+        return fail("値の複製が深すぎます(循環している可能性)");
+    }
+    Ok(match value {
+        Value::Struct(obj) => {
+            let obj = obj.borrow();
+            let mut fields = BTreeMap::new();
+            for (field, value) in &obj.fields {
+                fields.insert(*field, deep_clone(value, depth + 1)?);
+            }
+            new_obj(obj.type_, fields)
+        }
+        Value::Array(items) => {
+            let items = items.borrow();
+            let mut cloned = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                cloned.push(deep_clone(item, depth + 1)?);
+            }
+            Value::Array(Rc::new(RefCell::new(cloned)))
+        }
+        Value::Enum { variant, payload } => {
+            let mut cloned = Vec::with_capacity(payload.len());
+            for value in payload {
+                cloned.push(deep_clone(value, depth + 1)?);
+            }
+            Value::Enum {
+                variant: *variant,
+                payload: cloned,
+            }
+        }
+        // スカラーと `nil` は実体を共有しない
+        scalar => scalar.clone(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // テスト
 // ---------------------------------------------------------------------------
@@ -754,6 +802,52 @@ mod tests {
         let interp = Interp::new(&checked);
         let value = interp.run(entry).expect("走るはず");
         interp.show(&value)
+    }
+
+    /// `clone()` は独立した実体を作る。片方を変えても他方は動かない
+    /// (design.md 決定4、tasks 6.5)
+    #[test]
+    fn cloneした値は元と独立している() {
+        let src = "struct Inner { n: int }
+struct Outer { inner: Inner, xs: [Inner] }
+fn main(-> int) {
+  let a = Outer { inner = Inner { n = 1 }, xs = [Inner { n = 2 }] }
+  let b = a.clone()
+  a.inner.n = 9
+  b.inner.n
+}
+";
+        assert!(matches!(run(src, "main"), Ok(Value::Int(1))));
+    }
+
+    /// 深い複製は構造的に等しい値を作る
+    #[test]
+    fn cloneした値は元と等しい() {
+        let src = "struct Inner { n: int }
+struct Outer { inner: Inner, xs: [Inner] }
+fn main(-> bool) {
+  let a = Outer { inner = Inner { n = 1 }, xs = [Inner { n = 2 }] }
+  a.clone() == a
+}
+";
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(true))));
+    }
+
+    /// enum の payload も辿る
+    #[test]
+    fn cloneはenumのpayloadも辿る() {
+        let src = "struct Inner { n: int }
+enum Box { Full(Inner) Empty }
+fn main(-> int) {
+  let inner = Inner { n = 1 }
+  let a = Box::Full(inner)
+  let b = a.clone()
+  inner.n = 9
+  match b { Box::Full(i): i.n
+    Box::Empty: 0 }
+}
+";
+        assert!(matches!(run(src, "main"), Ok(Value::Int(1))));
     }
 
     /// 実行時に失敗していた形が、いまは実行前に止まること。

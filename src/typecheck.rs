@@ -2354,7 +2354,7 @@ fn argument(
 
 /// 呼び出し。解決した署名から個数・引数型・結果型が決まる(design.md 決定6)。
 fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
-    let resolved = match resolve(callee, cx, locals, out) {
+    let resolved = match resolve(callee, args.len(), cx, locals, out) {
         Ok(resolved) => resolved,
         Err(lowered) => {
             // 解決できなくても実引数自身は検査する。期待型は配れない
@@ -2429,6 +2429,7 @@ fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Ou
 /// `Err` はそのまま呼び出し式の下ろした形になる。
 fn resolve<'d>(
     callee: &Expr,
+    arity: usize,
     cx: &Cx<'d>,
     locals: &mut Locals,
     out: &mut Out,
@@ -2469,6 +2470,12 @@ fn resolve<'d>(
             } else {
                 let receiver = synth(recv, cx, locals, out);
                 match &receiver.outcome {
+                    // 組み込みの `clone()`。同名の宣言メソッドがあればそちらが勝つ
+                    Outcome::Typed(ty)
+                        if name == "clone" && arity == 0 && !declares_clone(ty, decls) =>
+                    {
+                        return Err(clone_of(receiver.id, ty, callee.span, cx, out));
+                    }
                     // optional の中身を取り出す規則はまだ無く、配列にメソッドも無い
                     Outcome::Typed(ty) => match ty.name().filter(|_| !ty.optional) {
                         Some(type_name) => from_type(type_name, name, true, decls).map(|found| {
@@ -2564,6 +2571,44 @@ fn resolve<'d>(
             Err(poison())
         }
     }
+}
+
+/// その型が `clone` という名前のメソッドを自分で宣言しているか。
+///
+/// 宣言があれば組み込みは引っ込む。`clone()` を検査器が知っているのはこの版に
+/// `Clone` 契約がまだ無いからで、既存の宣言を黙って隠すと後で契約へ移すときに
+/// 意味が変わってしまう(design.md 決定4)。
+fn declares_clone(ty: &KnownType, decls: &Decls) -> bool {
+    ty.name()
+        .filter(|_| !ty.optional)
+        .and_then(|name| decls.impls.get(name))
+        .is_some_and(|members| members.iter().any(|(member, _)| member == "clone"))
+}
+
+/// 組み込みの `clone()`(design.md 決定4、tasks 6.5)。
+///
+/// 結果は常に**所有**。`&T` は借用先を所有の `T` へ複製し、`&mut T` は複製
+/// できない。深さは実行時の構造そのままで、ここは型だけを決める。
+fn clone_of(recv: hir::ExprId, ty: &KnownType, span: Span, cx: &Cx, out: &mut Out) -> Lowered {
+    let kind = hir::ExprKind::Clone(recv);
+    if ty.reference == Some(hir::RefKind::Mutable) {
+        out.diagnostics.push(
+            Diag::at(
+                span,
+                format!("{}: 排他借用 `{ty}` は clone できません", cx.ctx),
+            )
+            .label("複製できない排他借用")
+            .help("共有借用か所有の値から clone してください"),
+        );
+        return lowered(Outcome::Poisoned, kind);
+    }
+    typed(
+        KnownType {
+            reference: None,
+            ..ty.clone()
+        },
+        kind,
+    )
 }
 
 /// レシーバの所有モードを署名と突き合わせる(tasks 5.2)。
@@ -3563,6 +3608,60 @@ mod tests {
             .unwrap_or_else(|| panic!("`{expected_msg_part}` を含む診断がない: {diagnostics:?}"));
         let span = found.span.expect("実行前の診断は位置を持つ");
         src[span.start as usize..span.end as usize].to_string()
+    }
+
+    // ---- 組み込みの clone(tasks 6.5) ----
+
+    /// `clone()` は所有を産む。`&T` からは借用先の所有の形へ
+    #[test]
+    fn cloneは所有の値を産む() {
+        let src = "struct User { id: int, name: str }
+fn copy_of(u: &User -> User) { u.clone() }
+fn main(-> int) { let u = User { id = 1, name = \"a\" }
+ copy_of(u).id + u.clone().id }
+";
+        assert_eq!(errors(src), Vec::<String>::new());
+    }
+
+    /// 排他借用は複製できない(design.md 決定4)
+    #[test]
+    fn 排他借用はcloneできない() {
+        assert_eq!(
+            only(
+                "struct User { id: int }
+fn copy_of(u: &mut User -> User) { u.clone() }
+"
+            ),
+            "copy_of: 排他借用 `&mut User` は clone できません"
+        );
+    }
+
+    /// optional と配列も複製できる。結果の形は元のまま
+    #[test]
+    fn optionalと配列もcloneできる() {
+        let src = "struct User { id: int }
+fn main(-> int) { let xs = [User { id = 1 }]
+ let o: User? = User { id = 2 }
+ let ys = xs.clone()
+ let p = o.clone()
+ 0 }
+";
+        assert_eq!(errors(src), Vec::<String>::new());
+    }
+
+    /// 宣言された `clone` があればそちらが勝つ。組み込みは引っ込む
+    #[test]
+    fn 宣言されたcloneが組み込みより優先する() {
+        assert_eq!(
+            only(
+                "struct User { id: int }
+impl User { fn clone(&self -> int) { self.id } }
+fn main(-> User) { let u = User { id = 1 }
+ u.clone() }
+"
+            ),
+            "main: 戻り値は `User` ですが、`int` を返しています"
+        );
     }
 
     // ---- 診断の位置 ----
@@ -6331,6 +6430,7 @@ rank: Rank }
             AssignLocal { .. } => "assign-local",
             AssignField { .. } => "assign-field",
             Access { .. } => "access",
+            Clone(_) => "clone",
             Neg(_) => "neg",
             Arith { .. } => "arith",
             Eq { .. } => "eq",

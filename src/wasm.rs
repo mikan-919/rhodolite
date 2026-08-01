@@ -252,6 +252,7 @@ fn check_expr(
         }
         hir::ExprKind::Array(_) => diagnostics.push(unsupported(expr.span, "配列")),
         hir::ExprKind::Coalesce { .. } => diagnostics.push(unsupported(expr.span, "`??`")),
+        hir::ExprKind::Clone(_) => diagnostics.push(unsupported(expr.span, "`clone()`")),
         hir::ExprKind::For { .. } => diagnostics.push(unsupported(expr.span, "`for`")),
         hir::ExprKind::With { .. } => diagnostics.push(unsupported(expr.span, "`with` の提供")),
         hir::ExprKind::Match { .. } => diagnostics.push(unsupported(expr.span, "`match`")),

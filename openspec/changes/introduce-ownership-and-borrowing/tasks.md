@@ -109,7 +109,7 @@
 - [x] 5.4 Add shared, mutable, moved, temporary-owned, and type-only modes to
   `with` providers; constrain their lifetime to the provision body and preserve
   nested provider shadowing
-- [ ] 5.5 Update requirement and ambient planning inputs to consume checked HIR
+- [x] 5.5 Update requirement and ambient planning inputs to consume checked HIR
   and provider modes while preserving callable/slot identities and every
   ownership-independent canonical plan fact
   (provider modes resolved and proven not to move any requirement/ambient fact;
@@ -123,27 +123,30 @@
 
 ## 6. Integrate Owned Data Expressions
 
-- [ ] 6.1 Implement owned struct construction, Copy/shared/mutable/consuming field
+- [x] 6.1 Implement owned struct construction, Copy/shared/mutable/consuming field
   projection, exclusive field replacement, and recursive ownership of direct and
   indirect fields in the plan
-- [ ] 6.2 Implement owned optional injection and nil, Copy/borrowed/consuming `??`,
+- [x] 6.2 Implement owned optional injection and nil, Copy/borrowed/consuming `??`,
   lazy fallback movement, and ownership-safe optional-field projection
-- [ ] 6.3 Implement owned payload enum construction plus shared, mutable, and
+- [x] 6.3 Implement owned payload enum construction plus shared, mutable, and
   consuming whole-scrutinee `match`, dropping unselected contents without
   partial-move states
-- [ ] 6.4 Implement owned array construction plus shared, mutable, and consuming
+- [x] 6.4 Implement owned array construction plus shared, mutable, and consuming
   `for`, iteration-scoped element access, buffer ownership, and conflicting
   structural-mutation rejection
-- [ ] 6.5 Implement compiler-known structural equality through shared borrows and
+- [x] 6.5 Implement compiler-known structural equality through shared borrows and
   explicit deep `clone()` for structs, active enum payloads, present optionals,
   strings, arrays, and indirect values; reject non-cloneable mutable references
-- [ ] 6.6 Complete reverse-declaration drop plans for fallthrough, branch and loop
+- [x] 6.6 Complete reverse-declaration drop plans for fallthrough, branch and loop
   exits, provision exits, explicit/final returns, moved values, and recursive
   composite contents while retaining trap-without-unwind behavior
-- [ ] 6.7 Add focused ownership-plan and diagnostic fixtures for every data form,
+  (the plan lists place drops only; values that never get a place are released by
+  the construct that made them, and conditionally-owned places stay in the plan
+  for phase 7's per-place runtime drop flags)
+- [x] 6.7 Add focused ownership-plan and diagnostic fixtures for every data form,
   evaluation order, short-circuiting, mutation, deep clone independence,
   structural equality, consuming extraction, and exact drop-once behavior
-- [ ] 6.8 Run formatting, the full test suite, data-expression plan snapshots,
+- [x] 6.8 Run formatting, the full test suite, data-expression plan snapshots,
   drop-path coverage, and strict OpenSpec validation, then commit complete owned
   expression planning as a stable snapshot
 

@@ -310,6 +310,7 @@ fn scan(
         hir::ExprKind::Neg(inner)
         | hir::ExprKind::Assert(inner)
         | hir::ExprKind::Access { place: inner, .. }
+        | hir::ExprKind::Clone(inner)
         | hir::ExprKind::Return(Some(inner)) => walk!(inner),
         hir::ExprKind::Arith { lhs, rhs, .. }
         | hir::ExprKind::Eq { lhs, rhs }
@@ -749,6 +750,15 @@ mod tests {
         crate::typecheck::check_and_lower(&p).expect("型検査を通るはず")
     }
 
+    /// 所有権検査まで通した HIR。要求解析の API は task 8.1 まで従来どおり
+    /// `hir::Program` を受けるが、ここでは provider mode が確定した入力でも
+    /// 要求の事実が変わらないことを検証する。
+    fn ownership_checked_of(src: &str) -> hir::Program {
+        crate::ownership::check(lowered_of(src))
+            .expect("所有権検査を通るはず")
+            .hir
+    }
+
     fn scan_of(program: &hir::Program, f: &str) -> Facts {
         let id = program.free_callable(f).expect("その名前の関数がない");
         scan_body(&program.callables[id].body)
@@ -780,6 +790,45 @@ mod tests {
                 .map(|call| show_key(&lowered, call.callee))
                 .collect(),
         )
+    }
+
+    /// provider の運び方は所有権検査が閉じる。要求はスロットが提供されたかと
+    /// 実体が要るかだけを扱うため、shared / mutable / moved / temporary の別で
+    /// 要求表や callable / slot の ID を動かしてはならない(tasks 5.5)。
+    #[test]
+    fn provider_modeは要求の事実とidを変えない() {
+        let variants = [
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(store) { stamp() }",
+            "let mut store = SharedFrozen { t = 1 }\n with shared_clock(&mut store) { stamp() }",
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(move store) { stamp() }",
+            "with shared_clock(SharedFrozen { t = 1 }) { stamp() }",
+        ];
+        let mut expected = None;
+        for provision in variants {
+            let program = ownership_checked_of(&format!(
+                "trait SharedClock {{ fn now(&self -> int) }}\n\
+                 struct SharedFrozen {{ t: int }}\n\
+                 impl SharedClock for SharedFrozen {{ fn now(&self -> int) {{ self.t }} }}\n\
+                 effect shared_clock: SharedClock\n\
+                 fn stamp(-> int) {{ shared_clock.now() }}\n\
+                 fn main(-> int) {{ {provision} }}\n"
+            ));
+            let analysis = analyze(&program);
+            let facts = (
+                analysis.render(),
+                program.free_callable("stamp"),
+                program.free_callable("main"),
+                slot_id(&program, "shared_clock"),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &facts, expected,
+                    "provider mode must not alter requirements"
+                );
+            } else {
+                expected = Some(facts);
+            }
+        }
     }
 
     // ---- 移行前後で同じ結果になることを固定する corpus ----

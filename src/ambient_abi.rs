@@ -518,6 +518,7 @@ impl<'a> Planner<'a> {
             }
             hir::ExprKind::Neg(inner)
             | hir::ExprKind::Assert(inner)
+            | hir::ExprKind::Clone(inner)
             | hir::ExprKind::Return(Some(inner)) => walk!(inner),
             hir::ExprKind::Arith { lhs, rhs, .. }
             | hir::ExprKind::Eq { lhs, rhs }
@@ -747,6 +748,15 @@ mod tests {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(&source).unwrap()))
             .expect("パースできるはず");
         crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず")
+    }
+
+    /// provider mode まで検査済みの HIR。計画 API 自体を `CheckedProgram` に
+    /// 切り替えるのは task 8.1 なので、ここではその前段で確定した mode が
+    /// 既存の ambient 計画の同一性を動かさないことだけを確認する。
+    fn ownership_checked_of(src: &str) -> hir::Program {
+        crate::ownership::check(lowered_of(src))
+            .expect("所有権検査を通るはず")
+            .hir
     }
 
     pub(super) fn slot(program: &hir::Program, name: &str) -> hir::SlotId {
@@ -1096,6 +1106,49 @@ mod tests {
         let found = instances_named(program, plan, name);
         assert_eq!(found.len(), 1, "{name} の instance が1つではない");
         found[0]
+    }
+
+    /// provider の mode は loan/drop の事実であり、specialization の鍵と
+    /// record layout は従来どおり callable / slot / implementation ID だけで
+    /// 決まる。値を作った expr ID は各 mode で異なり得るため比較しない(tasks 5.5)。
+    #[test]
+    fn provider_modeはambientのcanonical_plan_factを変えない() {
+        let variants = [
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(store) { ticks() }",
+            "let mut store = SharedFrozen { t = 1 }\n with shared_clock(&mut store) { ticks() }",
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(move store) { ticks() }",
+            "with shared_clock(SharedFrozen { t = 1 }) { ticks() }",
+        ];
+        let mut expected = None;
+        for provision in variants {
+            let program = ownership_checked_of(&format!(
+                "trait SharedClock {{ fn now(&self -> int) }}\n\
+                 struct SharedFrozen {{ t: int }}\n\
+                 impl SharedClock for SharedFrozen {{ fn now(&self -> int) {{ self.t }} }}\n\
+                 effect shared_clock: SharedClock\n\
+                 fn ticks(-> int) {{ shared_clock.now() }}\n\
+                 fn main(-> int) {{ {provision} }}\n"
+            ));
+            let analysis = crate::requirement::analyze(&program);
+            let entry = program.free_callable("main").unwrap();
+            let plan = plan(&program, &analysis, entry).expect("計画できるはず");
+            let ticks = only(&program, &plan, "ticks");
+            let layout = plan.layout(plan.instance(ticks).layout.expect("値要求の欄"));
+            let facts = (
+                plan.instance(ticks).key.clone(),
+                layout.fields.clone(),
+                providers_of(&program, &plan, ticks),
+                plan.instances().count(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &facts, expected,
+                    "provider mode must not alter ambient facts"
+                );
+            } else {
+                expected = Some(facts);
+            }
+        }
     }
 
     /// 型提供は鍵と呼び先を変えるが、実行時の欄は作らない(決定6)

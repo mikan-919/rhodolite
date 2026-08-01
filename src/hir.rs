@@ -448,8 +448,10 @@ impl Body {
     /// 場所として書けている式か。局所束縛とその非 optional なフィールド射影だけ
     /// が場所で、呼び出しや構築の結果は一時値(design.md 決定5)。
     ///
-    /// 所有権解析の `place_of` は同じ形から射影の列まで組み立てる。ここは
-    /// 「借用を挿してよいか」を決めるだけなので根の有無しか見ない
+    /// 所有権解析の `place_of` は同じ形から射影の列まで組み立てる。あちらは
+    /// `.?` も optional 射影の場所として畳むが、ここは「共有借用を挿してよいか」
+    /// だけを決める。`.?` の結果は必ず optional で、optional な参照は作れない
+    /// ので、挿せる位置がそもそも無い(design.md 決定3)
     pub fn is_place(&self, id: ExprId) -> bool {
         match &self.expr(id).kind {
             ExprKind::Local(_) => true,
@@ -514,6 +516,9 @@ pub enum ExprKind {
         mode: AccessMode,
         place: ExprId,
     },
+    /// `value.clone()` — 検査器が知っている構造的な深い複製。所有を産むので
+    /// レシーバは共有借用のまま残る(design.md 決定4)
+    Clone(ExprId),
     Neg(ExprId),
     Arith {
         op: ArithOp,
@@ -1083,6 +1088,7 @@ impl Program {
                 },
                 place.index()
             ),
+            ExprKind::Clone(inner) => format!("clone #{}", inner.index()),
             ExprKind::Neg(inner) => format!("neg #{}", inner.index()),
             ExprKind::Arith { op, lhs, rhs } => {
                 format!("{} #{} #{}", op.spelling(), lhs.index(), rhs.index())
