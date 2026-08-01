@@ -62,9 +62,8 @@ impl Scalar {
 
 /// scalar として扱える型か。`int?` のような optional は v0 の外
 pub fn scalar_of(ty: &hir::Type) -> Option<Scalar> {
-    // ponytail: 参照は v0 の公開 ABI にも局所表現にも無いので scalar から外す。
-    // 公開署名に借用が出たことを名指す診断は
-    // introduce-ownership-and-borrowing のフェーズ8(task 8.4)
+    // 参照は v0 の公開 ABI にも局所表現にも無いので scalar から外す。署名に
+    // 出た借用は `borrowed_signature` が名指す(tasks 4.6)
     if ty.optional || ty.reference.is_some() {
         return None;
     }
@@ -84,6 +83,27 @@ fn result_scalar(expr: &hir::Expr) -> Option<Scalar> {
         // 発散する式の後ろは到達しない。Wasm の stack は多相なので何も要らない
         hir::ExprResult::Diverges | hir::ExprResult::Poison => None,
     }
+}
+
+/// Wasm の境界に借用が出た(tasks 4.6、core-wasm-build spec)。
+///
+/// ABI v0 が運べるのは scalar だけで、借用は呼び出し側の記憶を指す。所有権
+/// 検査を通っていても、境界を越えた先にその所有者は居ない
+fn borrowed_signature(
+    program: &hir::Program,
+    span: crate::lex::Span,
+    what: &str,
+    ty: &hir::Type,
+) -> Diag {
+    Diag::at(
+        span,
+        format!(
+            "{what}の借用 `{}` は Wasm の署名には出せません",
+            program.show_type(ty)
+        ),
+    )
+    .label("署名に出た借用")
+    .help("所有する値をやり取りするか、その関数を Wasm から到達させないでください")
 }
 
 fn unsupported(span: crate::lex::Span, what: &str) -> Diag {
@@ -121,7 +141,14 @@ pub fn check_support(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
         if callable.receiver.is_some() {
             diagnostics.push(unsupported(callable.span, "メソッド"));
         }
-        if scalar_of(&callable.ret).is_none() {
+        if callable.ret.reference.is_some() {
+            diagnostics.push(borrowed_signature(
+                program,
+                callable.span,
+                "戻り値",
+                &callable.ret,
+            ));
+        } else if scalar_of(&callable.ret).is_none() {
             diagnostics.push(unsupported(
                 callable.span,
                 &format!("戻り値の型 `{}`", program.show_type(&callable.ret)),
@@ -130,7 +157,16 @@ pub fn check_support(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
 
         let body = &callable.body;
         for local in &callable.params {
-            check_local(program, body, *local, &mut diagnostics);
+            let decl = body.local(*local);
+            match decl.ty.as_ref().filter(|ty| ty.reference.is_some()) {
+                Some(ty) => diagnostics.push(borrowed_signature(
+                    program,
+                    decl.span,
+                    &format!("引数 `{}`", decl.name),
+                    ty,
+                )),
+                None => check_local(program, body, *local, &mut diagnostics),
+            }
         }
         for expr in &body.root {
             check_expr(program, body, *expr, &mut diagnostics);
@@ -814,6 +850,27 @@ pub(crate) mod tests {
         )
         .expect_err("止まるはず");
         assert!(messages(&errors).contains("Wasm ターゲットでは扱えません"));
+    }
+
+    /// 借用は境界を越えられない。署名に出たら名指して止める(tasks 4.6)
+    #[test]
+    fn 署名に出た借用はビルドを止める() {
+        let errors = compile(
+            "struct User { id: int }\n\
+             fn peek(u: &User -> &User) { u }\n\
+             fn main(-> int) { let one = User { id = 1 }\n peek(&one).id }\n",
+            &[],
+        )
+        .expect_err("止まるはず");
+        let found = messages(&errors);
+        assert!(
+            found.contains("戻り値の借用 `&User` は Wasm の署名には出せません"),
+            "{found}"
+        );
+        assert!(
+            found.contains("引数 `u`の借用 `&User` は Wasm の署名には出せません"),
+            "{found}"
+        );
     }
 
     /// 共有された instance の実装は1つ。呼び出しは全部そこを指す

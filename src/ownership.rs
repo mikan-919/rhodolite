@@ -1,12 +1,14 @@
 //! 所有権解析。型検査を通った HIR に「誰がいつ値を持っているか」を付ける段。
 //!
 //! 型検査は「どんな値か」を決めるが、「その値の所有がどこへ動いたか」は決めない。
-//! ここが決めるのは4つ:
+//! ここが決めるのは6つ:
 //!
 //!   1. スコープ  … 局所束縛がどの字句スコープに属するか(design.md 決定8)
 //!   2. CFG       … 本体の制御の流れを点と辺で表した**解析用の**表現(決定5)
 //!   3. アクセス  … 各場所式が Copy 読み・共有借用・排他借用・move のどれか
 //!   4. 破棄      … どの辺でどの所有値が落ちるか(決定8)
+//!   5. 借用      … どの借用がどの点で生きているか(非字句リージョン、決定6)
+//!   6. provenance … 参照を返す本体が、どの入力の場所を借りて返すか(決定6)
 //!
 //! CFG は解析データであって第二の下ろしではない。評価器が読むのは今までどおり
 //! 構造化された HIR で、ここが作る点と辺は `ExprId` へ鍵で戻るだけ。
@@ -20,12 +22,22 @@
 //! match の arm と guard は型検査が `locals.clone()` する境界で、そこだけが
 //! 新しいスコープになる。この対応は `scopes` の作り方1箇所に閉じている。
 //!
+//! # リージョンは字句スコープではない
+//!
+//! 借用は場所へのアクセスと同じ点で生まれ、**最後の使用まで**しか生きない
+//! (design.md 決定6)。生存区間は2つの単調な流れの交わりで決める:
+//!
+//!   - 前向き … 生まれた点から到達できる点
+//!   - 後ろ向き … その借用を要る点へ到達できる点
+//!
+//! 「要る点」は借用を持つ参照束縛を触った点・その借用を実引数に取る呼び出しの
+//! 点・戻り値に載るなら出口。だから `let v = &u` の後で `v` を使わなくなれば、
+//! そこから先は `u` を排他的に触れる。
+//!
 //! # まだやらないこと
 //!
-//! 借用の生存区間(非字句リージョン)・戻り値 provenance・借用の衝突検査は
-//! phase 4 の仕事。ここでは「参照を束縛したら、その束縛が生きている間は
-//! 借用元も借りられている」という字句的な上界だけを持ち、`move` との衝突を
-//! 見るのに使う。
+//! `match`/`for`/`??` の所有モード(phase 6)、提供値の所有モード(phase 5)、
+//! 評価器の所有(phase 7)。
 
 use crate::diag::Diag;
 use crate::hir::{self, AccessMode, Id as _, ReceiverMode};
@@ -69,17 +81,94 @@ pub struct Place {
 
 /// 場所の射影1段。
 ///
-/// ponytail: phase 3 が作るのは `Field` だけ。optional の中身・enum payload・
+/// ponytail: phase 3/4 が作るのは `Field` だけ。optional の中身・enum payload・
 /// 配列要素の射影は `match`/`for`/`??` の所有モードと一緒に phase 6 が入れる。
-/// 変種をここに書いておくのは、phase 4 の重なり判定がこの形を前提に書かれる
-/// ため(design.md 決定5)。
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// 変種をここに書いておくのは、重なり判定(`overlaps`)がこの形を前提に
+/// 書かれているため(design.md 決定5)。
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Projection {
     Field(hir::FieldId),
     OptionalPayload,
     EnumPayload(hir::VariantId, usize),
     /// 定数添字が分かっていれば `Some`。分からない添字は容器全体と重なる
     ArrayElement(Option<i64>),
+}
+
+/// 2つの場所が同じ記憶に触れうるか(design.md 決定5、tasks 4.2)。
+///
+/// 根が違えば重ならない。根が同じなら、片方の射影列がもう片方の**接頭辞**で
+/// ある限り重なる — つまり全体は子の全てと重なり、`p` と `p.left` は重なる。
+pub fn overlaps(a: &Place, b: &Place) -> bool {
+    a.root == b.root
+        && a.path
+            .iter()
+            .zip(&b.path)
+            .all(|(x, y)| projections_overlap(x, y))
+}
+
+/// 射影1段どうしの重なり。言い分けられないものは全部「重なる」へ倒す。
+///
+/// 保守的な側は**受理を狭める**側なので、判定を足せるようになったら
+/// 拒否が減るだけで、通っていたものが落ちることはない。
+fn projections_overlap(a: &Projection, b: &Projection) -> bool {
+    match (a, b) {
+        // 宣言の違うフィールドは別の記憶。ここだけが「重ならない」を言える
+        (Projection::Field(x), Projection::Field(y)) => x == y,
+        // 定数添字が両方分かっていれば言い分けられる(design.md 決定5 の
+        // 「narrow constant rule」)。記号的な不等式は後の最適化
+        (Projection::ArrayElement(Some(x)), Projection::ArrayElement(Some(y))) => x == y,
+        // enum payload・optional の中身・不明な添字・種類の違う射影は保守的に重なる
+        _ => true,
+    }
+}
+
+/// 本体1つの中で一意な借用。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct LoanId(u32);
+
+impl LoanId {
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// 借用1つ(design.md 決定6、tasks 4.1)。
+///
+/// 明示の `&place` / `&mut place` と、借用を受け取る位置への自動共有借用が
+/// 場所へのアクセスと同じ点で作る。生存区間は `BodyPlan::region` が持つ。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Loan {
+    pub place: Place,
+    pub kind: hir::RefKind,
+    /// 借用が生まれた点
+    pub point: PointId,
+    pub span: Span,
+}
+
+/// 戻り値 provenance の根。呼び出し側で実引数へ置き換わる(design.md 決定6)。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Input {
+    Receiver,
+    Param(usize),
+}
+
+/// 入力の場所。参照はローカル・引数・戻り値にしか置けないので、provenance は
+/// 「入力の根 + 射影」の**有限集合**で閉じる(design.md 決定6)。
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct InputPlace {
+    pub input: Input,
+    pub path: Vec<Projection>,
+}
+
+/// 参照を返す本体の要約(design.md 決定6、tasks 4.4)。
+///
+/// 分岐は origin を合流する。排他で返すなら候補は全部排他に予約されたままに
+/// なる — `&mut` を作れるのは排他な場所からだけなので、候補に共有の借用が
+/// 混ざることは構成上起きない(tasks 4.5)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ReturnProvenance {
+    pub kind: hir::RefKind,
+    pub origins: BTreeSet<InputPlace>,
 }
 
 /// 場所へのアクセスの分類(tasks 3.1)。
@@ -164,6 +253,10 @@ pub struct BodyPlan {
     accesses: BTreeMap<hir::ExprId, PointId>,
     /// 破棄の対象になる所有束縛。借用の束縛とループ変数は入らない
     owners: BTreeSet<hir::LocalId>,
+    /// 作った順 = 評価順の借用
+    loans: Vec<Loan>,
+    /// 借用ごとの生存区間。`loans` と同じ並び
+    regions: Vec<BTreeSet<PointId>>,
     entry: PointId,
     exit: PointId,
 }
@@ -195,17 +288,35 @@ impl BodyPlan {
             _ => None,
         }
     }
+
+    pub fn loans(&self) -> impl Iterator<Item = (LoanId, &Loan)> {
+        self.loans
+            .iter()
+            .enumerate()
+            .map(|(i, loan)| (LoanId(i as u32), loan))
+    }
+
+    /// その借用が生きている点。最後の使用より先には伸びない(design.md 決定6)
+    pub fn region(&self, loan: LoanId) -> &BTreeSet<PointId> {
+        &self.regions[loan.index()]
+    }
 }
 
 /// 本体ごとの計画。並びは宣言順。
 #[derive(Debug, Default)]
 pub struct Plan {
     bodies: BTreeMap<hir::BodyId, BodyPlan>,
+    provenance: BTreeMap<hir::CallableId, ReturnProvenance>,
 }
 
 impl Plan {
     pub fn body(&self, id: hir::BodyId) -> &BodyPlan {
         self.bodies.get(&id).expect("全ての本体に計画がある")
+    }
+
+    /// 参照を返す callable の要約。所有を返す callable は持たない
+    pub fn provenance(&self, id: hir::CallableId) -> Option<&ReturnProvenance> {
+        self.provenance.get(&id)
     }
 }
 
@@ -220,21 +331,99 @@ pub struct CheckedProgram {
 
 /// 型検査を通った HIR の所有権を閉じる。
 ///
-/// 本体は宣言順に1つずつ独立に見る。この段は本体をまたがない(呼び出し先の
-/// 戻り値 provenance は phase 4)。
+/// 3段。(1) 本体ごとに CFG・借用・carrier を1度だけ作る。(2) 戻り値
+/// provenance を全プログラムで不動点まで閉じる。(3) その要約を使って本体ごとに
+/// リージョンと衝突を確定する。(1) と (3) が本体を跨がないので、本体を跨ぐ
+/// 反復は (2) の集合演算だけで済む。
 pub fn check(hir: hir::Program) -> Result<CheckedProgram, Vec<Diag>> {
     let mut plan = Plan::default();
     let mut diagnostics = Vec::new();
-    for id in &hir.bodies {
-        let (body_plan, mut found) = analyze(&hir, *id);
-        diagnostics.append(&mut found);
-        plan.bodies.insert(*id, body_plan);
+    {
+        let mut builds: Vec<Build> = hir.bodies.iter().map(|id| walk_body(&hir, *id)).collect();
+        let summaries = solve_provenance(&hir, &mut builds);
+        for (id, build) in hir.bodies.iter().zip(builds) {
+            if let hir::BodyId::Callable(callable) = id
+                && let Some(kind) = hir.callables[*callable].ret.reference
+            {
+                plan.provenance.insert(
+                    *callable,
+                    ReturnProvenance {
+                        kind,
+                        origins: summaries
+                            .get(&Callee::Body(*callable))
+                            .cloned()
+                            .unwrap_or_default(),
+                    },
+                );
+            }
+            let (body_plan, mut found) = build.finish();
+            diagnostics.append(&mut found);
+            plan.bodies.insert(*id, body_plan);
+        }
     }
     if diagnostics.is_empty() {
         Ok(CheckedProgram { hir, plan })
     } else {
         Err(diagnostics)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 戻り値 provenance の不動点(tasks 4.4 / 4.5)
+// ---------------------------------------------------------------------------
+
+/// 呼び出し先の同一性。契約メソッドは、それを実装する全ての本体の provenance が
+/// 合流した仮想の本体(`requirement.rs` の `BodyKey` と同じ形)。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Callee {
+    Body(hir::CallableId),
+    Trait(hir::TraitMethodId),
+}
+
+type Summaries = BTreeMap<Callee, BTreeSet<InputPlace>>;
+
+/// 空から始めて、変化がなくなるまで回す。
+///
+/// origin は「入力の根 + ソースに書かれた射影」しか作らないので候補は有限で、
+/// 要約は増える一方(単調)。だから再帰も相互再帰も必ず止まる(design.md の
+/// リスク「whole-program region inference … fails to converge」)。
+///
+/// ponytail: `requirement::analyze` と同じ素朴な反復。呼び出しグラフを SCC で
+/// 縮約すれば反復は減るが、遅くなってからでよい。
+fn solve_provenance(program: &hir::Program, builds: &mut [Build]) -> Summaries {
+    // 実装本体 → その本体が実装する契約メソッド
+    let mut contracts: BTreeMap<hir::CallableId, Vec<hir::TraitMethodId>> = BTreeMap::new();
+    for (_, decl) in program.trait_impls.iter() {
+        for (method, callable) in &decl.methods {
+            contracts.entry(*callable).or_default().push(*method);
+        }
+    }
+    let mut summaries = Summaries::new();
+    loop {
+        let mut changed = false;
+        for build in builds.iter_mut() {
+            build.resolve(&summaries);
+            let hir::BodyId::Callable(callable) = build.id else {
+                continue;
+            };
+            let origins = build.provenance_origins();
+            changed |= merge_origins(&mut summaries, Callee::Body(callable), &origins);
+            for method in contracts.get(&callable).into_iter().flatten() {
+                changed |= merge_origins(&mut summaries, Callee::Trait(*method), &origins);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    summaries
+}
+
+fn merge_origins(into: &mut Summaries, key: Callee, origins: &BTreeSet<InputPlace>) -> bool {
+    let slot = into.entry(key).or_default();
+    let before = slot.len();
+    slot.extend(origins.iter().cloned());
+    slot.len() != before
 }
 
 // ---------------------------------------------------------------------------
@@ -267,17 +456,71 @@ enum Need {
     Argument(&'static str, Option<usize>),
 }
 
+/// 値が運ぶ借用の出どころ。解決は `Build::expand`。
+///
+/// `Local` と `Call` だけが後回しで、それ以外は走査中に決まる。`Local` は
+/// 束縛の不動点、`Call` は呼び出し先の要約を要る。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Carrier {
+    Loan(LoanId),
+    Local(hir::LocalId),
+    Call(hir::ExprId),
+}
+
+/// 解決済みの借用の出どころ。この本体の借用か、参照で受け取った入力そのもの。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Origin {
+    Loan(LoanId),
+    Input(Input),
+}
+
+/// 借用元を呼び出し側で名指せない理由。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Unrooted {
+    /// 一時値からの借用。所有者が式の中で終わる
+    Temporary,
+    /// スロットのレシーバ = 提供された実体。提供の所有モードは phase 5(5.4)
+    Provider,
+}
+
+/// 呼び出し1つ。結果の provenance を実引数へ置き換えるのに要る
+struct CallSite {
+    callee: Callee,
+    recv: Option<hir::ExprId>,
+    args: Vec<hir::ExprId>,
+}
+
 struct Build<'a> {
     program: &'a hir::Program,
     body: &'a hir::Body,
+    id: hir::BodyId,
     ctx: String,
     plan: BodyPlan,
     /// いま制御が居る点。抜けたら `None`
     cur: Option<PointId>,
     /// その点の後に走る破棄。フィールド消費の残余だけがここに入る
     residue: BTreeMap<PointId, Vec<Drop>>,
-    /// `let v = &u` の記録。v が生きている間 u は借りられている
-    borrows: BTreeMap<hir::LocalId, (hir::LocalId, Span)>,
+    /// 借用が生きていなければならない点。作成点は常に入る
+    loan_uses: Vec<BTreeSet<PointId>>,
+    /// 借用ごとの「借り直さずに使用へ届く」点。借用元の破棄と突き合わせる
+    outliving: Vec<BTreeSet<PointId>>,
+    /// 式の値が運ぶ借用の出どころ
+    carriers: BTreeMap<hir::ExprId, BTreeSet<Carrier>>,
+    /// 束縛へ流れ込む carrier。ponytail: 経路を区別せず和で閉じる。借用が
+    /// 実際より長く生きる側にしか動かないので、拒否が増えるだけ
+    flows: BTreeMap<hir::LocalId, BTreeSet<Carrier>>,
+    /// 呼び出し式 → 呼び先と実引数
+    calls: BTreeMap<hir::ExprId, CallSite>,
+    /// 戻り値へ流れる carrier(明示の `return` と本体の末尾)
+    returns: BTreeSet<Carrier>,
+    /// 参照で受け取る引数・レシーバ。provenance の根になる
+    inputs: BTreeMap<hir::LocalId, Input>,
+    /// `resolve` の結果
+    holds: BTreeMap<hir::LocalId, BTreeSet<Origin>>,
+    origins: BTreeMap<hir::ExprId, BTreeSet<Origin>>,
+    returned: BTreeSet<Origin>,
+    /// 借用を返す呼び出しなのに、借用元をこの本体で名指せないもの(tasks 4.3)
+    unrooted: BTreeMap<hir::ExprId, Unrooted>,
     /// 名前で参照できる束縛とその出自。ここに無いのは「知らない名前への代入」が
     /// 作った書き込み専用の束縛で、代入は初期化として扱う
     bindings: BTreeMap<hir::LocalId, Bound>,
@@ -293,16 +536,50 @@ impl<'a> Build<'a> {
         Build {
             program,
             body: program.body(id),
+            id,
             ctx: program.show_body(id),
             plan: BodyPlan::default(),
             cur: None,
             residue: BTreeMap::new(),
-            borrows: BTreeMap::new(),
+            loan_uses: Vec::new(),
+            outliving: Vec::new(),
+            carriers: BTreeMap::new(),
+            flows: BTreeMap::new(),
+            calls: BTreeMap::new(),
+            returns: BTreeSet::new(),
+            inputs: BTreeMap::new(),
+            holds: BTreeMap::new(),
+            origins: BTreeMap::new(),
+            returned: BTreeSet::new(),
+            unrooted: BTreeMap::new(),
             bindings: BTreeMap::new(),
             callee: None,
             demanded: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    // ---- carrier ----
+
+    /// 式の値が運ぶ借用を記録する
+    fn carry(&mut self, expr: hir::ExprId, carrier: Carrier) {
+        self.carriers.entry(expr).or_default().insert(carrier);
+    }
+
+    /// 部分式が運ぶものをそのまま親へ引き継ぐ(枝の合流もここ)
+    fn carry_from(&mut self, expr: hir::ExprId, from: hir::ExprId) {
+        let Some(carried) = self.carriers.get(&from).cloned() else {
+            return;
+        };
+        self.carriers.entry(expr).or_default().extend(carried);
+    }
+
+    /// 束縛へ流れ込む carrier を足す
+    fn flow(&mut self, local: hir::LocalId, from: hir::ExprId) {
+        let Some(carried) = self.carriers.get(&from).cloned() else {
+            return;
+        };
+        self.flows.entry(local).or_default().extend(carried);
     }
 
     // ---- 骨組み ----
@@ -340,6 +617,16 @@ impl<'a> Build<'a> {
         }
         self.cur = Some(id);
         id
+    }
+
+    /// `mark` 以降に作った借用を、`at` まで生かす。
+    ///
+    /// 呼び出しの実引数と、`for`/`match` が対象を借りている区間に使う。区間の
+    /// 出口を要求点にすると、そこへ到達できる点が全部リージョンに入る
+    fn hold_until(&mut self, mark: usize, at: PointId) {
+        for loan in mark..self.plan.loans.len() {
+            self.loan_uses[loan].insert(at);
+        }
     }
 
     fn edge(&mut self, from: PointId, to: PointId, exits: Vec<ScopeId>) {
@@ -413,17 +700,47 @@ impl<'a> Build<'a> {
         )
     }
 
-    fn access(&mut self, expr: hir::ExprId, place: Place, mode: Mode, scope: ScopeId) {
+    /// 場所へのアクセスを1点として積む。借りるアクセスなら借用も作って返す。
+    /// その借用を**値として運ぶ**かは呼び出し側が決める(代入先の排他アクセスは
+    /// 誰にも渡らない)
+    fn access(
+        &mut self,
+        expr: hir::ExprId,
+        place: Place,
+        mode: Mode,
+        scope: ScopeId,
+    ) -> Option<LoanId> {
         // 射影を消費したら根ごと消費され、残りはその場で落ちる
         let residue = (mode == Mode::Move && !place.path.is_empty()).then(|| Drop::Remaining {
             root: place.root,
             consumed: place.path.clone(),
         });
+        // 借りるアクセスはその場で借用を作る。明示の `&`/`&mut` も、借用を
+        // 受け取る位置への自動共有借用も同じ扱い(tasks 4.1)
+        let kind = match mode {
+            Mode::Shared => Some(hir::RefKind::Shared),
+            Mode::Mutable => Some(hir::RefKind::Mutable),
+            Mode::Read | Mode::Move => None,
+        };
+        let borrowed = kind.map(|kind| (kind, place.clone()));
         let point = self.point(Some(expr), scope, Effect::Access(Access { place, mode }));
         self.plan.accesses.insert(expr, point);
+        let loan = borrowed.map(|(kind, place)| {
+            let id = LoanId(self.plan.loans.len() as u32);
+            self.plan.loans.push(Loan {
+                place,
+                kind,
+                point,
+                span: self.body.expr(expr).span,
+            });
+            self.plan.regions.push(BTreeSet::new());
+            self.loan_uses.push(BTreeSet::from([point]));
+            id
+        });
         if let Some(residue) = residue {
             self.residue.insert(point, vec![residue]);
         }
+        loan
     }
 
     // ---- 走査 ----
@@ -432,9 +749,10 @@ impl<'a> Build<'a> {
         if let hir::ExprKind::Access { mode, place } = &self.body.expr(id).kind {
             let (mode, place) = (*mode, *place);
             let Some(resolved) = self.place_of(place) else {
-                // `&f()` のように場所でないものを修飾している。所有権解析は
-                // 場所にだけ効くので、中身を一時値として評価するだけ。
-                // ponytail: 場所でない借用の拒否は phase 4(4.3)
+                // `&f()` のように場所でないものを修飾している。借りる先も
+                // 移す先も無いので断る(tasks 4.3)。計画は完全に残したいので
+                // 中身は一時値として歩き続ける
+                self.report_not_a_place(id, mode);
                 return self.value(place, scope, Need::Take);
             };
             let mode = match mode {
@@ -442,12 +760,36 @@ impl<'a> Build<'a> {
                 AccessMode::Mutable => Mode::Mutable,
                 AccessMode::Move => Mode::Move,
             };
-            return self.access(id, resolved, mode, scope);
+            if let Some(loan) = self.access(id, resolved, mode, scope) {
+                self.carry(id, Carrier::Loan(loan));
+            }
+            return;
         }
         if let Some(place) = self.place_of(id) {
             return self.bare_place(id, place, scope, need);
         }
         self.compound(id, scope, need);
+    }
+
+    /// `&f()` / `&mut f()` / `move f()`。修飾は場所にしか掛けられない
+    fn report_not_a_place(&mut self, id: hir::ExprId, mode: AccessMode) {
+        let (what, help) = match mode {
+            AccessMode::Shared => ("共有借用", "借りるものを先に束縛してください"),
+            AccessMode::Mutable => ("排他借用", "借りるものを先に束縛してください"),
+            AccessMode::Move => (
+                "`move`",
+                "一時値は既に所有者なので `move` は要りません。修飾を外してください",
+            ),
+        };
+        let span = self.body.expr(id).span;
+        self.diagnostics.push(
+            Diag::at(
+                span,
+                format!("{}: 場所ではない値に{what}は掛けられません", self.ctx),
+            )
+            .label("場所ではない値への所有権修飾")
+            .help(help),
+        );
     }
 
     /// 修飾の付いていない場所。何を要求されているかで分類が決まる
@@ -460,8 +802,9 @@ impl<'a> Build<'a> {
             // Copy は暗黙に複製してよい。`&T` もここに入る
             _ if copy => Mode::Read,
             Need::Read => Mode::Shared,
-            // 参照そのものを渡すのは再借用。所有は動かない
-            // ponytail: 再借用の制約(元の借用より長く生きないこと)は phase 4(4.1)
+            // 参照そのものを渡すのは再借用。所有は動かない。元の借用より
+            // 長く生きられないことは、下の `Carrier::Local` が元の借用を
+            // 引き継ぐことで効く(tasks 4.1)
             _ if reborrow == Some(hir::RefKind::Mutable) => Mode::Mutable,
             Need::Take => Mode::Move,
             // 診断はここでは出さない。既に move 済みの値には別の診断が付くので、
@@ -472,7 +815,16 @@ impl<'a> Build<'a> {
                 Mode::Move
             }
         };
-        self.access(id, place, mode, scope);
+        // 参照束縛をそのまま渡す/再借用するときは、元が持っていた借用も
+        // 一緒に運ばれる(tasks 4.1 の再借用の制約)
+        let inherits = place.path.is_empty() && reborrow.is_some();
+        let root = place.root;
+        if let Some(loan) = self.access(id, place, mode, scope) {
+            self.carry(id, Carrier::Loan(loan));
+        }
+        if inherits {
+            self.carry(id, Carrier::Local(root));
+        }
     }
 
     fn compound(&mut self, id: hir::ExprId, scope: ScopeId, need: Need) {
@@ -510,23 +862,14 @@ impl<'a> Build<'a> {
 
             hir::ExprKind::Let { local, value } => {
                 self.value(*value, scope, Need::Take);
-                // 参照を束縛したら、その束縛が生きている間は借用元も借りられて
-                // いる(効かせるのは `report_access`)
-                if let hir::ExprKind::Access {
-                    mode: AccessMode::Shared | AccessMode::Mutable,
-                    place,
-                } = &body.expr(*value).kind
-                    && let Some(source) = self.place_of(*place)
-                {
-                    self.borrows
-                        .insert(*local, (source.root, body.expr(*value).span));
-                }
+                self.flow(*local, *value);
                 self.declare(*local, scope, Bound::Let);
                 self.point(Some(id), scope, Effect::Init(*local));
             }
 
             hir::ExprKind::AssignLocal { local, value } => {
                 self.value(*value, scope, Need::Take);
+                self.flow(*local, *value);
                 self.point(Some(id), scope, Effect::Assign(*local));
             }
 
@@ -556,6 +899,8 @@ impl<'a> Build<'a> {
                 self.value(*lhs, scope, Need::Read);
                 let branch = self.point(Some(id), scope, Effect::Nop);
                 self.value(*rhs, scope, need);
+                self.carry_from(id, *lhs);
+                self.carry_from(id, *rhs);
                 let fallback = self.cur;
                 let join = self.alloc(Some(id), scope, Effect::Nop);
                 self.edge(branch, join, Vec::new());
@@ -569,6 +914,9 @@ impl<'a> Build<'a> {
                 if let Some(value) = value {
                     // 戻り先が所有を宣言しているので、返す move は自動
                     self.value(*value, scope, Need::Take);
+                    if let Some(carried) = self.carriers.get(value).cloned() {
+                        self.returns.extend(carried);
+                    }
                 }
                 if let Some(from) = self.cur {
                     let exits = self.open(scope, None);
@@ -587,6 +935,7 @@ impl<'a> Build<'a> {
                     self.value(*e, scope, Need::Read);
                 }
                 self.value(*last, scope, need);
+                self.carry_from(id, *last);
             }
 
             hir::ExprKind::If { cond, then, orelse } => {
@@ -605,6 +954,10 @@ impl<'a> Build<'a> {
                     }
                     None => (Some(branch), None),
                 };
+                self.carry_from(id, *then);
+                if let Some(orelse) = orelse {
+                    self.carry_from(id, *orelse);
+                }
                 if taken.is_none() && other.is_none() {
                     self.cur = None;
                     return;
@@ -643,11 +996,17 @@ impl<'a> Build<'a> {
                 iter,
                 body: inner,
             } => {
+                let mark = self.plan.loans.len();
                 self.value(*iter, scope, Need::Read);
                 let head = self.point(Some(id), scope, Effect::Nop);
                 let after = self.alloc(Some(id), scope, Effect::Nop);
                 let inner_scope = self.scope(Some(scope));
                 self.declare(*var, inner_scope, Bound::Borrowed);
+                // ループ変数は要素の借用。対象の借用を持ち回るので、周回中は
+                // 対象を排他的に触れない。本体は背辺で head へ戻るので、
+                // head を要求点にすれば周回中ずっと生きる
+                self.flow(*var, *iter);
+                self.hold_until(mark, head);
                 self.cur = Some(head);
                 self.point(Some(id), inner_scope, Effect::Init(*var));
                 self.value(*inner, inner_scope, Need::Read);
@@ -671,6 +1030,7 @@ impl<'a> Build<'a> {
                 }
                 let inner_scope = self.scope(Some(scope));
                 self.value(*inner, inner_scope, need);
+                self.carry_from(id, *inner);
                 if let Some(from) = self.cur {
                     let join = self.alloc(Some(id), scope, Effect::Nop);
                     self.edge(from, join, vec![inner_scope]);
@@ -685,6 +1045,7 @@ impl<'a> Build<'a> {
             // ponytail: 素の `match` は対象全体を借用し、payload も借用で
             // 束縛する(design.md 決定7)。`&mut`/`move` は phase 6(6.3)
             hir::ExprKind::Match { subject, arms } => {
+                let mark = self.plan.loans.len();
                 self.value(*subject, scope, Need::Read);
                 let branch = self.point(Some(id), scope, Effect::Nop);
                 // 「ここまでの arm がどれも取らなかった」点
@@ -699,6 +1060,9 @@ impl<'a> Build<'a> {
                     if let hir::Pattern::Variant { bindings, .. } = &arm.pattern {
                         for bound in bindings.iter().flatten() {
                             self.declare(*bound, arm_scope, Bound::Borrowed);
+                            // payload 束縛は対象の借用。arm の間、対象は
+                            // 借りられたまま(design.md 決定7)
+                            self.flow(*bound, *subject);
                             self.point(Some(id), arm_scope, Effect::Init(*bound));
                         }
                     }
@@ -712,6 +1076,7 @@ impl<'a> Build<'a> {
                         }
                     }
                     self.value(arm.body, arm_scope, need);
+                    self.carry_from(id, arm.body);
                     if let Some(from) = self.cur {
                         ends.push((from, vec![arm_scope]));
                     }
@@ -730,48 +1095,90 @@ impl<'a> Build<'a> {
                 for (from, exits) in ends {
                     self.edge(from, join, exits);
                 }
+                // 対象は match の間ずっと借りられている(design.md 決定7)。
+                // 合流点を要求点にすると、そこへ到達できる arm が全部入る
+                self.hold_until(mark, join);
                 self.cur = Some(join);
             }
 
-            hir::ExprKind::Call(call) => match call {
-                hir::Call::Direct { callable, args } | hir::Call::Associated { callable, args } => {
-                    self.callee = Some(program.show_callable(*callable));
-                    let params = self.declared_params(*callable);
-                    self.arguments(scope, &params, args);
-                }
-                hir::Call::Method {
-                    callable,
-                    recv,
-                    args,
-                } => {
-                    self.callee = Some(program.show_callable(*callable));
-                    let need = match program.callables[*callable].receiver {
-                        Some(ReceiverMode::Owned) => Need::Argument("レシーバ", None),
-                        Some(ReceiverMode::Mutable) => Need::Mutate,
-                        _ => Need::Read,
-                    };
-                    self.value(*recv, scope, need);
-                    let params = self.declared_params(*callable);
-                    self.callee = Some(program.show_callable(*callable));
-                    self.arguments(scope, &params, args);
-                }
-                hir::Call::Slot { method, args, .. } => {
-                    self.callee = Some(program.show_trait_method(*method));
-                    let params: Vec<Option<hir::Type>> = program.trait_methods[*method]
-                        .params
-                        .iter()
-                        .map(|ty| Some(ty.clone()))
-                        .collect();
-                    self.arguments(scope, &params, args);
-                }
-                // enum の構築。呼び出しの綴りだが受け取るのは payload の所有で、
-                // struct リテラルや配列リテラルと同じ構築位置なので暗黙 move
-                hir::Call::Ctor { args, .. } => {
-                    for arg in args {
-                        self.value(*arg, scope, Need::Take);
+            // 実引数の借用は呼び出しの間ずっと生きている。だから引数の評価を
+            // 始める前に印を付けて、終わったら「呼び出しの点」を要求点として
+            // 全部に足す。これで `f(&mut u, &u)` が衝突として見える(tasks 4.3)
+            hir::ExprKind::Call(call) => {
+                let mark = self.plan.loans.len();
+                let site = match call {
+                    hir::Call::Direct { callable, args }
+                    | hir::Call::Associated { callable, args } => {
+                        self.callee = Some(program.show_callable(*callable));
+                        let params = self.declared_params(*callable);
+                        self.arguments(scope, &params, args);
+                        Some(CallSite {
+                            callee: Callee::Body(*callable),
+                            recv: None,
+                            args: args.clone(),
+                        })
                     }
+                    hir::Call::Method {
+                        callable,
+                        recv,
+                        args,
+                    } => {
+                        self.callee = Some(program.show_callable(*callable));
+                        let need = match program.callables[*callable].receiver {
+                            Some(ReceiverMode::Owned) => Need::Argument("レシーバ", None),
+                            Some(ReceiverMode::Mutable) => Need::Mutate,
+                            _ => Need::Read,
+                        };
+                        self.value(*recv, scope, need);
+                        let params = self.declared_params(*callable);
+                        self.callee = Some(program.show_callable(*callable));
+                        self.arguments(scope, &params, args);
+                        Some(CallSite {
+                            callee: Callee::Body(*callable),
+                            recv: Some(*recv),
+                            args: args.clone(),
+                        })
+                    }
+                    hir::Call::Slot { method, args, .. } => {
+                        self.callee = Some(program.show_trait_method(*method));
+                        let params: Vec<Option<hir::Type>> = program.trait_methods[*method]
+                            .params
+                            .iter()
+                            .map(|ty| Some(ty.clone()))
+                            .collect();
+                        self.arguments(scope, &params, args);
+                        Some(CallSite {
+                            callee: Callee::Trait(*method),
+                            // スロットのレシーバは提供が持つ実体で、この本体の
+                            // 場所ではない。provenance の根にはならない
+                            recv: None,
+                            args: args.clone(),
+                        })
+                    }
+                    // enum の構築。呼び出しの綴りだが受け取るのは payload の所有で、
+                    // struct リテラルや配列リテラルと同じ構築位置なので暗黙 move
+                    hir::Call::Ctor { args, .. } => {
+                        for arg in args {
+                            self.value(*arg, scope, Need::Take);
+                        }
+                        None
+                    }
+                };
+                let at = self.point(Some(id), scope, Effect::Nop);
+                self.hold_until(mark, at);
+                if let Some(site) = site {
+                    // 参照を返す呼び出しだけが借用を運ぶ
+                    if body
+                        .expr(id)
+                        .result
+                        .ty()
+                        .is_some_and(|ty| ty.reference.is_some())
+                    {
+                        self.carry(id, Carrier::Call(id));
+                    }
+                    self.calls.insert(id, site);
                 }
-            },
+            }
         }
     }
 
@@ -799,6 +1206,216 @@ impl<'a> Build<'a> {
         }
         self.callee = None;
     }
+
+    // ---- carrier の解決(tasks 4.4) ----
+
+    /// carrier を借用の出どころへ展開する。
+    ///
+    /// 呼び出し先の要約がまだ空なら何も出さない。要約は増える一方なので、
+    /// 空から始めても外側の反復で必ず追いつく
+    fn expand(
+        &self,
+        carriers: &BTreeSet<Carrier>,
+        holds: &BTreeMap<hir::LocalId, BTreeSet<Origin>>,
+        origins: &BTreeMap<hir::ExprId, BTreeSet<Origin>>,
+        summaries: &Summaries,
+        unrooted: &mut BTreeMap<hir::ExprId, Unrooted>,
+    ) -> BTreeSet<Origin> {
+        let mut out = BTreeSet::new();
+        for carrier in carriers {
+            match carrier {
+                Carrier::Loan(loan) => {
+                    out.insert(Origin::Loan(*loan));
+                }
+                Carrier::Local(local) => {
+                    out.extend(holds.get(local).into_iter().flatten().copied());
+                }
+                Carrier::Call(expr) => {
+                    let Some(site) = self.calls.get(expr) else {
+                        continue;
+                    };
+                    let Some(callee) = summaries.get(&site.callee) else {
+                        continue;
+                    };
+                    for place in callee {
+                        let arg = match place.input {
+                            Input::Receiver => site.recv,
+                            Input::Param(index) => site.args.get(index).copied(),
+                        };
+                        // ponytail: origin の射影で狭めず、実引数の場所を丸ごと
+                        // 借りたことにする。親の場所は子と重なる全てと重なる
+                        // (`overlaps` は接頭辞判定)ので、狭めない方は必ず
+                        // より多く拒否する。狭めるのは後の最適化
+                        let Some(arg) = arg else {
+                            // スロットのレシーバは提供された実体。この本体に
+                            // 場所が無いので借用元を追えない
+                            unrooted.insert(*expr, Unrooted::Provider);
+                            continue;
+                        };
+                        let found = origins.get(&arg).cloned().unwrap_or_default();
+                        // 場所でない実引数から借りたのに借用が付いていない =
+                        // 借用元は評価の途中で作られた一時値
+                        if found.is_empty() && self.place_of(arg).is_none() {
+                            unrooted.insert(*expr, Unrooted::Temporary);
+                        }
+                        out.extend(found);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 与えられた要約のもとで、束縛と式が持つ借用を不動点まで閉じる。
+    ///
+    /// 参照の引数だけを種にする。所有の引数は本体の中で落ちるので、そこからの
+    /// 借用は入力の provenance にならない(戻せば `report_escapes` が断る)
+    fn resolve(&mut self, summaries: &Summaries) {
+        let mut holds: BTreeMap<hir::LocalId, BTreeSet<Origin>> = self
+            .inputs
+            .iter()
+            .map(|(local, input)| (*local, BTreeSet::from([Origin::Input(*input)])))
+            .collect();
+        let mut origins: BTreeMap<hir::ExprId, BTreeSet<Origin>> = BTreeMap::new();
+        let mut unrooted = BTreeMap::new();
+        loop {
+            let mut changed = false;
+            for (expr, carriers) in &self.carriers {
+                let next = self.expand(carriers, &holds, &origins, summaries, &mut unrooted);
+                let slot = origins.entry(*expr).or_default();
+                let before = slot.len();
+                slot.extend(next);
+                changed |= slot.len() != before;
+            }
+            for (local, carriers) in &self.flows {
+                let next = self.expand(carriers, &holds, &origins, summaries, &mut unrooted);
+                let slot = holds.entry(*local).or_default();
+                let before = slot.len();
+                slot.extend(next);
+                changed |= slot.len() != before;
+            }
+            if !changed {
+                break;
+            }
+        }
+        // 途中の反復では要約がまだ育っていないので、最後にもう一度だけ判定する
+        unrooted.clear();
+        self.returned = self.expand(
+            &self.returns.clone(),
+            &holds,
+            &origins,
+            summaries,
+            &mut unrooted,
+        );
+        for carriers in self.carriers.values() {
+            self.expand(carriers, &holds, &origins, summaries, &mut unrooted);
+        }
+        self.unrooted = unrooted;
+        self.holds = holds;
+        self.origins = origins;
+    }
+
+    /// 借用の出どころを入力の場所へ戻す。入力に根を持たないなら `None` で、
+    /// それは本体の中で終わる場所の借用 = 返せない借用
+    fn input_place(&self, origin: Origin) -> Option<InputPlace> {
+        match origin {
+            Origin::Input(input) => Some(InputPlace {
+                input,
+                path: Vec::new(),
+            }),
+            Origin::Loan(loan) => Some(InputPlace {
+                input: *self.inputs.get(&self.plan.loans[loan.index()].place.root)?,
+                path: self.plan.loans[loan.index()].place.path.clone(),
+            }),
+        }
+    }
+
+    fn provenance_origins(&self) -> BTreeSet<InputPlace> {
+        self.returned
+            .iter()
+            .filter_map(|origin| self.input_place(*origin))
+            .collect()
+    }
+
+    // ---- リージョン(tasks 4.1) ----
+
+    /// 借用ごとの生存区間を決める。
+    ///
+    /// 「生まれた点から到達できる」かつ「要る点へ到達できる」点だけ。これが
+    /// 制約を満たす**最小**の点集合になる(design.md 決定6)。字句スコープは
+    /// 一切見ない
+    fn regions(&mut self) {
+        // 参照束縛を触った点は、その束縛が持つ借用の要求点
+        for (point, effect) in self.plan.points.iter().enumerate() {
+            let Effect::Access(access) = &effect.effect else {
+                continue;
+            };
+            for origin in self.holds.get(&access.place.root).into_iter().flatten() {
+                if let Origin::Loan(loan) = origin {
+                    self.loan_uses[loan.index()].insert(PointId(point as u32));
+                }
+            }
+        }
+        // 戻り値に載る借用は出口まで生きる
+        for origin in &self.returned {
+            if let Origin::Loan(loan) = origin {
+                self.loan_uses[loan.index()].insert(self.plan.exit);
+            }
+        }
+
+        let count = self.plan.points.len();
+        let mut successors: Vec<BTreeSet<PointId>> = vec![BTreeSet::new(); count];
+        let mut predecessors: Vec<BTreeSet<PointId>> = vec![BTreeSet::new(); count];
+        for edge in &self.plan.edges {
+            successors[edge.from.index()].insert(edge.to);
+            predecessors[edge.to.index()].insert(edge.from);
+        }
+        self.outliving = Vec::with_capacity(self.plan.loans.len());
+        for loan in 0..self.plan.loans.len() {
+            let born = self.plan.loans[loan].point;
+            let forward = spread(&successors, BTreeSet::from([born]), None);
+            let backward = spread(&predecessors, self.loan_uses[loan].clone(), None);
+            let region: BTreeSet<PointId> = forward.intersection(&backward).copied().collect();
+            // 「借用が生まれた点を通らずに使用へ届く」点だけ。ループの中では
+            // 背辺の先も点としてはリージョンに入るが、そこから使用へ行くには
+            // もう一度借り直すしかない。**次の周の**借用と混ざらないよう、
+            // 借用元の破棄を見るときはこちらを使う
+            let again = spread(&predecessors, self.loan_uses[loan].clone(), Some(born));
+            self.outliving
+                .push(region.intersection(&again).copied().collect());
+            self.plan.regions[loan] = region;
+        }
+    }
+
+    /// その点で生きている借用。点 ID で引ける形に畳む
+    fn live_loans(&self) -> Vec<BTreeSet<LoanId>> {
+        let mut live: Vec<BTreeSet<LoanId>> = vec![BTreeSet::new(); self.plan.points.len()];
+        for (loan, region) in self.plan.regions.iter().enumerate() {
+            for point in region {
+                live[point.index()].insert(LoanId(loan as u32));
+            }
+        }
+        live
+    }
+}
+
+/// 決定的な作業キューで到達集合を広げる。`edges` は隣接、`seed` は出発点。
+/// `blocked` を通る経路は数えない
+fn spread(
+    edges: &[BTreeSet<PointId>],
+    seed: BTreeSet<PointId>,
+    blocked: Option<PointId>,
+) -> BTreeSet<PointId> {
+    let mut reached: BTreeSet<PointId> = seed.into_iter().filter(|p| Some(*p) != blocked).collect();
+    let mut queue = reached.clone();
+    while let Some(point) = queue.pop_first() {
+        for next in &edges[point.index()] {
+            if Some(*next) != blocked && reached.insert(*next) {
+                queue.insert(*next);
+            }
+        }
+    }
+    reached
 }
 
 // ---------------------------------------------------------------------------
@@ -915,17 +1532,161 @@ impl Build<'_> {
     /// 型検査が診断を積む順(走査順)と同じ約束になる
     fn report(&mut self, input: &[Option<Facts>]) {
         let mut found = Vec::new();
-        for (facts, point) in input.iter().zip(&self.plan.points) {
+        let live = self.live_loans();
+        for (index, (facts, point)) in input.iter().zip(&self.plan.points).enumerate() {
             // 到達しない点。状態が無いので何も言えない
             let Some(facts) = facts else { continue };
             let span = point.expr.map(|e| self.body.expr(e).span);
+            let at = PointId(index as u32);
             match &point.effect {
                 Effect::Access(access) => {
-                    self.report_access(&mut found, facts, access, point.expr, span)
+                    self.report_access(&mut found, facts, access, point.expr, span);
+                    self.report_conflicts(&mut found, at, &access.place, access.mode, span, &live);
                 }
-                Effect::Assign(local) => self.report_assign(&mut found, facts, *local, span),
+                Effect::Assign(local) => {
+                    self.report_assign(&mut found, facts, *local, span);
+                    // 代入は古い値を落とす。束縛そのものへの排他アクセス
+                    let place = Place {
+                        root: *local,
+                        path: Vec::new(),
+                    };
+                    self.report_conflicts(&mut found, at, &place, Mode::Mutable, span, &live);
+                }
                 Effect::Init(_) | Effect::Nop => {}
             }
+        }
+        self.diagnostics.extend(found);
+    }
+
+    /// 生きている借用との衝突(tasks 4.3)。
+    ///
+    /// 自分自身が作った借用は数えない。それ以外で場所が重なるものだけを見る
+    fn report_conflicts(
+        &self,
+        found: &mut Vec<Diag>,
+        at: PointId,
+        place: &Place,
+        mode: Mode,
+        span: Option<Span>,
+        live: &[BTreeSet<LoanId>],
+    ) {
+        let ctx = &self.ctx;
+        let shown = self.show_place(place);
+        for loan in &live[at.index()] {
+            let held = &self.plan.loans[loan.index()];
+            if held.point == at || !overlaps(&held.place, place) {
+                continue;
+            }
+            let (msg, label, note) = match (mode, held.kind) {
+                (Mode::Move, hir::RefKind::Shared) | (Mode::Move, hir::RefKind::Mutable) => (
+                    format!("{ctx}: `{shown}` は借用されているので move できません"),
+                    "借用中の値の move",
+                    "ここで借用しています",
+                ),
+                (Mode::Mutable, hir::RefKind::Shared) => (
+                    format!("{ctx}: `{shown}` は共有借用されている間は排他的に触れません"),
+                    "共有借用との衝突",
+                    "ここで共有借用しています",
+                ),
+                (Mode::Mutable, hir::RefKind::Mutable) => (
+                    format!(
+                        "{ctx}: `{shown}` は既に排他借用されているので、もう一度は借りられません"
+                    ),
+                    "排他借用の重なり",
+                    "ここで排他借用しています",
+                ),
+                (Mode::Read | Mode::Shared, hir::RefKind::Mutable) => (
+                    format!("{ctx}: `{shown}` は排他借用されている間は読めません"),
+                    "排他借用との衝突",
+                    "ここで排他借用しています",
+                ),
+                // 共有どうしは重なってよい
+                (Mode::Read | Mode::Shared, hir::RefKind::Shared) => continue,
+            };
+            found.push(
+                Diag::from_span(span, msg)
+                    .label(label)
+                    .related(vec![Diag::at(held.span, note)]),
+            );
+            // 同じアクセスに衝突を並べても直し方は増えない
+            break;
+        }
+    }
+
+    /// 所有者より長く生きる借用(tasks 4.3 / 4.6)。
+    ///
+    /// 借用1つにつき1件。戻り値へ漏れるものを先に見て、残りを破棄と突き合わせる
+    fn report_escapes(&mut self) {
+        let ctx = self.ctx.clone();
+        let mut found = Vec::new();
+        for (expr, why) in &self.unrooted {
+            let (msg, label, help) = match why {
+                Unrooted::Temporary => (
+                    "この呼び出しは実引数から借りて返しますが、その実引数は式の中で終わる一時値です",
+                    "一時値からの借用",
+                    "借用元を先に束縛してから渡してください",
+                ),
+                Unrooted::Provider => (
+                    "スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の所有はこの版では追えません",
+                    "提供された実体からの借用",
+                    "借用を返さない契約にするか、実装を直接呼んでください",
+                ),
+            };
+            found.push(
+                Diag::at(self.body.expr(*expr).span, format!("{ctx}: {msg}"))
+                    .label(label)
+                    .help(help),
+            );
+        }
+        let escaping: BTreeSet<LoanId> = self
+            .returned
+            .iter()
+            .filter(|origin| self.input_place(**origin).is_none())
+            .filter_map(|origin| match origin {
+                Origin::Loan(loan) => Some(*loan),
+                Origin::Input(_) => None,
+            })
+            .collect();
+        for (index, loan) in self.plan.loans.iter().enumerate() {
+            let id = LoanId(index as u32);
+            let shown = self.show_place(&loan.place);
+            if escaping.contains(&id) {
+                found.push(
+                    Diag::at(
+                        loan.span,
+                        format!(
+                            "{ctx}: `{shown}` の借用は返せません。借用元がこの本体の中で終わります"
+                        ),
+                    )
+                    .label("所有者より長生きする借用")
+                    .help("所有ごと返すか、入力から借りたものを返してください"),
+                );
+                continue;
+            }
+            // 借用元が落ちる辺。その先でも借用が生きているなら宙に浮く
+            let region = &self.outliving[index];
+            let Some(edge) = self.plan.edges.iter().find(|edge| {
+                region.contains(&edge.to)
+                    && edge.drops.iter().any(|drop| match drop {
+                        Drop::Local(local) => *local == loan.place.root,
+                        Drop::Remaining { root, .. } => *root == loan.place.root,
+                    })
+            }) else {
+                continue;
+            };
+            let owner = self.body.local(loan.place.root);
+            let _ = edge;
+            found.push(
+                Diag::at(
+                    loan.span,
+                    format!("{ctx}: `{shown}` の借用は借用元より長く生きています"),
+                )
+                .label("所有者より長生きする借用")
+                .related(vec![Diag::at(
+                    owner.span,
+                    format!("`{}` はスコープの終わりで落ちます", owner.name),
+                )]),
+            );
         }
         self.diagnostics.extend(found);
     }
@@ -1015,31 +1776,6 @@ impl Build<'_> {
                     format!("`{}` はここで束ねられています", local.name),
                 )]),
             );
-        }
-        if access.mode == Mode::Move {
-            // 借用されたままの場所は move できない。
-            // ponytail: いま loan を作るのは `let v = &place` と直接書いた形だけで、
-            // 生存区間も束縛のスコープで上から抑えている。全ての借用に loan を
-            // 作って最終使用まで縮めるのは phase 4(4.1/4.3)
-            for (borrower, (source, borrowed_at)) in &self.borrows {
-                if *source == root && facts.get(borrower).is_some_and(|fact| fact.owned) {
-                    found.push(
-                        Diag::from_span(
-                            span,
-                            format!("{ctx}: `{shown}` は借用されているので move できません"),
-                        )
-                        .label("借用中の値の move")
-                        .related(vec![Diag::at(
-                            *borrowed_at,
-                            format!(
-                                "`{}` がここで借用しています",
-                                self.body.local(*borrower).name
-                            ),
-                        )]),
-                    );
-                    break;
-                }
-            }
         }
         if access.mode == Mode::Mutable && !self.mutable_root(root) {
             let local = self.body.local(root);
@@ -1156,8 +1892,8 @@ impl Build<'_> {
     }
 }
 
-/// 本体1つを解析する。
-fn analyze(program: &hir::Program, id: hir::BodyId) -> (BodyPlan, Vec<Diag>) {
+/// 本体1つを歩いて、要約に依らない事実を全部作る(check の第1段)。
+fn walk_body(program: &hir::Program, id: hir::BodyId) -> Build<'_> {
     let mut build = Build::new(program, id);
     let body = build.body;
     let root = build.scope(None);
@@ -1169,17 +1905,33 @@ fn analyze(program: &hir::Program, id: hir::BodyId) -> (BodyPlan, Vec<Diag>) {
 
     // `self` と引数は呼び出しの時点で所有を得ている。入口の直後に初期化を置くと、
     // 入口の状態が空のままで済む
-    let params: Vec<hir::LocalId> = match id {
+    let params: Vec<(hir::LocalId, Input)> = match id {
         hir::BodyId::Callable(callable) => body
             .receiver
             .iter()
-            .chain(program.callables[callable].params.iter())
-            .copied()
+            .map(|local| (*local, Input::Receiver))
+            .chain(
+                program.callables[callable]
+                    .params
+                    .iter()
+                    .enumerate()
+                    .map(|(index, local)| (*local, Input::Param(index))),
+            )
             .collect(),
         hir::BodyId::Test(_) => Vec::new(),
     };
-    for local in params {
+    for (local, input) in params {
         build.declare(local, root, Bound::Param);
+        // 参照で受け取った入力は、呼び出し側の場所の代理。この本体の中に
+        // 借用元が無いので、provenance の根になる(design.md 決定6)
+        if body
+            .local(local)
+            .ty
+            .as_ref()
+            .is_some_and(|ty| ty.reference.is_some())
+        {
+            build.inputs.insert(local, input);
+        }
         build.point(None, root, Effect::Init(local));
     }
 
@@ -1189,15 +1941,26 @@ fn analyze(program: &hir::Program, id: hir::BodyId) -> (BodyPlan, Vec<Diag>) {
             build.value(*e, root, Need::Read);
         }
         build.value(*last, root, Need::Take);
+        if let Some(carried) = build.carriers.get(last).cloned() {
+            build.returns.extend(carried);
+        }
     }
     if let Some(from) = build.cur {
         build.edge(from, exit, vec![root]);
     }
+    build
+}
 
-    let input = build.solve();
-    build.report(&input);
-    build.settle(&input);
-    (build.plan, build.diagnostics)
+impl Build<'_> {
+    /// 要約が閉じた後に、リージョン・破棄・診断を確定する(check の第3段)。
+    fn finish(mut self) -> (BodyPlan, Vec<Diag>) {
+        let input = self.solve();
+        self.settle(&input);
+        self.regions();
+        self.report(&input);
+        self.report_escapes();
+        (self.plan, self.diagnostics)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,6 +2025,39 @@ impl Plan {
                 }
                 let _ = writeln!(out, "{line}");
             }
+            for (loan_id, loan) in plan.loans() {
+                let points: Vec<String> = plan
+                    .region(loan_id)
+                    .iter()
+                    .map(|p| format!("#{}", p.index()))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "  loan#{} {} local#{}({}){} @ #{} region [{}]",
+                    loan_id.index(),
+                    loan.kind.spelling().trim_end(),
+                    loan.place.root.index(),
+                    body.local(loan.place.root).name,
+                    show_path(program, &loan.place.path),
+                    loan.point.index(),
+                    points.join(" ")
+                );
+            }
+            if let hir::BodyId::Callable(callable) = id
+                && let Some(provenance) = self.provenance(*callable)
+            {
+                let origins: Vec<String> = provenance
+                    .origins
+                    .iter()
+                    .map(|origin| show_input(program, origin))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "  provenance {} [{}]",
+                    provenance.kind.spelling().trim_end(),
+                    origins.join(" ")
+                );
+            }
             let _ = writeln!(
                 out,
                 "  entry #{} exit #{}",
@@ -1271,6 +2067,14 @@ impl Plan {
         }
         out
     }
+}
+
+fn show_input(program: &hir::Program, place: &InputPlace) -> String {
+    let root = match place.input {
+        Input::Receiver => "self".to_string(),
+        Input::Param(index) => format!("param#{index}"),
+    };
+    format!("{root}{}", show_path(program, &place.path))
 }
 
 fn show_effect(program: &hir::Program, body: &hir::Body, effect: &Effect) -> String {
@@ -1535,6 +2339,16 @@ test \"t\" { let b = 2 }
         accepted(&with_user("  while true { let u = make()\n take(move u) }"));
     }
 
+    /// 周ごとに作って周ごとに借りるだけなら、背辺の破棄は借用を殺さない。
+    /// 点の集合だけでは次の周の借用と区別が付かないので、借用が生まれた点を
+    /// 通らずに使用へ届くかで見る
+    #[test]
+    fn 周ごとに借り直す値はループを通る() {
+        accepted(&with_user(
+            "  while true { let u = make()\n let v = &u\n assert v.id == 1 }",
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // 3.4 束縛・Copy・呼び出し・戻り値
     // -----------------------------------------------------------------------
@@ -1723,7 +2537,7 @@ fn swap(r: &mut User, other: &mut User) { r = other }
         assert_eq!(diagnostic.label.as_deref(), Some("借用中の値の move"));
         assert_eq!(
             related(&src, &diagnostic),
-            vec![("`view` がここで借用しています".to_string(), "&u")]
+            vec![("ここで借用しています".to_string(), "&u")]
         );
     }
 
@@ -1879,8 +2693,9 @@ fn provided(-> int) {{ with clock(SystemClock {{}}) {{ clock.now() }} }}
 fn main(-> int) {{
   let mut n = 0
   let u = make()
+  let u2 = make()
   if true {{ n = take(move u) }} else {{ n = 1 }}
-  n + loops([1, 2]) + arms(Bronze) + provided() + take(move pick(true, make()))
+  n + loops([1, 2]) + arms(Bronze) + provided() + take(pick(true, move u2))
 }}
 test \"t\" {{ let b = make()
  assert b.id == 1 }}
@@ -2190,13 +3005,15 @@ body main
   point#2 expr#3 scope#0 init local#0
   point#3 expr#12 scope#0 nop
   point#4 expr#6 scope#1 move local#0(u)
-  point#5 expr#12 scope#0 nop
+  point#5 expr#7 scope#1 nop
+  point#6 expr#12 scope#0 nop
   edge #0 -> #2
   edge #2 -> #3
   edge #3 -> #4
-  edge #4 -> #5 exits [scope#1]
-  edge #3 -> #5 exits [scope#2]
-  edge #5 -> #1 exits [scope#0] drops [local#0]
+  edge #4 -> #5
+  edge #5 -> #6 exits [scope#1]
+  edge #3 -> #6 exits [scope#2]
+  edge #6 -> #1 exits [scope#0] drops [local#0]
   entry #0 exit #1
 "
         );
@@ -2253,6 +3070,704 @@ fn main(-> int) { let mut u = User { id = 1 }
             .collect();
         assert_eq!(spans.len(), 2, "{spans:?}");
         assert!(spans[0] < spans[1], "{spans:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 4.1 借用と非字句リージョン
+    // -----------------------------------------------------------------------
+
+    /// 射影を持つ場所を借りるための道具立て
+    const PAIR: &str = "struct Inner { n: int }
+struct Pair { left: Inner, right: Inner }
+fn bump(x: &mut Inner) { x.n = x.n + 1 }
+fn peek(x: &Inner -> int) { x.n }
+fn pair(-> Pair) { Pair { left = Inner { n = 1 }, right = Inner { n = 2 } } }
+";
+
+    /// 借用は最後の使用で終わる。括弧もリージョン注釈も要らない
+    #[test]
+    fn 共有借用は最後の使用で終わる() {
+        accepted(&with_user(
+            "  let mut u = make()\n  let view = &u\n  let n = view.id\n  u.id = 2\n  assert n == 1",
+        ));
+    }
+
+    /// 逆に、最後の使用が後ろにあれば同じ形が塞がる
+    #[test]
+    fn 使用が後ろにあれば共有借用は塞ぐ() {
+        let src =
+            with_user("  let mut u = make()\n  let view = &u\n  u.id = 2\n  assert view.id == 2");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `u.id` は共有借用されている間は排他的に触れません"
+        );
+        assert_eq!(diagnostic.label.as_deref(), Some("共有借用との衝突"));
+        assert_eq!(
+            related(&src, &diagnostic),
+            vec![("ここで共有借用しています".to_string(), "&u")]
+        );
+    }
+
+    /// リージョンは点の集合として計画に載る。使わなくなった先には伸びない
+    #[test]
+    fn リージョンは計画に載る() {
+        let src = with_user(
+            "  let mut u = make()\n  let view = &u\n  let n = view.id\n  u.id = 2\n  assert n == 1",
+        );
+        let checked = accepted(&src);
+        let plan = checked.plan.body(checked.hir.bodies[2]);
+        let (id, loan) = plan.loans().next().expect("借用が1つある");
+        assert_eq!(loan.kind, hir::RefKind::Shared);
+        let region = plan.region(id);
+        let write = plan
+            .points()
+            .find(
+                |(_, point)| matches!(&point.effect, Effect::Access(a) if a.mode == Mode::Mutable),
+            )
+            .expect("`u.id = 2` の排他アクセスがある")
+            .0;
+        assert!(region.contains(&loan.point), "作成点は必ず入る");
+        assert!(
+            !region.contains(&write),
+            "最後の使用より後には伸びない: {region:?}"
+        );
+    }
+
+    /// 再借用した参照が生きている間は、元の借用元も借りられたまま
+    #[test]
+    fn 再借用は元の借用も生かす() {
+        let src = format!(
+            "{PAIR}fn main() {{
+  let mut p = pair()
+  let e = &mut p
+  let r = e
+  p.left.n = 2
+  bump(&mut r.right)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p.left.n` は既に排他借用されているので、もう一度は借りられません"
+        );
+    }
+
+    /// 実引数の借用は呼び出しの間ずっと生きている。だから同じ呼び出しの中で
+    /// 排他と共有が並ぶと衝突する
+    #[test]
+    fn 同じ呼び出しの実引数どうしが衝突する() {
+        let src = format!(
+            "{PAIR}fn both(a: &mut Inner, b: &Inner -> int) {{ a.n + b.n }}
+fn main(-> int) {{
+  let mut p = pair()
+  both(&mut p.left, &p.left)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p.left` は排他借用されている間は読めません"
+        );
+    }
+
+    /// 素の `for` はループ変数が対象の借用を持ち回るので、周回中は対象を
+    /// 排他的に触れない
+    #[test]
+    fn ループ変数は対象の借用を持ち回る() {
+        let src = "struct Holder { xs: [int] }
+fn main(-> int) {
+  let mut h = Holder { xs = [1, 2] }
+  for x in h.xs { h.xs = [3] }
+  0
+}
+";
+        let diagnostic = only(src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `h.xs` は共有借用されている間は排他的に触れません"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4.2 場所の重なり
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn 別のフィールドは独立に排他借用できる() {
+        accepted(&format!(
+            "{PAIR}fn main() {{
+  let mut p = pair()
+  let a = &mut p.left
+  let b = &mut p.right
+  bump(a)
+  bump(b)
+}}
+"
+        ));
+    }
+
+    #[test]
+    fn 全体は子と重なる() {
+        let src = format!(
+            "{PAIR}fn main() {{
+  let mut p = pair()
+  let a = &mut p.left
+  let w = &mut p
+  bump(a)
+  bump(&mut w.right)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p` は既に排他借用されているので、もう一度は借りられません"
+        );
+    }
+
+    /// 重なり規則そのもの。ソースに添字構文が無いので配列と enum payload は
+    /// ここで直接固定する(tasks 4.2)
+    #[test]
+    fn 重なり規則は保守的な側へ倒れる() {
+        let root = hir::LocalId::from_index(0);
+        let other = hir::LocalId::from_index(1);
+        let left = Projection::Field(hir::FieldId::from_index(0));
+        let right = Projection::Field(hir::FieldId::from_index(1));
+        let at = |path: Vec<Projection>| Place { root, path };
+
+        assert!(overlaps(&at(vec![]), &at(vec![])));
+        // 根が違えば重ならない
+        assert!(!overlaps(
+            &at(vec![]),
+            &Place {
+                root: other,
+                path: vec![]
+            }
+        ));
+        // 全体は子の全てと重なる
+        assert!(overlaps(&at(vec![]), &at(vec![left.clone()])));
+        assert!(overlaps(&at(vec![left.clone()]), &at(vec![])));
+        // 宣言の違うフィールドは独立
+        assert!(!overlaps(&at(vec![left.clone()]), &at(vec![right])));
+        assert!(!overlaps(
+            &at(vec![left.clone(), left.clone()]),
+            &at(vec![
+                left.clone(),
+                Projection::Field(hir::FieldId::from_index(2))
+            ])
+        ));
+        // 定数添字が両方分かっていれば言い分けられる
+        assert!(!overlaps(
+            &at(vec![Projection::ArrayElement(Some(0))]),
+            &at(vec![Projection::ArrayElement(Some(1))])
+        ));
+        assert!(overlaps(
+            &at(vec![Projection::ArrayElement(Some(0))]),
+            &at(vec![Projection::ArrayElement(Some(0))])
+        ));
+        // 添字が分からなければ保守的に重なる
+        assert!(overlaps(
+            &at(vec![Projection::ArrayElement(None)]),
+            &at(vec![Projection::ArrayElement(Some(7))])
+        ));
+        // enum payload と optional の中身も保守的に重なる
+        let one = Projection::EnumPayload(hir::VariantId::from_index(0), 0);
+        let two = Projection::EnumPayload(hir::VariantId::from_index(1), 1);
+        assert!(overlaps(&at(vec![one]), &at(vec![two])));
+        assert!(overlaps(
+            &at(vec![Projection::OptionalPayload]),
+            &at(vec![left])
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // 4.3 借用の衝突と漏れ
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn 排他借用の重なりを拒否する() {
+        let src = format!(
+            "{PAIR}fn main() {{
+  let mut p = pair()
+  let a = &mut p.left
+  let b = &mut p.left
+  bump(a)
+  bump(b)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p.left` は既に排他借用されているので、もう一度は借りられません"
+        );
+        assert_eq!(diagnostic.label.as_deref(), Some("排他借用の重なり"));
+        assert_eq!(
+            related(&src, &diagnostic),
+            vec![("ここで排他借用しています".to_string(), "&mut p.left")]
+        );
+    }
+
+    #[test]
+    fn 排他借用中の読みを拒否する() {
+        let src = format!(
+            "{PAIR}fn main(-> int) {{
+  let mut p = pair()
+  let e = &mut p.left
+  let n = p.left.n
+  bump(e)
+  n
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p.left.n` は排他借用されている間は読めません"
+        );
+        assert_eq!(diagnostic.label.as_deref(), Some("排他借用との衝突"));
+    }
+
+    /// 借用が残ったまま所有者のスコープが終わる
+    #[test]
+    fn 所有者より長生きする借用を拒否する() {
+        let src = format!(
+            "{PAIR}fn main(outer: &Pair -> int) {{
+  let mut view = outer
+  if true {{
+    let inner = pair()
+    view = &inner
+  }}
+  peek(&view.left)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `inner` の借用は借用元より長く生きています"
+        );
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("所有者より長生きする借用")
+        );
+        assert_eq!(
+            related(&src, &diagnostic),
+            vec![(
+                "`inner` はスコープの終わりで落ちます".to_string(),
+                "let inner = pair()"
+            )]
+        );
+    }
+
+    /// 周回の緩和で穴を開けていないこと。ループの外へ持ち出す借用は塞ぐ
+    #[test]
+    fn ループの外へ持ち出す借用は拒否する() {
+        let src = format!(
+            "{PAIR}fn main(outer: &Pair -> int) {{
+  let mut view = outer
+  while true {{
+    let inner = pair()
+    view = &inner
+  }}
+  peek(&view.left)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `inner` の借用は借用元より長く生きています"
+        );
+    }
+
+    /// 局所の借用は返せない
+    #[test]
+    fn 局所からの借用を返すのを拒否する() {
+        let src = format!("{PAIR}fn leak(-> &Inner) {{ let p = pair()\n &p.left }}\n");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "leak: `p.left` の借用は返せません。借用元がこの本体の中で終わります"
+        );
+        assert_eq!(at(&src, &diagnostic), "&p.left");
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("所有ごと返すか、入力から借りたものを返してください")
+        );
+    }
+
+    /// 所有で受け取った引数も本体の中で終わるので、そこからの借用は返せない
+    #[test]
+    fn 所有の引数からの借用も返せない() {
+        let src = format!("{PAIR}fn leak(p: Pair -> &Inner) {{ &p.left }}\n");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "leak: `p.left` の借用は返せません。借用元がこの本体の中で終わります"
+        );
+    }
+
+    /// 一時値から借りて返す呼び出しは、借用元が式の中で終わる
+    #[test]
+    fn 一時値からの借用を返す呼び出しを拒否する() {
+        let src = format!(
+            "{PAIR}impl Pair {{ fn first(&self -> &Inner) {{ &self.left }} }}
+fn main(-> int) {{ peek(pair().first()) }}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: この呼び出しは実引数から借りて返しますが、その実引数は式の中で終わる一時値です"
+        );
+        assert_eq!(diagnostic.label.as_deref(), Some("一時値からの借用"));
+    }
+
+    /// スロット経由でレシーバから借りて返す契約は、提供の所有モードが
+    /// 決まるまで追えない(phase 5)
+    #[test]
+    fn スロット経由の借用返しを拒否する() {
+        let src = "struct Inner { n: int }
+struct Store { one: Inner }
+trait Peek { fn look(&self -> &Inner) }
+impl Peek for Store { fn look(&self -> &Inner) { &self.one } }
+effect store: Peek
+fn main(-> int) { with store(Store { one = Inner { n = 1 } }) { store.look().n } }
+";
+        let diagnostic = only(src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の所有はこの版では追えません"
+        );
+    }
+
+    #[test]
+    fn 場所でない値への借用を拒否する() {
+        let src = format!("{PAIR}fn main(-> int) {{ peek(&pair().left) }}\n");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: 場所ではない値に共有借用は掛けられません"
+        );
+        assert_eq!(
+            diagnostic.label.as_deref(),
+            Some("場所ではない値への所有権修飾")
+        );
+    }
+
+    #[test]
+    fn 場所でない値へのmoveを拒否する() {
+        let src = with_user("  let n = take(move make())\n  assert n == 1");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: 場所ではない値に`move`は掛けられません"
+        );
+        assert_eq!(
+            diagnostic.help.as_deref(),
+            Some("一時値は既に所有者なので `move` は要りません。修飾を外してください")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4.4 / 4.5 戻り値 provenance
+    // -----------------------------------------------------------------------
+
+    fn provenance(src: &str, name: &str) -> String {
+        let checked = accepted(src);
+        let callable = checked.hir.free_callable(name).expect("宣言がある");
+        let found = checked.plan.provenance(callable).expect("参照を返す");
+        let origins: Vec<String> = found
+            .origins
+            .iter()
+            .map(|origin| show_input(&checked.hir, origin))
+            .collect();
+        format!(
+            "{} [{}]",
+            found.kind.spelling().trim_end(),
+            origins.join(" ")
+        )
+    }
+
+    #[test]
+    fn 単一の入力から借りた戻り値の出自() {
+        let src = format!("{PAIR}fn left(p: &Pair -> &Inner) {{ &p.left }}\n");
+        assert_eq!(provenance(&src, "left"), "& [param#0.left]");
+    }
+
+    #[test]
+    fn 分岐は出自を合流する() {
+        let src = format!(
+            "{PAIR}fn pick(a: &Inner, b: &Inner, flag: bool -> &Inner) {{
+  if flag {{ a }} else {{ b }}
+}}
+"
+        );
+        assert_eq!(provenance(&src, "pick"), "& [param#0 param#1]");
+    }
+
+    /// 再帰は不動点で閉じる。1周目は `param#0` だけだが、再帰呼び出しが
+    /// 実引数を入れ替えているので `param#1` も候補になる
+    #[test]
+    fn 再帰する出自は不動点で閉じる() {
+        let src = format!(
+            "{PAIR}fn walk(a: &Inner, b: &Inner, n: int -> &Inner) {{
+  if n == 0 {{ a }} else {{ walk(b, a, n - 1) }}
+}}
+"
+        );
+        assert_eq!(provenance(&src, "walk"), "& [param#0 param#1]");
+    }
+
+    #[test]
+    fn 相互再帰する出自も閉じる() {
+        let src = format!(
+            "{PAIR}fn ping(a: &Inner, b: &Inner, n: int -> &Inner) {{
+  if n == 0 {{ a }} else {{ pong(b, a, n - 1) }}
+}}
+fn pong(a: &Inner, b: &Inner, n: int -> &Inner) {{
+  if n == 0 {{ b }} else {{ ping(a, b, n - 1) }}
+}}
+"
+        );
+        assert_eq!(provenance(&src, "ping"), "& [param#0 param#1]");
+        assert_eq!(provenance(&src, "pong"), "& [param#0 param#1]");
+    }
+
+    /// メソッドのレシーバも出自になる
+    #[test]
+    fn レシーバからの借用も出自になる() {
+        let src = format!(
+            "{PAIR}impl Pair {{ fn first(&self -> &Inner) {{ &self.left }} }}
+"
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(dumped.contains("provenance & [self.left]"), "{dumped}");
+    }
+
+    /// 呼び出し側では出自が実引数へ置き換わる。結果が生きている間、元は
+    /// 借りられたまま
+    #[test]
+    fn 呼び出し側で出自が実引数に置き換わる() {
+        let src = format!(
+            "{PAIR}fn left(p: &Pair -> &Inner) {{ &p.left }}
+fn main(-> int) {{
+  let mut p = pair()
+  let got = left(&p)
+  p.left.n = 5
+  peek(got)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p.left.n` は共有借用されている間は排他的に触れません"
+        );
+    }
+
+    /// 候補が2つなら両方が借りられたまま(design.md 決定6)
+    #[test]
+    fn 候補が複数なら全部が借りられたまま() {
+        let src = format!(
+            "{PAIR}fn pick(a: &Inner, b: &Inner, flag: bool -> &Inner) {{
+  if flag {{ a }} else {{ b }}
+}}
+fn main(-> int) {{
+  let mut x = pair()
+  let mut y = pair()
+  let got = pick(&x.left, &y.left, true)
+  y.left.n = 5
+  peek(got)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `y.left.n` は共有借用されている間は排他的に触れません"
+        );
+    }
+
+    /// 排他で返すなら候補は全部排他に予約されたまま(tasks 4.5)
+    #[test]
+    fn 排他で返した借用は候補を全部予約する() {
+        let src = format!(
+            "{PAIR}fn pick(a: &mut Inner, b: &mut Inner, flag: bool -> &mut Inner) {{
+  if flag {{ a }} else {{ b }}
+}}
+fn main() {{
+  let mut x = pair()
+  let mut y = pair()
+  let got = pick(&mut x.left, &mut y.left, true)
+  peek(&y.left)
+  bump(got)
+}}
+"
+        );
+        assert_eq!(
+            provenance(
+                &format!(
+                    "{PAIR}fn pick(a: &mut Inner, b: &mut Inner, flag: bool -> &mut Inner) {{ if flag {{ a }} else {{ b }} }}\n"
+                ),
+                "pick"
+            ),
+            "&mut [param#0 param#1]"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `y.left` は排他借用されている間は読めません"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4.6 参照が使える位置
+    // -----------------------------------------------------------------------
+
+    /// 局所・引数・戻り値・フィールド再借用・要素再借用は全部そのまま通る
+    #[test]
+    fn 参照は局所引数戻り値と射影の再借用で使える() {
+        accepted(&format!(
+            "{PAIR}fn field(p: &Pair -> &Inner) {{ &p.left }}
+fn element(xs: [Pair] -> int) {{
+  let mut total = 0
+  for p in xs {{ total = total + peek(&p.left) }}
+  total
+}}
+fn main(-> int) {{
+  let p = pair()
+  let local = &p
+  let n = peek(field(local))
+  n + element([pair()])
+}}
+"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // 4.7 計画のスナップショット
+    // -----------------------------------------------------------------------
+
+    /// 借用・リージョン・provenance の全文。並びまで固定する
+    #[test]
+    fn 借用とリージョンの全文を固定する() {
+        let src = "struct Inner { n: int }
+struct Pair { left: Inner, right: Inner }
+fn left(p: &Pair -> &Inner) { &p.left }
+";
+        assert_eq!(
+            dump(src),
+            "body left
+  scope#0 [local#0]
+  point#0 - scope#0 nop
+  point#1 - scope#0 nop
+  point#2 - scope#0 init local#0
+  point#3 expr#2 scope#0 & local#0(p).left
+  edge #0 -> #2
+  edge #2 -> #3
+  edge #3 -> #1 exits [scope#0]
+  loan#0 & local#0(p).left @ #3 region [#1 #3]
+  provenance & [param#0.left]
+  entry #0 exit #1
+"
+        );
+    }
+
+    /// 借用を作るようになっても、いま有効な形は全部そのまま通る。
+    /// `for`・`match`・`with`・test・可変な累算を1本に詰めてある
+    #[test]
+    fn 現行の有効な形は借用を作っても通る() {
+        accepted(
+            "enum Rank { Bronze Gold }
+struct Point { x: int, y: int }
+trait Clock { fn now(self -> int) }
+struct Frozen { t: int }
+impl Frozen { fn at(t: int -> Frozen) { Frozen { t = t } } }
+impl Clock for Frozen { fn now(self -> int) { self.t } }
+effect clock: Clock
+fn sum(xs: [int] -> int) {
+  let mut total = 0
+  for x in xs { total = total + x }
+  total
+}
+fn rank(r: Rank -> int) {
+  match r {
+    Rank::Bronze: 1
+    Rank::Gold: 2
+  }
+}
+fn stamped(-> int) { clock.now() }
+fn main(-> int) {
+  let p = Point { x = 3, y = 4 }
+  let n = sum([1, 2, 3]) + rank(Gold) + p.x * p.y
+  with clock(Frozen::at(1000)) { n + stamped() }
+}
+test \"合計\" { assert sum([1, 2]) == 3 }
+",
+        );
+    }
+
+    /// プロセスを跨いだ決定性の見本。借用・リージョン・provenance と、
+    /// それを閉じる不動点を全部通る
+    fn fingerprint_source() -> String {
+        format!(
+            "{PAIR}fn ping(a: &Inner, b: &Inner, n: int -> &Inner) {{
+  if n == 0 {{ a }} else {{ pong(b, a, n - 1) }}
+}}
+fn pong(a: &Inner, b: &Inner, n: int -> &Inner) {{
+  if n == 0 {{ b }} else {{ ping(a, b, n - 1) }}
+}}
+fn field(p: &Pair -> &Inner) {{ &p.left }}
+fn main(-> int) {{
+  let mut p = pair()
+  let a = &mut p.left
+  let b = &mut p.right
+  bump(a)
+  bump(b)
+  let view = &p
+  peek(field(view)) + peek(ping(&p.left, &p.right, 3))
+}}
+"
+        )
+    }
+
+    const FINGERPRINT: &str = "ownership::tests::計画の指紋を出す";
+
+    /// 子プロセスから呼ばれる。標準出力に計画をそのまま出すだけ
+    #[test]
+    fn 計画の指紋を出す() {
+        println!("<<<plan\n{}plan>>>", dump(&fingerprint_source()));
+    }
+
+    /// 別々のプロセスで走らせても同じ計画が出る。
+    ///
+    /// 同じプロセスで2回呼ぶだけでは、走るたびに変わる種(ハッシュの初期値、
+    /// アドレス)を掴んでいても気付けない。自分自身のテストバイナリを2回
+    /// 起動して突き合わせる
+    #[test]
+    fn 計画はプロセスを跨いでも同じ文字列になる() {
+        let exe = std::env::current_exe().expect("テストバイナリの位置が分かる");
+        let run = || {
+            let out = std::process::Command::new(&exe)
+                .args(["--exact", "--nocapture", FINGERPRINT])
+                .output()
+                .expect("子プロセスが起動する");
+            let stdout = String::from_utf8(out.stdout).expect("UTF-8");
+            let (_, rest) = stdout.split_once("<<<plan\n").expect("指紋が出ている");
+            let (plan, _) = rest.split_once("plan>>>").expect("指紋が閉じている");
+            plan.to_string()
+        };
+        let first = run();
+        assert_eq!(first, run());
+        assert_eq!(first, dump(&fingerprint_source()));
+        assert!(first.contains("provenance & [param#0 param#1]"), "{first}");
+        assert!(first.contains("loan#"), "{first}");
     }
 
     /// 未移行の実例。落ちるのは移行項目だけで、余計な診断は出ない

@@ -70,28 +70,28 @@
 
 ## 4. Infer Loans and Return Provenance
 
-- [ ] 4.1 Generate explicit and automatic shared/mutable loans, reborrow
+- [x] 4.1 Generate explicit and automatic shared/mutable loans, reborrow
   constraints, last-use constraints, and minimal non-lexical regions over CFG
   points
-- [ ] 4.2 Implement place overlap for whole values and projections, accepting
+- [x] 4.2 Implement place overlap for whole values and projections, accepting
   disjoint struct fields and conservatively overlapping enum payloads and
   unknown array indices
-- [ ] 4.3 Reject mutation through shared access, overlapping mutable/shared
+- [x] 4.3 Reject mutation through shared access, overlapping mutable/shared
   loans, owner moves or drops during loans, mutable borrows from immutable
   places, and references that outlive their owners
-- [ ] 4.4 Infer shared and mutable return provenance as deterministic sets of
+- [x] 4.4 Infer shared and mutable return provenance as deterministic sets of
   input paths and substitute caller places through direct and resolved method
   calls
-- [ ] 4.5 Close recursive and mutually recursive return-provenance summaries with
+- [x] 4.5 Close recursive and mutually recursive return-provenance summaries with
   a monotone deterministic fixed point and conservatively union conditional
   origins
-- [ ] 4.6 Reject borrowed values stored in aggregates or exposed in public Wasm
+- [x] 4.6 Reject borrowed values stored in aggregates or exposed in public Wasm
   signatures while retaining local, parameter, result, field-reborrow, and
   element-reborrow cases
-- [ ] 4.7 Add plan snapshots and diagnostics for last-use shortening, reborrows,
+- [x] 4.7 Add plan snapshots and diagnostics for last-use shortening, reborrows,
   disjoint fields, conservative array conflicts, escaping returns, multiple
   return origins, recursion, and mutable returned loans
-- [ ] 4.8 Run formatting, the full test suite, region/provenance fixed-point tests,
+- [x] 4.8 Run formatting, the full test suite, region/provenance fixed-point tests,
   determinism checks, and strict OpenSpec validation, then commit borrow
   inference as a stable snapshot
 
