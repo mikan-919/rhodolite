@@ -16,8 +16,8 @@
 
 ## 3. Typed data lowering and checked cleanup
 
-- [ ] 3.1 Add the flat Copy/owned-address/borrowed-address representation planner and expand function params, results, block types, and locals to deterministic Wasm value sequences
-- [ ] 3.2 Expose a narrow read-only backend cleanup view from `ownership::BodyPlan`, with snapshots proving it preserves the existing access modes and edge drop order
+- [x] 3.1 Add the flat Copy/owned-address/borrowed-address representation planner and expand function params, results, block types, and locals to deterministic Wasm value sequences
+- [x] 3.2 Expose a narrow read-only backend cleanup view from `ownership::BodyPlan`, with snapshots proving it preserves the existing access modes and edge drop order
 - [ ] 3.3 Add `wasm_data.rs` interfaces for emitting values and places, moving, assigning, discarding, loading/storing Copy layouts, and relocating inline owned layouts
 - [ ] 3.4 Give every non-Copy owner an address slot and initialization flag, and lower checked `Drop::Local` plus move flag transitions
 - [ ] 3.5 Lower `Drop::Remaining` for consuming nested projections without double-dropping the selected path

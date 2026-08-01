@@ -18,6 +18,7 @@ use crate::ambient_abi::{Plan, ProductionPlan};
 use crate::diag::Diag;
 use crate::hir;
 use crate::ownership::CheckedProgram;
+use crate::wasm_layout::Layouts;
 use std::collections::BTreeMap;
 use wasm_encoder::{
     BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
@@ -73,16 +74,6 @@ pub fn scalar_of(ty: &hir::Type) -> Option<Scalar> {
         hir::TypeKind::Builtin(hir::Builtin::Bool) => Some(Scalar::Bool),
         hir::TypeKind::Builtin(hir::Builtin::Int) => Some(Scalar::Int),
         _ => None,
-    }
-}
-
-/// 式が stack に残す値。`unit` は実行時表現を持たないので何も残さないし、
-/// 発散する式も残さない
-fn result_scalar(expr: &hir::Expr) -> Option<Scalar> {
-    match &expr.result {
-        hir::ExprResult::Value(ty) => scalar_of(ty).filter(|s| s.val_type().is_some()),
-        // 発散する式の後ろは到達しない。Wasm の stack は多相なので何も要らない
-        hir::ExprResult::Diverges | hir::ExprResult::Poison => None,
     }
 }
 
@@ -282,14 +273,48 @@ fn check_expr(
 // 関数の割り当て
 // ---------------------------------------------------------------------------
 
+/// 値1つを運ぶ Wasm の値の並び(design.md 決定2)。
+///
+/// 到達した型は対応検査を通っているので、ここで並びが計画できないことは無い。
+/// 32bit に収まらない型はその検査が名指して止める
+fn values_of(layouts: &mut Layouts, program: &hir::Program, ty: &hir::Type) -> Vec<ValType> {
+    layouts
+        .repr(program, ty)
+        .expect("対応検査を通った型は 32bit に収まる")
+        .values
+}
+
+/// 式が stack に残す値の並び。発散する式は何も残さない
+fn result_values(layouts: &mut Layouts, program: &hir::Program, expr: &hir::Expr) -> Vec<ValType> {
+    match &expr.result {
+        hir::ExprResult::Value(ty) => values_of(layouts, program, ty),
+        // 発散する式の後ろは到達しない。Wasm の stack は多相なので何も要らない
+        hir::ExprResult::Diverges | hir::ExprResult::Poison => Vec::new(),
+    }
+}
+
+/// 束縛が占める値の並び。読めない束縛(初期化子が発散した `let`)は空
+fn local_values(
+    layouts: &mut Layouts,
+    program: &hir::Program,
+    body: &hir::Body,
+    local: hir::LocalId,
+) -> Vec<ValType> {
+    match &body.local(local).ty {
+        Some(ty) => values_of(layouts, program, ty),
+        None => Vec::new(),
+    }
+}
+
 /// instance 1つ分の、Wasm 関数としての形。
 struct Lowered {
     callable: hir::CallableId,
     /// 値を運ぶ引数だけ。`unit` の引数は席を持たない
     params: Vec<ValType>,
-    result: Scalar,
-    /// HIR のローカル → Wasm のローカル番号。`unit` のローカルは載らない
-    slots: BTreeMap<hir::LocalId, u32>,
+    results: Vec<ValType>,
+    /// HIR のローカル → Wasm のローカル番号の**並び**。`unit` のローカルは空。
+    /// 値を複数持つ表現(Copy な optional など)は席をその数だけ取る
+    slots: BTreeMap<hir::LocalId, Vec<u32>>,
     /// 引数の後ろに並ぶ宣言ローカルの型
     extra_locals: Vec<ValType>,
 }
@@ -298,46 +323,48 @@ struct Lowered {
 ///
 /// 番号は Wasm の規則どおり引数が先。どちらも HIR の宣言順で歩くので、
 /// 同じ入力からは同じ割り当てになる
-fn lower_signature(program: &hir::Program, callable_id: hir::CallableId) -> Lowered {
+fn lower_signature(
+    layouts: &mut Layouts,
+    program: &hir::Program,
+    callable_id: hir::CallableId,
+) -> Lowered {
     let callable = &program.callables[callable_id];
     let body = &callable.body;
-    let mut slots = BTreeMap::new();
+    let mut slots: BTreeMap<hir::LocalId, Vec<u32>> = BTreeMap::new();
     let mut params = Vec::new();
 
     for local in &callable.params {
-        let scalar = body
-            .local(*local)
-            .ty
-            .as_ref()
-            .and_then(scalar_of)
-            .unwrap_or(Scalar::Unit);
-        if let Some(val_type) = scalar.val_type() {
-            slots.insert(*local, params.len() as u32);
-            params.push(val_type);
-        }
+        let values = local_values(layouts, program, body, *local);
+        let seats = values
+            .iter()
+            .map(|value| {
+                params.push(*value);
+                params.len() as u32 - 1
+            })
+            .collect();
+        slots.insert(*local, seats);
     }
 
     let mut extra_locals = Vec::new();
-    for (id, decl) in body.locals() {
+    for (id, _) in body.locals() {
         if slots.contains_key(&id) {
             continue;
         }
-        let Some(val_type) = decl
-            .ty
-            .as_ref()
-            .and_then(scalar_of)
-            .and_then(Scalar::val_type)
-        else {
-            continue;
-        };
-        slots.insert(id, (params.len() + extra_locals.len()) as u32);
-        extra_locals.push(val_type);
+        let values = local_values(layouts, program, body, id);
+        let seats = values
+            .iter()
+            .map(|value| {
+                extra_locals.push(*value);
+                (params.len() + extra_locals.len() - 1) as u32
+            })
+            .collect();
+        slots.insert(id, seats);
     }
 
     Lowered {
         callable: callable_id,
         params,
-        result: scalar_of(&callable.ret).unwrap_or(Scalar::Unit),
+        results: values_of(layouts, program, &callable.ret),
         slots,
         extra_locals,
     }
@@ -351,15 +378,16 @@ struct Types {
 }
 
 impl Types {
-    fn intern(&mut self, params: &[ValType], result: Scalar) -> u32 {
-        let results: Vec<ValType> = result.val_type().into_iter().collect();
-        let key = (params.to_vec(), results.clone());
+    fn intern(&mut self, params: &[ValType], results: &[ValType]) -> u32 {
+        let key = (params.to_vec(), results.to_vec());
         if let Some(found) = self.ids.get(&key) {
             return *found;
         }
         let id = self.ids.len() as u32;
         self.ids.insert(key, id);
-        self.section.ty().function(params.to_vec(), results);
+        self.section
+            .ty()
+            .function(params.to_vec(), results.to_vec());
         id
     }
 }
@@ -372,8 +400,14 @@ struct Emitter<'a> {
     program: &'a hir::Program,
     instance: &'a crate::ambient_abi::Instance,
     lowered: &'a Lowered,
+    layouts: &'a mut Layouts,
+    types: &'a mut Types,
     function: Function,
 }
+
+/// `int` 1つ、`bool` 1つ。scalar の演算が要求する形
+const WANT_INT: &[ValType] = &[ValType::I64];
+const WANT_BOOL: &[ValType] = &[ValType::I32];
 
 impl Emitter<'_> {
     fn push(&mut self, instruction: Instruction<'_>) {
@@ -384,30 +418,39 @@ impl Emitter<'_> {
         &self.program.callables[self.lowered.callable].body
     }
 
+    /// 式が残す値の並び
+    fn produced(&mut self, id: hir::ExprId) -> Vec<ValType> {
+        let program = self.program;
+        let expr = &program.callables[self.lowered.callable].body.expr(id);
+        result_values(self.layouts, program, expr)
+    }
+
     /// 式の列を下ろす。値になるのは最後の式だけで、途中の値は捨てる
-    fn sequence(&mut self, exprs: &[hir::ExprId], want: Option<Scalar>) {
+    fn sequence(&mut self, exprs: &[hir::ExprId], want: &[ValType]) {
         let Some((last, leading)) = exprs.split_last() else {
             return;
         };
         for expr in leading {
-            self.expr(*expr, None);
+            self.expr(*expr, &[]);
         }
         self.expr(*last, want);
     }
 
     /// 式を「この結果で終わる」ように下ろす。
     ///
-    /// `want` が `None` なら stack には何も残さない。値を産む式なら落とす。
-    /// 発散する式は何も残さないので、どちらの `want` でも足すものは無い
-    fn expr(&mut self, id: hir::ExprId, want: Option<Scalar>) {
-        let produced = result_scalar(self.body().expr(id));
+    /// `want` が空なら stack には何も残さない。値を産む式なら、その並びのぶん
+    /// だけ落とす。発散する式は何も残さないので足すものは無い
+    fn expr(&mut self, id: hir::ExprId, want: &[ValType]) {
+        let produced = self.produced(id);
         self.lower(id);
-        if produced.is_some() && want.is_none() {
-            self.push(Instruction::Drop);
+        if want.is_empty() {
+            for _ in &produced {
+                self.push(Instruction::Drop);
+            }
         }
     }
 
-    /// 式そのもの。残す値は `result_scalar` が決めたぶんだけ
+    /// 式そのもの。残す値は `result_values` が決めたぶんだけ
     fn lower(&mut self, id: hir::ExprId) {
         let body = self.body();
         let expr = body.expr(id);
@@ -416,17 +459,20 @@ impl Emitter<'_> {
             hir::ExprKind::Bool(b) => self.push(Instruction::I32Const(i32::from(*b))),
 
             hir::ExprKind::Local(local) => {
-                if let Some(slot) = self.lowered.slots.get(local).copied() {
-                    self.push(Instruction::LocalGet(slot));
+                let seats = self.lowered.slots.get(local).cloned().unwrap_or_default();
+                for seat in seats {
+                    self.push(Instruction::LocalGet(seat));
                 }
             }
 
             hir::ExprKind::Let { local, value } | hir::ExprKind::AssignLocal { local, value } => {
-                let slot = self.lowered.slots.get(local).copied();
-                let want = slot.map(|_| local_scalar(body, *local));
-                self.expr(*value, want);
-                if let Some(slot) = slot {
-                    self.push(Instruction::LocalSet(slot));
+                let (local, value) = (*local, *value);
+                let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
+                let want = self.local_want(local);
+                self.expr(value, &want);
+                // stack の上は並びの最後。奥から埋めるので逆順で受ける
+                for seat in seats.iter().rev() {
+                    self.push(Instruction::LocalSet(*seat));
                 }
             }
 
@@ -434,14 +480,14 @@ impl Emitter<'_> {
             hir::ExprKind::Neg(inner) => {
                 let inner = *inner;
                 self.push(Instruction::I64Const(0));
-                self.expr(inner, Some(Scalar::Int));
+                self.expr(inner, WANT_INT);
                 self.push(Instruction::I64Sub);
             }
 
             hir::ExprKind::Arith { op, lhs, rhs } => {
                 let (op, lhs, rhs) = (*op, *lhs, *rhs);
-                self.expr(lhs, Some(Scalar::Int));
-                self.expr(rhs, Some(Scalar::Int));
+                self.expr(lhs, WANT_INT);
+                self.expr(rhs, WANT_INT);
                 self.push(match op {
                     hir::ArithOp::Add => Instruction::I64Add,
                     hir::ArithOp::Sub => Instruction::I64Sub,
@@ -453,33 +499,35 @@ impl Emitter<'_> {
 
             hir::ExprKind::Eq { lhs, rhs } => {
                 let (lhs, rhs) = (*lhs, *rhs);
-                let operand = result_scalar(body.expr(lhs))
-                    .or_else(|| result_scalar(body.expr(rhs)))
-                    .unwrap_or(Scalar::Unit);
-                self.expr(lhs, operand.val_type().map(|_| operand));
-                self.expr(rhs, operand.val_type().map(|_| operand));
-                match operand {
-                    Scalar::Int => self.push(Instruction::I64Eq),
-                    Scalar::Bool => self.push(Instruction::I32Eq),
+                let mut operand = self.produced(lhs);
+                if operand.is_empty() {
+                    operand = self.produced(rhs);
+                }
+                self.expr(lhs, &operand);
+                self.expr(rhs, &operand);
+                match operand.as_slice() {
+                    [ValType::I64] => self.push(Instruction::I64Eq),
+                    [ValType::I32] => self.push(Instruction::I32Eq),
                     // unit は値を持たないので常に等しい。両辺の効果だけ走らせた
-                    Scalar::Unit => self.push(Instruction::I32Const(1)),
+                    [] => self.push(Instruction::I32Const(1)),
+                    // 所有の複合値の等値は生成した glue が受ける(tasks 4.2)
+                    other => unreachable!("等値を下ろせない表現です: {other:?}"),
                 }
             }
 
             // Wasm の `return` は関数の結果型ぶんを stack から返す。以降の式は
             // 到達しないので、下ろしても validator は多相な stack で受ける
             hir::ExprKind::Return(value) => {
-                let (value, result) = (*value, self.lowered.result);
-                match value {
-                    Some(value) => self.expr(value, result.val_type().map(|_| result)),
-                    None => {}
+                let (value, results) = (*value, self.lowered.results.clone());
+                if let Some(value) = value {
+                    self.expr(value, &results);
                 }
                 self.push(Instruction::Return);
             }
 
             hir::ExprKind::Assert(cond) => {
                 let cond = *cond;
-                self.expr(cond, Some(Scalar::Bool));
+                self.expr(cond, WANT_BOOL);
                 self.push(Instruction::I32Eqz);
                 self.push(Instruction::If(BlockType::Empty));
                 self.push(Instruction::Unreachable);
@@ -487,19 +535,21 @@ impl Emitter<'_> {
             }
 
             hir::ExprKind::Block(exprs) => {
-                let (exprs, want) = (exprs.clone(), result_scalar(expr));
-                self.sequence(&exprs, want);
+                let exprs = exprs.clone();
+                let want = self.produced(id);
+                self.sequence(&exprs, &want);
             }
 
             hir::ExprKind::If { cond, then, orelse } => {
                 let (cond, then, orelse) = (*cond, *then, *orelse);
-                let want = result_scalar(body.expr(id));
-                self.expr(cond, Some(Scalar::Bool));
-                self.push(Instruction::If(block_type(want)));
-                self.expr(then, want);
+                let want = self.produced(id);
+                self.expr(cond, WANT_BOOL);
+                let block = self.block_type(&want);
+                self.push(Instruction::If(block));
+                self.expr(then, &want);
                 if let Some(orelse) = orelse {
                     self.push(Instruction::Else);
-                    self.expr(orelse, want);
+                    self.expr(orelse, &want);
                 }
                 self.push(Instruction::End);
             }
@@ -508,10 +558,10 @@ impl Emitter<'_> {
                 let (cond, inner) = (*cond, *inner);
                 self.push(Instruction::Block(BlockType::Empty));
                 self.push(Instruction::Loop(BlockType::Empty));
-                self.expr(cond, Some(Scalar::Bool));
+                self.expr(cond, WANT_BOOL);
                 self.push(Instruction::I32Eqz);
                 self.push(Instruction::BrIf(1));
-                self.expr(inner, None);
+                self.expr(inner, &[]);
                 self.push(Instruction::Br(0));
                 self.push(Instruction::End);
                 self.push(Instruction::End);
@@ -520,16 +570,12 @@ impl Emitter<'_> {
             // 呼び先は計画が持っている。名前で引き直さない(design.md 決定5)
             hir::ExprKind::Call(hir::Call::Direct { callable, args }) => {
                 let (callable, args) = (*callable, args.clone());
-                let params: Vec<Option<Scalar>> = self.program.callables[callable]
-                    .params
-                    .iter()
-                    .map(|local| {
-                        let scalar = local_scalar(&self.program.callables[callable].body, *local);
-                        scalar.val_type().map(|_| scalar)
-                    })
-                    .collect();
-                for (arg, want) in args.iter().zip(params) {
-                    self.expr(*arg, want);
+                let params: Vec<hir::LocalId> = self.program.callables[callable].params.clone();
+                for (arg, param) in args.iter().zip(params) {
+                    let program = self.program;
+                    let callee = &program.callables[callable].body;
+                    let want = local_values(self.layouts, program, callee, param);
+                    self.expr(*arg, &want);
                 }
                 let target = self.instance.calls[&id].target;
                 self.push(Instruction::Call(target.index() as u32));
@@ -539,21 +585,22 @@ impl Emitter<'_> {
             other => unreachable!("Wasm へ下ろせない式が検査を抜けました: {other:?}"),
         }
     }
-}
 
-/// 束縛の scalar。読めない束縛(初期化子が発散した `let`)は `unit` と同じ扱い
-fn local_scalar(body: &hir::Body, local: hir::LocalId) -> Scalar {
-    body.local(local)
-        .ty
-        .as_ref()
-        .and_then(scalar_of)
-        .unwrap_or(Scalar::Unit)
-}
+    /// 束縛が受ける値の並び
+    fn local_want(&mut self, local: hir::LocalId) -> Vec<ValType> {
+        let program = self.program;
+        let body = &program.callables[self.lowered.callable].body;
+        local_values(self.layouts, program, body, local)
+    }
 
-fn block_type(want: Option<Scalar>) -> BlockType {
-    match want.and_then(Scalar::val_type) {
-        Some(val_type) => BlockType::Result(val_type),
-        None => BlockType::Empty,
+    /// 値を1つも産まない・1つだけ産むブロックは即値で書ける。複数の値を
+    /// 産むブロックだけが関数型の番号を要る(multi-value)
+    fn block_type(&mut self, want: &[ValType]) -> BlockType {
+        match want {
+            [] => BlockType::Empty,
+            [one] => BlockType::Result(*one),
+            many => BlockType::FunctionType(self.types.intern(&[], many)),
+        }
     }
 }
 
@@ -605,10 +652,12 @@ fn build(
     signatures: &crate::wasm_abi::Signatures,
 ) -> Vec<u8> {
     let plan = &production.plan;
+    // 到達した型の並びはここで1つの表に溜める。番号は要求順なので決定的
+    let mut layouts = Layouts::default();
     let lowered: Vec<Lowered> = plan
         .instances()
         .map(|(_, instance)| match instance.key.body {
-            hir::BodyId::Callable(id) => lower_signature(program, id),
+            hir::BodyId::Callable(id) => lower_signature(&mut layouts, program, id),
             hir::BodyId::Test(_) => unreachable!("test は生産の根に入らない"),
         })
         .collect();
@@ -619,7 +668,7 @@ fn build(
 
     for (index, (_, instance)) in plan.instances().enumerate() {
         let lowered = &lowered[index];
-        functions.function(types.intern(&lowered.params, lowered.result));
+        functions.function(types.intern(&lowered.params, &lowered.results));
 
         let locals = lowered
             .extra_locals
@@ -630,11 +679,13 @@ fn build(
             program,
             instance,
             lowered,
+            layouts: &mut layouts,
+            types: &mut types,
             function: Function::new(locals),
         };
         let root = program.callables[lowered.callable].body.root.clone();
-        let want = lowered.result.val_type().map(|_| lowered.result);
-        emitter.sequence(&root, want);
+        let want = lowered.results.clone();
+        emitter.sequence(&root, &want);
         emitter.push(Instruction::End);
         code.function(&emitter.function);
     }
@@ -648,7 +699,8 @@ fn build(
             .iter()
             .filter_map(|scalar| scalar.val_type())
             .collect();
-        functions.function(types.intern(&params, signature.result));
+        let results: Vec<ValType> = signature.result.val_type().into_iter().collect();
+        functions.function(types.intern(&params, &results));
         code.function(&wrapper(&params, signature, instance.index() as u32));
         exports.export(&signature.name, ExportKind::Func, next_index);
         next_index += 1;

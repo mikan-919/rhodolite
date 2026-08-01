@@ -247,6 +247,25 @@ pub enum Drop {
     },
 }
 
+/// 構造化された出口1つ(design.md 決定6)。
+///
+/// backend は CFG ではなく構造化された HIR を歩く。掃除を字句スコープから
+/// 組み直すと、move と合流の答えを2箇所で解くことになって必ずずれるので、
+/// 「この出口を通るとき何を落とすか」だけをここを鍵に引かせる。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Exit {
+    /// 本体の末尾から関数を抜ける
+    Fallthrough,
+    /// その `return` 式から関数を抜ける
+    Return(hir::ExprId),
+    /// `if` の枝が合流へ入る。`taken` が真なら then 側
+    Join { branch: hir::ExprId, taken: bool },
+    /// `while` の本体末尾から条件へ戻る
+    LoopBack(hir::ExprId),
+    /// `while` の条件が偽で抜ける
+    LoopExit(hir::ExprId),
+}
+
 /// 制御の辺。`exits` は抜ける字句スコープ、`drops` は解析が確定した破棄。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Edge {
@@ -277,6 +296,8 @@ pub struct BodyPlan {
     loans: Vec<Loan>,
     /// 借用ごとの生存区間。`loans` と同じ並び
     regions: Vec<BTreeSet<PointId>>,
+    /// 構造化された出口 → その辺。backend が掃除を引くための索引
+    cleanups: BTreeMap<Exit, usize>,
     entry: PointId,
     exit: PointId,
 }
@@ -301,6 +322,21 @@ impl BodyPlan {
     #[cfg(test)]
     pub fn edges(&self) -> &[Edge] {
         &self.edges
+    }
+
+    /// その出口を通るときに走る破棄。並びは計画が決めた順(design.md 決定6)。
+    ///
+    /// backend 側の読み取り専用の窓。作るのは所有権検査だけなので、生成器が
+    /// 掃除の順を自分で組み直すことはできない。制御がそこへ届かない出口
+    /// (発散した枝など)は空を返す
+    // ponytail: 読むのは所有データの下ろし。それが入るまでは単体テストだけの
+    // 利用者なので、ここだけ許す。slice が入ったらこの許可を外すこと
+    #[allow(dead_code)]
+    pub fn cleanup(&self, exit: Exit) -> &[Drop] {
+        match self.cleanups.get(&exit) {
+            Some(edge) => &self.edges[*edge].drops,
+            None => &[],
+        }
     }
 
     /// この式が場所へのアクセスなら、その分類。
@@ -745,6 +781,16 @@ impl<'a> Build<'a> {
         });
     }
 
+    /// 辺を張って、構造化された出口としても引けるようにする。
+    ///
+    /// `settle` は `edges` を作り直さず中身だけ差し替えるので、ここで覚えた
+    /// 番号は確定後の破棄をそのまま指す
+    fn exit_edge(&mut self, from: PointId, to: PointId, exits: Vec<ScopeId>, at: Exit) {
+        self.edge(from, to, exits);
+        let last = self.plan.edges.len() - 1;
+        self.plan.cleanups.insert(at, last);
+    }
+
     /// スコープ `from` から `to`(排他)までの、抜ける順のスコープ列。
     /// `to` が `None` なら根まで全部
     fn open(&self, from: ScopeId, to: Option<ScopeId>) -> Vec<ScopeId> {
@@ -1163,7 +1209,7 @@ impl<'a> Build<'a> {
                 if let Some(from) = self.cur {
                     let exits = self.open(scope, None);
                     let exit = self.plan.exit;
-                    self.edge(from, exit, exits);
+                    self.exit_edge(from, exit, exits, Exit::Return(id));
                 }
                 self.cur = None;
             }
@@ -1206,10 +1252,18 @@ impl<'a> Build<'a> {
                 }
                 let join = self.alloc(Some(id), scope, Effect::Nop);
                 if let Some(from) = taken {
-                    self.edge(from, join, vec![taken_scope]);
+                    let at = Exit::Join {
+                        branch: id,
+                        taken: true,
+                    };
+                    self.exit_edge(from, join, vec![taken_scope], at);
                 }
                 if let Some(from) = other {
-                    self.edge(from, join, other_scope.into_iter().collect());
+                    let at = Exit::Join {
+                        branch: id,
+                        taken: false,
+                    };
+                    self.exit_edge(from, join, other_scope.into_iter().collect(), at);
                 }
                 self.cur = Some(join);
             }
@@ -1226,9 +1280,9 @@ impl<'a> Build<'a> {
                     self.value(*inner, inner_scope, Need::Read);
                     self.depth -= 1;
                     if let Some(from) = self.cur {
-                        self.edge(from, head, vec![inner_scope]);
+                        self.exit_edge(from, head, vec![inner_scope], Exit::LoopBack(id));
                     }
-                    self.edge(test, after, Vec::new());
+                    self.exit_edge(test, after, Vec::new(), Exit::LoopExit(id));
                 }
                 self.cur = Some(after);
             }
@@ -2420,7 +2474,7 @@ fn walk_body(program: &hir::Program, id: hir::BodyId) -> Build<'_> {
         }
     }
     if let Some(from) = build.cur {
-        build.edge(from, exit, vec![root]);
+        build.exit_edge(from, exit, vec![root], Exit::Fallthrough);
     }
     build
 }
@@ -5820,5 +5874,195 @@ fn rank(b: bool -> int) {{ if b {{ 1 }} else {{ 0 }} }}
     fn 移行済みcanonicalは所有権検査を通る() {
         let src = std::fs::read_to_string("examples/canonical.rd").expect("読める");
         let _ = accepted(&src);
+    }
+
+    // -----------------------------------------------------------------------
+    // backend 向けの掃除の窓(tasks 3.2)
+    // -----------------------------------------------------------------------
+
+    /// `main` の本体と計画。backend が受け取る組み合わせと同じ
+    fn main_plan(src: &str) -> (CheckedProgram, hir::BodyId) {
+        let checked = accepted(src);
+        let id = checked.hir.free_callable("main").expect("main がある");
+        (checked, hir::BodyId::Callable(id))
+    }
+
+    /// 述語に合う最初の式。宣言順なのでソースの見た目と一致する
+    fn first_expr(
+        checked: &CheckedProgram,
+        body: hir::BodyId,
+        pick: impl Fn(&hir::ExprKind) -> bool,
+    ) -> hir::ExprId {
+        checked
+            .hir
+            .body(body)
+            .exprs()
+            .find(|(_, expr)| pick(&expr.kind))
+            .map(|(id, _)| id)
+            .expect("その式がない")
+    }
+
+    /// 破棄を読める形にする。並びが答えなので、集合ではなく列で比べる
+    fn shown(program: &hir::Program, drops: &[Drop]) -> Vec<String> {
+        drops.iter().map(|drop| show_drop(program, drop)).collect()
+    }
+
+    /// 窓が返すのは、その出口の辺が持つ破棄そのもの。
+    ///
+    /// backend が字句スコープから順を組み直さないことの担保なので、辺の中身と
+    /// 1つずつ突き合わせる
+    #[test]
+    fn 掃除の窓は辺の破棄をそのまま返す() {
+        let (checked, body) = main_plan(
+            "struct User { name: str }
+fn main(-> int) {
+  let a = User { name = \"a\" }
+  let b = User { name = \"b\" }
+  1
+}
+",
+        );
+        let plan = checked.plan.body(body);
+        let edge = plan
+            .edges()
+            .iter()
+            .find(|edge| edge.to == plan.exit)
+            .expect("出口へ抜ける辺がある");
+        assert_eq!(
+            shown(&checked.hir, plan.cleanup(Exit::Fallthrough)),
+            shown(&checked.hir, &edge.drops),
+            "末尾の落下"
+        );
+        // 宣言順の逆に落ちる。窓を通しても順は変わらない
+        assert_eq!(
+            shown(&checked.hir, plan.cleanup(Exit::Fallthrough)),
+            ["local#1", "local#0"]
+        );
+    }
+
+    /// `return` は式ごとに引ける。抜ける途中のスコープぶんも入る
+    #[test]
+    fn returnの出口は式ごとに引ける() {
+        let (checked, body) = main_plan(
+            "struct User { name: str }
+fn main(-> int) {
+  let outer = User { name = \"a\" }
+  if true {
+    let inner = User { name = \"b\" }
+    return 1
+  }
+  2
+}
+",
+        );
+        let plan = checked.plan.body(body);
+        let ret = first_expr(&checked, body, |kind| {
+            matches!(kind, hir::ExprKind::Return(_))
+        });
+        // 内側から外側へ。`inner` を落としてから `outer`
+        assert_eq!(
+            shown(&checked.hir, plan.cleanup(Exit::Return(ret))),
+            ["local#1", "local#0"]
+        );
+    }
+
+    /// 分岐は枝ごとに別の出口。合流の手前で枝の束縛だけが落ちる
+    #[test]
+    fn 分岐の合流は枝ごとに引ける() {
+        let (checked, body) = main_plan(
+            "struct User { name: str }
+fn main(-> int) {
+  if true {
+    let taken = User { name = \"a\" }
+    1
+  } else {
+    let other = User { name = \"b\" }
+    2
+  }
+}
+",
+        );
+        let plan = checked.plan.body(body);
+        let branch = first_expr(&checked, body, |kind| {
+            matches!(kind, hir::ExprKind::If { .. })
+        });
+        assert_eq!(
+            shown(
+                &checked.hir,
+                plan.cleanup(Exit::Join {
+                    branch,
+                    taken: true
+                })
+            ),
+            ["local#0"]
+        );
+        assert_eq!(
+            shown(
+                &checked.hir,
+                plan.cleanup(Exit::Join {
+                    branch,
+                    taken: false
+                })
+            ),
+            ["local#1"]
+        );
+    }
+
+    /// 周回の末尾で反復ぶんが落ち、抜ける辺では落ちない
+    #[test]
+    fn ループは周回末尾と脱出で別に引ける() {
+        let (checked, body) = main_plan(
+            "struct User { name: str }
+fn main(-> int) {
+  let mut n = 0
+  while n == 0 {
+    let each = User { name = \"a\" }
+    n = 1
+  }
+  n
+}
+",
+        );
+        let plan = checked.plan.body(body);
+        let loop_ = first_expr(&checked, body, |kind| {
+            matches!(kind, hir::ExprKind::While { .. })
+        });
+        assert_eq!(
+            shown(&checked.hir, plan.cleanup(Exit::LoopBack(loop_))),
+            ["local#1"]
+        );
+        assert!(plan.cleanup(Exit::LoopExit(loop_)).is_empty());
+    }
+
+    /// 制御が届かない出口は空。発散した枝の掃除を勝手に作らない
+    #[test]
+    fn 届かない出口は空を返す() {
+        let (checked, body) = main_plan("fn main(-> int) {\n return 1\n}\n");
+        let plan = checked.plan.body(body);
+        assert!(plan.cleanup(Exit::Fallthrough).is_empty());
+    }
+
+    /// アクセスの分類は窓を足しても変わらない。backend が読むのは同じ答え
+    #[test]
+    fn アクセスの分類は据え置き() {
+        let (checked, body) = main_plan(
+            "struct User { name: str }
+fn peek(u: &User -> int) { 1 }
+fn take(u: User -> int) { 2 }
+fn main(-> int) {
+  let u = User { name = \"a\" }
+  peek(&u) + take(move u)
+}
+",
+        );
+        let plan = checked.plan.body(body);
+        let modes: Vec<Mode> = checked
+            .hir
+            .body(body)
+            .exprs()
+            .filter_map(|(id, _)| plan.access(id).map(|access| access.mode))
+            .collect();
+        assert!(modes.contains(&Mode::Shared), "{modes:?}");
+        assert!(modes.contains(&Mode::Move), "{modes:?}");
     }
 }

@@ -14,6 +14,7 @@
 
 use crate::hir;
 use std::collections::BTreeMap;
+use wasm_encoder::ValType;
 
 /// 実行時のアドレス幅。線形メモリは 32bit なので `i32` 1つ
 pub const ADDR_SIZE: u32 = 4;
@@ -128,6 +129,27 @@ pub struct Layout {
     pub copy: bool,
 }
 
+/// 値1つを実行時に運ぶ形(design.md 決定2)。
+///
+/// 記憶の並び(`Layout`)とは別物。こちらは「Wasm の値をいくつ、どの型で
+/// 積むか」で、Copy な値は平らに載り、所有と借用はアドレス1つになる。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Repr {
+    /// stack と局所に載る値の並び。`unit` は空
+    pub values: Vec<ValType>,
+    pub kind: ReprKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReprKind {
+    /// 平らな Copy 値。中身がそのまま並ぶので、写しても所有は動かない
+    Flat,
+    /// 所有する非 Copy 値。根の割り当てを指す非 0 のアドレス1つ
+    Owned(LayoutId),
+    /// 借用。検査済みの場所を指すアドレス1つ。所有は取らない
+    Borrowed(LayoutId),
+}
+
 /// 到達した型の並びを、要求された順に溜める。
 ///
 /// 同じ型は必ず同じ `LayoutId` になる。鍵は**浅い**型(`Struct(id)` など)なので
@@ -161,6 +183,46 @@ impl Layouts {
         debug_assert!(ty.reference.is_none(), "借用に記憶の並びは無い");
         let key = self.key(program, ty)?;
         self.plan_key(program, &key)
+    }
+
+    /// 値1つの実行時表現。借用はここで剥がして、指す先の並びだけを覚える
+    pub fn repr(&mut self, program: &hir::Program, ty: &hir::Type) -> Result<Repr, Overflow> {
+        if ty.reference.is_some() {
+            let mut pointee = ty.clone();
+            pointee.reference = None;
+            let layout = self.plan(program, &pointee)?;
+            return Ok(Repr {
+                values: vec![ValType::I32],
+                kind: ReprKind::Borrowed(layout),
+            });
+        }
+        let layout = self.plan(program, ty)?;
+        if self.get(layout).copy {
+            return Ok(Repr {
+                values: self.flat(layout),
+                kind: ReprKind::Flat,
+            });
+        }
+        Ok(Repr {
+            values: vec![ValType::I32],
+            kind: ReprKind::Owned(layout),
+        })
+    }
+
+    /// Copy 値を平らにした並び。optional は tag を先頭に足す
+    fn flat(&self, id: LayoutId) -> Vec<ValType> {
+        match &self.get(id).shape {
+            Shape::Unit => Vec::new(),
+            Shape::Bool | Shape::Tag(_) => vec![ValType::I32],
+            Shape::Int => vec![ValType::I64],
+            Shape::Optional { payload } => {
+                let mut values = vec![ValType::I32];
+                values.extend(self.flat(payload.layout));
+                values
+            }
+            // 所有の複合値は `copy` が偽なので、ここへは来ない
+            other => unreachable!("Copy ではない値を平らにしようとしました: {other:?}"),
+        }
     }
 
     pub fn get(&self, id: LayoutId) -> &Layout {
@@ -668,6 +730,75 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(shapes(()), shapes(()));
+    }
+
+    // -----------------------------------------------------------------------
+    // 実行時表現(tasks 3.1)
+    // -----------------------------------------------------------------------
+
+    fn repr(program: &hir::Program, ty: &hir::Type) -> Repr {
+        Layouts::default()
+            .repr(program, ty)
+            .expect("計画できるはず")
+    }
+
+    /// Copy 値は平ら。`unit` は席を持たず、optional は tag が先頭に付く
+    #[test]
+    fn copy値は平らに載る() {
+        let program = hir::Program::default();
+        for (builtin, values) in [
+            (hir::Builtin::Unit, vec![]),
+            (hir::Builtin::Bool, vec![ValType::I32]),
+            (hir::Builtin::Int, vec![ValType::I64]),
+        ] {
+            let found = repr(&program, &hir::Type::builtin(builtin));
+            assert_eq!(found.values, values, "{builtin:?}");
+            assert_eq!(found.kind, ReprKind::Flat, "{builtin:?}");
+        }
+        assert_eq!(
+            repr(&program, &optional(hir::Type::builtin(hir::Builtin::Int))).values,
+            [ValType::I32, ValType::I64]
+        );
+    }
+
+    #[test]
+    fn payloadを持たないenumはタグ1つ() {
+        let program = program_of("enum Color { Red\n Green }\nfn main() { assert true }\n");
+        let found = repr(&program, &named(&program, "Color"));
+        assert_eq!(found.values, [ValType::I32]);
+        assert_eq!(found.kind, ReprKind::Flat);
+    }
+
+    /// 所有する複合値はアドレス1つ。中身の大きさは表現に出ない
+    #[test]
+    fn 所有する値はアドレス1つ() {
+        let program = program_of("struct User { name: str }\nfn main() { assert true }\n");
+        for ty in [
+            hir::Type::builtin(hir::Builtin::Str),
+            named(&program, "User"),
+            optional(named(&program, "User")),
+        ] {
+            let found = repr(&program, &ty);
+            assert_eq!(found.values, [ValType::I32], "{ty:?}");
+            assert!(matches!(found.kind, ReprKind::Owned(_)), "{ty:?}");
+        }
+    }
+
+    /// 借用もアドレス1つ。ただし所有は取らないので種別で言い分ける
+    #[test]
+    fn 借用は所有を取らないアドレス1つ() {
+        let program = program_of("struct User { name: str }\nfn main() { assert true }\n");
+        for kind in [hir::RefKind::Shared, hir::RefKind::Mutable] {
+            let mut ty = named(&program, "User");
+            ty.reference = Some(kind);
+            let found = repr(&program, &ty);
+            assert_eq!(found.values, [ValType::I32], "{kind:?}");
+            assert!(matches!(found.kind, ReprKind::Borrowed(_)), "{kind:?}");
+        }
+        // Copy な値の借用でも、運ぶのは場所のアドレス
+        let mut int = hir::Type::builtin(hir::Builtin::Int);
+        int.reference = Some(hir::RefKind::Shared);
+        assert_eq!(repr(&hir::Program::default(), &int).values, [ValType::I32]);
     }
 
     #[test]
