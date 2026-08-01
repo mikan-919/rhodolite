@@ -19,8 +19,8 @@ use crate::diag::Diag;
 use crate::hir;
 use crate::ownership::CheckedProgram;
 use crate::wasm_data::{self, Indices};
-use crate::wasm_layout::{LayoutId, Layouts, ReprKind};
-use crate::wasm_runtime::{self, Runtime};
+use crate::wasm_layout::{self, LayoutId, Layouts, ReprKind};
+use crate::wasm_runtime::{self, Body, Runtime};
 use std::collections::BTreeMap;
 use wasm_encoder::{
     BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
@@ -103,7 +103,7 @@ fn borrowed_signature(
 fn unsupported(span: crate::lex::Span, what: &str) -> Diag {
     Diag::at(span, format!("{what} は現在の Wasm ターゲットでは扱えません"))
         .label("ここが未対応")
-        .help("いまの Wasm は unit / bool / int / str と、束縛・代入・算術・比較・`clone()`・所有権修飾・if・while・直接呼び出し・return・assert を扱います")
+        .help("いまの Wasm は unit / bool / int / str / struct と、束縛・代入・フィールド・算術・比較・`clone()`・所有権修飾・if・while・直接呼び出し・return・assert を扱います")
 }
 
 /// この backend が下ろせる型か。
@@ -118,7 +118,7 @@ fn supported(ty: &hir::Type) -> bool {
         ty.kind,
         hir::TypeKind::Builtin(
             hir::Builtin::Unit | hir::Builtin::Bool | hir::Builtin::Int | hir::Builtin::Str
-        )
+        ) | hir::TypeKind::Struct(_)
     )
 }
 
@@ -252,15 +252,19 @@ fn check_expr(
         hir::ExprKind::Access { place, .. } => children.push(*place),
         hir::ExprKind::Clone(inner) => children.push(*inner),
         hir::ExprKind::Nil => diagnostics.push(unsupported(expr.span, "optional の `nil`")),
-        hir::ExprKind::UnitStruct(_) | hir::ExprKind::StructLit { .. } => {
-            diagnostics.push(unsupported(expr.span, "struct の値"))
+        hir::ExprKind::UnitStruct(_) => {}
+        hir::ExprKind::StructLit { fields, .. } => {
+            children.extend(fields.iter().map(|(_, value)| *value))
         }
         hir::ExprKind::Variant(_) | hir::ExprKind::Call(hir::Call::Ctor { .. }) => {
             diagnostics.push(unsupported(expr.span, "enum の値"))
         }
-        hir::ExprKind::Field { .. } | hir::ExprKind::AssignField { .. } => {
-            diagnostics.push(unsupported(expr.span, "フィールドの参照"))
+        // `.?` は optional を伝播するので、optional のスライスまで待つ
+        hir::ExprKind::Field { optional: true, .. } => {
+            diagnostics.push(unsupported(expr.span, "`.?` のフィールド参照"))
         }
+        hir::ExprKind::Field { recv, .. } => children.push(*recv),
+        hir::ExprKind::AssignField { recv, value, .. } => children.extend([*recv, *value]),
         hir::ExprKind::Array(_) => diagnostics.push(unsupported(expr.span, "配列")),
         hir::ExprKind::Coalesce { .. } => diagnostics.push(unsupported(expr.span, "`??`")),
         hir::ExprKind::For { .. } => diagnostics.push(unsupported(expr.span, "`for`")),
@@ -335,8 +339,10 @@ struct Lowered {
     owned: BTreeMap<hir::LocalId, LayoutId>,
     /// 所有する束縛 → 初期化フラグの局所番号(tasks 3.4)
     flags: BTreeMap<hir::LocalId, u32>,
-    /// 作業用 `i32` の先頭番号。所有データを組み立てない本体は取らない
-    scratch: u32,
+    /// 作業用 `i32` の区画。要る式ごとに別を配るので、入れ子でも踏み合わない
+    scratch: BTreeMap<hir::ExprId, u32>,
+    /// 掃除が使う共通の作業用区画。先頭が区画の走査用、続いて射影の段ごとの器
+    common: u32,
 }
 
 /// 引数と宣言ローカルへ Wasm のローカル番号を振る。
@@ -397,18 +403,29 @@ fn lower_signature(
         }
     }
 
-    // 作業用の席は、所有データを組み立てる本体だけが取る。scalar だけの
-    // 本体のバイト列を動かさないため(tasks 1.1)
-    let builds_data = !owned.is_empty()
-        || body
-            .exprs()
-            .any(|(_, expr)| matches!(expr.kind, hir::ExprKind::Str(_)));
-    let scratch = (params.len() + extra_locals.len()) as u32;
-    if builds_data {
+    // 作業用の席は、所有データを触る式にだけ配る。scalar だけの本体は1つも
+    // 取らないので、バイト列がこの change の前と変わらない(tasks 1.1)
+    let mut scratch = BTreeMap::new();
+    for (id, _) in body.exprs() {
+        if !needs_scratch(layouts, program, body, id) {
+            continue;
+        }
+        scratch.insert(id, (params.len() + extra_locals.len()) as u32);
         extra_locals.extend(std::iter::repeat_n(
             ValType::I32,
             wasm_data::SCRATCH as usize,
         ));
+    }
+
+    // 残余の破棄は射影の段ごとに器のアドレスを1つ持つ。深さはソースから分かる
+    let common = (params.len() + extra_locals.len()) as u32;
+    if !owned.is_empty() || !scratch.is_empty() {
+        let levels = body
+            .exprs()
+            .map(|(id, _)| projection_depth(body, id))
+            .max()
+            .unwrap_or(0);
+        extra_locals.extend(std::iter::repeat_n(ValType::I32, 2 + levels as usize));
     }
 
     Lowered {
@@ -420,6 +437,44 @@ fn lower_signature(
         owned,
         flags,
         scratch,
+        common,
+    }
+}
+
+/// 作業用の局所が要る式か。
+///
+/// 所有値を組み立てる・差し替える・持ち出す・借りて比べる式だけ。scalar しか
+/// 触らない式には1つも配らないので、この change の前とバイト列が変わらない
+fn needs_scratch(
+    layouts: &mut Layouts,
+    program: &hir::Program,
+    body: &hir::Body,
+    id: hir::ExprId,
+) -> bool {
+    let owned = |layouts: &mut Layouts, at: hir::ExprId| {
+        matches!(
+            body.expr(at)
+                .result
+                .ty()
+                .map(|ty| layouts.repr(program, ty).expect("計画できる").kind),
+            Some(ReprKind::Owned(_))
+        )
+    };
+    match &body.expr(id).kind {
+        // フィールドの差し替えは、器のアドレスを持ち回すので常に要る
+        hir::ExprKind::AssignField { .. } => true,
+        hir::ExprKind::AssignLocal { value, .. } => owned(layouts, *value),
+        hir::ExprKind::Eq { lhs, rhs } => owned(layouts, *lhs) || owned(layouts, *rhs),
+        _ => owned(layouts, id),
+    }
+}
+
+/// 場所式が根から何段の射影を通っているか。残余の破棄が潜る深さの上限になる
+fn projection_depth(body: &hir::Body, id: hir::ExprId) -> u32 {
+    match &body.expr(id).kind {
+        hir::ExprKind::Field { recv, .. } => 1 + projection_depth(body, *recv),
+        hir::ExprKind::Access { place, .. } => projection_depth(body, *place),
+        _ => 0,
     }
 }
 
@@ -513,7 +568,7 @@ struct Emitter<'a> {
     types: &'a mut Types,
     indices: &'a Indices,
     statics: &'a BTreeMap<String, (u32, u32)>,
-    function: Function,
+    out: Body,
 }
 
 /// `int` 1つ、`bool` 1つ。scalar の演算が要求する形
@@ -522,7 +577,7 @@ const WANT_BOOL: &[ValType] = &[ValType::I32];
 
 impl Emitter<'_> {
     fn push(&mut self, instruction: Instruction<'_>) {
-        self.function.instruction(&instruction);
+        self.out.ins(instruction);
     }
 
     fn body(&self) -> &hir::Body {
@@ -554,10 +609,17 @@ impl Emitter<'_> {
     fn expr(&mut self, id: hir::ExprId, want: &[ValType]) {
         let produced = self.produced(id);
         self.lower(id);
-        if want.is_empty() {
-            for _ in &produced {
-                self.push(Instruction::Drop);
-            }
+        if !want.is_empty() {
+            return;
+        }
+        // 捨てる値が一時値なら、落とすのはここ。持ち主が他に居ない
+        if let Some(layout) = self.temporary(id) {
+            let slot = self.lowered.common;
+            self.release(layout, slot);
+            return;
+        }
+        for _ in &produced {
+            self.push(Instruction::Drop);
         }
     }
 
@@ -586,7 +648,7 @@ impl Emitter<'_> {
                     self.push(Instruction::LocalSet(*seat));
                 }
                 if let Some(flag) = self.lowered.flags.get(&local).copied() {
-                    wasm_data::mark_initialized(&mut self.function, flag);
+                    wasm_data::mark_initialized(&mut self.out, flag);
                 }
             }
 
@@ -600,13 +662,13 @@ impl Emitter<'_> {
                     // 途中で trap したときに落ちた値をもう一度落としてしまう
                     Some(layout) => {
                         let flag = self.lowered.flags[&local];
-                        let scratch = self.lowered.scratch;
+                        let scratch = self.scratch(id);
                         let glue = self.indices.of(layout);
                         self.push(Instruction::LocalSet(scratch));
-                        wasm_data::drop_guarded(&mut self.function, glue, seats[0], flag);
+                        wasm_data::drop_guarded(&mut self.out, self.indices, glue, seats[0], flag);
                         self.push(Instruction::LocalGet(scratch));
                         self.push(Instruction::LocalSet(seats[0]));
-                        wasm_data::mark_initialized(&mut self.function, flag);
+                        wasm_data::mark_initialized(&mut self.out, flag);
                     }
                     None => {
                         for seat in seats.iter().rev() {
@@ -618,31 +680,85 @@ impl Emitter<'_> {
 
             hir::ExprKind::Str(text) => {
                 let (offset, len) = self.statics[text];
-                let scratch = self.lowered.scratch;
-                wasm_data::literal_str(&mut self.function, self.indices, scratch, offset, len);
+                let scratch = self.scratch(id);
+                wasm_data::literal_str(&mut self.out, self.indices, scratch, offset, len);
+            }
+
+            // フィールドを持たない struct も、他と区別できる根を1つ持つ
+            hir::ExprKind::UnitStruct(_) => {
+                let layout = self.owned_layout(id).expect("struct の値は所有を産む");
+                wasm_data::alloc_root(&mut self.out, self.indices, self.layouts, layout);
+            }
+
+            // 値はソースの順に評価し、置き場所は宣言の順(design.md 決定3)
+            hir::ExprKind::StructLit { struct_, fields } => {
+                let (struct_, fields) = (*struct_, fields.clone());
+                self.struct_literal(id, struct_, &fields);
+            }
+
+            hir::ExprKind::Field {
+                recv,
+                field,
+                optional: false,
+            } => {
+                let (recv, field) = (*recv, *field);
+                let slot = self.slot_of(recv, field);
+                self.expr(recv, &[ValType::I32]);
+                self.read_slot(&slot);
+            }
+
+            hir::ExprKind::AssignField { recv, field, value } => {
+                let (recv, field, value) = (*recv, *field, *value);
+                self.assign_field(id, recv, field, value);
             }
 
             // 借用は所有を取らずにアドレスを写すだけ。move はそれに加えて
             // 持ち出し元のフラグを落とす(design.md 決定2)
             hir::ExprKind::Access { mode, place } => {
                 let (mode, place) = (*mode, *place);
+                if mode == hir::AccessMode::Move
+                    && let hir::ExprKind::Field {
+                        recv,
+                        field,
+                        optional: false,
+                    } = self.body().expr(place).kind
+                {
+                    self.consume_field(id, recv, field);
+                    // 器の残りはここで落ちる。出口まで持ち越さない
+                    self.residue(id);
+                    self.residue(place);
+                    return;
+                }
                 let want = self.produced(place);
                 self.expr(place, &want);
                 if mode == hir::AccessMode::Move
                     && let Some(root) = self.moved_root(place)
                     && let Some(flag) = self.lowered.flags.get(&root).copied()
                 {
-                    wasm_data::mark_moved(&mut self.function, flag);
+                    wasm_data::mark_moved(&mut self.out, flag);
                 }
             }
 
+            // glue は割り当て済みの器へ写す。根はここで用意する
             hir::ExprKind::Clone(inner) => {
                 let inner = *inner;
                 let want = self.produced(inner);
                 self.expr(inner, &want);
                 let layout = self.owned_layout(id).expect("`clone()` は所有を産む");
-                let glue = self.indices.of(layout);
-                self.push(Instruction::Call(glue.clone));
+                let scratch = self.scratch(id);
+                let (fresh, source) = (scratch, scratch + 1);
+                let temporary = self.temporary(inner);
+                if temporary.is_some() {
+                    self.push(Instruction::LocalTee(source));
+                }
+                wasm_data::alloc_root(&mut self.out, self.indices, self.layouts, layout);
+                self.push(Instruction::LocalTee(fresh));
+                self.push(Instruction::Call(self.indices.of(layout).clone));
+                if let Some(layout) = temporary {
+                    let (indices, glue) = (self.indices, self.indices.of(layout));
+                    wasm_data::drop_root(&mut self.out, indices, glue, source);
+                }
+                self.push(Instruction::LocalGet(fresh));
             }
 
             // Wasm に単項マイナスは無い。`0 - n` は MIN でも仕様どおり回り込む
@@ -671,9 +787,25 @@ impl Emitter<'_> {
                 // 所有の複合値の等値は、並びごとに生成した glue が受ける
                 if let Some(layout) = self.compound_operand(lhs, rhs) {
                     let glue = self.indices.of(layout);
+                    let scratch = self.scratch(id);
                     self.expr(lhs, &[ValType::I32]);
+                    let left = self.temporary(lhs);
+                    if left.is_some() {
+                        self.push(Instruction::LocalTee(scratch));
+                    }
                     self.expr(rhs, &[ValType::I32]);
+                    let right = self.temporary(rhs);
+                    if right.is_some() {
+                        self.push(Instruction::LocalTee(scratch + 1));
+                    }
                     self.push(Instruction::Call(glue.eq));
+                    // 比べるだけでは所有は動かない。持ち込んだ一時値はここで落とす
+                    for (temporary, slot) in [(left, scratch), (right, scratch + 1)] {
+                        if let Some(layout) = temporary {
+                            let (indices, glue) = (self.indices, self.indices.of(layout));
+                            wasm_data::drop_root(&mut self.out, indices, glue, slot);
+                        }
+                    }
                     return;
                 }
                 let mut operand = self.produced(lhs);
@@ -836,10 +968,322 @@ impl Emitter<'_> {
                     };
                     let address = self.lowered.slots[&local][0];
                     let glue = self.indices.of(layout);
-                    wasm_data::drop_guarded(&mut self.function, glue, address, flag);
+                    wasm_data::drop_guarded(&mut self.out, self.indices, glue, address, flag);
                 }
-                // 射影を消費した残余は struct スライスの仕事(tasks 3.5)
-                crate::ownership::Drop::Remaining { .. } => {}
+                // 消費した経路だけを飛ばして、器の残り全部を落とす(tasks 3.5)
+                crate::ownership::Drop::Remaining { root, consumed } => {
+                    self.drop_remaining(root, &consumed);
+                }
+            }
+        }
+    }
+
+    /// その式に配った作業用の区画の先頭
+    fn scratch(&self, id: hir::ExprId) -> u32 {
+        self.lowered.scratch[&id]
+    }
+
+    /// その式が、誰も持ち主でない所有値を残すか。
+    ///
+    /// 場所を読んだだけなら持ち主は元のまま。構築・呼び出し・`clone()`・
+    /// `move` は新しい持ち主をこちらへ渡すので、使い終えたら落とす責任が付く
+    fn temporary(&mut self, id: hir::ExprId) -> Option<LayoutId> {
+        let layout = match self.kind_of(id) {
+            Some(ReprKind::Owned(layout)) => layout,
+            _ => return None,
+        };
+        match self.plan.access(id).map(|access| access.mode) {
+            Some(
+                crate::ownership::Mode::Shared
+                | crate::ownership::Mode::Mutable
+                | crate::ownership::Mode::Read,
+            ) => None,
+            _ => Some(layout),
+        }
+    }
+
+    /// stack の一番上にある一時値を、局所へ預けたうえで落とす
+    fn release(&mut self, layout: LayoutId, slot: u32) {
+        let (indices, glue) = (self.indices, self.indices.of(layout));
+        self.out.set(slot);
+        wasm_data::drop_root(&mut self.out, indices, glue, slot);
+    }
+
+    /// レシーバの並びの中で、そのフィールドが占める区画
+    fn slot_of(&mut self, recv: hir::ExprId, field: hir::FieldId) -> wasm_layout::Slot {
+        let owner = self.program.fields[field].owner;
+        let position = self.program.structs[owner]
+            .fields
+            .iter()
+            .position(|declared| *declared == field)
+            .expect("宣言に無いフィールド");
+        let layout = self
+            .kind_of(recv)
+            .and_then(|kind| match kind {
+                ReprKind::Owned(layout) | ReprKind::Borrowed(layout) => Some(layout),
+                ReprKind::Flat => None,
+            })
+            .expect("フィールドのレシーバは器のアドレス");
+        match &self.layouts.get(layout).shape {
+            wasm_layout::Shape::Struct { fields, .. } => fields[position],
+            other => unreachable!("フィールドを持たない並びです: {other:?}"),
+        }
+    }
+
+    /// 器のアドレスを、その区画の値か場所へ置き換える。
+    ///
+    /// Copy な区画は読み出し、直接置かれた所有の子はその場所、`indirect` の
+    /// 子は指している根が答えになる
+    fn read_slot(&mut self, slot: &wasm_layout::Slot) {
+        if slot.indirect {
+            self.out.offset(slot.offset).load();
+            return;
+        }
+        if self.layouts.get(slot.layout).copy {
+            let (layouts, layout, offset) = (&*self.layouts, slot.layout, slot.offset);
+            wasm_data::load_copy(&mut self.out, layouts, layout, offset);
+            return;
+        }
+        self.out.offset(slot.offset);
+    }
+
+    /// struct の値を1つ組み立てる(tasks 5.1)
+    fn struct_literal(
+        &mut self,
+        id: hir::ExprId,
+        struct_: hir::StructId,
+        fields: &[(hir::FieldId, hir::ExprId)],
+    ) {
+        let layout = self.owned_layout(id).expect("struct の値は所有を産む");
+        let scratch = self.scratch(id);
+        let (root, temporary) = (scratch, scratch + 1);
+        let declared = self.program.structs[struct_].fields.clone();
+
+        wasm_data::alloc_root(&mut self.out, self.indices, self.layouts, layout);
+        self.out.set(root);
+        for (field, value) in fields {
+            let position = declared
+                .iter()
+                .position(|d| d == field)
+                .expect("宣言に無いフィールド");
+            let slot = match &self.layouts.get(layout).shape {
+                wasm_layout::Shape::Struct { fields, .. } => fields[position],
+                other => unreachable!("struct ではない並びです: {other:?}"),
+            };
+            self.install_slot(&slot, *value, root, temporary);
+        }
+        self.out.get(root);
+    }
+
+    /// 評価した値を区画へ収める。所有の子は一時的な根から中身ごと移す
+    fn install_slot(
+        &mut self,
+        slot: &wasm_layout::Slot,
+        value: hir::ExprId,
+        container: u32,
+        temporary: u32,
+    ) {
+        if slot.indirect {
+            // `indirect` の子は独立した根のまま。アドレスだけを収める
+            self.expr(value, &[ValType::I32]);
+            self.out.set(temporary);
+            self.out
+                .get(container)
+                .offset(slot.offset)
+                .get(temporary)
+                .store();
+            return;
+        }
+        if self.layouts.get(slot.layout).copy {
+            self.out.get(container);
+            let want = self.produced(value);
+            self.expr(value, &want);
+            let (layouts, layout, offset) = (&*self.layouts, slot.layout, slot.offset);
+            wasm_data::store_copy(&mut self.out, layouts, layout, offset);
+            return;
+        }
+        self.expr(value, &[ValType::I32]);
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::relocate_into(
+            &mut self.out,
+            indices,
+            layouts,
+            slot.layout,
+            container,
+            slot.offset,
+            temporary,
+        );
+    }
+
+    /// フィールドの差し替え。新しい値が出来てから古い中身を落とす(tasks 5.2)
+    fn assign_field(
+        &mut self,
+        id: hir::ExprId,
+        recv: hir::ExprId,
+        field: hir::FieldId,
+        value: hir::ExprId,
+    ) {
+        let slot = self.slot_of(recv, field);
+        let scratch = self.scratch(id);
+        let (container, temporary) = (scratch, scratch + 1);
+        self.expr(recv, &[ValType::I32]);
+        self.out.set(container);
+
+        if self.layouts.get(slot.layout).copy && !slot.indirect {
+            self.out.get(container);
+            let want = self.produced(value);
+            self.expr(value, &want);
+            let (layouts, layout, offset) = (&*self.layouts, slot.layout, slot.offset);
+            wasm_data::store_copy(&mut self.out, layouts, layout, offset);
+            return;
+        }
+
+        // 新しい値を先に作る。落としてから作ると、途中の trap で二度落ちる
+        self.expr(value, &[ValType::I32]);
+        self.out.set(temporary);
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::drop_slot(
+            &mut self.out,
+            indices,
+            layouts,
+            &slot,
+            container,
+            scratch + 2,
+        );
+        if slot.indirect {
+            self.out
+                .get(container)
+                .offset(slot.offset)
+                .get(temporary)
+                .store();
+            return;
+        }
+        self.out.get(temporary);
+        wasm_data::relocate_into(
+            &mut self.out,
+            indices,
+            layouts,
+            slot.layout,
+            container,
+            slot.offset,
+            temporary,
+        );
+    }
+
+    /// 直接置かれた/`indirect` なフィールドを消費する(tasks 5.4)。
+    ///
+    /// 器の残りを落とすのは計画が出す残余の破棄。ここは選ばれた値を独立させ、
+    /// 二度落とされない形にするところまで
+    fn consume_field(&mut self, id: hir::ExprId, recv: hir::ExprId, field: hir::FieldId) {
+        let slot = self.slot_of(recv, field);
+        let scratch = self.scratch(id);
+        let (container, fresh) = (scratch, scratch + 1);
+        self.expr(recv, &[ValType::I32]);
+
+        if slot.indirect {
+            self.out.set(container);
+            self.out.get(container).offset(slot.offset).load();
+            // 器の側を空にする。残余の破棄がここをもう一度返さないように
+            self.out.get(container).offset(slot.offset).num(0).store();
+            return;
+        }
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::extract_root(
+            &mut self.out,
+            indices,
+            layouts,
+            slot.layout,
+            container,
+            slot.offset,
+            fresh,
+        );
+    }
+
+    /// 射影を消費した直後の残余を出す。取り出した値は stack に載ったままだが、
+    /// 落とすのは器のほうなので釣り合いは崩れない
+    fn residue(&mut self, at: hir::ExprId) {
+        let drops: Vec<crate::ownership::Drop> = self.plan.residue(at).to_vec();
+        for drop in drops {
+            if let crate::ownership::Drop::Remaining { root, consumed } = drop {
+                self.drop_remaining(root, &consumed);
+            }
+        }
+    }
+
+    /// 射影を消費した器の、残り全部を落とす(tasks 3.5)。
+    ///
+    /// 消費した**経路**を飛ばすので、`move u.inner.name` でも持ち出された
+    /// `name` を二度落とさない。最後に器の根そのものを返す
+    fn drop_remaining(&mut self, root: hir::LocalId, consumed: &[crate::ownership::Projection]) {
+        let (Some(flag), Some(layout)) = (
+            self.lowered.flags.get(&root).copied(),
+            self.lowered.owned.get(&root).copied(),
+        ) else {
+            return;
+        };
+        let address = self.lowered.slots[&root][0];
+        self.out.get(flag);
+        self.out.ins(Instruction::If(BlockType::Empty));
+        self.drop_around(layout, address, consumed, 0);
+        self.out
+            .get(address)
+            .ins(Instruction::Call(self.indices.free));
+        wasm_data::mark_moved(&mut self.out, flag);
+        self.out.ins(Instruction::End);
+    }
+
+    /// `container` が指す並びの、`consumed` の先頭が指す区画**以外**を落とす。
+    /// 経路が続くならその区画へ潜る
+    fn drop_around(
+        &mut self,
+        layout: LayoutId,
+        container: u32,
+        consumed: &[crate::ownership::Projection],
+        level: u32,
+    ) {
+        let slots = match &self.layouts.get(layout).shape {
+            wasm_layout::Shape::Struct { fields, .. } => fields.clone(),
+            // 消費できる射影を持つのは、いまは struct だけ
+            other => unreachable!("射影を消費できない並びです: {other:?}"),
+        };
+        let skipped = match consumed.first() {
+            Some(crate::ownership::Projection::Field(field)) => {
+                let owner = self.program.fields[*field].owner;
+                self.program.structs[owner]
+                    .fields
+                    .iter()
+                    .position(|declared| declared == field)
+            }
+            // 経路が尽きたか、struct 以外の射影。残り全部を落とす
+            _ => None,
+        };
+
+        let scan = self.lowered.common;
+        for (position, slot) in slots.iter().enumerate() {
+            if Some(position) != skipped {
+                let (indices, layouts) = (self.indices, &*self.layouts);
+                wasm_data::drop_slot(&mut self.out, indices, layouts, slot, container, scan);
+                continue;
+            }
+            let rest = &consumed[1..];
+            if rest.is_empty() {
+                // ここが持ち出された区画。触らない
+                continue;
+            }
+            let inner = self.lowered.common + 1 + level;
+            if slot.indirect {
+                self.out
+                    .get(container)
+                    .offset(slot.offset)
+                    .load()
+                    .set(inner);
+                self.drop_around(slot.layout, inner, rest, level + 1);
+                self.out
+                    .get(inner)
+                    .ins(Instruction::Call(self.indices.free));
+            } else {
+                self.out.get(container).offset(slot.offset).set(inner);
+                self.drop_around(slot.layout, inner, rest, level + 1);
             }
         }
     }
@@ -933,21 +1377,21 @@ fn build(
             types: &mut types,
             indices: &indices,
             statics: &statics.at,
-            function: Function::new(locals),
+            out: Body::with_locals(locals),
         };
         // 引数は呼ばれた時点で所有を得ている。局所の初期値は 0 なので、
         // 持っていることを明示的に立てる(tasks 3.4)
         for local in &program.callables[lowered.callable].params {
             if let Some(flag) = lowered.flags.get(local).copied() {
-                wasm_data::mark_initialized(&mut emitter.function, flag);
+                wasm_data::mark_initialized(&mut emitter.out, flag);
             }
         }
         let root = program.callables[lowered.callable].body.root.clone();
         let want = lowered.results.clone();
         emitter.sequence(&root, &want);
         emitter.cleanup(crate::ownership::Exit::Fallthrough);
-        emitter.push(Instruction::End);
-        code.function(&emitter.function);
+        // `finish` が関数の `end` を付ける
+        code.function(&emitter.out.finish());
     }
 
     // ラッパは実装関数の後ろ。エントリ、続いて公開名の昇順
@@ -1202,9 +1646,8 @@ pub(crate) mod tests {
     #[test]
     fn 到達した未対応の構文はビルドを止める() {
         let errors = compile(
-            "struct User { name: str }\n\
-             fn reached(u: User -> str) { u.name }\n\
-             fn main(-> int) { let ignored = reached(User { name = \"a\" })\n 1 }\n",
+            "fn reached(-> int) {\n let xs = [1, 2]\n 1\n}\n\
+             fn main(-> int) { reached() }\n",
             &[],
         )
         .expect_err("止まるはず");
@@ -1860,6 +2303,26 @@ pub(crate) mod tests {
         assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![5000]));
     }
 
+    /// 誰にも束縛されない一時値も落ちる。
+    ///
+    /// `s == "x"` の右辺は持ち主の居ない所有値なので、比べ終えたところで
+    /// 落とさないとループのたびに溜まる
+    #[test]
+    fn 束縛されない一時値も落ちる() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let s = \"compared\"\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 3000) == false {\n\
+                   \x20   if (s == \"compared\") == false { return 0 }\n\
+                   \x20   n = n + 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![3000]));
+    }
+
     /// 同時に生きる所有値が上限を越えれば、伸ばせずに trap する。
     ///
     /// 上限を広げれば同じプログラムが通ることも見る。stack を使い切ったのでは
@@ -1882,6 +2345,193 @@ pub(crate) mod tests {
             "1ページには収まらない"
         );
         assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 8), Ok(vec![0]));
+    }
+
+    // -----------------------------------------------------------------------
+    // 所有する struct(tasks 5.1〜5.5)
+    // -----------------------------------------------------------------------
+
+    /// フィールドは宣言順に置かれ、Copy も所有も読み書きできる
+    #[test]
+    fn structのフィールドを読み書きできる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { id: int, admin: bool, name: str }\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut u = User { id = 7, admin = true, name = \"a\" }\n\
+                 \x20 u.id = u.id + 1\n\
+                 \x20 u.name = \"b\"\n\
+                 \x20 if u.admin == false { return 0 }\n\
+                 \x20 if u.name == \"b\": u.id else: 0\n\
+                 }\n"
+            ),
+            8
+        );
+    }
+
+    /// 値はソースの順に評価する。置き場所が宣言順でも順序は入れ替わらない
+    #[test]
+    fn 構築はソースの順に評価する() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Pair { first: int, second: int }\n\
+                 fn bump(n: &mut int -> int) { 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut seen = 0\n\
+                 \x20 let p = Pair { second = { seen = 1\n 2 }, first = seen }\n\
+                 \x20 p.first * 10 + p.second\n\
+                 }\n"
+            ),
+            12
+        );
+    }
+
+    /// フィールドを持たない struct も値として扱える
+    #[test]
+    fn フィールドのないstructも値になる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Marker {}\n\
+                 fn take(m: Marker -> int) { 1 }\n\
+                 fn main(-> int) {\n let m = Marker {}\n take(move m)\n}\n"
+            ),
+            1
+        );
+    }
+
+    /// 深い複製は元と記憶を共有しない。片方を書き換えても他方は動かない
+    #[test]
+    fn structのcloneは中身まで独立する() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { name: str }\n\
+                 fn main(-> int) {\n\
+                 \x20 let a = User { name = \"same\" }\n\
+                 \x20 let mut b = a.clone()\n\
+                 \x20 if (a == b) == false { return 0 }\n\
+                 \x20 b.name = \"other\"\n\
+                 \x20 if a.name == \"same\": 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 等値は宣言順に潜って、違いを見つけたところで打ち切る
+    #[test]
+    fn structの等値は構造で決まる() {
+        for (fields, expected) in [
+            ("id = 1, name = \"a\"", 1),
+            ("id = 2, name = \"a\"", 0),
+            ("id = 1, name = \"b\"", 0),
+        ] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "struct User {{ id: int, name: str }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let a = User {{ id = 1, name = \"a\" }}\n\
+                     \x20 let b = User {{ {fields} }}\n\
+                     \x20 if a == b: 1 else: 0\n\
+                     }}\n"
+                )),
+                expected,
+                "{fields}"
+            );
+        }
+    }
+
+    /// `indirect` の子は別の割り当てに置かれる。読み・複製・等値・掃除が
+    /// その1段を越えて働く。
+    ///
+    /// 再帰する鎖そのものは `Node?` を組み立てられるようになってから
+    /// (optional のスライス)
+    #[test]
+    fn indirectな子も辿れて複製できる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Inner { name: str }\n\
+                 struct Boxed { tag: int, indirect inner: Inner }\n\
+                 fn main(-> int) {\n\
+                 \x20 let a = Boxed { tag = 1, inner = Inner { name = \"x\" } }\n\
+                 \x20 let mut b = a.clone()\n\
+                 \x20 if (a == b) == false { return 0 }\n\
+                 \x20 b.inner = Inner { name = \"y\" }\n\
+                 \x20 if a == b { return 0 }\n\
+                 \x20 if a.inner.name == \"x\": a.tag else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 器ごと動かしても、掃除は最後の持ち主のところで一度だけ
+    #[test]
+    fn structの丸ごとの移動は一度だけ落とす() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { name: str }\n\
+                 fn consume(u: User -> int) { if u.name == \"a\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let u = User { name = \"a\" }\n\
+                 \x20 consume(move u)\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// フィールドを消費したら、器の残りだけが落ちる(tasks 3.5・5.4)
+    #[test]
+    fn フィールドを消費すると器の残りが落ちる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { id: int, name: str, note: str }\n\
+                 fn take(s: str -> int) { if s == \"n\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let u = User { id = 1, name = \"n\", note = \"x\" }\n\
+                 \x20 take(move u.name)\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 射影を消費する形でも記憶は漏れない。
+    ///
+    /// 取り出した値・器の残り・器の根の3つが全部返らないと、1ページでは
+    /// 回りきらない
+    #[test]
+    fn 射影を消費するループでも記憶は漏れない() {
+        let src = "struct User { name: str, note: str }\n\
+                   fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 2000) == false {\n\
+                   \x20   let u = User { name = \"a\", note = \"b\" }\n\
+                   \x20   n = n + take(move u.name)\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![2000]));
+    }
+
+    /// 有界なループなら、struct を作って捨てても記憶は使い回される
+    #[test]
+    fn ループで作ったstructは使い回される() {
+        let src = "struct User { id: int, name: str }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 3000) == false {\n\
+                   \x20   let each = User { id = n, name = \"looped\" }\n\
+                   \x20   n = n + 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![3000]));
     }
 
     /// 所有データを使わないモジュールには、メモリも allocator も載らない

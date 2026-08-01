@@ -298,6 +298,8 @@ pub struct BodyPlan {
     regions: Vec<BTreeSet<PointId>>,
     /// 構造化された出口 → その辺。backend が掃除を引くための索引
     cleanups: BTreeMap<Exit, usize>,
+    /// 射影を消費した式 → その点。残余の破棄はその場で走る
+    residues: BTreeMap<hir::ExprId, PointId>,
     entry: PointId,
     exit: PointId,
 }
@@ -335,6 +337,21 @@ impl BodyPlan {
     pub fn cleanup(&self, exit: Exit) -> &[Drop] {
         match self.cleanups.get(&exit) {
             Some(edge) => &self.edges[*edge].drops,
+            None => &[],
+        }
+    }
+
+    /// 射影を消費した直後に走る破棄(design.md 決定6)。
+    ///
+    /// 出口の掃除とは別。消費した瞬間に器の残りが落ちるので、その場で出す
+    #[allow(dead_code)]
+    pub fn residue(&self, expr: hir::ExprId) -> &[Drop] {
+        let Some(point) = self.residues.get(&expr) else {
+            return &[];
+        };
+        match self.edges.iter().find(|edge| edge.from == *point) {
+            Some(edge) => &edge.drops,
+            // その点から先へ制御が流れない(発散した)。落ちるものも無い
             None => &[],
         }
     }
@@ -996,6 +1013,7 @@ impl<'a> Build<'a> {
         let loan = borrowed.map(|(kind, place)| self.loan_at(place, kind, point, span));
         if let Some(residue) = residue {
             self.residue.insert(point, vec![residue]);
+            self.plan.residues.insert(expr, point);
         }
         loan
     }

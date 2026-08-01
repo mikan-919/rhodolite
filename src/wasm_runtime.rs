@@ -156,48 +156,67 @@ impl Runtime {
 // 命令の組み立て
 // ---------------------------------------------------------------------------
 
-/// 命令を並べるための薄い包み。`Function` を直に触ると読めなくなる
-struct Body(Function);
+/// 命令を並べるための薄い包み。`Function` を直に触ると読めなくなる。
+///
+/// glue を出す `wasm_data` も同じ形で命令を並べるので、そちらへも見せる
+pub struct Body(pub Function);
 
 impl Body {
-    fn new(locals: u32) -> Body {
+    pub fn new(locals: u32) -> Body {
         Body(Function::new([(locals, ValType::I32)]))
     }
 
-    fn ins(&mut self, instruction: Instruction<'_>) -> &mut Body {
+    /// 型の違う局所を並べて始める。生成する本体はこちらを使う
+    pub fn with_locals(locals: Vec<(u32, ValType)>) -> Body {
+        Body(Function::new(locals))
+    }
+
+    pub fn ins(&mut self, instruction: Instruction<'_>) -> &mut Body {
         self.0.instruction(&instruction);
         self
     }
 
-    fn get(&mut self, local: u32) -> &mut Body {
+    pub fn get(&mut self, local: u32) -> &mut Body {
         self.ins(Instruction::LocalGet(local))
     }
 
-    fn set(&mut self, local: u32) -> &mut Body {
+    pub fn set(&mut self, local: u32) -> &mut Body {
         self.ins(Instruction::LocalSet(local))
     }
 
-    fn num(&mut self, value: u32) -> &mut Body {
+    pub fn tee(&mut self, local: u32) -> &mut Body {
+        self.ins(Instruction::LocalTee(local))
+    }
+
+    pub fn num(&mut self, value: u32) -> &mut Body {
         self.ins(Instruction::I32Const(value as i32))
     }
 
     /// stack のアドレスから `u32` を読む
-    fn load(&mut self) -> &mut Body {
+    pub fn load(&mut self) -> &mut Body {
         self.ins(Instruction::I32Load(WORD))
     }
 
     /// stack のアドレスへ `u32` を書く(アドレス、値の順に積んでおく)
-    fn store(&mut self) -> &mut Body {
+    pub fn store(&mut self) -> &mut Body {
         self.ins(Instruction::I32Store(WORD))
     }
 
+    /// 根からの offset を足す。0 なら何も出さない
+    pub fn offset(&mut self, by: u32) -> &mut Body {
+        if by != 0 {
+            self.num(by).ins(Instruction::I32Add);
+        }
+        self
+    }
+
     /// `local` が指すブロックの「次」の場所
-    fn next_of(&mut self, local: u32) -> &mut Body {
+    pub fn next_of(&mut self, local: u32) -> &mut Body {
         self.get(local).num(4).ins(Instruction::I32Add)
     }
 
     /// `local` が指すブロックの終端(ヘッダ + payload の次)
-    fn end_of(&mut self, local: u32) -> &mut Body {
+    pub fn end_of(&mut self, local: u32) -> &mut Body {
         self.get(local)
             .num(HEADER)
             .ins(Instruction::I32Add)
@@ -207,13 +226,13 @@ impl Body {
     }
 
     /// 条件が真なら trap する。所有権ランタイムに巻き戻しは無い
-    fn trap_if(&mut self) -> &mut Body {
+    pub fn trap_if(&mut self) -> &mut Body {
         self.ins(Instruction::If(BlockType::Empty))
             .ins(Instruction::Unreachable)
             .ins(Instruction::End)
     }
 
-    fn finish(mut self) -> Function {
+    pub fn finish(mut self) -> Function {
         self.0.instruction(&Instruction::End);
         self.0
     }

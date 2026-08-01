@@ -1,19 +1,28 @@
 //! 所有データの下ろし(design.md 決定5・6・7)。
 //!
-//! ここが持つのは「値を積む」「場所を作る」「所有を渡す」「掃除する」ための
-//! 命令の断片と、並びごとに生成する clone/drop/等値の glue。所有と借用の
-//! 判断そのものは所有権検査が済ませてあるので、ここで組み直さない。
+//! ここが持つのは「値を組み立てる」「所有を渡す」「掃除する」ための命令の
+//! 断片と、並びごとに生成する clone/drop/等値の glue。所有と借用の判断そのもの
+//! は所有権検査が済ませてあるので、ここで組み直さない。
+//!
+//! glue の約束は「**その値が持っているものを解放する。値そのものが載っている
+//! 記憶は解放しない**」。だから同じ関数が、単独の割り当ての根としても、
+//! struct の中に直に置かれたフィールドとしても使える(design.md 決定5)。
+//! 根を返すのは持ち主の仕事。
 //!
 //! 割り当てと解放は `wasm_runtime`、記憶の並びは `wasm_layout` が決める。
 
 use crate::wasm_layout::{
-    BUFFER_CAPACITY, BUFFER_DATA, BUFFER_LEN, BUFFER_SIZE, LayoutId, Layouts, Shape,
+    BUFFER_CAPACITY, BUFFER_DATA, BUFFER_LEN, BUFFER_SIZE, LayoutId, Layouts, Shape, Slot,
 };
-use crate::wasm_runtime::Helper;
+use crate::wasm_runtime::{Body, Helper};
 use std::collections::BTreeMap;
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
-/// 並び1つ分の生成関数。番号は本体を出す前に確定している(design.md 決定5)
+/// 並び1つ分の生成関数。番号は本体を出す前に確定している(design.md 決定5)。
+///
+/// - `drop(ptr)` — `ptr` が持っている記憶を解放する。`ptr` 自身は解放しない
+/// - `clone(src, dst)` — 割り当て済みの `dst` へ深く写す
+/// - `eq(a, b) -> i32` — 構造的に等しいか
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Glue {
     pub drop: u32,
@@ -63,7 +72,7 @@ impl Indices {
     }
 }
 
-/// `u32` の load/store。根の帳簿はどれも 4 byte 揃え
+/// `u32` の load/store。根の帳簿も子アドレスも 4 byte 揃え
 fn word(offset: u32) -> MemArg {
     MemArg {
         offset: u64::from(offset),
@@ -72,74 +81,200 @@ fn word(offset: u32) -> MemArg {
     }
 }
 
-/// 本体1つが使う作業用の局所。所有データを組み立てる途中の値を置く
-pub const SCRATCH: u32 = 2;
+fn byte(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 0,
+        memory_index: 0,
+    }
+}
+
+/// 式1つが使える作業用の局所の数。入れ子になっても踏まないよう、要る式ごとに
+/// 別の区画を配る
+pub const SCRATCH: u32 = 3;
 
 // ---------------------------------------------------------------------------
-// 値と場所
+// Copy な値の読み書き(tasks 3.3)
+// ---------------------------------------------------------------------------
+
+/// Copy な並びを記憶から読む。stack のアドレスを、平らな値の並びへ置き換える
+pub fn load_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, offset: u32) {
+    match &layouts.get(layout).shape {
+        // 値を持たないので、アドレスも要らない
+        Shape::Unit => b.ins(Instruction::Drop),
+        Shape::Bool => b.ins(Instruction::I32Load8U(byte(offset))),
+        Shape::Tag(_) => b.ins(Instruction::I32Load(word(offset))),
+        Shape::Int => b.ins(Instruction::I64Load(MemArg {
+            offset: u64::from(offset),
+            align: 3,
+            memory_index: 0,
+        })),
+        other => unreachable!("Copy ではない並びを読もうとしました: {other:?}"),
+    };
+}
+
+/// Copy な並びを記憶へ書く。アドレスと値をこの順に積んでおくこと
+pub fn store_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, offset: u32) {
+    match &layouts.get(layout).shape {
+        // アドレスだけが積まれている。書くものが無いので落とす
+        Shape::Unit => b.ins(Instruction::Drop),
+        Shape::Bool => b.ins(Instruction::I32Store8(byte(offset))),
+        Shape::Tag(_) => b.ins(Instruction::I32Store(word(offset))),
+        Shape::Int => b.ins(Instruction::I64Store(MemArg {
+            offset: u64::from(offset),
+            align: 3,
+            memory_index: 0,
+        })),
+        other => unreachable!("Copy ではない並びを書こうとしました: {other:?}"),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// 値の組み立てと受け渡し
 // ---------------------------------------------------------------------------
 
 /// 静的データの UTF-8 から、所有する `str` の根を1つ作る(tasks 4.1)。
 ///
 /// 帳簿と中身は別の割り当てにする。だから同じリテラルから作った文字列どうしも
 /// 記憶を共有せず、片方を drop してももう片方は生きている
-pub fn literal_str(f: &mut Function, indices: &Indices, scratch: u32, offset: u32, len: u32) {
+pub fn literal_str(b: &mut Body, indices: &Indices, scratch: u32, offset: u32, len: u32) {
     let (root, buffer) = (scratch, scratch + 1);
-    f.instruction(&Instruction::I32Const(BUFFER_SIZE as i32));
-    f.instruction(&Instruction::Call(indices.alloc));
-    f.instruction(&Instruction::LocalSet(root));
-    f.instruction(&Instruction::I32Const(len as i32));
-    f.instruction(&Instruction::Call(indices.alloc));
-    f.instruction(&Instruction::LocalSet(buffer));
+    b.num(BUFFER_SIZE).ins(Instruction::Call(indices.alloc));
+    b.set(root);
+    b.num(len).ins(Instruction::Call(indices.alloc)).set(buffer);
 
-    f.instruction(&Instruction::LocalGet(buffer));
-    f.instruction(&Instruction::I32Const(offset as i32));
-    f.instruction(&Instruction::I32Const(len as i32));
-    f.instruction(&Instruction::MemoryCopy {
+    b.get(buffer).num(offset).num(len);
+    b.ins(Instruction::MemoryCopy {
         src_mem: 0,
         dst_mem: 0,
     });
 
-    for (at, value) in [
-        (BUFFER_DATA, buffer),
-        (BUFFER_LEN, u32::MAX),
-        (BUFFER_CAPACITY, u32::MAX),
-    ] {
-        f.instruction(&Instruction::LocalGet(root));
-        if value == u32::MAX {
-            f.instruction(&Instruction::I32Const(len as i32));
-        } else {
-            f.instruction(&Instruction::LocalGet(value));
-        }
-        f.instruction(&Instruction::I32Store(word(at)));
-    }
-    f.instruction(&Instruction::LocalGet(root));
+    b.get(root)
+        .get(buffer)
+        .ins(Instruction::I32Store(word(BUFFER_DATA)));
+    b.get(root)
+        .num(len)
+        .ins(Instruction::I32Store(word(BUFFER_LEN)));
+    b.get(root)
+        .num(len)
+        .ins(Instruction::I32Store(word(BUFFER_CAPACITY)));
+    b.get(root);
+}
+
+/// 所有する値の根を1つ確保する。中身はまだ何も入っていない
+pub fn alloc_root(b: &mut Body, indices: &Indices, layouts: &Layouts, layout: LayoutId) {
+    b.num(layouts.extent(layout).size)
+        .ins(Instruction::Call(indices.alloc));
+}
+
+/// 一時的な根に載っている所有値を、器の中の区画へそのまま移す(tasks 3.3)。
+///
+/// 写すのは記憶の中身だけ。中身が指している buffer や子の所有はそのまま移る
+/// ので、空になった一時的な根だけを返す
+pub fn relocate_into(
+    b: &mut Body,
+    indices: &Indices,
+    layouts: &Layouts,
+    layout: LayoutId,
+    container: u32,
+    offset: u32,
+    temporary: u32,
+) {
+    b.set(temporary);
+    b.get(container).offset(offset);
+    b.get(temporary);
+    b.num(layouts.extent(layout).size);
+    b.ins(Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+    b.get(temporary).ins(Instruction::Call(indices.free));
+}
+
+/// 器の中の区画を、独立した根へ取り出す(tasks 5.4)。
+///
+/// 直接置かれたフィールドを消費するときに使う。器そのものの後始末は、計画が
+/// 出した残余の破棄が受け持つ
+pub fn extract_root(
+    b: &mut Body,
+    indices: &Indices,
+    layouts: &Layouts,
+    layout: LayoutId,
+    source: u32,
+    offset: u32,
+    fresh: u32,
+) {
+    b.set(source);
+    alloc_root(b, indices, layouts, layout);
+    b.set(fresh);
+    b.get(fresh);
+    b.get(source).offset(offset);
+    b.num(layouts.extent(layout).size);
+    b.ins(Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+    b.get(fresh);
+}
+
+/// 所有する値を根ごと落とす。glue は中身しか解放しないので、根はここで返す
+pub fn drop_root(b: &mut Body, indices: &Indices, glue: Glue, address: u32) {
+    b.get(address).ins(Instruction::Call(glue.drop));
+    b.get(address).ins(Instruction::Call(indices.free));
 }
 
 /// 初期化フラグで守った破棄(tasks 3.4)。
 ///
 /// 経路によっては move 済みかもしれない。計画は「持っていれば落とす」までしか
 /// 言えないので、実際に持っているかは実行時のフラグが答える
-pub fn drop_guarded(f: &mut Function, glue: Glue, address: u32, flag: u32) {
-    f.instruction(&Instruction::LocalGet(flag));
-    f.instruction(&Instruction::If(BlockType::Empty));
-    f.instruction(&Instruction::LocalGet(address));
-    f.instruction(&Instruction::Call(glue.drop));
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::LocalSet(flag));
-    f.instruction(&Instruction::End);
+pub fn drop_guarded(b: &mut Body, indices: &Indices, glue: Glue, address: u32, flag: u32) {
+    b.get(flag);
+    b.ins(Instruction::If(BlockType::Empty));
+    drop_root(b, indices, glue, address);
+    b.num(0).set(flag);
+    b.ins(Instruction::End);
 }
 
 /// 束縛が所有を得た。フラグは値が完成した**後**に立てる
-pub fn mark_initialized(f: &mut Function, flag: u32) {
-    f.instruction(&Instruction::I32Const(1));
-    f.instruction(&Instruction::LocalSet(flag));
+pub fn mark_initialized(b: &mut Body, flag: u32) {
+    b.num(1).set(flag);
 }
 
 /// 所有を持ち出した。アドレスはそのままだが、もうここの持ち物ではない
-pub fn mark_moved(f: &mut Function, flag: u32) {
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::LocalSet(flag));
+pub fn mark_moved(b: &mut Body, flag: u32) {
+    b.num(0).set(flag);
+}
+
+/// 区画1つを落とす。`address` の局所に器の根が入っている前提。
+///
+/// 直接置かれた子は中身だけを落とし、`indirect` の子は根ごと返す。器そのものは
+/// 触らない
+pub fn drop_slot(
+    b: &mut Body,
+    indices: &Indices,
+    layouts: &Layouts,
+    slot: &Slot,
+    address: u32,
+    scratch: u32,
+) {
+    let child = layouts.get(slot.layout);
+    if slot.indirect {
+        b.get(address).offset(slot.offset).load().tee(scratch);
+        // 0 は `nil` か持ち出し済み。どちらにせよ返すものが無い
+        b.ins(Instruction::If(BlockType::Empty));
+        if child.copy {
+            b.get(scratch).ins(Instruction::Call(indices.free));
+        } else {
+            drop_root(b, indices, indices.of(slot.layout), scratch);
+        }
+        b.ins(Instruction::End);
+        return;
+    }
+    if child.copy {
+        return;
+    }
+    b.get(address).offset(slot.offset);
+    b.ins(Instruction::Call(indices.of(slot.layout).drop));
 }
 
 // ---------------------------------------------------------------------------
@@ -153,23 +288,23 @@ pub fn glue_functions(layouts: &Layouts, indices: &Indices) -> Vec<Helper> {
         if layout.copy {
             continue;
         }
-        match &layout.shape {
-            Shape::Str => {
-                helpers.push(one(vec![ValType::I32], vec![], str_drop(indices)));
-                helpers.push(one(
-                    vec![ValType::I32],
-                    vec![ValType::I32],
-                    str_clone(indices),
-                ));
-                helpers.push(one(
-                    vec![ValType::I32, ValType::I32],
-                    vec![ValType::I32],
-                    str_eq(),
-                ));
-            }
+        let (drop, clone, eq) = match &layout.shape {
+            Shape::Str => (str_drop(indices), str_clone(indices), str_eq()),
+            Shape::Struct { fields, .. } => (
+                compound_drop(indices, layouts, fields),
+                compound_clone(indices, layouts, id, fields),
+                compound_eq(indices, layouts, fields),
+            ),
             // 対応検査が先に止めるので、ここへ来たら検査の抜け
             other => unreachable!("glue を出せない並びです: {other:?} ({id:?})"),
-        }
+        };
+        helpers.push(one(vec![ValType::I32], vec![], drop));
+        helpers.push(one(vec![ValType::I32, ValType::I32], vec![], clone));
+        helpers.push(one(
+            vec![ValType::I32, ValType::I32],
+            vec![ValType::I32],
+            eq,
+        ));
     }
     helpers
 }
@@ -182,101 +317,206 @@ fn one(params: Vec<ValType>, results: Vec<ValType>, body: Function) -> Helper {
     }
 }
 
-/// `drop_str(ptr)`。中身の buffer を先に返してから帳簿を返す
+/// `drop_str(ptr)`。中身の buffer を返す。帳簿そのものは持ち主が返す
 fn str_drop(indices: &Indices) -> Function {
-    let mut f = Function::new([]);
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::I32Load(word(BUFFER_DATA)));
-    f.instruction(&Instruction::Call(indices.free));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::Call(indices.free));
-    f.instruction(&Instruction::End);
-    f
+    let mut b = Body::new(0);
+    b.get(0)
+        .ins(Instruction::I32Load(word(BUFFER_DATA)))
+        .ins(Instruction::Call(indices.free));
+    b.finish()
 }
 
-/// `clone_str(ptr) -> i32`。中身まで写すので、元と複製は記憶を共有しない
+/// `clone_str(src, dst)`。中身まで写すので、元と複製は記憶を共有しない
 fn str_clone(indices: &Indices) -> Function {
-    // 1: root, 2: buffer, 3: len
-    let mut f = Function::new([(3, ValType::I32)]);
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::I32Load(word(BUFFER_LEN)));
-    f.instruction(&Instruction::LocalSet(3));
+    // 2: buffer, 3: len
+    let mut b = Body::new(2);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_LEN))).set(3);
+    b.get(3).ins(Instruction::Call(indices.alloc)).set(2);
 
-    f.instruction(&Instruction::I32Const(BUFFER_SIZE as i32));
-    f.instruction(&Instruction::Call(indices.alloc));
-    f.instruction(&Instruction::LocalSet(1));
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::Call(indices.alloc));
-    f.instruction(&Instruction::LocalSet(2));
-
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::I32Load(word(BUFFER_DATA)));
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::MemoryCopy {
+    b.get(2)
+        .get(0)
+        .ins(Instruction::I32Load(word(BUFFER_DATA)))
+        .get(3);
+    b.ins(Instruction::MemoryCopy {
         src_mem: 0,
         dst_mem: 0,
     });
 
-    for (at, value) in [(BUFFER_DATA, 2), (BUFFER_LEN, 3), (BUFFER_CAPACITY, 3)] {
-        f.instruction(&Instruction::LocalGet(1));
-        f.instruction(&Instruction::LocalGet(value));
-        f.instruction(&Instruction::I32Store(word(at)));
-    }
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::End);
-    f
+    b.get(1)
+        .get(2)
+        .ins(Instruction::I32Store(word(BUFFER_DATA)));
+    b.get(1).get(3).ins(Instruction::I32Store(word(BUFFER_LEN)));
+    b.get(1)
+        .get(3)
+        .ins(Instruction::I32Store(word(BUFFER_CAPACITY)));
+    b.finish()
 }
 
 /// `eq_str(a, b) -> i32`。長さが違えばそこで、違う byte を見つけたらそこで打ち切る
 fn str_eq() -> Function {
     // 2: len, 3: index
-    let mut f = Function::new([(2, ValType::I32)]);
-    f.instruction(&Instruction::LocalGet(0));
-    f.instruction(&Instruction::I32Load(word(BUFFER_LEN)));
-    f.instruction(&Instruction::LocalSet(2));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::LocalGet(1));
-    f.instruction(&Instruction::I32Load(word(BUFFER_LEN)));
-    f.instruction(&Instruction::I32Ne);
-    f.instruction(&Instruction::If(BlockType::Empty));
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::Return);
-    f.instruction(&Instruction::End);
+    let mut b = Body::new(2);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_LEN))).set(2);
+    b.get(2)
+        .get(1)
+        .ins(Instruction::I32Load(word(BUFFER_LEN)))
+        .ins(Instruction::I32Ne);
+    b.ins(Instruction::If(BlockType::Empty));
+    b.num(0).ins(Instruction::Return);
+    b.ins(Instruction::End);
 
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::LocalSet(3));
-    f.instruction(&Instruction::Block(BlockType::Empty));
-    f.instruction(&Instruction::Loop(BlockType::Empty));
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::LocalGet(2));
-    f.instruction(&Instruction::I32GeU);
-    f.instruction(&Instruction::BrIf(1));
+    b.num(0).set(3);
+    b.ins(Instruction::Block(BlockType::Empty));
+    b.ins(Instruction::Loop(BlockType::Empty));
+    b.get(3).get(2).ins(Instruction::I32GeU);
+    b.ins(Instruction::BrIf(1));
     for side in [0, 1] {
-        f.instruction(&Instruction::LocalGet(side));
-        f.instruction(&Instruction::I32Load(word(BUFFER_DATA)));
-        f.instruction(&Instruction::LocalGet(3));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::I32Load8U(MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        }));
+        b.get(side)
+            .ins(Instruction::I32Load(word(BUFFER_DATA)))
+            .get(3)
+            .ins(Instruction::I32Add)
+            .ins(Instruction::I32Load8U(byte(0)));
     }
-    f.instruction(&Instruction::I32Ne);
-    f.instruction(&Instruction::If(BlockType::Empty));
-    f.instruction(&Instruction::I32Const(0));
-    f.instruction(&Instruction::Return);
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::LocalGet(3));
-    f.instruction(&Instruction::I32Const(1));
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::LocalSet(3));
-    f.instruction(&Instruction::Br(0));
-    f.instruction(&Instruction::End);
-    f.instruction(&Instruction::End);
+    b.ins(Instruction::I32Ne);
+    b.ins(Instruction::If(BlockType::Empty));
+    b.num(0).ins(Instruction::Return);
+    b.ins(Instruction::End);
+    b.get(3).num(1).ins(Instruction::I32Add).set(3);
+    b.ins(Instruction::Br(0));
+    b.ins(Instruction::End);
+    b.ins(Instruction::End);
 
-    f.instruction(&Instruction::I32Const(1));
-    f.instruction(&Instruction::End);
-    f
+    b.num(1);
+    b.finish()
+}
+
+/// 直接置かれた子は中身だけ、`indirect` の子は根ごと落とす
+fn compound_drop(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
+    // 1: 子のアドレス
+    let mut b = Body::new(1);
+    for slot in slots {
+        drop_slot(&mut b, indices, layouts, slot, 0, 1);
+    }
+    b.finish()
+}
+
+/// まず浅く写してから、所有している子だけを作り直して上書きする
+fn compound_clone(
+    indices: &Indices,
+    layouts: &Layouts,
+    layout: LayoutId,
+    slots: &[Slot],
+) -> Function {
+    // 2: 元の子, 3: 新しい子
+    let mut b = Body::new(2);
+    b.get(1).get(0).num(layouts.extent(layout).size);
+    b.ins(Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+
+    for slot in slots {
+        let child = layouts.get(slot.layout);
+        if slot.indirect {
+            b.get(0).offset(slot.offset).load().tee(2);
+            b.ins(Instruction::If(BlockType::Empty));
+            b.num(layouts.extent(slot.layout).size)
+                .ins(Instruction::Call(indices.alloc))
+                .set(3);
+            if child.copy {
+                b.get(3).get(2).num(layouts.extent(slot.layout).size);
+                b.ins(Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+            } else {
+                b.get(2)
+                    .get(3)
+                    .ins(Instruction::Call(indices.of(slot.layout).clone));
+            }
+            b.get(1)
+                .offset(slot.offset)
+                .get(3)
+                .ins(Instruction::I32Store(word(0)));
+            b.ins(Instruction::End);
+            continue;
+        }
+        // Copy な子は浅い写しでもう正しい
+        if child.copy {
+            continue;
+        }
+        b.get(0).offset(slot.offset);
+        b.get(1).offset(slot.offset);
+        b.ins(Instruction::Call(indices.of(slot.layout).clone));
+    }
+    b.finish()
+}
+
+/// 宣言順に比べて、違いを見つけたところで打ち切る
+fn compound_eq(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
+    // 2: 左の子, 3: 右の子
+    let mut b = Body::new(2);
+    for slot in slots {
+        let child = layouts.get(slot.layout);
+        if slot.indirect {
+            b.get(0).offset(slot.offset).load().set(2);
+            b.get(1).offset(slot.offset).load().set(3);
+            // 片方だけが `nil` なら違う。両方 `nil` なら次のフィールドへ
+            b.get(2).ins(Instruction::I32Eqz);
+            b.get(3).ins(Instruction::I32Eqz);
+            b.ins(Instruction::I32Ne);
+            b.ins(Instruction::If(BlockType::Empty));
+            b.num(0).ins(Instruction::Return);
+            b.ins(Instruction::End);
+            b.get(2);
+            b.ins(Instruction::If(BlockType::Empty));
+            if child.copy {
+                b.get(2);
+                load_copy(&mut b, layouts, slot.layout, 0);
+                b.get(3);
+                load_copy(&mut b, layouts, slot.layout, 0);
+                equal_flat(&mut b, layouts, slot.layout);
+            } else {
+                b.get(2)
+                    .get(3)
+                    .ins(Instruction::Call(indices.of(slot.layout).eq));
+            }
+            b.ins(Instruction::I32Eqz);
+            b.ins(Instruction::If(BlockType::Empty));
+            b.num(0).ins(Instruction::Return);
+            b.ins(Instruction::End);
+            b.ins(Instruction::End);
+            continue;
+        }
+        if child.copy {
+            // `unit` は値を持たないので常に等しい
+            if matches!(child.shape, Shape::Unit) {
+                continue;
+            }
+            b.get(0);
+            load_copy(&mut b, layouts, slot.layout, slot.offset);
+            b.get(1);
+            load_copy(&mut b, layouts, slot.layout, slot.offset);
+            equal_flat(&mut b, layouts, slot.layout);
+        } else {
+            b.get(0).offset(slot.offset);
+            b.get(1).offset(slot.offset);
+            b.ins(Instruction::Call(indices.of(slot.layout).eq));
+        }
+        b.ins(Instruction::I32Eqz);
+        b.ins(Instruction::If(BlockType::Empty));
+        b.num(0).ins(Instruction::Return);
+        b.ins(Instruction::End);
+    }
+    b.num(1);
+    b.finish()
+}
+
+/// 平らに積んだ Copy 値2つを比べる
+fn equal_flat(b: &mut Body, layouts: &Layouts, layout: LayoutId) {
+    match &layouts.get(layout).shape {
+        Shape::Int => b.ins(Instruction::I64Eq),
+        Shape::Bool | Shape::Tag(_) => b.ins(Instruction::I32Eq),
+        other => unreachable!("平らに比べられない並びです: {other:?}"),
+    };
 }

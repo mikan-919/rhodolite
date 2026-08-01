@@ -1863,8 +1863,7 @@ fn 各段の失敗で成果物を出さない() {
             "提供されていません",
         ),
         (
-            "struct User { name: str }\n\
-             fn main(-> int) {\n let u = User { name = \"a\" }\n 1\n}\n",
+            "fn main(-> int) {\n let xs = [1, 2]\n 1\n}\n",
             "Wasm ターゲットでは扱えません",
         ),
     ] {

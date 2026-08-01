@@ -18,11 +18,11 @@
 
 - [x] 3.1 Add the flat Copy/owned-address/borrowed-address representation planner and expand function params, results, block types, and locals to deterministic Wasm value sequences
 - [x] 3.2 Expose a narrow read-only backend cleanup view from `ownership::BodyPlan`, with snapshots proving it preserves the existing access modes and edge drop order
-- [ ] 3.3 Add `wasm_data.rs` interfaces for emitting values and places, moving, assigning, discarding, loading/storing Copy layouts, and relocating inline owned layouts
+- [x] 3.3 Add `wasm_data.rs` interfaces for emitting values and places, moving, assigning, discarding, loading/storing Copy layouts, and relocating inline owned layouts
 - [x] 3.4 Give every non-Copy owner an address slot and initialization flag, and lower checked `Drop::Local` plus move flag transitions
-- [ ] 3.5 Lower `Drop::Remaining` for consuming nested projections without double-dropping the selected path
+- [x] 3.5 Lower `Drop::Remaining` for consuming nested projections without double-dropping the selected path
 - [x] 3.6 Route fallthrough, return, branch exit, and loop exit through plan-ordered cleanup while leaving traps non-unwinding
-- [ ] 3.7 Add engine tests for conditional initialization, move across branches, nested early return, loop cleanup, reverse declaration order, and consuming field projection
+- [x] 3.7 Add engine tests for conditional initialization, move across branches, nested early return, loop cleanup, reverse declaration order, and consuming field projection
 
 ## 4. String vertical slice
 
@@ -33,11 +33,11 @@
 
 ## 5. Owned struct vertical slice
 
-- [ ] 5.1 Lower zero-field and field-bearing struct construction while preserving source evaluation order and declaration-order storage
-- [ ] 5.2 Lower Copy field reads, shared/mutable owned-field places, optional-field propagation, and field assignment with drop-before-install semantics
-- [ ] 5.3 Generate recursive struct drop, clone, and equality glue for direct and `indirect` fields
-- [ ] 5.4 Lower whole-struct moves and consuming direct/indirect field projections using the checked remainder plan
-- [ ] 5.5 Add engine tests for nested mutation, deep clone independence, structural equality, recursive `indirect` chains, moves, and exact cleanup
+- [x] 5.1 Lower zero-field and field-bearing struct construction while preserving source evaluation order and declaration-order storage
+- [x] 5.2 Lower Copy field reads, shared/mutable owned-field places, optional-field propagation, and field assignment with drop-before-install semantics
+- [x] 5.3 Generate recursive struct drop, clone, and equality glue for direct and `indirect` fields
+- [x] 5.4 Lower whole-struct moves and consuming direct/indirect field projections using the checked remainder plan
+- [x] 5.5 Add engine tests for nested mutation, deep clone independence, structural equality, recursive `indirect` chains, moves, and exact cleanup
 
 ## 6. Enum, optional, coalesce, and match slice
 
