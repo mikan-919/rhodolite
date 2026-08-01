@@ -9,8 +9,8 @@
 // ---- 契約 ----
 
 trait Database {
-    fn find(self, id: int -> User?)
-    fn save(self, u: User -> unit)
+    fn find(&self, id: int -> User?)
+    fn save(&mut self, u: User -> unit)
 }
 
 trait Clock {
@@ -39,17 +39,17 @@ effect clock: Clock
 
 // ---- 使用: スロット名で呼ぶ ----
 
-fn stamp(u: User) {
+fn stamp(u: &mut User) {
     u.promoted_at = clock.now()
-    db.save(u)
 }
 
 // ---- 経由するだけ: 無記述 ----
 
 fn promote(id: int -> bool) {
-    let u = db.find(id) ?? return false
+    let mut u = db.find(id) ?? return false
     u.rank = Gold
-    stamp(u)
+    stamp(&mut u)
+    db.save(move u)
     true
 }
 
@@ -72,10 +72,10 @@ impl Postgres {
 impl Database for Postgres {
     // v1 に本物の接続は無いので空の DB として振る舞う。
     // 差し替えが動くことの検証は下の test が InMemoryDb でやる
-    fn find(self, id: int -> User?) {
+    fn find(&self, id: int -> User?) {
         nil
     }
-    fn save(self, u: User -> unit) {
+    fn save(&mut self, u: User -> unit) {
         let ignored = u
     }
 }
@@ -101,29 +101,25 @@ fn main(-> bool) {
 // ---- 差し替え用のハンドラ。同じ trait の別の impl でしかない ----
 
 struct InMemoryDb {
-    users: [User]
+    user: User
 }
 
 impl InMemoryDb {
-    fn new(users: [User] -> InMemoryDb) {
-        InMemoryDb { users = users }
+    fn new(user: User -> InMemoryDb) {
+        InMemoryDb { user = user }
     }
     // テストから中を覗くための関連関数。self を取らないので `::` で呼ぶ
-    fn get(store: InMemoryDb, id: int -> User?) {
-        store.find(id)
+    fn get(store: &InMemoryDb, id: int -> User?) {
+        if store.user.id == id: store.user.clone() else: nil
     }
 }
 
 impl Database for InMemoryDb {
-    fn find(self, id: int -> User?) {
-        for u in self.users {
-            if u.id == id: return u
-        }
-        nil
+    fn find(&self, id: int -> User?) {
+        if self.user.id == id: self.user.clone() else: nil
     }
-    fn save(self, u: User -> unit) {
-        // 配列が同じ実体を持っているので、変更はもう見えている
-        let ignored = u
+    fn save(&mut self, u: User -> unit) {
+        self.user = move u
     }
 }
 
@@ -147,15 +143,15 @@ impl Clock for Frozen {
 
 test "昇格すると Gold になり時刻が刻まれる" {
     let alice = User { id = 1, rank = Bronze, promoted_at = 0 }
-    let store = InMemoryDb::new([alice])
+    let mut store = InMemoryDb::new(move alice)
 
-    with db(store), clock(Frozen::at(1000)) {
-        assert handle(alice.id)
-
-        // `get` は `User?` を返す。見つからなければ Bronze の別人になるので、
-        // 下の assert がそのまま「見つかったこと」も確かめる
-        let u = InMemoryDb::get(store, alice.id) ?? User { id = 0, rank = Bronze, promoted_at = 0 }
-        assert u.rank == Gold
-        assert u.promoted_at == 1000
+    with db(&mut store), clock(Frozen::at(1000)) {
+        assert handle(1)
     }
+
+    // `get` は `User?` を返す。見つからなければ Bronze の別人になるので、
+    // 下の assert がそのまま「見つかったこと」も確かめる
+    let u = InMemoryDb::get(store, 1) ?? User { id = 0, rank = Bronze, promoted_at = 0 }
+    assert u.rank == Gold
+    assert u.promoted_at == 1000
 }

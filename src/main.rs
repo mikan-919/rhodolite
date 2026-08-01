@@ -15,11 +15,6 @@ mod eval;
 mod hir;
 mod lex;
 mod module;
-// ponytail: 所有権計画はまだパイプラインへ繋がない。繋ぐと canonical.rd を
-// はじめ未移行のソースが全部落ちるので、入口の付け替えは移行と同じ段
-// (tasks 8.1/8.2)でまとめてやる。それまでは検査と計画を単体テストから
-// だけ駆動するので、まだ読まれない口が残る
-#[allow(dead_code)]
 mod ownership;
 mod parse;
 mod render;
@@ -116,7 +111,14 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
     };
     let sources = loaded.sources;
 
-    let checked = match typecheck::check_and_lower(&loaded.program) {
+    let lowered = match typecheck::check_and_lower(&loaded.program) {
+        Ok(lowered) => lowered,
+        Err(errors) => {
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
+    let checked = match ownership::check(lowered) {
         Ok(checked) => checked,
         Err(errors) => {
             render::report(&errors, &sources);
@@ -124,7 +126,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
         }
     };
 
-    let Some(entry_callable) = checked.free_callable(&loaded.entry) else {
+    let Some(entry_callable) = checked.hir.free_callable(&loaded.entry) else {
         eprintln!("エントリー `{}` がありません", loaded.entry);
         return ExitCode::FAILURE;
     };
@@ -156,7 +158,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
         .filter_map(|export| {
             Some((
                 export.name.clone(),
-                checked.free_callable(&export.canonical)?,
+                checked.hir.free_callable(&export.canonical)?,
             ))
         })
         .collect();
@@ -167,7 +169,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
     roots.extend(
         exports
             .iter()
-            .map(|(_, id)| checked.callables[*id].name.clone()),
+            .map(|(_, id)| checked.hir.callables[*id].name.clone()),
     );
     let errors = analysis.errors_for_roots(&roots);
     if !errors.is_empty() {
@@ -179,7 +181,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
         match ambient_abi::plan_production(&checked, &analysis, entry_callable, &exports) {
             Ok(production) => production,
             Err(error) => {
-                eprintln!("{}", error.show(&checked));
+                eprintln!("{}", error.show(&checked.hir));
                 return ExitCode::FAILURE;
             }
         };
@@ -266,7 +268,15 @@ fn main() -> ExitCode {
 
     // 検査と下ろしはひとつ。ここを通れば、後段が受け取るのは型の付いた
     // 参照解決済みの HIR で、名前を引き直す必要がない(src/hir.rs)
-    let checked = match typecheck::check_and_lower(&program) {
+    let lowered = match typecheck::check_and_lower(&program) {
+        Ok(lowered) => lowered,
+        Err(errors) => {
+            eprintln!();
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
+    let checked = match ownership::check(lowered) {
         Ok(checked) => checked,
         Err(errors) => {
             eprintln!();
@@ -299,10 +309,14 @@ fn main() -> ExitCode {
 }
 
 /// `test` があれば全部走らせる。無ければ `main` を走らせる。
-fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> ExitCode {
-    let interp = eval::Interp::new(checked);
+fn run(
+    checked: &ownership::CheckedProgram,
+    entry: &str,
+    sources: &[module::SourceFile],
+) -> ExitCode {
+    let interp = eval::Interp::new_checked(checked);
 
-    if checked.tests.is_empty() {
+    if checked.hir.tests.is_empty() {
         println!("\n実行:");
         return match interp.run(entry) {
             Ok(v) => {
@@ -319,7 +333,7 @@ fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> E
 
     println!("\nテスト:");
     let mut failed = 0;
-    for (id, declared) in checked.tests.iter() {
+    for (id, declared) in checked.hir.tests.iter() {
         let name = &declared.name;
         match interp.run_test(id) {
             Ok(_) => println!("  ok   {name}"),
@@ -331,7 +345,7 @@ fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> E
         }
     }
 
-    let total = checked.tests.len();
+    let total = checked.hir.tests.len();
     println!("\n{total} 件中 {} 件成功", total - failed);
     if failed == 0 {
         ExitCode::SUCCESS

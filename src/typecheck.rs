@@ -6300,13 +6300,13 @@ rank: Rank }
         }
 
         // struct のフィールドは所属 struct を指し、型は宣言を指す
-        let users = program
+        let user = program
             .fields
             .iter()
-            .find(|(_, f)| f.name == "users")
-            .expect("正典に `users` がある");
-        assert_eq!(program.structs[users.1.owner].name, "InMemoryDb");
-        assert_eq!(program.show_type(&users.1.ty), "[User]");
+            .find(|(_, f)| f.name == "user")
+            .expect("正典に `user` がある");
+        assert_eq!(program.structs[user.1.owner].name, "InMemoryDb");
+        assert_eq!(program.show_type(&user.1.ty), "User");
     }
 
     /// 受理される式の形すべてが HIR の形へ下がること。1つでも `Poison` が
@@ -6551,13 +6551,12 @@ rank: Rank }
         assert!(errors.is_empty(), "{errors:?}");
     }
 
-    /// 正典の `for u in self.users` が静的に検査されていること。
-    /// `users: [User]` を宣言した効果は、ループ本体の誤りが実行前に出ることで見える
+    /// 正典の `self.user` が静的に検査されていること。
     #[test]
     fn 正典のループ本体は要素型で検査される() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
-        let broken = src.replace("if u.id == id", "if u.nope == id");
-        assert_ne!(broken, src, "正典のループ本体が変わったらここも直す");
+        let broken = src.replace("if self.user.id == id", "if self.user.nope == id");
+        assert_ne!(broken, src, "正典の find 本体が変わったらここも直す");
 
         let e = only(&broken);
         assert!(e.contains("`User`"), "{e}");

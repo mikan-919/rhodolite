@@ -13,18 +13,19 @@ struct User {
     at: int
 }
 
-fn stamp(u: User) {
+fn stamp(u: &mut User) {
     u.at = clock.now()
 }
 
-fn promote(u: User) {
+fn promote(u: &mut User) {
     stamp(u)
 }
 
-fn handle(u: User) {
+fn handle(u: &mut User) {
     promote(u)
 }
 
 fn main() {
-    handle(User { at = 0 })
+    let mut user = User { at = 0 }
+    handle(&mut user)
 }

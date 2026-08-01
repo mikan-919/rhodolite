@@ -17,6 +17,7 @@
 use crate::ambient_abi::{Plan, ProductionPlan};
 use crate::diag::Diag;
 use crate::hir;
+use crate::ownership::CheckedProgram;
 use std::collections::BTreeMap;
 use wasm_encoder::{
     BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
@@ -121,7 +122,11 @@ fn unsupported(span: crate::lex::Span, what: &str) -> Diag {
 /// 読み込んだ全コードは通常の静的検査を既に通っている。ここが見るのは
 /// 「生産の根から到達したか」だけなので、使われていない richer な宣言は
 /// 生産ビルドを止めない(core-wasm-build spec)
-pub fn check_support(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
+pub fn check_support(checked: &CheckedProgram, plan: &Plan) -> Vec<Diag> {
+    check_support_impl(&checked.hir, plan)
+}
+
+fn check_support_impl(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
     let mut diagnostics = Vec::new();
     for (_, instance) in plan.instances() {
         let body_id = instance.key.body;
@@ -568,9 +573,30 @@ pub struct Signature {
 ///
 /// 呼ぶ前に `check_support` と ABI 署名の検査を通しておくこと。ここは
 /// 「通った計画を決定的な bytes にする」ことだけを受け持つ
-pub fn emit(program: &hir::Program, production: &ProductionPlan) -> Result<Vec<u8>, Vec<Diag>> {
-    let signatures = crate::wasm_abi::signatures(program, production)?;
+pub fn emit(checked: &CheckedProgram, production: &ProductionPlan) -> Result<Vec<u8>, Vec<Diag>> {
+    let signatures = crate::wasm_abi::signatures(checked, production)?;
+    Ok(build(&checked.hir, production, &signatures))
+}
+
+#[cfg(test)]
+fn emit_impl(program: &hir::Program, production: &ProductionPlan) -> Result<Vec<u8>, Vec<Diag>> {
+    let signatures = crate::wasm_abi::signatures_hir_for_test(program, production)?;
     Ok(build(program, production, &signatures))
+}
+
+/// Wasm 下ろし単体テストだけが HIR を直接渡す入口。
+#[cfg(test)]
+pub(crate) fn check_support_hir_for_test(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
+    check_support_impl(program, plan)
+}
+
+/// Wasm 下ろし単体テストだけが HIR を直接渡す入口。
+#[cfg(test)]
+pub(crate) fn emit_hir_for_test(
+    program: &hir::Program,
+    production: &ProductionPlan,
+) -> Result<Vec<u8>, Vec<Diag>> {
+    emit_impl(program, production)
 }
 
 fn build(
@@ -693,18 +719,18 @@ pub(crate) mod tests {
     /// ソース1本を生産ビルドと同じ順で通す。`exports` は `公開名=関数名`
     pub(crate) fn compile(src: &str, exports: &[&str]) -> Result<Vec<u8>, Vec<Diag>> {
         let (program, production) = plan_of(src, exports);
-        let unsupported = check_support(&program, &production.plan);
+        let unsupported = check_support_hir_for_test(&program, &production.plan);
         if !unsupported.is_empty() {
             return Err(unsupported);
         }
-        emit(&program, &production)
+        emit_hir_for_test(&program, &production)
     }
 
     pub(crate) fn plan_of(src: &str, exports: &[&str]) -> (hir::Program, ProductionPlan) {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap()))
             .expect("パースできるはず");
         let program = crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず");
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let entry = program.free_callable("main").expect("main がない");
         let exports: Vec<(String, hir::CallableId)> = exports
             .iter()
@@ -716,8 +742,9 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        let production = crate::ambient_abi::plan_production(&program, &analysis, entry, &exports)
-            .expect("計画できるはず");
+        let production =
+            crate::ambient_abi::plan_production_hir_for_test(&program, &analysis, entry, &exports)
+                .expect("計画できるはず");
         (program, production)
     }
 
@@ -775,8 +802,9 @@ pub(crate) mod tests {
     /// 「同じ意味」と言える
     pub(crate) fn same_as_interpreter(src: &str) -> i64 {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap())).unwrap();
-        let checked = crate::typecheck::check_and_lower(&parsed).unwrap();
-        let interpreted = match crate::eval::Interp::new(&checked)
+        let hir = crate::typecheck::check_and_lower(&parsed).unwrap();
+        let checked = crate::ownership::check(hir).unwrap();
+        let interpreted = match crate::eval::Interp::new_checked(&checked)
             .run("main")
             .expect("インタプリタでも走るはず")
         {
@@ -899,7 +927,7 @@ pub(crate) mod tests {
     #[test]
     fn リテラルと束縛と代入() {
         assert_eq!(
-            same_as_interpreter("fn main(-> int) {\n let n = 1\n n = n + 2\n n\n}\n"),
+            same_as_interpreter("fn main(-> int) {\n let mut n = 1\n n = n + 2\n n\n}\n"),
             3
         );
         // unit の束縛は Wasm のローカルを持たないが、初期化子の効果は走る
@@ -968,7 +996,7 @@ pub(crate) mod tests {
         );
         // else の無い `if` は unit。分岐の中の代入は外から見える
         assert_eq!(
-            same_as_interpreter("fn main(-> int) {\n let n = 1\n if true { n = 5 }\n n\n}\n"),
+            same_as_interpreter("fn main(-> int) {\n let mut n = 1\n if true { n = 5 }\n n\n}\n"),
             5
         );
     }
@@ -978,8 +1006,8 @@ pub(crate) mod tests {
         assert_eq!(
             same_as_interpreter(
                 "fn main(-> int) {\n\
-                 \x20 let n = 0\n\
-                 \x20 let total = 0\n\
+                 \x20 let mut n = 0\n\
+                 \x20 let mut total = 0\n\
                  \x20 while n == n + 0 {\n\
                  \x20   if n == 5 { return total }\n\
                  \x20   total = total + n\n\
@@ -999,8 +1027,8 @@ pub(crate) mod tests {
             same_as_interpreter(
                 "fn done(n: int -> bool) { n == 3 }\n\
                  fn main(-> int) {\n\
-                 \x20 let n = 0\n\
-                 \x20 let acc = 0\n\
+                 \x20 let mut n = 0\n\
+                 \x20 let mut acc = 0\n\
                  \x20 while done(n) == false {\n\
                  \x20   if n == 1 { acc = acc + 10 } else { acc = acc + 1 }\n\
                  \x20   n = n + 1\n\
@@ -1069,8 +1097,8 @@ pub(crate) mod tests {
                 "fn triple(n: int -> int) { n * 3 }\n\
                  fn sum_to(n: int -> int) { if n == 0: 0 else: n + sum_to(n - 1) }\n\
                  fn main(-> int) {\n\
-                 \x20 let total = 0\n\
-                 \x20 let i = 0\n\
+                 \x20 let mut total = 0\n\
+                 \x20 let mut i = 0\n\
                  \x20 while (i == 4) == false {\n\
                  \x20   if i == 2 { total = total + triple(i) } else { total = total + i }\n\
                  \x20   i = i + 1\n\
@@ -1107,7 +1135,10 @@ pub(crate) mod tests {
 
     fn abi_error(src: &str, exports: &[&str]) -> String {
         let (program, production) = plan_of(src, exports);
-        messages(&crate::wasm_abi::signatures(&program, &production).expect_err("止まるはず"))
+        messages(
+            &crate::wasm_abi::signatures_hir_for_test(&program, &production)
+                .expect_err("止まるはず"),
+        )
     }
 
     fn export_names(bytes: &[u8]) -> Vec<String> {

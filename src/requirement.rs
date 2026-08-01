@@ -23,6 +23,7 @@
 use crate::diag::Diag;
 use crate::hir;
 use crate::lex::Span;
+use crate::ownership::CheckedProgram;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -380,8 +381,16 @@ fn merge_facts(into: &mut Facts, from: Facts) {
     into.calls.extend(from.calls);
 }
 
-/// 型検査を通った HIR から要求を推論する。
-pub fn analyze(program: &hir::Program) -> Analysis {
+/// 所有権検査済みプログラムから要求を推論する。
+///
+/// 通常のパイプラインが未検査 HIR を後段へ渡せないよう、公開入口は
+/// `CheckedProgram` だけを受け取る。
+pub fn analyze(checked: &CheckedProgram) -> Analysis {
+    analyze_hir(&checked.hir)
+}
+
+/// HIR 単体の走査本体。公開しないので通常の後段入口にはならない。
+fn analyze_hir(program: &hir::Program) -> Analysis {
     let mut diagnostics = duplicate_slot_diagnostics(program);
     diagnostics.sort();
     diagnostics.dedup();
@@ -515,6 +524,12 @@ pub fn analyze(program: &hir::Program) -> Analysis {
         semantic,
         diagnostics,
     }
+}
+
+/// HIR 走査そのものを対象にする単体テストだけの明示的な抜け道。
+#[cfg(test)]
+pub(crate) fn analyze_hir_for_test(program: &hir::Program) -> Analysis {
+    analyze_hir(program)
 }
 
 /// 本体の表示名。到達経路のホップに載る綴り。
@@ -702,7 +717,7 @@ mod tests {
 
     fn analysis_of_program(p: &ast::Program) -> Analysis {
         let lowered = crate::typecheck::check_and_lower(p).expect("型検査を通るはず");
-        analyze(&lowered)
+        analyze_hir_for_test(&lowered)
     }
 
     /// 文言だけを見る検査のための取り出し。
@@ -813,7 +828,7 @@ mod tests {
                  fn stamp(-> int) {{ shared_clock.now() }}\n\
                  fn main(-> int) {{ {provision} }}\n"
             ));
-            let analysis = analyze(&program);
+            let analysis = analyze_hir_for_test(&program);
             let facts = (
                 analysis.render(),
                 program.free_callable("stamp"),
@@ -923,7 +938,7 @@ mod tests {
     /// あるので、入力が HIR へ変わって結果が動いたらここが落ちる
     const EXPECTED: [&str; 5] = [
         // 正典
-        "  stamp / clock, db\n\
+        "  stamp / clock\n\
          \x20 promote / clock, db\n\
          \x20 handle / clock, db\n\
          \x20 main / (要求なし)\n\
@@ -1053,11 +1068,11 @@ mod tests {
     fn 意味の結果は全ての本体をidで引ける() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let lowered = crate::typecheck::check_and_lower(&program(&src)).expect("型検査を通る");
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
 
         assert_eq!(
             semantic_report(&lowered, &analysis),
-            "callable#0 stamp / slot#0 db (値), slot#1 clock (値)\n\
+            "callable#0 stamp / slot#1 clock (値)\n\
              callable#1 promote / slot#0 db (値), slot#1 clock (値)\n\
              callable#2 handle / slot#0 db (値), slot#1 clock (値)\n\
              callable#3 impl Postgres::new / -\n\
@@ -1082,7 +1097,7 @@ mod tests {
             "fn make(-> int) { clock::zero() }\n\
              fn used(-> int) { clock.now() }\n",
         );
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
         let clock = slot_id(&lowered, "clock");
 
         let make = hir::BodyId::Callable(lowered.free_callable("make").unwrap());
@@ -1120,7 +1135,7 @@ mod tests {
         ])
         .expect("ロードできる");
         let lowered = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
 
         let both = hir::BodyId::Callable(lowered.free_callable("main::both").unwrap());
         let reqs = analysis.requirements(both);
@@ -1136,7 +1151,7 @@ mod tests {
     #[test]
     fn 意味の結果に契約メソッドの仮想本体は出ない() {
         let lowered = lowered_of("fn main(u: User) { db.save(u) }\n");
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
         assert_eq!(
             analysis.bodies().count(),
             lowered.bodies.len(),
@@ -1150,7 +1165,7 @@ mod tests {
     #[test]
     fn 手順1_スロット表を作る() {
         let lowered = lowered_of("fn main() { assert true }\n");
-        let slots = analyze(&lowered).slots;
+        let slots = analyze_hir_for_test(&lowered).slots;
 
         assert_eq!(slots.trait_of("db"), Some("Database"));
         assert_eq!(slots.trait_of("clock"), Some("Clock"));
@@ -1173,7 +1188,7 @@ mod tests {
     #[test]
     fn 重複したスロットを報告する() {
         let lowered = lowered_of("effect db: Database\nfn main() { assert true }\n");
-        let errors = analyze(&lowered).errors();
+        let errors = analyze_hir_for_test(&lowered).errors();
 
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(
@@ -1198,7 +1213,7 @@ mod tests {
     #[test]
     fn 後で定義された関数は呼び出せる() {
         let lowered = lowered_of("fn main() { stamp() }\nfn stamp() { let n = 1 }\n");
-        assert!(analyze(&lowered).errors().is_empty());
+        assert!(analyze_hir_for_test(&lowered).errors().is_empty());
     }
 
     // ---- 手順2 ----
@@ -1549,8 +1564,8 @@ mod tests {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let a = analysis_of(&src);
 
-        // stamp が clock と db を使い、promote / handle は1文字も書いていないのに届く
-        assert_eq!(a.reqs["stamp"].keys().count(), 2);
+        // stamp が clock を使い、promote / handle は1文字も書いていない db と clock が届く
+        assert_eq!(a.reqs["stamp"].keys().count(), 1);
         assert_eq!(a.reqs["promote"].keys().count(), 2);
         assert_eq!(a.reqs["handle"].keys().count(), 2);
 

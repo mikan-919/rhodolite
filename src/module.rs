@@ -1753,9 +1753,10 @@ mod tests {
         ])
         .expect("ロードできる");
 
-        let checked = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let hir = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let checked = crate::ownership::check(hir).expect("所有権検査を通る");
         let Err(crate::eval::Flow::Error(diagnostic)) =
-            crate::eval::Interp::new(&checked).run(&loaded.entry)
+            crate::eval::Interp::new_checked(&checked).run(&loaded.entry)
         else {
             panic!("`assert false` は失敗するはず");
         };

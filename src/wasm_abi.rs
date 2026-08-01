@@ -10,6 +10,7 @@
 use crate::ambient_abi::{InstanceId, ProductionPlan};
 use crate::diag::Diag;
 use crate::hir;
+use crate::ownership::CheckedProgram;
 use crate::wasm::{ABI_VERSION, ENTRY_EXPORT, Scalar, Signature, scalar_of};
 
 /// 公開面の全体。ラッパの生成と埋め込みメタデータはここだけを読む
@@ -82,6 +83,13 @@ fn push_string(out: &mut String, value: &str) {
 /// ここで弾くのは**公開面だけ**。同じ型を使う非公開の宣言は、到達しない限り
 /// 生産ビルドを止めない
 pub fn signatures(
+    checked: &CheckedProgram,
+    production: &ProductionPlan,
+) -> Result<Signatures, Vec<Diag>> {
+    signatures_impl(&checked.hir, production)
+}
+
+fn signatures_impl(
     program: &hir::Program,
     production: &ProductionPlan,
 ) -> Result<Signatures, Vec<Diag>> {
@@ -174,6 +182,14 @@ pub fn signatures(
         ),
         exports,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn signatures_hir_for_test(
+    program: &hir::Program,
+    production: &ProductionPlan,
+) -> Result<Signatures, Vec<Diag>> {
+    signatures_impl(program, production)
 }
 
 fn rejected_result(program: &hir::Program, span: crate::lex::Span, ty: &hir::Type) -> Diag {

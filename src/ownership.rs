@@ -5814,28 +5814,10 @@ fn rank(b: bool -> int) {{ if b {{ 1 }} else {{ 0 }} }}
         ));
     }
 
-    /// 未移行の実例。落ちるのは移行項目だけで、余計な診断は出ない
+    /// 正典は所有権構文へ移行済みなので、通常入口へ渡す前に受理される。
     #[test]
-    fn 未移行のcanonicalは移行項目だけで落ちる() {
+    fn 移行済みcanonicalは所有権検査を通る() {
         let src = std::fs::read_to_string("examples/canonical.rd").expect("読める");
-        let messages: Vec<String> = rejected(&src).into_iter().map(|d| d.msg).collect();
-        assert_eq!(
-            messages,
-            vec![
-                "stamp: `u.promoted_at` は可変な束縛ではないので変更できません",
-                "stamp: `impl Database::save` の第 1 引数は所有を受け取りますが、束縛済みの `u` をそのまま渡しています",
-                "promote: `u.rank` は可変な束縛ではないので変更できません",
-                "promote: `stamp` の第 1 引数は所有を受け取りますが、束縛済みの `u` をそのまま渡しています",
-                "impl InMemoryDb::get: `impl InMemoryDb::find` のレシーバは所有を受け取りますが、束縛済みの `store` をそのまま渡しています",
-                // 素の `for` はループ変数を借用で束ねるので、要素を返せない
-                "impl InMemoryDb::find: `u` は借用で束ねた名前なので move できません",
-                "test \"昇格すると Gold になり時刻が刻まれる\": `alice.id` は既に move されているので使えません",
-                // `with db(store)` は共有借用の提供なので `store` は残るが、
-                // 所有を取る関連関数へはそのまま渡せない(tasks 5.4)
-                "test \"昇格すると Gold になり時刻が刻まれる\": `impl InMemoryDb::get` の第 1 引数は所有を受け取りますが、束縛済みの `store` をそのまま渡しています",
-                "test \"昇格すると Gold になり時刻が刻まれる\": `store` は借用されているので move できません",
-                "test \"昇格すると Gold になり時刻が刻まれる\": `alice.id` は既に move されているので使えません",
-            ]
-        );
+        let _ = accepted(&src);
     }
 }

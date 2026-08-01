@@ -12,9 +12,7 @@
 use crate::diag::Diag;
 use crate::hir;
 use crate::ownership;
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // 値
@@ -36,7 +34,7 @@ pub enum Value {
     Unit,
     /// `User?` の無い方
     Nil,
-    Struct(Rc<RefCell<Obj>>),
+    Struct(Obj),
     /// `Gold` / `Lookup.Found(user)`。variant の宣言と宣言順の payload を持つ
     /// **不変**な値。fieldless は payload が空。
     ///
@@ -46,106 +44,18 @@ pub enum Value {
         variant: hir::VariantId,
         payload: Vec<Value>,
     },
-    /// `[alice]`。struct と同じく**参照**。`let a = b` は別物にならない。
-    /// 「複合値は参照」の規則1本で済ませるため(型によって代入の意味が変わらない)
-    Array(Rc<RefCell<Vec<Value>>>),
+    Array(Vec<Value>),
 }
 
 /// struct の実体。
 ///
-/// `Rc<RefCell<_>>` にしてあるのは `stamp(u)` の中の `u.promoted_at = ...` が
-/// **呼び出し元から見えないといけない**ため。値のコピーだと差し替えのデモが成立しない。
-///
-/// ponytail: 参照カウント。`u.x = u` で循環が作れるので**漏れる**。
-/// 短命なプロセスなので放置している。常駐させるなら GC か arena + 世代 index に替える。
-/// (漏れは放置できるが、循環を辿る比較は落ちるので `eq_at` で深さを見ている)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Obj {
     pub type_: hir::StructId,
-    /// 宣言フィールド → 値。宣言順に並ぶので比較も表示も宣言順
-    pub fields: BTreeMap<hir::FieldId, Value>,
 }
 
-impl Value {
-    /// `u.rank == Gold` のための等値。struct は**中身**で比べる。
-    fn eq(&self, other: &Value) -> Result<bool, Flow> {
-        self.eq_at(other, 0)
-    }
-
-    /// 循環は `u.x = u` で作れてしまう。深さを見ていないと**プロセスが落ちる**
-    /// (スタックオーバーフローは catch できない)ので、上限でエラーに変える。
-    ///
-    /// ponytail: 深さ上限。到達可能な実体を覚えて回る方が正確だが、上限に
-    /// 当たるのは循環しているときだけなので足りている
-    fn eq_at(&self, other: &Value, depth: u32) -> Result<bool, Flow> {
-        const MAX_DEPTH: u32 = 100;
-        if depth > MAX_DEPTH {
-            return fail("値の比較が深すぎます(循環している可能性)");
-        }
-
-        use Value::*;
-        Ok(match (self, other) {
-            (Int(a), Int(b)) => a == b,
-            (Str(a), Str(b)) => a == b,
-            (Bool(a), Bool(b)) => a == b,
-            (Unit, Unit) | (Nil, Nil) => true,
-            // 同じ variant で payload が対応ごとに等しいときだけ等しい。
-            // `VariantId` は所属 enum ごと一意なので、別の enum の同名 variant は
-            // 別の ID になる(design.md 決定6)
-            (
-                Enum {
-                    variant: va,
-                    payload: pa,
-                },
-                Enum {
-                    variant: vb,
-                    payload: pb,
-                },
-            ) => {
-                if va != vb || pa.len() != pb.len() {
-                    return Ok(false);
-                }
-                for (x, y) in pa.iter().zip(pb.iter()) {
-                    if !x.eq_at(y, depth + 1)? {
-                        return Ok(false);
-                    }
-                }
-                true
-            }
-            (Struct(a), Struct(b)) => {
-                // 同じ実体なら中身を見ない。循環していても答えが出る
-                if Rc::ptr_eq(a, b) {
-                    return Ok(true);
-                }
-                let (a, b) = (a.borrow(), b.borrow());
-                if a.type_ != b.type_ || a.fields.len() != b.fields.len() {
-                    return Ok(false);
-                }
-                for ((ka, va), (kb, vb)) in a.fields.iter().zip(b.fields.iter()) {
-                    if ka != kb || !va.eq_at(vb, depth + 1)? {
-                        return Ok(false);
-                    }
-                }
-                true
-            }
-            (Array(a), Array(b)) => {
-                if Rc::ptr_eq(a, b) {
-                    return Ok(true);
-                }
-                let (a, b) = (a.borrow(), b.borrow());
-                if a.len() != b.len() {
-                    return Ok(false);
-                }
-                for (x, y) in a.iter().zip(b.iter()) {
-                    if !x.eq_at(y, depth + 1)? {
-                        return Ok(false);
-                    }
-                }
-                true
-            }
-            _ => false,
-        })
-    }
+fn new_obj(type_: hir::StructId) -> Value {
+    Value::Struct(Obj { type_ })
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +66,7 @@ impl Value {
 #[derive(Debug)]
 pub enum Flow {
     /// `return` — 関数の境界で受け止める。エラーではないので診断にしない
-    Return(Value),
+    Return,
     /// 実行時エラー。実行前の段と同じ `Diag` に載せる。span は式の境界
     /// (`Interp::eval`)で内側から1回だけ埋まる
     Error(Diag),
@@ -166,7 +76,7 @@ impl std::fmt::Display for Flow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Flow::Error(d) => write!(f, "{d}"),
-            Flow::Return(_) => write!(f, "`return` が関数の外に出ました"),
+            Flow::Return => write!(f, "`return` が関数の外に出ました"),
         }
     }
 }
@@ -178,19 +88,11 @@ fn fail<T>(msg: impl Into<String>) -> Result<T, Flow> {
     Err(Flow::Error(Diag::msg(msg)))
 }
 
-/// 字句的な束縛。**関数呼び出しで切れる。**
-///
-/// `LocalId` は本体の中で一意なので、名前解決も入れ子のスコープも要らない。
-/// ブロックが束縛を外へ漏らすかどうかは型検査が決めていて、ここは既に
-/// 決まった宛先へ書くだけ(design.md 決定5)。
-type Env = HashMap<hir::LocalId, Value>;
-
 // ---------------------------------------------------------------------------
 // 所有権検査済み評価器の値基盤
 // ---------------------------------------------------------------------------
 
-/// checked evaluator 内だけで使う store のアドレス。これは値として観測できず、
-/// 比較も常に構造で行う。従来の `Rc` と違い、所有者が drop すれば必ず消える。
+/// Checked evaluator 内だけで使う store のアドレス。値としては観測できない。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct LocationId(usize);
 
@@ -331,9 +233,8 @@ impl Store {
 // ownership-checked evaluator
 // ---------------------------------------------------------------------------
 
-/// `new_checked` の実行状態。既存の評価器とは意図的に分離している: こちらの
-/// compound value は全て `Store` の location で、環境には値または place しか
-/// 入らない。従ってこの経路では `Rc<RefCell<_>>` を意味論に使わない。
+/// `new_checked` の実行状態。compound value は全て `Store` の location で、
+/// 環境には値または place しか入らない。
 #[derive(Debug)]
 enum CheckedValue {
     Owned(OwnedValue),
@@ -382,7 +283,7 @@ impl<'p> CheckedInterp<'p> {
                 return Err(error);
             }
         };
-        let shown = self.into_legacy_ref(&value)?;
+        let shown = self.into_public_value(&value)?;
         self.drop_checked(value);
         self.dispose();
         Ok(shown)
@@ -393,7 +294,7 @@ impl<'p> CheckedInterp<'p> {
         let mut env = CheckedEnv::new();
         let frame = self.slots.len();
         let value = match self.body(body, &mut env) {
-            Err(Flow::Return(_)) => self
+            Err(Flow::Return) => self
                 .returned
                 .take()
                 .unwrap_or(CheckedValue::Owned(OwnedValue::Unit)),
@@ -405,7 +306,7 @@ impl<'p> CheckedInterp<'p> {
             }
         };
         self.cleanup_frame(frame);
-        let shown = self.into_legacy_ref(&value)?;
+        let shown = self.into_public_value(&value)?;
         self.drop_checked(value);
         self.dispose();
         Ok(shown)
@@ -427,7 +328,7 @@ impl<'p> CheckedInterp<'p> {
             self.bind(&mut env, *local, value)?;
         }
         let result = match self.body(&declared.body, &mut env) {
-            Err(Flow::Return(_)) => Ok(self
+            Err(Flow::Return) => Ok(self
                 .returned
                 .take()
                 .unwrap_or(CheckedValue::Owned(OwnedValue::Unit))),
@@ -491,7 +392,7 @@ impl<'p> CheckedInterp<'p> {
         {
             return self.access(env, access);
         }
-        match &expr.kind {
+        (|| match &expr.kind {
             hir::ExprKind::Int(n) => Ok(CheckedValue::Owned(OwnedValue::Int(*n))),
             hir::ExprKind::Str(s) => Ok(CheckedValue::Owned(OwnedValue::Str(s.clone()))),
             hir::ExprKind::Bool(b) => Ok(CheckedValue::Owned(OwnedValue::Bool(*b))),
@@ -637,9 +538,11 @@ impl<'p> CheckedInterp<'p> {
                     hir::ArithOp::Add => a.wrapping_add(b),
                     hir::ArithOp::Sub => a.wrapping_sub(b),
                     hir::ArithOp::Mul => a.wrapping_mul(b),
-                    hir::ArithOp::Div => a
-                        .checked_div(b)
-                        .ok_or_else(|| Flow::Error(Diag::msg("0 で割れません")))?,
+                    hir::ArithOp::Div => match a.checked_div(b) {
+                        Some(value) => value,
+                        None if b == 0 => return fail("0 で割れません"),
+                        None => return fail("この割り算は int の範囲を超えます"),
+                    },
                 };
                 Ok(CheckedValue::Owned(OwnedValue::Int(value)))
             }
@@ -649,7 +552,7 @@ impl<'p> CheckedInterp<'p> {
                     None => CheckedValue::Owned(OwnedValue::Unit),
                 };
                 self.returned = Some(value);
-                return Err(Flow::Return(Value::Unit));
+                return Err(Flow::Return);
             }
             hir::ExprKind::Assert(inner) => {
                 let evaluated = self.eval(body, *inner, env)?;
@@ -713,7 +616,15 @@ impl<'p> CheckedInterp<'p> {
             } => self.eval_with(body, provisions, *inner, env),
             hir::ExprKind::Call(call) => self.call_expr(body, call, env),
             _ => fail("この構文の ownership-aware 評価はまだ未実装です"),
-        }
+        })()
+        .map_err(|flow| match flow {
+            Flow::Error(mut diagnostic) if diagnostic.span.is_none() => {
+                diagnostic.span = Some(expr.span);
+                diagnostic.label = Some("ここで失敗しました".to_string());
+                Flow::Error(diagnostic)
+            }
+            other => other,
+        })
     }
 
     fn access(
@@ -1372,11 +1283,11 @@ impl<'p> CheckedInterp<'p> {
         }
     }
 
-    fn into_legacy_ref(&self, value: &CheckedValue) -> Eval {
+    fn into_public_value(&self, value: &CheckedValue) -> Eval {
         let value = self.owned_ref(value)?;
-        self.legacy_value(&value)
+        self.public_value(&value)
     }
-    fn legacy_value(&self, value: &OwnedValue) -> Eval {
+    fn public_value(&self, value: &OwnedValue) -> Eval {
         Ok(match value {
             OwnedValue::Int(n) => Value::Int(*n),
             OwnedValue::Str(s) => Value::Str(s.clone()),
@@ -1384,61 +1295,24 @@ impl<'p> CheckedInterp<'p> {
             OwnedValue::Unit => Value::Unit,
             OwnedValue::Nil => Value::Nil,
             OwnedValue::Location(id) => match self.store.get(*id) {
-                StoredValue::Struct { type_, fields } => {
-                    let mut out = BTreeMap::new();
-                    for (field, value) in fields {
-                        out.insert(*field, self.legacy_value(value)?);
-                    }
-                    new_obj(*type_, out)
-                }
+                StoredValue::Struct { type_, .. } => new_obj(*type_),
                 StoredValue::Enum { variant, payload } => Value::Enum {
                     variant: *variant,
                     payload: payload
                         .iter()
-                        .map(|value| self.legacy_value(value))
+                        .map(|value| self.public_value(value))
                         .collect::<Result<_, _>>()?,
                 },
-                StoredValue::Array(values) => Value::Array(Rc::new(RefCell::new(
+                StoredValue::Array(values) => Value::Array(
                     values
                         .iter()
-                        .map(|value| self.legacy_value(value))
+                        .map(|value| self.public_value(value))
                         .collect::<Result<_, _>>()?,
-                ))),
+                ),
             },
         })
     }
 }
-
-/// ambient 束縛。型だけ選んだ状態と、実体まで置いた状態を区別する。
-///
-/// どちらも実装は `TraitImplId` で持つ。スロット呼び出しはそこから契約メソッドの
-/// 本体を引くので、実行時に名前で候補を探す必要がない(design.md 決定9)。
-#[derive(Clone)]
-enum AmbientBinding {
-    Type(hir::TraitImplId),
-    Value {
-        implementation: hir::TraitImplId,
-        value: Value,
-    },
-}
-
-impl AmbientBinding {
-    fn implementation(&self) -> hir::TraitImplId {
-        match self {
-            AmbientBinding::Type(implementation) | AmbientBinding::Value { implementation, .. } => {
-                *implementation
-            }
-        }
-    }
-}
-
-/// ambient 束縛。スロット → 選ばれた実装。**関数呼び出しで切れない。**
-///
-/// `Env` との差はこれだけ: `call` が `Env` を作り直すのに対し、`Ambient` は
-/// そのまま渡す。CONTEXT.md「ambient」の「関数呼び出しで切れないもの」の実装が
-/// この1行の違い。requirement.rs の `scan` が `provided` を引数で運ぶのと同じ形で、
-/// スコープの終わりを書く必要がない(戻った時点で `inner` は消えている)。
-type Ambient = BTreeMap<hir::SlotId, AmbientBinding>;
 
 // ---------------------------------------------------------------------------
 // インタプリタ
@@ -1446,29 +1320,15 @@ type Ambient = BTreeMap<hir::SlotId, AmbientBinding>;
 
 pub struct Interp<'p> {
     program: &'p hir::Program,
-    /// `Some` なら所有権検査済みの入口から作られた。通常経路の切替は
-    /// task 8.1 だが、所有権対応の評価器テストはここから計画だけを読む。
-    plan: Option<&'p ownership::Plan>,
+    plan: &'p ownership::Plan,
 }
 
 impl<'p> Interp<'p> {
-    pub fn new(program: &'p hir::Program) -> Self {
-        Interp {
-            program,
-            plan: None,
-        }
-    }
-
     /// 所有権検査済み HIR を評価する入口。
-    ///
-    /// 既存の `new` と CLI の切替は source migration と同時に task 8.1 で行う。
-    /// それまでこの入口は、評価中の全 HIR 式が計画の CFG 点に対応することを
-    /// 検証して、未検査 HIR が ownership-aware 実行へ紛れ込まないようにする。
-    #[allow(dead_code)] // task 8.1 で通常の CLI 経路へ切り替わるまで test 専用
     pub fn new_checked(checked: &'p ownership::CheckedProgram) -> Self {
         Interp {
             program: &checked.hir,
-            plan: Some(&checked.plan),
+            plan: &checked.plan,
         }
     }
 
@@ -1481,7 +1341,7 @@ impl<'p> Interp<'p> {
             Value::Bool(b) => b.to_string(),
             Value::Unit => "unit".to_string(),
             Value::Nil => "nil".to_string(),
-            Value::Struct(o) => self.program.structs[o.borrow().type_].name.clone(),
+            Value::Struct(o) => self.program.structs[o.type_].name.clone(),
             Value::Enum { variant, payload } => {
                 let declared = &self.program.variants[*variant];
                 let owner = &self.program.enums[declared.owner].name;
@@ -1492,7 +1352,7 @@ impl<'p> Interp<'p> {
                     format!("{owner}.{}({})", declared.name, shown.join(", "))
                 }
             }
-            Value::Array(xs) => format!("[{} 要素]", xs.borrow().len()),
+            Value::Array(xs) => format!("[{} 要素]", xs.len()),
         }
     }
 
@@ -1500,544 +1360,13 @@ impl<'p> Interp<'p> {
     ///
     /// **ambient は空から始まる。**提供されていないものは何も届かない、が出発点。
     pub fn run(&self, entry: &str) -> Eval {
-        if let Some(plan) = self.plan {
-            return CheckedInterp::new(self.program, plan).run(entry);
-        }
-        let Some(callable) = self.program.free_callable(entry) else {
-            return fail(format!("関数 `{entry}` がありません"));
-        };
-        self.call(callable, None, Vec::new(), &Ambient::new())
+        CheckedInterp::new(self.program, self.plan).run(entry)
     }
 
     /// `test` の本体を走らせる。関数と同じ扱いで、`Env` も `Ambient` も空から。
     pub fn run_test(&self, id: hir::TestId) -> Eval {
-        if let Some(plan) = self.plan {
-            return CheckedInterp::new(self.program, plan).run_test(id);
-        }
-        let body = &self.program.tests[id].body;
-        let mut env = Env::new();
-        match self.body(body, &mut env, &Ambient::new()) {
-            Err(Flow::Return(v)) => Ok(v),
-            other => other,
-        }
+        CheckedInterp::new(self.program, self.plan).run_test(id)
     }
-
-    /// 本体を新しい `Env` で走らせる。
-    ///
-    /// **`Env` をここで作り直す。**呼び出し元のローカル束縛は届かない。
-    /// `Ambient` はこの境界を越える — それが推移性。
-    fn call(
-        &self,
-        callable: hir::CallableId,
-        recv: Option<Value>,
-        args: Vec<Value>,
-        ambient: &Ambient,
-    ) -> Eval {
-        let declared = &self.program.callables[callable];
-        let mut env = Env::new();
-        // `self` は普通の束縛。ambient と違って**関数呼び出しで切れる**
-        if let (Some(receiver), Some(value)) = (declared.body.receiver, recv) {
-            env.insert(receiver, value);
-        }
-        // 個数は型検査が合わせている(design.md 決定6)
-        for (local, value) in declared.params.iter().zip(args) {
-            env.insert(*local, value);
-        }
-        // **ここが言語の全部。**`env` は上で新しく作った。`ambient` はそのまま渡す
-        match self.body(&declared.body, &mut env, ambient) {
-            Err(Flow::Return(v)) => Ok(v),
-            other => other,
-        }
-    }
-
-    /// 本体の式の列。値は最後の式(CONTEXT.md「値ベース」)。
-    fn body(&self, body: &hir::Body, env: &mut Env, ambient: &Ambient) -> Eval {
-        self.sequence(body, &body.root, env, ambient)
-    }
-
-    fn sequence(
-        &self,
-        body: &hir::Body,
-        ids: &[hir::ExprId],
-        env: &mut Env,
-        ambient: &Ambient,
-    ) -> Eval {
-        let mut last = Value::Unit;
-        for id in ids {
-            last = self.eval(body, *id, env, ambient)?;
-        }
-        Ok(last)
-    }
-
-    /// 式の評価。**位置を持つのはここだけ。**
-    ///
-    /// 失敗がまだ位置を持っていなければ、いま評価している式の span を入れる。
-    /// 再帰も呼び出し先の本体もこの境界を通るので、最初に失敗を見た内側の式が
-    /// 埋め、外側(ブロック・呼び出し元・別モジュール)は上書きしない
-    /// (design.md 決定2)。
-    fn eval(&self, body: &hir::Body, id: hir::ExprId, env: &mut Env, ambient: &Ambient) -> Eval {
-        if let Some(plan) = self.plan {
-            let body_id = self
-                .program
-                .bodies
-                .iter()
-                .copied()
-                .find(|body_id| match body_id {
-                    hir::BodyId::Callable(callable) => {
-                        std::ptr::eq(body, &self.program.callables[*callable].body)
-                    }
-                    hir::BodyId::Test(test) => std::ptr::eq(body, &self.program.tests[*test].body),
-                })
-                .expect("評価する本体はプログラムに属する");
-            // CFG の点を持つのは制御構文の全てではなく、所有権に関係する
-            // access と効果だけである。実際の access は必ず計画から引ける。
-            if plan.body(body_id).access(id).is_some() {
-                debug_assert!(
-                    plan.body(body_id).point_of(id).is_some(),
-                    "所有権検査済み access には CFG 点が必要です"
-                );
-            }
-        }
-        let expr = body.expr(id);
-        self.eval_kind(body, expr, env, ambient)
-            .map_err(|flow| match flow {
-                Flow::Error(mut d) if d.span.is_none() => {
-                    d.span = Some(expr.span);
-                    d.label = Some("ここで失敗しました".to_string());
-                    Flow::Error(d)
-                }
-                other => other,
-            })
-    }
-
-    fn eval_kind(
-        &self,
-        body: &hir::Body,
-        expr: &hir::Expr,
-        env: &mut Env,
-        ambient: &Ambient,
-    ) -> Eval {
-        match &expr.kind {
-            hir::ExprKind::Int(n) => Ok(Value::Int(*n)),
-            hir::ExprKind::Str(s) => Ok(Value::Str(s.clone())),
-            hir::ExprKind::Bool(b) => Ok(Value::Bool(*b)),
-            hir::ExprKind::Nil => Ok(Value::Nil),
-
-            // 実行されなかった `let` の宛先を読むことがある(`if false { let x = 1 }`
-            // の後の `x`)。型は付いていても値はまだ無い
-            hir::ExprKind::Local(local) => match env.get(local) {
-                Some(value) => Ok(value.clone()),
-                None => fail(format!(
-                    "`{}` が束縛されていません",
-                    body.local(*local).name
-                )),
-            },
-
-            hir::ExprKind::UnitStruct(id) => Ok(new_obj(*id, BTreeMap::new())),
-            hir::ExprKind::Variant(variant) => Ok(Value::Enum {
-                variant: *variant,
-                payload: Vec::new(),
-            }),
-
-            hir::ExprKind::Field {
-                recv,
-                field,
-                optional,
-            } => {
-                let value = self.eval(body, *recv, env, ambient)?;
-                // `.?` は nil をそのまま伝播する
-                if *optional && matches!(value, Value::Nil) {
-                    return Ok(Value::Nil);
-                }
-                self.read_field(&value, *field)
-            }
-
-            hir::ExprKind::StructLit { struct_, fields } => {
-                let mut obj = BTreeMap::new();
-                for (field, value) in fields {
-                    let value = self.eval(body, *value, env, ambient)?;
-                    obj.insert(*field, value);
-                }
-                Ok(new_obj(*struct_, obj))
-            }
-
-            hir::ExprKind::Array(items) => {
-                let mut xs = Vec::with_capacity(items.len());
-                for item in items {
-                    xs.push(self.eval(body, *item, env, ambient)?);
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(xs))))
-            }
-
-            hir::ExprKind::Let { local, value } | hir::ExprKind::AssignLocal { local, value } => {
-                let value = self.eval(body, *value, env, ambient)?;
-                env.insert(*local, value);
-                Ok(Value::Unit)
-            }
-
-            hir::ExprKind::AssignField { recv, field, value } => {
-                let value = self.eval(body, *value, env, ambient)?;
-                let recv = self.eval(body, *recv, env, ambient)?;
-                let Value::Struct(o) = recv else {
-                    return fail("フィールドを持たない値には代入できません");
-                };
-                o.borrow_mut().fields.insert(*field, value);
-                Ok(Value::Unit)
-            }
-
-            hir::ExprKind::Neg(inner) => match self.eval(body, *inner, env, ambient)? {
-                Value::Int(n) => Ok(Value::Int(n.wrapping_neg())),
-                other => fail(format!("`-` は整数だけです ({})", self.show(&other))),
-            },
-
-            hir::ExprKind::Arith { op, lhs, rhs } => {
-                let l = self.eval(body, *lhs, env, ambient)?;
-                let r = self.eval(body, *rhs, env, ambient)?;
-                match (l, r) {
-                    (Value::Int(a), Value::Int(b)) => match op {
-                        // int は符号付き64bit。加減乗と単項マイナスはラップし、
-                        // 除算だけが実行時失敗を持つ (0除算 / MIN / -1)
-                        hir::ArithOp::Add => Ok(Value::Int(a.wrapping_add(b))),
-                        hir::ArithOp::Sub => Ok(Value::Int(a.wrapping_sub(b))),
-                        hir::ArithOp::Mul => Ok(Value::Int(a.wrapping_mul(b))),
-                        hir::ArithOp::Div => match a.checked_div(b) {
-                            Some(q) => Ok(Value::Int(q)),
-                            None if b == 0 => fail("0 で割れません"),
-                            None => fail("この割り算は int の範囲を超えます"),
-                        },
-                    },
-                    (a, b) => fail(format!(
-                        "{} を {} と {} には使えません",
-                        op.spelling(),
-                        self.show(&a),
-                        self.show(&b)
-                    )),
-                }
-            }
-
-            hir::ExprKind::Eq { lhs, rhs } => {
-                let l = self.eval(body, *lhs, env, ambient)?;
-                let r = self.eval(body, *rhs, env, ambient)?;
-                Ok(Value::Bool(l.eq(&r)?))
-            }
-
-            // `??` は短絡する。`db.find(id) ?? return false` の右辺は
-            // 左辺が nil のときだけ走らないといけない
-            hir::ExprKind::Coalesce { lhs, rhs } => {
-                let l = self.eval(body, *lhs, env, ambient)?;
-                if matches!(l, Value::Nil) {
-                    self.eval(body, *rhs, env, ambient)
-                } else {
-                    Ok(l)
-                }
-            }
-
-            hir::ExprKind::Return(value) => {
-                let value = match value {
-                    Some(value) => self.eval(body, *value, env, ambient)?,
-                    None => Value::Unit,
-                };
-                Err(Flow::Return(value))
-            }
-
-            hir::ExprKind::Assert(inner) => match self.eval(body, *inner, env, ambient)? {
-                Value::Bool(true) => Ok(Value::Unit),
-                Value::Bool(false) => fail("assert が偽になりました"),
-                other => fail(format!(
-                    "assert には bool が必要です ({})",
-                    self.show(&other)
-                )),
-            },
-
-            hir::ExprKind::Block(ids) => self.sequence(body, ids, env, ambient),
-
-            hir::ExprKind::If { cond, then, orelse } => {
-                if self.cond(body, *cond, env, ambient)? {
-                    self.eval(body, *then, env, ambient)
-                } else if let Some(orelse) = orelse {
-                    self.eval(body, *orelse, env, ambient)
-                } else {
-                    Ok(Value::Unit)
-                }
-            }
-
-            hir::ExprKind::While { cond, body: inner } => {
-                while self.cond(body, *cond, env, ambient)? {
-                    self.eval(body, *inner, env, ambient)?;
-                }
-                Ok(Value::Unit)
-            }
-
-            hir::ExprKind::For {
-                var,
-                iter,
-                body: inner,
-            } => {
-                let Value::Array(xs) = self.eval(body, *iter, env, ambient)? else {
-                    return fail("for で回せるのは配列だけです");
-                };
-                // ponytail: 開始時点のスナップショットを回す。本体が同じ配列を
-                // 触っても RefCell が二重借用で落ちない。回している最中の追加は見えない
-                let snapshot: Vec<Value> = xs.borrow().clone();
-                for value in snapshot {
-                    env.insert(*var, value);
-                    self.eval(body, *inner, env, ambient)?;
-                }
-                Ok(Value::Unit)
-            }
-
-            // 対象は一度だけ評価し、選ばれた arm の本体だけを走らせる。payload は
-            // その arm の束縛へ入れ、`_` は捨てる(design.md 決定5)。guard があれば
-            // payload を束縛した後に一度だけ評価し、偽なら `_` へ落ちる
-            hir::ExprKind::Match { subject, arms } => {
-                let value = self.eval(body, *subject, env, ambient)?;
-                let Value::Enum { variant, payload } = &value else {
-                    return fail(format!(
-                        "`match` の対象は enum だけです ({})",
-                        self.show(&value)
-                    ));
-                };
-                let exact = arms.iter().find(|arm| {
-                    matches!(&arm.pattern, hir::Pattern::Variant { variant: v, .. } if v == variant)
-                });
-                if let Some(arm) = exact {
-                    let hir::Pattern::Variant { bindings, .. } = &arm.pattern else {
-                        unreachable!("`exact` は限定 arm だけを拾う")
-                    };
-                    // 束縛は `LocalId` なので、arm の外から読まれることはない
-                    for (binding, value) in bindings.iter().zip(payload) {
-                        if let Some(local) = binding {
-                            env.insert(*local, value.clone());
-                        }
-                    }
-                    // guard は payload が見えるこの状態で一度だけ走る
-                    let selected = match arm.guard {
-                        Some(guard) => self.cond(body, guard, env, ambient)?,
-                        None => true,
-                    };
-                    if selected {
-                        return self.eval(body, arm.body, env, ambient);
-                    }
-                }
-
-                // 限定 arm が無いか guard が偽のときだけ `_` へ落ちる。型検査は
-                // `_` を最後に強制するが、選択規則そのものを順序に頼らせない
-                // (design.md 決定4)
-                let catch_all = arms
-                    .iter()
-                    .find(|arm| matches!(arm.pattern, hir::Pattern::CatchAll));
-                match catch_all {
-                    Some(arm) => self.eval(body, arm.body, env, ambient),
-                    None => fail(format!("{} に一致する arm がありません", self.show(&value))),
-                }
-            }
-
-            hir::ExprKind::With {
-                provisions,
-                body: inner,
-            } => {
-                // 提供する値は**提供の外**で評価する。`db(make(clock.now()))` の
-                // clock は db が立つ前に走る(requirement.rs の手順4と同じ規則)
-                let mut next = ambient.clone();
-                for provision in provisions {
-                    let binding = match provision.value {
-                        Some(value) => AmbientBinding::Value {
-                            implementation: provision.implementation,
-                            value: self.eval(body, value, env, ambient)?,
-                        },
-                        None => AmbientBinding::Type(provision.implementation),
-                    };
-                    // 内側勝ち。同じスロットの入れ子は上書きになる
-                    next.insert(provision.slot, binding);
-                }
-                self.eval(body, *inner, env, &next)
-            }
-
-            hir::ExprKind::Call(call) => self.call_expr(body, call, env, ambient),
-
-            hir::ExprKind::Clone(inner) => {
-                let value = self.eval(body, *inner, env, ambient)?;
-                deep_clone(&value, 0)
-            }
-
-            // ponytail: 修飾は場所をそのまま評価する。所有・借用・移動を
-            // 意味として実装するのは introduce-ownership-and-borrowing の
-            // フェーズ7(いまの評価器は複合値を共有したままなので、
-            // `&` も `move` も観測できる違いを持たない)
-            hir::ExprKind::Access { place, .. } => self.eval(body, *place, env, ambient),
-
-            // 型検査を通った HIR に `Poison` は残らない(design.md 決定7)
-            hir::ExprKind::Poison => fail("型が決まらない式を実行しようとしました"),
-        }
-    }
-
-    /// 呼び出し。宛先は既に選ばれているので、名前で候補を探すことはしない。
-    fn call_expr(
-        &self,
-        body: &hir::Body,
-        call: &hir::Call,
-        env: &mut Env,
-        ambient: &Ambient,
-    ) -> Eval {
-        match call {
-            hir::Call::Direct { callable, args } | hir::Call::Associated { callable, args } => {
-                let args = self.args(body, args, env, ambient)?;
-                self.call(*callable, None, args, ambient)
-            }
-            // レシーバ → 引数 の順に評価する(左から右)
-            hir::Call::Method {
-                callable,
-                recv,
-                args,
-            } => {
-                let recv = self.eval(body, *recv, env, ambient)?;
-                let args = self.args(body, args, env, ambient)?;
-                self.call(*callable, Some(recv), args, ambient)
-            }
-            hir::Call::Ctor { variant, args } => Ok(Value::Enum {
-                variant: *variant,
-                payload: self.args(body, args, env, ambient)?,
-            }),
-            // スロット経由。実体はその場の提供から来て、走る本体はその実装の
-            // 契約メソッドから引く。**スロットは常に名前を持つので曖昧性が
-            // 発生しない**(CONTEXT.md)
-            hir::Call::Slot {
-                slot,
-                method,
-                receiver,
-                args,
-                ..
-            } => {
-                let name = &self.program.slots[*slot].name;
-                let member = &self.program.trait_methods[*method].name;
-                let Some(binding) = ambient.get(slot) else {
-                    return fail(format!(
-                        "`{name}` が提供されていません(`{}{member}` の呼び出し)",
-                        dot(*receiver)
-                    ));
-                };
-                let recv = match (receiver, binding) {
-                    (hir::SlotReceiver::Value, AmbientBinding::Value { value, .. }) => {
-                        Some(value.clone())
-                    }
-                    (hir::SlotReceiver::Value, AmbientBinding::Type(_)) => {
-                        return fail(format!(
-                            "`{name}` は型だけが提供されています。実体が必要です(`.{member}` の呼び出し)"
-                        ));
-                    }
-                    (hir::SlotReceiver::Type, _) => None,
-                };
-                let Some(callable) = self
-                    .program
-                    .implementation_of(binding.implementation(), *method)
-                else {
-                    return fail(format!(
-                        "`{name}` に提供された実装が `{member}` を持っていません"
-                    ));
-                };
-                let args = self.args(body, args, env, ambient)?;
-                self.call(callable, recv, args, ambient)
-            }
-        }
-    }
-
-    fn args(
-        &self,
-        body: &hir::Body,
-        args: &[hir::ExprId],
-        env: &mut Env,
-        ambient: &Ambient,
-    ) -> Result<Vec<Value>, Flow> {
-        let mut values = Vec::with_capacity(args.len());
-        for arg in args {
-            values.push(self.eval(body, *arg, env, ambient)?);
-        }
-        Ok(values)
-    }
-
-    fn read_field(&self, value: &Value, field: hir::FieldId) -> Eval {
-        let Value::Struct(o) = value else {
-            return fail(format!(
-                "`.{}` を読めません。struct ではありません",
-                self.program.fields[field].name
-            ));
-        };
-        match o.borrow().fields.get(&field) {
-            Some(value) => Ok(value.clone()),
-            None => fail(format!(
-                "フィールド `{}` がありません",
-                self.program.fields[field].name
-            )),
-        }
-    }
-
-    fn cond(
-        &self,
-        body: &hir::Body,
-        id: hir::ExprId,
-        env: &mut Env,
-        ambient: &Ambient,
-    ) -> Result<bool, Flow> {
-        match self.eval(body, id, env, ambient)? {
-            Value::Bool(b) => Ok(b),
-            other => fail(format!("条件には bool が必要です ({})", self.show(&other))),
-        }
-    }
-}
-
-/// スロット呼び出しの綴り。診断の文言でだけ使う
-fn dot(receiver: hir::SlotReceiver) -> &'static str {
-    match receiver {
-        hir::SlotReceiver::Value => ".",
-        hir::SlotReceiver::Type => "::",
-    }
-}
-
-fn new_obj(type_: hir::StructId, fields: BTreeMap<hir::FieldId, Value>) -> Value {
-    Value::Struct(Rc::new(RefCell::new(Obj { type_, fields })))
-}
-
-/// `value.clone()` の中身。struct・enum payload・optional の中身・配列を辿って
-/// **独立した実体**を作る(design.md 決定4)。
-///
-/// ponytail: 深さ上限は `eq_at` と同じ理由。いまの値は `u.x = u` で循環を作れる
-/// ので、辿り切る前に落ちるのを診断に変えている。所有の場所へ置き換わる phase 7
-/// (tasks 7.4)では循環そのものが作れなくなるので、上限も消える
-fn deep_clone(value: &Value, depth: u32) -> Eval {
-    const MAX_DEPTH: u32 = 100;
-    if depth > MAX_DEPTH {
-        return fail("値の複製が深すぎます(循環している可能性)");
-    }
-    Ok(match value {
-        Value::Struct(obj) => {
-            let obj = obj.borrow();
-            let mut fields = BTreeMap::new();
-            for (field, value) in &obj.fields {
-                fields.insert(*field, deep_clone(value, depth + 1)?);
-            }
-            new_obj(obj.type_, fields)
-        }
-        Value::Array(items) => {
-            let items = items.borrow();
-            let mut cloned = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                cloned.push(deep_clone(item, depth + 1)?);
-            }
-            Value::Array(Rc::new(RefCell::new(cloned)))
-        }
-        Value::Enum { variant, payload } => {
-            let mut cloned = Vec::with_capacity(payload.len());
-            for value in payload {
-                cloned.push(deep_clone(value, depth + 1)?);
-            }
-            Value::Enum {
-                variant: *variant,
-                payload: cloned,
-            }
-        }
-        // スカラーと `nil` は実体を共有しない
-        scalar => scalar.clone(),
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,12 +1386,16 @@ mod tests {
     /// 合っていなければならない(design.md 決定7)。
     fn run(src: &str, entry: &str) -> Result<Value, Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        let checked = crate::typecheck::check_and_lower(&program)
+        let hir = crate::typecheck::check_and_lower(&program)
             .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
-        Interp::new(&checked).run(entry).map_err(|f| match f {
-            Flow::Error(d) => d,
-            Flow::Return(_) => panic!("return が関数境界を越えた"),
-        })
+        let checked =
+            crate::ownership::check(hir).unwrap_or_else(|d| panic!("所有権検査を通るはず: {d:?}"));
+        Interp::new_checked(&checked)
+            .run(entry)
+            .map_err(|f| match f {
+                Flow::Error(d) => d,
+                Flow::Return => panic!("return が関数境界を越えた"),
+            })
     }
 
     fn checked_run(src: &str, entry: &str) -> Result<Value, Diag> {
@@ -2075,7 +1408,7 @@ mod tests {
             .run(entry)
             .map_err(|f| match f {
                 Flow::Error(d) => d,
-                Flow::Return(_) => panic!("return が関数境界を越えた"),
+                Flow::Return => panic!("return が関数境界を越えた"),
             })
     }
 
@@ -2259,9 +1592,10 @@ fn main(-> int) {\n\
     /// プログラムを知っている側から引く
     fn shown(src: &str, entry: &str) -> String {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        let checked = crate::typecheck::check_and_lower(&program)
+        let hir = crate::typecheck::check_and_lower(&program)
             .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
-        let interp = Interp::new(&checked);
+        let checked = crate::ownership::check(hir).expect("所有権検査を通るはず");
+        let interp = Interp::new_checked(&checked);
         let value = interp.run(entry).expect("走るはず");
         interp.show(&value)
     }
@@ -2273,7 +1607,7 @@ fn main(-> int) {\n\
         let src = "struct Inner { n: int }
 struct Outer { inner: Inner, xs: [Inner] }
 fn main(-> int) {
-  let a = Outer { inner = Inner { n = 1 }, xs = [Inner { n = 2 }] }
+  let mut a = Outer { inner = Inner { n = 1 }, xs = [Inner { n = 2 }] }
   let b = a.clone()
   a.inner.n = 9
   b.inner.n
@@ -2301,11 +1635,11 @@ fn main(-> bool) {
         let src = "struct Inner { n: int }
 enum Box { Full(Inner) Empty }
 fn main(-> int) {
-  let inner = Inner { n = 1 }
-  let a = Box::Full(inner)
+  let mut a = Box::Full(Inner { n = 1 })
   let b = a.clone()
-  inner.n = 9
-  match b { Box::Full(i): i.n
+  match &mut a { Box::Full(i): i.n = 9
+    Box::Empty: assert true }
+  match move b { Box::Full(i): i.n
     Box::Empty: 0 }
 }
 ";
@@ -2457,7 +1791,7 @@ fn main(-> int) {
     fn structのフィールドを読み書きする() {
         let src = "struct User { rank: int }\n\
                    fn main(-> int) {\n\
-                   \x20 let u = User { rank = 1 }\n\
+                   \x20 let mut u = User { rank = 1 }\n\
                    \x20 u.rank = 2\n\
                    \x20 u.rank\n\
                    }\n";
@@ -2496,13 +1830,13 @@ fn main(-> int) {
     fn optional_field_accessはレシーバを一度だけ評価する() {
         let src = "struct Counter { n: int }\n\
                    struct Box { n: int }\n\
-                   fn next(c: Counter -> Box?) {\n\
+                   fn next(c: &mut Counter -> Box?) {\n\
                    \x20 c.n = c.n + 1\n\
                    \x20 Box { n = c.n }\n\
                    }\n\
                    fn main(-> int) {\n\
-                   \x20 let c = Counter { n = 0 }\n\
-                   \x20 let n = next(c).?n\n\
+                   \x20 let mut c = Counter { n = 0 }\n\
+                   \x20 let n = next(&mut c).?n\n\
                    \x20 c.n * 10 + (n ?? 0)\n\
                    }\n";
         assert_eq!(int(src), 11);
@@ -2512,12 +1846,12 @@ fn main(-> int) {
     #[test]
     fn 呼び出し先でのフィールド変更が呼び出し元に見える() {
         let src = "struct User { rank: int }\n\
-                   fn stamp(u: User) {\n\
+                   fn stamp(u: &mut User) {\n\
                    \x20 u.rank = 99\n\
                    }\n\
                    fn main(-> int) {\n\
-                   \x20 let u = User { rank = 1 }\n\
-                   \x20 stamp(u)\n\
+                   \x20 let mut u = User { rank = 1 }\n\
+                   \x20 stamp(&mut u)\n\
                    \x20 u.rank\n\
                    }\n";
         assert_eq!(int(src), 99);
@@ -2576,8 +1910,13 @@ fn main(-> int) {
             variant: hir::Id::from_index(1),
             payload: Vec::new(),
         };
-        assert!(!a.eq(&b).unwrap());
-        assert!(a.eq(&a.clone()).unwrap());
+        assert!(matches!(
+            (&a, &b),
+            (Value::Enum { variant: av, .. }, Value::Enum { variant: bv, .. }) if av != bv
+        ));
+        assert!(
+            matches!(a.clone(), Value::Enum { variant, .. } if variant == hir::Id::from_index(0))
+        );
     }
 
     #[test]
@@ -2638,13 +1977,13 @@ fn main(-> int) {
     fn matchは対象を一度だけ評価する() {
         let src = format!(
             "{RANKS}struct Counter {{ n: int }}\n\
-             fn next(c: Counter -> Rank) {{\n\
+             fn next(c: &mut Counter -> Rank) {{\n\
              \x20 c.n = c.n + 1\n\
              \x20 Gold\n\
              }}\n\
              fn main(-> int) {{\n\
-             \x20 let c = Counter {{ n = 0 }}\n\
-             \x20 let picked = match next(c) {{ Rank::Bronze: 0\nRank::Gold: 1 }}\n\
+             \x20 let mut c = Counter {{ n = 0 }}\n\
+             \x20 let picked = match next(&mut c) {{ Rank::Bronze: 0\nRank::Gold: 1 }}\n\
              \x20 c.n * 10 + picked\n\
              }}\n"
         );
@@ -2759,15 +2098,15 @@ fn main(-> int) {
     fn guardは一致したarmで一度だけ走る() {
         let src = format!(
             "{RANKS}struct Counter {{ n: int }}\n\
-             fn bump(c: Counter -> bool) {{\n\
+             fn bump(c: &mut Counter -> bool) {{\n\
              \x20 c.n = c.n + 1\n\
              \x20 true\n\
              }}\n\
              fn main(-> int) {{\n\
-             \x20 let c = Counter {{ n = 0 }}\n\
+             \x20 let mut c = Counter {{ n = 0 }}\n\
              \x20 let picked = match Gold {{\n\
-             \x20   Rank::Bronze if bump(c): 1\n\
-             \x20   Rank::Gold if bump(c): 2\n\
+             \x20   Rank::Bronze if bump(&mut c): 1\n\
+             \x20   Rank::Gold if bump(&mut c): 2\n\
              \x20   _: 3\n\
              \x20 }}\n\
              \x20 c.n * 10 + picked\n\
@@ -2844,10 +2183,12 @@ fn main(-> int) {
     fn payloadの引数は左から一度ずつ評価される() {
         let src = "enum Pair { Two(int, int) }\n\
                    struct Counter { n: int }\n\
-                   fn bump(c: Counter -> int) {\n c.n = c.n + 1\n c.n\n}\n\
+                   fn bump(c: &mut Counter -> int) {\n c.n = c.n + 1\n c.n\n}\n\
                    fn main(-> int) {\n\
-                   \x20 let c = Counter { n = 0 }\n\
-                   \x20 let p = Pair::Two(bump(c), bump(c))\n\
+                   \x20 let mut c = Counter { n = 0 }\n\
+                   \x20 let first = bump(&mut c)\n\
+                   \x20 let second = bump(&mut c)\n\
+                   \x20 let p = Pair::Two(first, second)\n\
                    \x20 match p { Pair::Two(a, b): a * 100 + b * 10 + c.n }\n\
                    }\n";
         // 左が先に1回、右が次に1回。呼び出しは合計2回
@@ -2862,9 +2203,9 @@ fn main(-> int) {
              \x20 assert (Lookup::Missing(\"a\") == Lookup::Missing(\"b\")) == false\n\
              \x20 assert (Lookup::Missing(\"a\") == Lookup::Skipped) == false\n\
              \x20 let u = User {{ id = 1 }}\n\
-             \x20 let v = User {{ id = 1 }}\n\
-             \x20 assert Lookup::Found(u, 2) == Lookup::Found(v, 2)\n\
-             \x20 assert (Lookup::Found(u, 2) == Lookup::Found(v, 3)) == false\n\
+             \x20 let mut v = User {{ id = 1 }}\n\
+             \x20 assert Lookup::Found(u.clone(), 2) == Lookup::Found(v.clone(), 2)\n\
+             \x20 assert (Lookup::Found(u.clone(), 2) == Lookup::Found(v.clone(), 3)) == false\n\
              \x20 v.id = 9\n\
              \x20 Lookup::Found(u, 2) == Lookup::Found(v, 2)\n\
              }}\n"
@@ -2872,22 +2213,22 @@ fn main(-> int) {
         assert!(matches!(run(&src, "main"), Ok(Value::Bool(false))));
     }
 
-    /// 複合 payload は既存の「複合値は参照」の規則にそのまま乗る
+    /// payload への値渡しは clone で明示し、元の変更は payload へ漏れない。
     #[test]
-    fn 共有された複合payloadは同じ実体を指す() {
+    fn cloneした複合payloadは元の変更を共有しない() {
         let src = format!(
             "{LOOKUP}fn main(-> int) {{\n\
-             \x20 let u = User {{ id = 1 }}\n\
-             \x20 let l = Lookup::Found(u, 0)\n\
+             \x20 let mut u = User {{ id = 1 }}\n\
+             \x20 let l = Lookup::Found(u.clone(), 0)\n\
              \x20 u.id = 7\n\
-             \x20 match l {{\n\
+             \x20 match move l {{\n\
              \x20   Lookup::Found(found, _): found.id\n\
              \x20   Lookup::Missing(_): 0\n\
              \x20   Lookup::Skipped: 0\n\
              \x20 }}\n\
              }}\n"
         );
-        assert_eq!(int(&src), 7);
+        assert_eq!(int(&src), 1);
     }
 
     #[test]
@@ -2943,7 +2284,7 @@ fn main(-> int) {
              \x20 let reason = 1\n\
              \x20 let inner = match Lookup::Missing(\"gone\") {{\n\
              \x20   Lookup::Found(_, _): \"f\"\n\
-             \x20   Lookup::Missing(reason): reason\n\
+             \x20   Lookup::Missing(reason): reason.clone()\n\
              \x20   Lookup::Skipped: \"s\"\n\
              \x20 }}\n\
              \x20 assert inner == \"gone\"\n\
@@ -3009,7 +2350,7 @@ fn main(-> int) {
     #[test]
     fn whileが回る() {
         let src = "fn main(-> int) {\n\
-                   \x20 let n = 0\n\
+                   \x20 let mut n = 0\n\
                    \x20 while n == 0: n = 1\n\
                    \x20 n\n\
                    }\n";
@@ -3044,20 +2385,22 @@ fn main(-> int) {
     }
 
     #[test]
-    fn 配列は参照() {
-        // `let b = a` でコピーされない。for が両方から同じものを見る
-        let src = "fn main(-> bool) {\n\
-                   \x20 let a = [1, 2]\n\
-                   \x20 let b = a\n\
+    fn cloneした配列は元と独立している() {
+        // `clone()` は配列とその要素を独立した store location に複製する。
+        let src = "struct Cell { n: int }\n\
+                   fn main(-> bool) {\n\
+                   \x20 let mut a = [Cell { n = 1 }, Cell { n = 2 }]\n\
+                   \x20 let b = a.clone()\n\
+                   \x20 for item in &mut a: item.n = 9\n\
                    \x20 a == b\n\
                    }\n";
-        assert!(matches!(run(src, "main"), Ok(Value::Bool(true))));
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(false))));
     }
 
     #[test]
     fn forで配列を回す() {
         let src = "fn main(-> int) {\n\
-                   \x20 let total = 0\n\
+                   \x20 let mut total = 0\n\
                    \x20 for x in [1, 2, 3]: total = total + x\n\
                    \x20 total\n\
                    }\n";
@@ -3105,10 +2448,10 @@ fn main(-> int) {
     /// ハンドラの本体が自分の保存先に手が届くこと。これが無いと差し替えが書けない
     #[test]
     fn メソッドはselfでレシーバに触れる() {
-        let src = "trait Clock { fn now(self -> int) }\n\
+        let src = "trait Clock { fn now(&self -> int) }\n\
                    struct Frozen { t: int }\n\
                    impl Clock for Frozen {\n\
-                   \x20 fn now(self -> int) {\n\
+                   \x20 fn now(&self -> int) {\n\
                    \x20   self.t\n\
                    \x20 }\n\
                    }\n\
@@ -3123,8 +2466,8 @@ fn main(-> int) {
     #[test]
     fn メソッドがselfの配列を変更できる() {
         let src = "trait Db {\n\
-                   \x20 fn save(self, x: int -> unit)\n\
-                   \x20 fn count(self -> int)\n\
+                   \x20 fn save(&mut self, x: int -> unit)\n\
+                   \x20 fn count(&self -> int)\n\
                    }\n\
                    struct Store { xs: [int] }\n\
                    impl Store {\n\
@@ -3134,18 +2477,18 @@ fn main(-> int) {
                    \x20 }\n\
                    }\n\
                    impl Db for Store {\n\
-                   \x20 fn save(self, x: int -> unit) {\n\
+                   \x20 fn save(&mut self, x: int -> unit) {\n\
                    \x20   self.xs = [x]\n\
                    \x20 }\n\
-                   \x20 fn count(self -> int) {\n\
-                   \x20   let n = 0\n\
+                   \x20 fn count(&self -> int) {\n\
+                   \x20   let mut n = 0\n\
                    \x20   for y in self.xs: n = n + 1\n\
                    \x20   n\n\
                    \x20 }\n\
                    }\n\
                    fn main(-> int) {\n\
-                   \x20 let s = Store::new()\n\
-                   \x20 s.save(7)\n\
+                   \x20 let mut s = Store::new()\n\
+                   \x20 &mut s.save(7)\n\
                    \x20 s.count()\n\
                    }\n";
         assert_eq!(int(src), 1);
@@ -3212,11 +2555,12 @@ fn main(-> int) {
     fn 正典のテストが通る() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let program = parse::parse(&join(lex(&src).unwrap())).expect("パースできるはず");
-        let checked = crate::typecheck::check_and_lower(&program).expect("型検査を通る");
-        let interp = Interp::new(&checked);
+        let hir = crate::typecheck::check_and_lower(&program).expect("型検査を通る");
+        let checked = crate::ownership::check(hir).expect("所有権検査を通る");
+        let interp = Interp::new_checked(&checked);
 
-        assert_eq!(checked.tests.len(), 1, "正典の test は1つ");
-        for (id, declared) in checked.tests.iter() {
+        assert_eq!(checked.hir.tests.len(), 1, "正典の test は1つ");
+        for (id, declared) in checked.hir.tests.iter() {
             if let Err(e) = interp.run_test(id) {
                 panic!("test {:?} が失敗: {e}", declared.name);
             }
@@ -3405,13 +2749,13 @@ fn main(-> int) {
     fn 型提供から内側で実体を初期化できる() {
         let src = "trait Database {\n\
                    \x20 fn new(-> Postgres)\n\
-                   \x20 fn value(self -> int)\n\
+                   \x20 fn value(&self -> int)\n\
                    }\n\
                    effect db: Database\n\
                    struct Postgres {}\n\
                    impl Database for Postgres {\n\
                    \x20 fn new(-> Postgres) { Postgres {} }\n\
-                   \x20 fn value(self -> int) { 7 }\n\
+                   \x20 fn value(&self -> int) { 7 }\n\
                    }\n\
                    fn main(-> int) {\n\
                    \x20 with db<Postgres> {\n\
@@ -3466,54 +2810,55 @@ fn main(-> int) {
         assert!(e.contains("`db` はスロットなので代入できません"), "{e}");
     }
 
-    /// `u.x = u` で循環が作れる。比較でプロセスが落ちないこと
+    /// `u.x = u.clone()` は有限な深い複製を格納する。構造比較が安全に終わること。
     #[test]
-    fn 自己参照structを比較しても落ちない() {
+    fn cloneを格納したstructを比較しても落ちない() {
         let src = "struct Node { indirect x: Node? }\n\
                    fn main(-> bool) {\n\
-                   \x20 let u = Node { x = nil }\n\
-                   \x20 u.x = u\n\
+                   \x20 let mut u = Node { x = nil }\n\
+                   \x20 u.x = u.clone()\n\
                    \x20 u == u\n\
                    }\n";
-        // 同じ実体なので中身を見ずに真
+        // 自己比較なので、有限な構造比較の結果は真。
         assert!(matches!(run(src, "main"), Ok(Value::Bool(true))));
     }
 
-    /// 相互に参照し合う2つを比べる。上限に当たってエラーになる(落ちない)
+    /// 相互に clone を格納しても、それぞれ有限な値になり比較が安全に終わる。
     #[test]
-    fn 相互循環の比較はエラーになる() {
+    fn cloneを格納した二つのstructの比較は安全に終わる() {
         let src = "struct Node { indirect x: Node? }\n\
                    fn main(-> bool) {\n\
-                   \x20 let a = Node { x = nil }\n\
-                   \x20 let b = Node { x = nil }\n\
-                   \x20 a.x = b\n\
-                   \x20 b.x = a\n\
+                   \x20 let mut a = Node { x = nil }\n\
+                   \x20 let mut b = Node { x = nil }\n\
+                   \x20 a.x = b.clone()\n\
+                   \x20 b.x = a.clone()\n\
                    \x20 a == b\n\
                    }\n";
-        assert!(run(src, "main").is_err());
+        assert!(matches!(run(src, "main"), Ok(Value::Bool(_))));
     }
 
     #[test]
     fn 同名の引数はスロットを一貫して隠す() {
-        let src = "trait Database { fn save(self, u: int -> unit) }\n\
+        let src = "trait Database { fn save(&mut self, u: int -> unit) }\n\
                    effect db: Database\n\
                    struct Slot { n: int }\n\
                    impl Database for Slot {\n\
-                   \x20 fn save(self, u: int -> unit) { self.n = 1 }\n\
+                   \x20 fn save(&mut self, u: int -> unit) { self.n = 1 }\n\
                    }\n\
                    struct Local { n: int }\n\
                    impl Database for Local {\n\
-                   \x20 fn save(self, u: int -> unit) { self.n = 2 }\n\
+                   \x20 fn save(&mut self, u: int -> unit) { self.n = 2 }\n\
                    }\n\
-                   fn handle(db: Local -> int) {\n\
-                   \x20 db.save(0)\n\
+                   fn handle(db: &mut Local -> int) {\n\
+                   \x20 &mut db.save(0)\n\
                    \x20 db.n\n\
                    }\n\
                    fn main(-> int) {\n\
-                   \x20 let slot = Slot { n = 0 }\n\
-                   \x20 with db(slot) {\n\
-                   \x20   let result = handle(Local { n = 7 })\n\
-                   \x20   result * 10 + slot.n\n\
+                   \x20 let mut slot = Slot { n = 0 }\n\
+                   \x20 with db(&mut slot) {\n\
+                   \x20   let mut local = Local { n = 7 }\n\
+                   \x20   let result = handle(&mut local)\n\
+                   \x20   result * 10\n\
                    \x20 }\n\
                    }\n";
         assert_eq!(shown(src, "main"), "20");
@@ -3521,15 +2866,15 @@ fn main(-> int) {
 
     #[test]
     fn withの右辺は外側で本体はスロットとして解決する() {
-        let src = "trait Database { fn save(self, u: int -> unit) }\n\
+        let src = "trait Database { fn save(&mut self, u: int -> unit) }\n\
                    effect db: Database\n\
                    struct Store { n: int }\n\
                    impl Database for Store {\n\
-                   \x20 fn save(self, u: int -> unit) { self.n = u }\n\
+                   \x20 fn save(&mut self, u: int -> unit) { self.n = u }\n\
                    }\n\
                    fn main(-> int) {\n\
-                   \x20 let db = Store { n = 0 }\n\
-                   \x20 with db(db) { db.save(9) }\n\
+                   \x20 let mut db = Store { n = 0 }\n\
+                   \x20 with db(&mut db) { db.save(9) }\n\
                    \x20 db.n\n\
                    }\n";
         assert_eq!(shown(src, "main"), "9");

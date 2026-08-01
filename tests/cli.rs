@@ -752,7 +752,7 @@ fn catch_all_armは残りのvariantを受けて実行される() {
          \x20 Skipped\n\
          }\n\
          fn describe(l: Lookup -> str) {\n\
-         \x20 match l {\n\
+         \x20 match move l {\n\
          \x20   Lookup::Found(n) {\n\
          \x20     assert n == 7\n\
          \x20     \"found\"\n\
@@ -836,7 +836,7 @@ fn guard付きのarmは条件どおりに選ばれて実行される() {
          \x20 Skipped\n\
          }\n\
          fn describe(l: Lookup -> str) {\n\
-         \x20 match l {\n\
+         \x20 match move l {\n\
          \x20   Lookup::Found(n) if n == threshold(): \"exact\"\n\
          \x20   Lookup::Missing(reason) if reason == \"gone\" {\n\
          \x20     \"gone\"\n\
@@ -922,7 +922,7 @@ fn payloadの構築と分解が往復して実行される() {
          \x20 Skipped\n\
          }\n\
          fn describe(l: Lookup -> str) {\n\
-         \x20 match l {\n\
+         \x20 match move l {\n\
          \x20   Lookup::Found(found, _) {\n\
          \x20     assert found.id == 7\n\
          \x20     \"found\"\n\
@@ -940,7 +940,7 @@ fn payloadの構築と分解が往復して実行される() {
          }\n\
          fn main(-> str) {\n\
          \x20 let u = make()\n\
-         \x20 assert rank(Lookup::Found(u, 5)) == 5\n\
+         \x20 assert rank(Lookup::Found(u.clone(), 5)) == 5\n\
          \x20 assert describe(Lookup::Missing(\"gone\")) == \"gone\"\n\
          \x20 assert describe(Skipped) == \"skipped\"\n\
          \x20 assert Lookup::Missing(\"a\") == Lookup::Missing(\"a\")\n\
@@ -1039,9 +1039,9 @@ fn payload束縛に隠されたスロットは要求にならない() {
     let project = Project::new();
     project.write(
         "main.rd",
-        "trait Clock { fn now(self -> int) }\n\
+        "trait Clock { fn now(&self -> int) }\n\
          struct SystemClock {}\n\
-         impl Clock for SystemClock { fn now(self -> int) { 42 } }\n\
+         impl Clock for SystemClock { fn now(&self -> int) { 42 } }\n\
          effect clock: Clock\n\
          enum Lookup { Found(SystemClock) Skipped }\n\
          fn read(l: Lookup -> int) {\n\
@@ -1071,7 +1071,7 @@ fn enum型フィールドに同じenumのvariantを入れたプログラムは�
         "enum Rank { Bronze Gold }\n\
          struct User { rank: Rank }\n\
          fn main(-> bool) {\n\
-           let u = User { rank = Bronze }\n\
+           let mut u = User { rank = Bronze }\n\
            u.rank = Gold\n\
            u.rank == Gold\n\
          }\n",
@@ -1381,6 +1381,23 @@ fn 型の決まらない式は呼ばれない宣言でも実行前に失敗す�
     );
 }
 
+/// 所有権検査も到達性に依らず全本体を走る。未呼び出しの関数にある
+/// use-after-move を、実行時の経路へ持ち越さない。
+#[test]
+fn move後使用は呼ばれない宣言でも実行前に失敗する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         fn broken(-> int) {\n\
+         \x20 let user = User { id = 1 }\n\
+         \x20 let moved = move user\n\
+         \x20 moved.id\n\
+         \x20 user.id\n\
+         }\n\
+         fn main(-> int) { 1 }\n",
+        "既に move されているので使えません",
+    );
+}
+
 /// 呼び出し先が一意に決まらない呼び出しも、実行に到達する前に落ちる。
 /// 評価器の同じ防御(`find_method` など)には頼らない
 #[test]
@@ -1452,19 +1469,19 @@ fn 全ての式の形を含むプログラムが検査を通って走る() {
          profile: Profile? }\n\
          fn make(-> User) { User { id = 1, rank = Gold, profile = nil } }\n\
          fn every(u: User, us: [User], o: Rank?, l: Lookup -> int) {\n\
-         \x20 let n = 1\n\
+         \x20 let mut n = 1\n\
          \x20 let s = \"x\"\n\
          \x20 let b = true\n\
          \x20 let nothing: User? = nil\n\
          \x20 let empty: [User] = []\n\
          \x20 let id = u.id\n\
-         \x20 let alias = u.profile.?name\n\
+         \x20 let alias: str? = nil\n\
          \x20 let made = make()\n\
-         \x20 let xs = [u, made]\n\
+         \x20 let xs = [u.clone(), made]\n\
          \x20 let lit = User { id = 2, rank = Bronze, profile = nil }\n\
          \x20 let qualified = Rank::Gold\n\
          \x20 let bare = Bronze\n\
-         \x20 let ctor = Lookup::Found(u, n)\n\
+         \x20 let ctor = Lookup::Found(move u, n)\n\
          \x20 let neg = -n\n\
          \x20 let unwrapped = o ?? Gold\n\
          \x20 n = n + 1 - 1 * 1 / 1\n\
@@ -1483,10 +1500,11 @@ fn 全ての式の形を含むプログラムが検査を通って走る() {
          \x20   _: 0\n\
          \x20 }\n\
          \x20 if m == 0 { return 0 }\n\
-         \x20 m + id + neg + nothing_id(nothing)\n\
+         \x20 m + id + neg + nothing_id(move nothing)\n\
          }\n\
          fn nothing_id(u: User? -> int) { u.?id ?? 0 }\n\
-         fn unused(u: User, l: Lookup -> int) { every(u, [u], nil, l) }\n";
+         fn unused(u: User, l: Lookup -> int) { let copied = u.clone()\n\
+         \x20 every(move copied, [move u], nil, move l) }\n";
 
     let project = Project::new();
     project.write(

@@ -173,21 +173,21 @@
 
 ## 8. Cut Over Repository Sources and the Build Pipeline
 
-- [ ] 8.1 Route CLI interpretation, tests, requirement analysis, production
+- [x] 8.1 Route CLI interpretation, tests, requirement analysis, production
   planning, and Wasm building through `ownership::CheckedProgram`, removing every
   normal path that accepts ownership-unchecked HIR
-- [ ] 8.2 Migrate the canonical program, examples, inline fixtures, parser/HIR
+- [x] 8.2 Migrate the canonical program, examples, inline fixtures, parser/HIR
   snapshots, and CLI corpus to `let mut`, receiver/parameter modes, visible
   `&mut`, visible call-site `move`, and ownership-aware `with`
-- [ ] 8.3 Replace old implicit-alias tests with explicit move, borrow, mutable
+- [x] 8.3 Replace old implicit-alias tests with explicit move, borrow, mutable
   access, clone, drop, and rejection cases; retain no compatibility flag or
   legacy evaluator behavior
-- [ ] 8.4 Keep reachable non-scalar/reference code unsupported in Core Wasm,
+- [x] 8.4 Keep reachable non-scalar/reference code unsupported in Core Wasm,
   reject public borrowed signatures, and prove the existing scalar Wasm corpus
   remains valid, executable, deterministic, import-free, and start-free
-- [ ] 8.5 Preserve whole-program checking of ownership errors in unreachable code
+- [x] 8.5 Preserve whole-program checking of ownership errors in unreachable code
   and reachability-sensitive backend support for ownership-safe unsupported data
-- [ ] 8.6 Run formatting, all unit and CLI tests, the migrated canonical program,
+- [x] 8.6 Run formatting, all unit and CLI tests, the migrated canonical program,
   missing-provider/runtime diagnostics, ambient-plan snapshots, Wasm validation/
   execution, deterministic rebuild comparison, and strict OpenSpec validation,
   then commit the repository-wide ownership cutover as a stable snapshot

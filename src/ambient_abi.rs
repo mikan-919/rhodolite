@@ -253,10 +253,11 @@ pub type ProviderContext = BTreeMap<hir::SlotId, ProviderBinding>;
 /// 根は空の提供文脈から始まる。要求が残っていれば提供忘れだが、それは前段の
 /// 診断が先に止めるので、ここへ来たら不変条件の破れとして返す。
 pub fn plan(
-    program: &hir::Program,
+    checked: &crate::ownership::CheckedProgram,
     analysis: &crate::requirement::Analysis,
     entry: hir::CallableId,
 ) -> Result<Plan, PlanError> {
+    let program = &checked.hir;
     let roots: Vec<_> = std::iter::once(hir::BodyId::Callable(entry))
         .chain(program.tests.ids().map(hir::BodyId::Test))
         .map(|body| (body, ProviderContext::new()))
@@ -283,11 +284,12 @@ pub struct ProductionPlan {
 /// `exports` は公開名の昇順で渡す。`main` の提供状態が後続の公開呼び出しへ
 /// 引き継がれることはない
 pub fn plan_production(
-    program: &hir::Program,
+    checked: &crate::ownership::CheckedProgram,
     analysis: &crate::requirement::Analysis,
     entry: hir::CallableId,
     exports: &[(String, hir::CallableId)],
 ) -> Result<ProductionPlan, PlanError> {
+    let program = &checked.hir;
     let mut seen = BTreeSet::from([entry]);
     let mut roots = vec![(hir::BodyId::Callable(entry), ProviderContext::new())];
     for (_, callable) in exports {
@@ -308,12 +310,53 @@ pub fn plan_production(
     })
 }
 
+/// 単相化アルゴリズムの単体テスト用。通常経路では使わない。
+#[cfg(test)]
+pub(crate) fn plan_hir_for_test(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    entry: hir::CallableId,
+) -> Result<Plan, PlanError> {
+    let roots: Vec<_> = std::iter::once(hir::BodyId::Callable(entry))
+        .chain(program.tests.ids().map(hir::BodyId::Test))
+        .map(|body| (body, ProviderContext::new()))
+        .collect();
+    plan_roots(program, analysis, &roots)
+}
+
+/// 生産根の単相化アルゴリズムの単体テスト用。通常経路では使わない。
+#[cfg(test)]
+pub(crate) fn plan_production_hir_for_test(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    entry: hir::CallableId,
+    exports: &[(String, hir::CallableId)],
+) -> Result<ProductionPlan, PlanError> {
+    let mut seen = BTreeSet::from([entry]);
+    let mut roots = vec![(hir::BodyId::Callable(entry), ProviderContext::new())];
+    for (_, callable) in exports {
+        if seen.insert(*callable) {
+            roots.push((hir::BodyId::Callable(*callable), ProviderContext::new()));
+        }
+    }
+    let plan = plan_roots(program, analysis, &roots)?;
+    let instance_of: BTreeMap<hir::BodyId, InstanceId> = plan.roots.iter().copied().collect();
+    Ok(ProductionPlan {
+        entry: instance_of[&hir::BodyId::Callable(entry)],
+        exports: exports
+            .iter()
+            .map(|(name, callable)| (name.clone(), instance_of[&hir::BodyId::Callable(*callable)]))
+            .collect(),
+        plan,
+    })
+}
+
 /// 根の並びを呼び出し側が決める計画。
 ///
 /// 根は与えられた順に確保されるので、instance の番号もその順で決まる。
 /// 同じ本体を指す根が複数あっても intern が1つに寄せる(別名の再エクスポートが
 /// 同じ実装を共有するのはこの性質)
-pub fn plan_roots(
+fn plan_roots(
     program: &hir::Program,
     analysis: &crate::requirement::Analysis,
     roots: &[(hir::BodyId, ProviderContext)],
@@ -795,9 +838,9 @@ mod tests {
     }
 
     fn plan_program(program: &hir::Program) -> Plan {
-        let analysis = crate::requirement::analyze(program);
+        let analysis = crate::requirement::analyze_hir_for_test(program);
         let entry = program.free_callable("main").expect("main がない");
-        plan(program, &analysis, entry).expect("計画できるはず")
+        plan_hir_for_test(program, &analysis, entry).expect("計画できるはず")
     }
 
     /// 前置きを付けずに下ろして計画する(正典など完結したソース用)
@@ -1041,7 +1084,7 @@ mod tests {
             "fn ticks(-> int) { clock.now() }\n\
              fn main(-> int) { 0 }\n",
         );
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let ticks = hir::BodyId::Callable(program.free_callable("ticks").unwrap());
         let clock = slot(&program, "clock");
 
@@ -1129,9 +1172,9 @@ mod tests {
                  fn ticks(-> int) {{ shared_clock.now() }}\n\
                  fn main(-> int) {{ {provision} }}\n"
             ));
-            let analysis = crate::requirement::analyze(&program);
+            let analysis = crate::requirement::analyze_hir_for_test(&program);
             let entry = program.free_callable("main").unwrap();
-            let plan = plan(&program, &analysis, entry).expect("計画できるはず");
+            let plan = plan_hir_for_test(&program, &analysis, entry).expect("計画できるはず");
             let ticks = only(&program, &plan, "ticks");
             let layout = plan.layout(plan.instance(ticks).layout.expect("値要求の欄"));
             let facts = (
@@ -1454,14 +1497,16 @@ mod tests {
              root test \"昇格すると Gold になり時刻が刻まれる\" -> instance#1\n\
              layout#0 { db: Postgres, clock: SystemClock }\n\
              layout#1 { db: InMemoryDb, clock: Frozen }\n\
+             layout#2 { clock: SystemClock }\n\
+             layout#3 { clock: Frozen }\n\
              instance#0 main [] ambient -\n\
              \x20 expr#3 -> instance#2 {}\n\
              \x20 expr#6 -> instance#3 { db <- provision expr#3, clock <- provision expr#4 }\n\
              instance#1 test \"昇格すると Gold になり時刻が刻まれる\" [] ambient -\n\
              \x20 expr#7 -> instance#4 {}\n\
-             \x20 expr#11 -> instance#5 {}\n\
-             \x20 expr#14 -> instance#6 { db <- provision expr#9, clock <- provision expr#11 }\n\
-             \x20 expr#19 -> instance#7 {}\n\
+             \x20 expr#12 -> instance#5 {}\n\
+             \x20 expr#14 -> instance#6 { db <- provision expr#10, clock <- provision expr#12 }\n\
+             \x20 expr#21 -> instance#7 {}\n\
              instance#2 impl Postgres::new [] ambient -\n\
              instance#3 handle [db=Postgres, clock=SystemClock] ambient layout#0\n\
              \x20 expr#1 -> instance#8 { db <- field db, clock <- field clock }\n\
@@ -1470,25 +1515,24 @@ mod tests {
              instance#6 handle [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
              \x20 expr#1 -> instance#9 { db <- field db, clock <- field clock }\n\
              instance#7 impl InMemoryDb::get [] ambient -\n\
-             \x20 expr#2 -> instance#10 {}\n\
              instance#8 promote [db=Postgres, clock=SystemClock] ambient layout#0\n\
-             \x20 expr#1 -> instance#11 self=field db {}\n\
-             \x20 expr#10 -> instance#12 { db <- field db, clock <- field clock }\n\
-             instance#9 promote [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
              \x20 expr#1 -> instance#10 self=field db {}\n\
-             \x20 expr#10 -> instance#13 { db <- field db, clock <- field clock }\n\
-             instance#10 impl InMemoryDb::find [] ambient -\n\
-             instance#11 impl Postgres::find [] ambient -\n\
-             instance#12 stamp [db=Postgres, clock=SystemClock] ambient layout#0\n\
-             \x20 expr#1 -> instance#14 self=field clock {}\n\
-             \x20 expr#4 -> instance#15 self=field db {}\n\
-             instance#13 stamp [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#11 -> instance#11 { clock <- field clock }\n\
+             \x20 expr#14 -> instance#12 self=field db {}\n\
+             instance#9 promote [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#1 -> instance#13 self=field db {}\n\
+             \x20 expr#11 -> instance#14 { clock <- field clock }\n\
+             \x20 expr#14 -> instance#15 self=field db {}\n\
+             instance#10 impl Postgres::find [] ambient -\n\
+             instance#11 stamp [clock=SystemClock] ambient layout#2\n\
              \x20 expr#1 -> instance#16 self=field clock {}\n\
-             \x20 expr#4 -> instance#17 self=field db {}\n\
-             instance#14 impl SystemClock::now [] ambient -\n\
-             instance#15 impl Postgres::save [] ambient -\n\
-             instance#16 impl Frozen::now [] ambient -\n\
-             instance#17 impl InMemoryDb::save [] ambient -\n"
+             instance#12 impl Postgres::save [] ambient -\n\
+             instance#13 impl InMemoryDb::find [] ambient -\n\
+             instance#14 stamp [clock=Frozen] ambient layout#3\n\
+             \x20 expr#1 -> instance#17 self=field clock {}\n\
+             instance#15 impl InMemoryDb::save [] ambient -\n\
+             instance#16 impl SystemClock::now [] ambient -\n\
+             instance#17 impl Frozen::now [] ambient -\n"
         );
     }
 
@@ -1499,7 +1543,7 @@ mod tests {
     /// `公開名=関数名` で別名を書ける。別名を書かなければ両方同じ綴り
     fn production(src: &str, exports: &[&str]) -> (hir::Program, ProductionPlan) {
         let program = lowered_of(src);
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let entry = program.free_callable("main").expect("main がない");
         let exports: Vec<(String, hir::CallableId)> = exports
             .iter()
@@ -1511,8 +1555,8 @@ mod tests {
                 )
             })
             .collect();
-        let planned =
-            plan_production(&program, &analysis, entry, &exports).expect("計画できるはず");
+        let planned = plan_production_hir_for_test(&program, &analysis, entry, &exports)
+            .expect("計画できるはず");
         (program, planned)
     }
 
@@ -1572,7 +1616,7 @@ mod tests {
             "fn ticks(-> int) { clock.now() }\n\
              fn main(-> int) { with clock(Frozen { t = 1 }) { ticks() } }\n",
         );
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let entry = program.free_callable("main").expect("main がない");
         let ticks = program.free_callable("ticks").expect("ticks がない");
 
@@ -1581,7 +1625,13 @@ mod tests {
         // 同じ本体でも、公開の根として単体で立てば要求が残る
         assert_eq!(analysis.errors_for_roots(&["ticks".to_string()]).len(), 1);
         assert_eq!(
-            plan_production(&program, &analysis, entry, &[("ticks".to_string(), ticks)]).err(),
+            plan_production_hir_for_test(
+                &program,
+                &analysis,
+                entry,
+                &[("ticks".to_string(), ticks)]
+            )
+            .err(),
             Some(PlanError::MissingProvider {
                 body: hir::BodyId::Callable(ticks),
                 slot: slot(&program, "clock"),
