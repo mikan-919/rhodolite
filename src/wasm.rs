@@ -269,21 +269,6 @@ fn check_expr(
         hir::ExprKind::Field { optional: true, .. } => {
             diagnostics.push(unsupported(expr.span, "`.?` のフィールド参照"))
         }
-        // `indirect` な optional は「アドレス、0 なら `nil`」として置いてある。
-        // 読み出しはその形を optional の値へ組み直すことになるので、まだ扱わない
-        // (`nil` や所有値を**入れる**側は扱える)
-        hir::ExprKind::Field { recv, field, .. }
-            if program.fields[*field].indirect && program.fields[*field].ty.optional =>
-        {
-            diagnostics.push(unsupported(
-                expr.span,
-                &format!(
-                    "`indirect` な optional フィールド `{}` の参照",
-                    program.fields[*field].name
-                ),
-            ));
-            children.push(*recv);
-        }
         hir::ExprKind::Field { recv, .. } => children.push(*recv),
         hir::ExprKind::AssignField { recv, value, .. } => children.extend([*recv, *value]),
         hir::ExprKind::Array(_) => diagnostics.push(unsupported(expr.span, "配列")),
@@ -1595,8 +1580,18 @@ impl Emitter<'_> {
         if slot.indirect {
             self.out.set(container);
             self.out.get(container).offset(slot.offset).load();
+            self.out.set(fresh);
             // 器の側を空にする。残余の破棄がここをもう一度返さないように
             self.out.get(container).offset(slot.offset).num(0).store();
+            if !slot.nullable {
+                // 非 optional の `indirect` は子の根がそのまま値になる
+                self.out.get(fresh);
+                return;
+            }
+            let optional = self
+                .owned_layout(id)
+                .expect("`indirect` な optional は optional の値になる");
+            self.wrap_child(optional, fresh, container);
             return;
         }
         let (indices, layouts) = (self.indices, &*self.layouts);
@@ -1609,6 +1604,44 @@ impl Emitter<'_> {
             slot.offset,
             fresh,
         );
+    }
+
+    /// `indirect` な optional の区画から取り出した子アドレスを、optional の
+    /// 値へ包み直す(`child_address` の逆)。
+    ///
+    /// 記憶の上では「アドレス、0 なら `nil`」だが、値としての `T?` は
+    /// `{tag, 詰め物, payload}` の根1つ(design.md 決定3)。読み出しはその
+    /// 食い違いをここで埋める。所有はそのまま移るので、空になった子の根だけ返す
+    fn wrap_child(&mut self, optional: LayoutId, child: u32, root: u32) {
+        let payload = match self.layouts.get(optional).shape {
+            wasm_layout::Shape::Optional { payload } => payload,
+            ref other => unreachable!("optional ではない並びです: {other:?}"),
+        };
+        let size = self.layouts.extent(payload.layout).size;
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::alloc_root(&mut self.out, indices, layouts, optional);
+        self.out.set(root);
+
+        self.out.get(child);
+        self.out.ins(Instruction::If(BlockType::Empty));
+        self.out
+            .get(root)
+            .num(wasm_layout::OPTIONAL_PRESENT)
+            .ins(Instruction::I32Store8(wasm_data::tag_byte()));
+        self.out.get(root).offset(payload.offset);
+        self.out.get(child).num(size);
+        self.out.ins(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+        self.out.get(child).ins(Instruction::Call(indices.free));
+        self.out.ins(Instruction::Else);
+        self.out
+            .get(root)
+            .num(wasm_layout::OPTIONAL_EMPTY)
+            .ins(Instruction::I32Store8(wasm_data::tag_byte()));
+        self.out.ins(Instruction::End);
+        self.out.get(root);
     }
 
     /// `lhs ?? rhs`(tasks 6.4)。
@@ -3709,24 +3742,73 @@ pub(crate) mod tests {
         }
     }
 
-    /// `indirect` な optional を**読む**形はまだ扱えない。黙って壊れず止まる
+    /// `indirect` な optional の鎖を、消費しながら辿れる(tasks 6.4)。
+    ///
+    /// 記憶の上では「アドレス、0 なら `nil`」だが、値としての `Node?` は
+    /// 帳簿1つ。読み出しがその食い違いを埋めているので、連結リストが
+    /// 組めるだけでなく歩ける
     #[test]
-    fn indirectなoptionalの参照はビルドを止める() {
-        let errors = compile(
-            "struct Node { value: int, indirect next: Node? }\n\
-             fn main(-> int) {\n\
-             \x20 let head = Node { value = 1, next = nil }\n\
-             \x20 let peeked = head.next\n\
-             \x20 1\n\
-             }\n",
-            &[],
-        )
-        .expect_err("止まるはず");
-        assert!(
-            messages(&errors).contains("`indirect` な optional フィールド `next` の参照"),
-            "{}",
-            messages(&errors)
+    fn indirectなoptionalの鎖を辿れる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Node { value: int, indirect next: Node? }\n\
+                 fn total(n: Node -> int) {\n\
+                 \x20 let v = n.value\n\
+                 \x20 let tail = move n.next ?? return v\n\
+                 \x20 v + total(move tail)\n\
+                 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let tail = Node { value = 3, next = nil }\n\
+                 \x20 let mid = Node { value = 2, next = move tail }\n\
+                 \x20 let head = Node { value = 1, next = move mid }\n\
+                 \x20 total(move head)\n\
+                 }\n"
+            ),
+            6
         );
+    }
+
+    /// 取り出した `nil` も、値としての空の帳簿になる
+    #[test]
+    fn indirectなoptionalの空も取り出せる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Node { value: int, indirect next: Node? }\n\
+                 fn main(-> int) {\n\
+                 \x20 let head = Node { value = 1, next = nil }\n\
+                 \x20 let peeked = head.next\n\
+                 \x20 let fallback = move peeked ?? Node { value = 9, next = nil }\n\
+                 \x20 fallback.value\n\
+                 }\n"
+            ),
+            9
+        );
+    }
+
+    /// 鎖を組んでは辿るループでも記憶は漏れない。
+    ///
+    /// 包み直した帳簿・移した中身・空になった子の根が全部返らないと、
+    /// 1ページでは回りきらない
+    #[test]
+    fn 鎖を辿るループでも記憶は漏れない() {
+        let src = "struct Node { value: int, indirect next: Node? }\n\
+                   fn total(n: Node -> int) {\n\
+                   \x20 let v = n.value\n\
+                   \x20 let tail = move n.next ?? return v\n\
+                   \x20 v + total(move tail)\n\
+                   }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 1000) == false {\n\
+                   \x20   let tail = Node { value = 1, next = nil }\n\
+                   \x20   let head = Node { value = 1, next = move tail }\n\
+                   \x20   n = n + total(move head) - 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![1000]));
     }
 
     /// メタデータを知らないエンジンでも検証・実行できる
