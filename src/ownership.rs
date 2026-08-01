@@ -307,6 +307,17 @@ impl BodyPlan {
         }
     }
 
+    /// 式に対応する CFG 点。ownership-aware evaluator の debug assertion と
+    /// 計画スナップショットが、分類済み access に点があることを照合する。
+    pub fn point_of(&self, expr: hir::ExprId) -> Option<PointId> {
+        self.accesses.get(&expr).copied().or_else(|| {
+            self.points
+                .iter()
+                .position(|point| point.expr == Some(expr))
+                .map(|index| PointId(index as u32))
+        })
+    }
+
     pub fn loans(&self) -> impl Iterator<Item = (LoanId, &Loan)> {
         self.loans
             .iter()

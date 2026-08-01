@@ -11,6 +11,7 @@
 
 use crate::diag::Diag;
 use crate::hir;
+use crate::ownership;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -184,6 +185,1230 @@ fn fail<T>(msg: impl Into<String>) -> Result<T, Flow> {
 /// 決まった宛先へ書くだけ(design.md 決定5)。
 type Env = HashMap<hir::LocalId, Value>;
 
+// ---------------------------------------------------------------------------
+// 所有権検査済み評価器の値基盤
+// ---------------------------------------------------------------------------
+
+/// checked evaluator 内だけで使う store のアドレス。これは値として観測できず、
+/// 比較も常に構造で行う。従来の `Rc` と違い、所有者が drop すれば必ず消える。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct LocationId(usize);
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum OwnedValue {
+    Int(i64),
+    Str(String),
+    Bool(bool),
+    Unit,
+    Nil,
+    Location(LocationId),
+}
+
+#[derive(Debug)]
+enum StoredValue {
+    Struct {
+        type_: hir::StructId,
+        fields: BTreeMap<hir::FieldId, OwnedValue>,
+    },
+    Enum {
+        variant: hir::VariantId,
+        payload: Vec<OwnedValue>,
+    },
+    Array(Vec<OwnedValue>),
+}
+
+/// 環境のスロットは所有値または静的に検査済みの場所である。reference を
+/// compound value に埋め込む変種は意図的に持たない。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RuntimeSlotId(usize);
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct RuntimePlace {
+    root: RuntimeSlotId,
+    path: Vec<ownership::Projection>,
+}
+
+#[derive(Debug)]
+enum Slot {
+    Empty,
+    Owned(OwnedValue),
+    Reference(RuntimePlace),
+}
+
+/// 実行1回だけに属する location store。`Vec<Option<_>>` は stable address の
+/// ためだけの実装詳細で、参照カウント、GC、実行時借用カウンタを持たない。
+#[derive(Debug, Default)]
+struct Store {
+    locations: Vec<Option<StoredValue>>,
+}
+
+impl Store {
+    fn alloc(&mut self, value: StoredValue) -> OwnedValue {
+        let id = LocationId(self.locations.len());
+        self.locations.push(Some(value));
+        OwnedValue::Location(id)
+    }
+
+    fn get(&self, id: LocationId) -> &StoredValue {
+        self.locations[id.0]
+            .as_ref()
+            .expect("所有権計画が drop 済みの location を読んだ")
+    }
+
+    fn get_mut(&mut self, id: LocationId) -> &mut StoredValue {
+        self.locations[id.0]
+            .as_mut()
+            .expect("所有権計画が drop 済みの location を変更した")
+    }
+
+    /// 所有グラフを再帰的に手放す。子を先に落とすので、親を除いた後に
+    /// 到達不能な値が残らない。accepted program は unique ownership なので
+    /// location を二度通ることはコンパイラ不変条件違反である。
+    fn drop_value(&mut self, value: OwnedValue) {
+        let OwnedValue::Location(id) = value else {
+            return;
+        };
+        let stored = self.locations[id.0]
+            .take()
+            .expect("所有権計画が location を二度 drop した");
+        match stored {
+            StoredValue::Struct { fields, .. } => {
+                for (_, value) in fields.into_iter().rev() {
+                    self.drop_value(value);
+                }
+            }
+            StoredValue::Enum { payload, .. } | StoredValue::Array(payload) => {
+                for value in payload.into_iter().rev() {
+                    self.drop_value(value);
+                }
+            }
+        }
+    }
+
+    fn clone_value(&mut self, value: &OwnedValue) -> OwnedValue {
+        match value {
+            OwnedValue::Int(n) => OwnedValue::Int(*n),
+            OwnedValue::Str(text) => OwnedValue::Str(text.clone()),
+            OwnedValue::Bool(value) => OwnedValue::Bool(*value),
+            OwnedValue::Unit => OwnedValue::Unit,
+            OwnedValue::Nil => OwnedValue::Nil,
+            OwnedValue::Location(id) => match self.get(*id) {
+                StoredValue::Struct { type_, fields } => {
+                    let type_ = *type_;
+                    let fields: Vec<_> = fields
+                        .iter()
+                        .map(|(field, value)| (*field, value.clone()))
+                        .collect();
+                    let mut cloned = BTreeMap::new();
+                    for (field, value) in fields {
+                        cloned.insert(field, self.clone_value(&value));
+                    }
+                    self.alloc(StoredValue::Struct {
+                        type_,
+                        fields: cloned,
+                    })
+                }
+                StoredValue::Enum { variant, payload } => {
+                    let variant = *variant;
+                    let payload = payload.clone();
+                    let payload = payload
+                        .iter()
+                        .map(|value| self.clone_value(value))
+                        .collect();
+                    self.alloc(StoredValue::Enum { variant, payload })
+                }
+                StoredValue::Array(values) => {
+                    let values = values.clone();
+                    let values = values.iter().map(|value| self.clone_value(value)).collect();
+                    self.alloc(StoredValue::Array(values))
+                }
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ownership-checked evaluator
+// ---------------------------------------------------------------------------
+
+/// `new_checked` の実行状態。既存の評価器とは意図的に分離している: こちらの
+/// compound value は全て `Store` の location で、環境には値または place しか
+/// 入らない。従ってこの経路では `Rc<RefCell<_>>` を意味論に使わない。
+#[derive(Debug)]
+enum CheckedValue {
+    Owned(OwnedValue),
+    Reference(RuntimePlace),
+}
+
+type CheckedEnv = HashMap<hir::LocalId, RuntimeSlotId>;
+
+#[derive(Clone)]
+struct CheckedAmbientBinding {
+    implementation: hir::TraitImplId,
+    value: Option<RuntimeSlotId>,
+}
+
+type CheckedAmbient = BTreeMap<hir::SlotId, CheckedAmbientBinding>;
+
+struct CheckedInterp<'p> {
+    program: &'p hir::Program,
+    plan: &'p ownership::Plan,
+    store: Store,
+    slots: Vec<Slot>,
+    returned: Option<CheckedValue>,
+    ambient: Vec<CheckedAmbient>,
+}
+
+impl<'p> CheckedInterp<'p> {
+    fn new(program: &'p hir::Program, plan: &'p ownership::Plan) -> Self {
+        Self {
+            program,
+            plan,
+            store: Store::default(),
+            slots: Vec::new(),
+            returned: None,
+            ambient: vec![CheckedAmbient::new()],
+        }
+    }
+
+    fn run(mut self, entry: &str) -> Eval {
+        let Some(callable) = self.program.free_callable(entry) else {
+            return fail(format!("関数 `{entry}` がありません"));
+        };
+        let value = match self.call(callable, None, Vec::new()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.dispose();
+                return Err(error);
+            }
+        };
+        let shown = self.into_legacy_ref(&value)?;
+        self.drop_checked(value);
+        self.dispose();
+        Ok(shown)
+    }
+
+    fn run_test(mut self, id: hir::TestId) -> Eval {
+        let body = &self.program.tests[id].body;
+        let mut env = CheckedEnv::new();
+        let frame = self.slots.len();
+        let value = match self.body(body, &mut env) {
+            Err(Flow::Return(_)) => self
+                .returned
+                .take()
+                .unwrap_or(CheckedValue::Owned(OwnedValue::Unit)),
+            Ok(value) => value,
+            Err(Flow::Error(diag)) => {
+                self.cleanup_frame(frame);
+                self.dispose();
+                return Err(Flow::Error(diag));
+            }
+        };
+        self.cleanup_frame(frame);
+        let shown = self.into_legacy_ref(&value)?;
+        self.drop_checked(value);
+        self.dispose();
+        Ok(shown)
+    }
+
+    fn call(
+        &mut self,
+        callable: hir::CallableId,
+        recv: Option<CheckedValue>,
+        args: Vec<CheckedValue>,
+    ) -> Result<CheckedValue, Flow> {
+        let declared = &self.program.callables[callable];
+        let frame = self.slots.len();
+        let mut env = CheckedEnv::new();
+        if let (Some(local), Some(value)) = (declared.body.receiver, recv) {
+            self.bind(&mut env, local, value)?;
+        }
+        for (local, value) in declared.params.iter().zip(args) {
+            self.bind(&mut env, *local, value)?;
+        }
+        let result = match self.body(&declared.body, &mut env) {
+            Err(Flow::Return(_)) => Ok(self
+                .returned
+                .take()
+                .unwrap_or(CheckedValue::Owned(OwnedValue::Unit))),
+            Ok(value) => Ok(value),
+            Err(Flow::Error(diag)) => Err(Flow::Error(diag)),
+        };
+        self.cleanup_frame(frame);
+        result
+    }
+
+    fn bind(
+        &mut self,
+        env: &mut CheckedEnv,
+        local: hir::LocalId,
+        value: CheckedValue,
+    ) -> Result<(), Flow> {
+        let slot = RuntimeSlotId(self.slots.len());
+        self.slots.push(match value {
+            CheckedValue::Owned(value) => Slot::Owned(value),
+            CheckedValue::Reference(place) => Slot::Reference(place),
+        });
+        env.insert(local, slot);
+        Ok(())
+    }
+
+    fn body(&mut self, body: &hir::Body, env: &mut CheckedEnv) -> Result<CheckedValue, Flow> {
+        let mut last = CheckedValue::Owned(OwnedValue::Unit);
+        for id in &body.root {
+            last = self.eval(body, *id, env)?;
+        }
+        Ok(last)
+    }
+
+    fn body_plan(&self, body: &hir::Body) -> &ownership::BodyPlan {
+        let id = self
+            .program
+            .bodies
+            .iter()
+            .copied()
+            .find(|id| match id {
+                hir::BodyId::Callable(callable) => {
+                    std::ptr::eq(body, &self.program.callables[*callable].body)
+                }
+                hir::BodyId::Test(test) => std::ptr::eq(body, &self.program.tests[*test].body),
+            })
+            .expect("評価する本体はプログラムに属する");
+        self.plan.body(id)
+    }
+
+    fn eval(
+        &mut self,
+        body: &hir::Body,
+        id: hir::ExprId,
+        env: &mut CheckedEnv,
+    ) -> Result<CheckedValue, Flow> {
+        let expr = body.expr(id);
+        if matches!(
+            expr.kind,
+            hir::ExprKind::Local(_) | hir::ExprKind::Field { .. } | hir::ExprKind::Access { .. }
+        ) && let Some(access) = self.body_plan(body).access(id).cloned()
+        {
+            return self.access(env, access);
+        }
+        match &expr.kind {
+            hir::ExprKind::Int(n) => Ok(CheckedValue::Owned(OwnedValue::Int(*n))),
+            hir::ExprKind::Str(s) => Ok(CheckedValue::Owned(OwnedValue::Str(s.clone()))),
+            hir::ExprKind::Bool(b) => Ok(CheckedValue::Owned(OwnedValue::Bool(*b))),
+            hir::ExprKind::Nil => Ok(CheckedValue::Owned(OwnedValue::Nil)),
+            hir::ExprKind::UnitStruct(struct_) => {
+                Ok(CheckedValue::Owned(self.store.alloc(StoredValue::Struct {
+                    type_: *struct_,
+                    fields: BTreeMap::new(),
+                })))
+            }
+            hir::ExprKind::Variant(variant) => {
+                Ok(CheckedValue::Owned(self.store.alloc(StoredValue::Enum {
+                    variant: *variant,
+                    payload: Vec::new(),
+                })))
+            }
+            hir::ExprKind::Local(local) => self.read_local(env, *local),
+            hir::ExprKind::Access { .. } => fail("所有権 access の計画がありません"),
+            hir::ExprKind::Field {
+                recv,
+                field,
+                optional,
+            } => {
+                let evaluated = self.eval(body, *recv, env)?;
+                let recv_value = self.owned_ref(&evaluated)?;
+                if *optional && recv_value == OwnedValue::Nil {
+                    self.drop_checked(evaluated);
+                    return Ok(CheckedValue::Owned(OwnedValue::Nil));
+                }
+                if expr.result.ty().is_some_and(|ty| self.program.is_copy(ty)) {
+                    let field = self.field(recv_value, *field)?;
+                    let copied = self.store.clone_value(&field);
+                    self.drop_checked(evaluated);
+                    Ok(CheckedValue::Owned(copied))
+                } else if expr.result.ty().is_some_and(|ty| ty.reference.is_none())
+                    && matches!(evaluated, CheckedValue::Owned(_))
+                {
+                    // Fresh compound projection is itself an owned temporary. There is
+                    // no source place to borrow, so move the selected child and drop the
+                    // residue exactly like a consuming bound projection.
+                    let CheckedValue::Owned(value) = evaluated else {
+                        unreachable!()
+                    };
+                    let mut path = Vec::new();
+                    if *optional {
+                        path.push(ownership::Projection::OptionalPayload);
+                    }
+                    path.push(ownership::Projection::Field(*field));
+                    Ok(CheckedValue::Owned(self.extract(value, &path)?))
+                } else {
+                    let mut place = match evaluated {
+                        CheckedValue::Reference(place) => place,
+                        CheckedValue::Owned(value) => RuntimePlace {
+                            root: self.alloc_slot(Slot::Owned(value)),
+                            path: Vec::new(),
+                        },
+                    };
+                    if *optional {
+                        place.path.push(ownership::Projection::OptionalPayload);
+                    }
+                    place.path.push(ownership::Projection::Field(*field));
+                    Ok(CheckedValue::Reference(place))
+                }
+            }
+            hir::ExprKind::StructLit { struct_, fields } => {
+                let mut values = BTreeMap::new();
+                for (field, value) in fields {
+                    let evaluated = self.eval(body, *value, env)?;
+                    values.insert(*field, self.owned(evaluated)?);
+                }
+                Ok(CheckedValue::Owned(self.store.alloc(StoredValue::Struct {
+                    type_: *struct_,
+                    fields: values,
+                })))
+            }
+            hir::ExprKind::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    let evaluated = self.eval(body, *item, env)?;
+                    values.push(self.owned(evaluated)?);
+                }
+                Ok(CheckedValue::Owned(
+                    self.store.alloc(StoredValue::Array(values)),
+                ))
+            }
+            hir::ExprKind::Let { local, value } => {
+                let value = self.eval(body, *value, env)?;
+                self.bind(env, *local, value)?;
+                Ok(CheckedValue::Owned(OwnedValue::Unit))
+            }
+            hir::ExprKind::AssignLocal { local, value } => {
+                let value = self.eval(body, *value, env)?;
+                let slot = *env.get(local).expect("検査済み代入先がある");
+                self.drop_slot(slot);
+                self.slots[slot.0] = self.slot_from(value);
+                Ok(CheckedValue::Owned(OwnedValue::Unit))
+            }
+            hir::ExprKind::AssignField { recv, field, value } => {
+                // The ownership plan records receiver access before RHS evaluation.
+                // Resolve the canonical runtime place first to preserve that order.
+                let place = self.place_from_expr(body, *recv)?;
+                let place = self.runtime_place(env, &place)?;
+                let evaluated = self.eval(body, *value, env)?;
+                let value = self.owned(evaluated)?;
+                self.replace_runtime_field(&place, *field, value)?;
+                Ok(CheckedValue::Owned(OwnedValue::Unit))
+            }
+            hir::ExprKind::Clone(inner) => {
+                let evaluated = self.eval(body, *inner, env)?;
+                let value = self.owned_ref(&evaluated)?;
+                let cloned = self.store.clone_value(&value);
+                self.drop_checked(evaluated);
+                Ok(CheckedValue::Owned(cloned))
+            }
+            hir::ExprKind::Eq { lhs, rhs } => {
+                let evaluated_lhs = self.eval(body, *lhs, env)?;
+                let lhs = self.owned_ref(&evaluated_lhs)?;
+                let evaluated_rhs = self.eval(body, *rhs, env)?;
+                let rhs = self.owned_ref(&evaluated_rhs)?;
+                let equal = self.equal(&lhs, &rhs);
+                self.drop_checked(evaluated_rhs);
+                self.drop_checked(evaluated_lhs);
+                Ok(CheckedValue::Owned(OwnedValue::Bool(equal)))
+            }
+            hir::ExprKind::Neg(inner) => {
+                let evaluated = self.eval(body, *inner, env)?;
+                match self.owned(evaluated)? {
+                    OwnedValue::Int(n) => {
+                        Ok(CheckedValue::Owned(OwnedValue::Int(n.wrapping_neg())))
+                    }
+                    _ => fail("`-` は整数だけです"),
+                }
+            }
+            hir::ExprKind::Arith { op, lhs, rhs } => {
+                let evaluated_lhs = self.eval(body, *lhs, env)?;
+                let lhs = self.owned(evaluated_lhs)?;
+                let evaluated_rhs = self.eval(body, *rhs, env)?;
+                let rhs = self.owned(evaluated_rhs)?;
+                let (OwnedValue::Int(a), OwnedValue::Int(b)) = (lhs, rhs) else {
+                    return fail("算術演算には int が必要です");
+                };
+                let value = match op {
+                    hir::ArithOp::Add => a.wrapping_add(b),
+                    hir::ArithOp::Sub => a.wrapping_sub(b),
+                    hir::ArithOp::Mul => a.wrapping_mul(b),
+                    hir::ArithOp::Div => a
+                        .checked_div(b)
+                        .ok_or_else(|| Flow::Error(Diag::msg("0 で割れません")))?,
+                };
+                Ok(CheckedValue::Owned(OwnedValue::Int(value)))
+            }
+            hir::ExprKind::Return(value) => {
+                let value = match value {
+                    Some(value) => self.eval(body, *value, env)?,
+                    None => CheckedValue::Owned(OwnedValue::Unit),
+                };
+                self.returned = Some(value);
+                return Err(Flow::Return(Value::Unit));
+            }
+            hir::ExprKind::Assert(inner) => {
+                let evaluated = self.eval(body, *inner, env)?;
+                match self.owned(evaluated)? {
+                    OwnedValue::Bool(true) => Ok(CheckedValue::Owned(OwnedValue::Unit)),
+                    OwnedValue::Bool(false) => fail("assert が偽になりました"),
+                    _ => fail("assert には bool が必要です"),
+                }
+            }
+            hir::ExprKind::Block(ids) => {
+                let mut last = CheckedValue::Owned(OwnedValue::Unit);
+                for id in ids {
+                    last = self.eval(body, *id, env)?;
+                }
+                Ok(last)
+            }
+            hir::ExprKind::If { cond, then, orelse } => {
+                let evaluated = self.eval(body, *cond, env)?;
+                let OwnedValue::Bool(cond) = self.owned(evaluated)? else {
+                    return fail("条件には bool が必要です");
+                };
+                if cond {
+                    self.eval(body, *then, env)
+                } else if let Some(otherwise) = orelse {
+                    self.eval(body, *otherwise, env)
+                } else {
+                    Ok(CheckedValue::Owned(OwnedValue::Unit))
+                }
+            }
+            hir::ExprKind::While { cond, body: inner } => {
+                loop {
+                    let evaluated = self.eval(body, *cond, env)?;
+                    let OwnedValue::Bool(keep_going) = self.owned(evaluated)? else {
+                        return fail("条件には bool が必要です");
+                    };
+                    if !keep_going {
+                        break;
+                    }
+                    self.eval(body, *inner, env)?;
+                }
+                Ok(CheckedValue::Owned(OwnedValue::Unit))
+            }
+            hir::ExprKind::Coalesce { lhs, rhs } => {
+                let left = self.eval(body, *lhs, env)?;
+                if self.owned_ref(&left)? == OwnedValue::Nil {
+                    self.drop_checked(left);
+                    self.eval(body, *rhs, env)
+                } else {
+                    Ok(left)
+                }
+            }
+            hir::ExprKind::For {
+                var,
+                iter,
+                body: inner,
+            } => self.eval_for(body, *var, *iter, *inner, env),
+            hir::ExprKind::Match { subject, arms } => self.eval_match(body, *subject, arms, env),
+            hir::ExprKind::With {
+                provisions,
+                body: inner,
+            } => self.eval_with(body, provisions, *inner, env),
+            hir::ExprKind::Call(call) => self.call_expr(body, call, env),
+            _ => fail("この構文の ownership-aware 評価はまだ未実装です"),
+        }
+    }
+
+    fn access(
+        &mut self,
+        env: &mut CheckedEnv,
+        access: ownership::Access,
+    ) -> Result<CheckedValue, Flow> {
+        use ownership::Mode;
+        let place = self.runtime_place(env, &access.place)?;
+        match access.mode {
+            Mode::Read => {
+                let value = self.read_place(&place)?;
+                Ok(CheckedValue::Owned(self.store.clone_value(&value)))
+            }
+            Mode::Shared | Mode::Mutable => Ok(CheckedValue::Reference(place)),
+            Mode::Move => Ok(CheckedValue::Owned(self.take_place(&place)?)),
+        }
+    }
+
+    fn explicit_move(&self, body: &hir::Body, id: hir::ExprId) -> bool {
+        matches!(
+            body.expr(id).kind,
+            hir::ExprKind::Access {
+                mode: hir::AccessMode::Move,
+                ..
+            }
+        )
+    }
+
+    fn eval_for(
+        &mut self,
+        body: &hir::Body,
+        var: hir::LocalId,
+        iter: hir::ExprId,
+        inner: hir::ExprId,
+        env: &mut CheckedEnv,
+    ) -> Result<CheckedValue, Flow> {
+        let evaluated = self.eval(body, iter, env)?;
+        let mut temporary = None;
+        let subject = match evaluated {
+            CheckedValue::Reference(place) => CheckedValue::Reference(place),
+            CheckedValue::Owned(value) if self.explicit_move(body, iter) => {
+                CheckedValue::Owned(value)
+            }
+            CheckedValue::Owned(value) => {
+                let slot = self.alloc_slot(Slot::Owned(value));
+                temporary = Some(slot);
+                CheckedValue::Reference(RuntimePlace {
+                    root: slot,
+                    path: Vec::new(),
+                })
+            }
+        };
+        let result = match subject {
+            CheckedValue::Reference(place) => {
+                let array = self.read_place(&place)?;
+                let id = self.location(array)?;
+                let len = match self.store.get(id) {
+                    StoredValue::Array(values) => values.len(),
+                    _ => return fail("for で回せるのは配列だけです"),
+                };
+                let mut result = Ok(CheckedValue::Owned(OwnedValue::Unit));
+                for index in 0..len {
+                    let frame = self.slots.len();
+                    let mut element = place.clone();
+                    element
+                        .path
+                        .push(ownership::Projection::ArrayElement(Some(index as i64)));
+                    self.bind(env, var, CheckedValue::Reference(element))?;
+                    result = self.eval(body, inner, env);
+                    env.remove(&var);
+                    self.cleanup_frame(frame);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            }
+            CheckedValue::Owned(value) => {
+                let id = self.location(value)?;
+                let stored = self.store.locations[id.0]
+                    .take()
+                    .expect("consuming for buffer は生存している");
+                let StoredValue::Array(values) = stored else {
+                    return fail("for で回せるのは配列だけです");
+                };
+                let mut values = values.into_iter();
+                let mut result = Ok(CheckedValue::Owned(OwnedValue::Unit));
+                while let Some(value) = values.next() {
+                    let frame = self.slots.len();
+                    self.bind(env, var, CheckedValue::Owned(value))?;
+                    result = self.eval(body, inner, env);
+                    env.remove(&var);
+                    self.cleanup_frame(frame);
+                    if result.is_err() {
+                        for remaining in values {
+                            self.store.drop_value(remaining);
+                        }
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        if let Some(slot) = temporary {
+            self.drop_slot(slot);
+        }
+        result
+    }
+
+    fn eval_match(
+        &mut self,
+        body: &hir::Body,
+        subject_id: hir::ExprId,
+        arms: &[hir::MatchArm],
+        env: &mut CheckedEnv,
+    ) -> Result<CheckedValue, Flow> {
+        let evaluated = self.eval(body, subject_id, env)?;
+        let mut temporary = None;
+        let subject = match evaluated {
+            CheckedValue::Reference(place) => CheckedValue::Reference(place),
+            CheckedValue::Owned(value) if self.explicit_move(body, subject_id) => {
+                CheckedValue::Owned(value)
+            }
+            CheckedValue::Owned(value) => {
+                let slot = self.alloc_slot(Slot::Owned(value));
+                temporary = Some(slot);
+                CheckedValue::Reference(RuntimePlace {
+                    root: slot,
+                    path: Vec::new(),
+                })
+            }
+        };
+        let snapshot = self.owned_ref(&subject)?;
+        let id = self.location(snapshot)?;
+        let variant = match self.store.get(id) {
+            StoredValue::Enum { variant, .. } => *variant,
+            _ => return fail("`match` の対象は enum だけです"),
+        };
+        let exact = arms.iter().find(|arm| {
+            matches!(arm.pattern, hir::Pattern::Variant { variant: candidate, .. } if candidate == variant)
+        });
+        let mut result = None;
+        if let Some(arm) = exact {
+            let frame = self.slots.len();
+            if let hir::Pattern::Variant { bindings, .. } = &arm.pattern {
+                match &subject {
+                    CheckedValue::Reference(place) => {
+                        for (index, binding) in bindings.iter().enumerate() {
+                            if let Some(local) = binding {
+                                let mut payload = place.clone();
+                                payload
+                                    .path
+                                    .push(ownership::Projection::EnumPayload(variant, index));
+                                self.bind(env, *local, CheckedValue::Reference(payload))?;
+                            }
+                        }
+                    }
+                    CheckedValue::Owned(value) => {
+                        let id = self.location(value.clone())?;
+                        let StoredValue::Enum { payload, .. } = self.store.locations[id.0]
+                            .take()
+                            .expect("consuming match subject は生存している")
+                        else {
+                            unreachable!()
+                        };
+                        for (binding, value) in bindings.iter().zip(payload) {
+                            if let Some(local) = binding {
+                                self.bind(env, *local, CheckedValue::Owned(value))?;
+                            } else {
+                                self.store.drop_value(value);
+                            }
+                        }
+                    }
+                }
+            }
+            let selected = match arm.guard {
+                Some(guard) => {
+                    let guard = self.eval(body, guard, env)?;
+                    matches!(self.owned(guard)?, OwnedValue::Bool(true))
+                }
+                None => true,
+            };
+            if selected {
+                result = Some(self.eval(body, arm.body, env));
+            }
+            if let hir::Pattern::Variant { bindings, .. } = &arm.pattern {
+                for local in bindings.iter().flatten() {
+                    env.remove(local);
+                }
+            }
+            self.cleanup_frame(frame);
+        }
+        if result.is_none() {
+            result = arms
+                .iter()
+                .find(|arm| matches!(arm.pattern, hir::Pattern::CatchAll))
+                .map(|arm| self.eval(body, arm.body, env));
+        }
+        let result = result.unwrap_or_else(|| fail("一致する arm がありません"));
+        if let Some(slot) = temporary {
+            self.drop_slot(slot);
+        }
+        if let CheckedValue::Owned(value) = subject {
+            if let OwnedValue::Location(id) = value {
+                if self.store.locations.get(id.0).is_some_and(Option::is_some) {
+                    self.store.drop_value(OwnedValue::Location(id));
+                }
+            }
+        }
+        result
+    }
+
+    fn eval_with(
+        &mut self,
+        body: &hir::Body,
+        provisions: &[hir::Provision],
+        inner: hir::ExprId,
+        env: &mut CheckedEnv,
+    ) -> Result<CheckedValue, Flow> {
+        let mut evaluated = Vec::with_capacity(provisions.len());
+        for provision in provisions {
+            evaluated.push(match provision.value {
+                Some(value) => Some(self.eval(body, value, env)?),
+                None => None,
+            });
+        }
+        let mut next = self.ambient.last().cloned().unwrap_or_default();
+        let mut owned_slots = Vec::new();
+        for (provision, value) in provisions.iter().zip(evaluated) {
+            let value = value.map(|value| {
+                let slot = self.alloc_slot(self.slot_from(value));
+                owned_slots.push(slot);
+                slot
+            });
+            next.insert(
+                provision.slot,
+                CheckedAmbientBinding {
+                    implementation: provision.implementation,
+                    value,
+                },
+            );
+        }
+        self.ambient.push(next);
+        let result = self.eval(body, inner, env);
+        self.ambient.pop();
+        for slot in owned_slots.into_iter().rev() {
+            self.drop_slot(slot);
+        }
+        result
+    }
+
+    fn call_expr(
+        &mut self,
+        body: &hir::Body,
+        call: &hir::Call,
+        env: &mut CheckedEnv,
+    ) -> Result<CheckedValue, Flow> {
+        match call {
+            hir::Call::Direct { callable, args } | hir::Call::Associated { callable, args } => {
+                let args = self.args(body, args, env)?;
+                self.call(*callable, None, args)
+            }
+            hir::Call::Method {
+                callable,
+                recv,
+                args,
+            } => {
+                let recv = self.eval(body, *recv, env)?;
+                let args = self.args(body, args, env)?;
+                self.call(*callable, Some(recv), args)
+            }
+            hir::Call::Ctor { variant, args } => {
+                let args = self.args(body, args, env)?;
+                let mut payload = Vec::new();
+                for value in args {
+                    payload.push(self.owned(value)?);
+                }
+                Ok(CheckedValue::Owned(self.store.alloc(StoredValue::Enum {
+                    variant: *variant,
+                    payload,
+                })))
+            }
+            hir::Call::Slot {
+                slot,
+                method,
+                receiver,
+                args,
+                ..
+            } => {
+                let binding = self
+                    .ambient
+                    .last()
+                    .and_then(|ambient| ambient.get(slot))
+                    .cloned()
+                    .ok_or_else(|| Flow::Error(Diag::msg("必要な値が提供されていません")))?;
+                let callable = self
+                    .program
+                    .implementation_of(binding.implementation, *method)
+                    .ok_or_else(|| {
+                        Flow::Error(Diag::msg("提供された実装にメソッドがありません"))
+                    })?;
+                let recv = match receiver {
+                    hir::SlotReceiver::Type => None,
+                    hir::SlotReceiver::Value => {
+                        let slot = binding.value.ok_or_else(|| {
+                            Flow::Error(Diag::msg("型だけの提供には実体がありません"))
+                        })?;
+                        let place = RuntimePlace {
+                            root: slot,
+                            path: Vec::new(),
+                        };
+                        Some(match self.program.callables[callable].receiver {
+                            Some(hir::ReceiverMode::Owned) => {
+                                CheckedValue::Owned(self.take_place(&place)?)
+                            }
+                            Some(hir::ReceiverMode::Shared | hir::ReceiverMode::Mutable) => {
+                                CheckedValue::Reference(place)
+                            }
+                            None => return fail("実体スロット呼び出しに receiver がありません"),
+                        })
+                    }
+                };
+                let args = self.args(body, args, env)?;
+                self.call(callable, recv, args)
+            }
+        }
+    }
+
+    fn args(
+        &mut self,
+        body: &hir::Body,
+        args: &[hir::ExprId],
+        env: &mut CheckedEnv,
+    ) -> Result<Vec<CheckedValue>, Flow> {
+        args.iter().map(|arg| self.eval(body, *arg, env)).collect()
+    }
+
+    fn alloc_slot(&mut self, slot: Slot) -> RuntimeSlotId {
+        let id = RuntimeSlotId(self.slots.len());
+        self.slots.push(slot);
+        id
+    }
+
+    fn slot_from(&self, value: CheckedValue) -> Slot {
+        match value {
+            CheckedValue::Owned(value) => Slot::Owned(value),
+            CheckedValue::Reference(place) => Slot::Reference(place),
+        }
+    }
+
+    fn runtime_place(
+        &self,
+        env: &CheckedEnv,
+        place: &ownership::Place,
+    ) -> Result<RuntimePlace, Flow> {
+        let root = *env
+            .get(&place.root)
+            .ok_or_else(|| Flow::Error(Diag::msg("place の runtime slot がありません")))?;
+        match &self.slots[root.0] {
+            Slot::Reference(base) => {
+                let mut resolved = base.clone();
+                resolved.path.extend(place.path.iter().cloned());
+                Ok(resolved)
+            }
+            _ => Ok(RuntimePlace {
+                root,
+                path: place.path.clone(),
+            }),
+        }
+    }
+
+    fn drop_slot(&mut self, slot: RuntimeSlotId) {
+        if let Slot::Owned(value) = std::mem::replace(&mut self.slots[slot.0], Slot::Empty) {
+            self.store.drop_value(value);
+        }
+    }
+
+    fn drop_checked(&mut self, value: CheckedValue) {
+        if let CheckedValue::Owned(value) = value {
+            self.store.drop_value(value);
+        }
+    }
+
+    fn cleanup_frame(&mut self, start: usize) {
+        for index in (start..self.slots.len()).rev() {
+            self.drop_slot(RuntimeSlotId(index));
+        }
+    }
+
+    fn dispose(&mut self) {
+        for index in (0..self.slots.len()).rev() {
+            self.drop_slot(RuntimeSlotId(index));
+        }
+        // `f(make(), 1 / 0)` のように、後続の部分式が失敗した時点では前の
+        // 一時所有値がまだ slot に入っていない。実行文脈そのものを捨てる最後の
+        // sweep は、そうした root も allocation の逆順に再帰 drop する。
+        for index in (0..self.store.locations.len()).rev() {
+            if self.store.locations[index].is_some() {
+                self.store
+                    .drop_value(OwnedValue::Location(LocationId(index)));
+            }
+        }
+        debug_assert!(self.store.locations.iter().all(Option::is_none));
+    }
+
+    fn extract(
+        &mut self,
+        value: OwnedValue,
+        path: &[ownership::Projection],
+    ) -> Result<OwnedValue, Flow> {
+        let Some((head, tail)) = path.split_first() else {
+            return Ok(value);
+        };
+        if matches!(head, ownership::Projection::OptionalPayload) {
+            return self.extract(value, tail);
+        }
+        let id = self.location(value)?;
+        let stored = self.store.locations[id.0]
+            .take()
+            .expect("consuming projection の root は生存している");
+        let selected = match (stored, head) {
+            (StoredValue::Struct { fields, .. }, ownership::Projection::Field(field)) => {
+                let mut selected = None;
+                for (candidate, child) in fields.into_iter().rev() {
+                    if candidate == *field {
+                        selected = Some(child);
+                    } else {
+                        self.store.drop_value(child);
+                    }
+                }
+                selected.ok_or_else(|| Flow::Error(Diag::msg("フィールドがありません")))?
+            }
+            (StoredValue::Enum { payload, .. }, ownership::Projection::EnumPayload(_, index)) => {
+                let mut selected = None;
+                for (candidate, child) in payload.into_iter().enumerate().rev() {
+                    if candidate == *index {
+                        selected = Some(child);
+                    } else {
+                        self.store.drop_value(child);
+                    }
+                }
+                selected.ok_or_else(|| Flow::Error(Diag::msg("payload がありません")))?
+            }
+            (StoredValue::Array(values), ownership::Projection::ArrayElement(Some(index))) => {
+                let mut selected = None;
+                for (candidate, child) in values.into_iter().enumerate().rev() {
+                    if i64::try_from(candidate) == Ok(*index) {
+                        selected = Some(child);
+                    } else {
+                        self.store.drop_value(child);
+                    }
+                }
+                selected.ok_or_else(|| Flow::Error(Diag::msg("配列要素がありません")))?
+            }
+            (stored, _) => {
+                for child in match stored {
+                    StoredValue::Struct { fields, .. } => fields.into_values().collect(),
+                    StoredValue::Enum { payload, .. } | StoredValue::Array(payload) => payload,
+                } {
+                    self.store.drop_value(child);
+                }
+                return fail("consuming projection の形が値と一致しません");
+            }
+        };
+        self.extract(selected, tail)
+    }
+
+    fn read_local(&mut self, env: &CheckedEnv, local: hir::LocalId) -> Result<CheckedValue, Flow> {
+        match env.get(&local).map(|slot| &self.slots[slot.0]) {
+            Some(Slot::Owned(value)) => Ok(CheckedValue::Owned(value.clone())),
+            Some(Slot::Reference(place)) => Ok(CheckedValue::Reference(place.clone())),
+            _ => fail("未初期化または move 済みの local を読みました"),
+        }
+    }
+
+    fn owned(&self, value: CheckedValue) -> Result<OwnedValue, Flow> {
+        match value {
+            CheckedValue::Owned(value) => Ok(value),
+            CheckedValue::Reference(place) => self.read_place(&place),
+        }
+    }
+
+    fn owned_ref(&self, value: &CheckedValue) -> Result<OwnedValue, Flow> {
+        match value {
+            CheckedValue::Owned(value) => Ok(value.clone()),
+            CheckedValue::Reference(place) => self.read_place(place),
+        }
+    }
+
+    fn read_place(&self, place: &RuntimePlace) -> Result<OwnedValue, Flow> {
+        let root = match &self.slots[place.root.0] {
+            Slot::Owned(value) => value.clone(),
+            Slot::Reference(other) => {
+                let mut joined = other.clone();
+                joined.path.extend(place.path.iter().cloned());
+                return self.read_place(&joined);
+            }
+            _ => return fail("move 済みの place を読みました"),
+        };
+        self.follow(root, &place.path)
+    }
+
+    fn follow(
+        &self,
+        mut value: OwnedValue,
+        path: &[ownership::Projection],
+    ) -> Result<OwnedValue, Flow> {
+        for projection in path {
+            value = match projection {
+                ownership::Projection::Field(field) => {
+                    match self.store.get(self.location(value)?) {
+                        StoredValue::Struct { fields, .. } => fields
+                            .get(field)
+                            .cloned()
+                            .ok_or_else(|| Flow::Error(Diag::msg("フィールドがありません")))?,
+                        _ => return fail("field projection の対象は struct ではありません"),
+                    }
+                }
+                ownership::Projection::OptionalPayload => value,
+                ownership::Projection::EnumPayload(_, index) => {
+                    match self.store.get(self.location(value)?) {
+                        StoredValue::Enum { payload, .. } => payload
+                            .get(*index)
+                            .cloned()
+                            .ok_or_else(|| Flow::Error(Diag::msg("payload がありません")))?,
+                        _ => return fail("payload projection の対象は enum ではありません"),
+                    }
+                }
+                ownership::Projection::ArrayElement(Some(index)) => {
+                    match self.store.get(self.location(value)?) {
+                        StoredValue::Array(values) => values
+                            .get(
+                                usize::try_from(*index)
+                                    .map_err(|_| Flow::Error(Diag::msg("配列添字が範囲外です")))?,
+                            )
+                            .cloned()
+                            .ok_or_else(|| Flow::Error(Diag::msg("配列要素がありません")))?,
+                        _ => return fail("要素 projection の対象は配列ではありません"),
+                    }
+                }
+                ownership::Projection::ArrayElement(None) => {
+                    return fail("実行時の配列 place には具体的な添字が必要です");
+                }
+            };
+        }
+        Ok(value)
+    }
+
+    fn take_place(&mut self, place: &RuntimePlace) -> Result<OwnedValue, Flow> {
+        let root = std::mem::replace(&mut self.slots[place.root.0], Slot::Empty);
+        match root {
+            Slot::Owned(value) if place.path.is_empty() => Ok(value),
+            Slot::Owned(value) => self.extract(value, &place.path),
+            Slot::Reference(_) => fail("borrowed place を move しました"),
+            Slot::Empty => fail("move 済みの place を move しました"),
+        }
+    }
+
+    fn place_from_expr(&self, body: &hir::Body, id: hir::ExprId) -> Result<ownership::Place, Flow> {
+        match &body.expr(id).kind {
+            hir::ExprKind::Access { place, .. } => self.place_from_expr(body, *place),
+            hir::ExprKind::Local(root) => Ok(ownership::Place {
+                root: *root,
+                path: Vec::new(),
+            }),
+            hir::ExprKind::Field {
+                recv,
+                field,
+                optional: false,
+            } => {
+                let mut place = self.place_from_expr(body, *recv)?;
+                place.path.push(ownership::Projection::Field(*field));
+                Ok(place)
+            }
+            _ => fail("代入先が place ではありません"),
+        }
+    }
+
+    fn replace_runtime_field(
+        &mut self,
+        place: &RuntimePlace,
+        field: hir::FieldId,
+        value: OwnedValue,
+    ) -> Result<(), Flow> {
+        let parent = self.read_place(place)?;
+        let id = self.location(parent)?;
+        let old = {
+            let StoredValue::Struct { fields, .. } = self.store.get_mut(id) else {
+                return fail("フィールドを持たない値には代入できません");
+            };
+            fields.insert(field, value)
+        };
+        if let Some(old) = old {
+            self.store.drop_value(old);
+        }
+        Ok(())
+    }
+
+    fn field(&self, value: OwnedValue, field: hir::FieldId) -> Result<OwnedValue, Flow> {
+        self.follow(value, &[ownership::Projection::Field(field)])
+    }
+    fn location(&self, value: OwnedValue) -> Result<LocationId, Flow> {
+        match value {
+            OwnedValue::Location(id) => Ok(id),
+            _ => fail("compound value の location が必要です"),
+        }
+    }
+
+    fn equal(&self, left: &OwnedValue, right: &OwnedValue) -> bool {
+        match (left, right) {
+            (OwnedValue::Int(a), OwnedValue::Int(b)) => a == b,
+            (OwnedValue::Str(a), OwnedValue::Str(b)) => a == b,
+            (OwnedValue::Bool(a), OwnedValue::Bool(b)) => a == b,
+            (OwnedValue::Unit, OwnedValue::Unit) | (OwnedValue::Nil, OwnedValue::Nil) => true,
+            (OwnedValue::Location(a), OwnedValue::Location(b)) => {
+                match (self.store.get(*a), self.store.get(*b)) {
+                    (
+                        StoredValue::Struct {
+                            type_: ta,
+                            fields: fa,
+                        },
+                        StoredValue::Struct {
+                            type_: tb,
+                            fields: fb,
+                        },
+                    ) => {
+                        ta == tb
+                            && fa.len() == fb.len()
+                            && fa
+                                .iter()
+                                .zip(fb)
+                                .all(|((ka, va), (kb, vb))| ka == kb && self.equal(va, vb))
+                    }
+                    (
+                        StoredValue::Enum {
+                            variant: va,
+                            payload: pa,
+                        },
+                        StoredValue::Enum {
+                            variant: vb,
+                            payload: pb,
+                        },
+                    ) => {
+                        va == vb
+                            && pa.len() == pb.len()
+                            && pa.iter().zip(pb).all(|(a, b)| self.equal(a, b))
+                    }
+                    (StoredValue::Array(a), StoredValue::Array(b)) => {
+                        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.equal(a, b))
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn into_legacy_ref(&self, value: &CheckedValue) -> Eval {
+        let value = self.owned_ref(value)?;
+        self.legacy_value(&value)
+    }
+    fn legacy_value(&self, value: &OwnedValue) -> Eval {
+        Ok(match value {
+            OwnedValue::Int(n) => Value::Int(*n),
+            OwnedValue::Str(s) => Value::Str(s.clone()),
+            OwnedValue::Bool(b) => Value::Bool(*b),
+            OwnedValue::Unit => Value::Unit,
+            OwnedValue::Nil => Value::Nil,
+            OwnedValue::Location(id) => match self.store.get(*id) {
+                StoredValue::Struct { type_, fields } => {
+                    let mut out = BTreeMap::new();
+                    for (field, value) in fields {
+                        out.insert(*field, self.legacy_value(value)?);
+                    }
+                    new_obj(*type_, out)
+                }
+                StoredValue::Enum { variant, payload } => Value::Enum {
+                    variant: *variant,
+                    payload: payload
+                        .iter()
+                        .map(|value| self.legacy_value(value))
+                        .collect::<Result<_, _>>()?,
+                },
+                StoredValue::Array(values) => Value::Array(Rc::new(RefCell::new(
+                    values
+                        .iter()
+                        .map(|value| self.legacy_value(value))
+                        .collect::<Result<_, _>>()?,
+                ))),
+            },
+        })
+    }
+}
+
 /// ambient 束縛。型だけ選んだ状態と、実体まで置いた状態を区別する。
 ///
 /// どちらも実装は `TraitImplId` で持つ。スロット呼び出しはそこから契約メソッドの
@@ -221,11 +1446,30 @@ type Ambient = BTreeMap<hir::SlotId, AmbientBinding>;
 
 pub struct Interp<'p> {
     program: &'p hir::Program,
+    /// `Some` なら所有権検査済みの入口から作られた。通常経路の切替は
+    /// task 8.1 だが、所有権対応の評価器テストはここから計画だけを読む。
+    plan: Option<&'p ownership::Plan>,
 }
 
 impl<'p> Interp<'p> {
     pub fn new(program: &'p hir::Program) -> Self {
-        Interp { program }
+        Interp {
+            program,
+            plan: None,
+        }
+    }
+
+    /// 所有権検査済み HIR を評価する入口。
+    ///
+    /// 既存の `new` と CLI の切替は source migration と同時に task 8.1 で行う。
+    /// それまでこの入口は、評価中の全 HIR 式が計画の CFG 点に対応することを
+    /// 検証して、未検査 HIR が ownership-aware 実行へ紛れ込まないようにする。
+    #[allow(dead_code)] // task 8.1 で通常の CLI 経路へ切り替わるまで test 専用
+    pub fn new_checked(checked: &'p ownership::CheckedProgram) -> Self {
+        Interp {
+            program: &checked.hir,
+            plan: Some(&checked.plan),
+        }
     }
 
     /// 値の表示。値が名前を持たないので、描画はプログラムを知っている側の仕事
@@ -256,6 +1500,9 @@ impl<'p> Interp<'p> {
     ///
     /// **ambient は空から始まる。**提供されていないものは何も届かない、が出発点。
     pub fn run(&self, entry: &str) -> Eval {
+        if let Some(plan) = self.plan {
+            return CheckedInterp::new(self.program, plan).run(entry);
+        }
         let Some(callable) = self.program.free_callable(entry) else {
             return fail(format!("関数 `{entry}` がありません"));
         };
@@ -264,6 +1511,9 @@ impl<'p> Interp<'p> {
 
     /// `test` の本体を走らせる。関数と同じ扱いで、`Env` も `Ambient` も空から。
     pub fn run_test(&self, id: hir::TestId) -> Eval {
+        if let Some(plan) = self.plan {
+            return CheckedInterp::new(self.program, plan).run_test(id);
+        }
         let body = &self.program.tests[id].body;
         let mut env = Env::new();
         match self.body(body, &mut env, &Ambient::new()) {
@@ -326,6 +1576,28 @@ impl<'p> Interp<'p> {
     /// 埋め、外側(ブロック・呼び出し元・別モジュール)は上書きしない
     /// (design.md 決定2)。
     fn eval(&self, body: &hir::Body, id: hir::ExprId, env: &mut Env, ambient: &Ambient) -> Eval {
+        if let Some(plan) = self.plan {
+            let body_id = self
+                .program
+                .bodies
+                .iter()
+                .copied()
+                .find(|body_id| match body_id {
+                    hir::BodyId::Callable(callable) => {
+                        std::ptr::eq(body, &self.program.callables[*callable].body)
+                    }
+                    hir::BodyId::Test(test) => std::ptr::eq(body, &self.program.tests[*test].body),
+                })
+                .expect("評価する本体はプログラムに属する");
+            // CFG の点を持つのは制御構文の全てではなく、所有権に関係する
+            // access と効果だけである。実際の access は必ず計画から引ける。
+            if plan.body(body_id).access(id).is_some() {
+                debug_assert!(
+                    plan.body(body_id).point_of(id).is_some(),
+                    "所有権検査済み access には CFG 点が必要です"
+                );
+            }
+        }
         let expr = body.expr(id);
         self.eval_kind(body, expr, env, ambient)
             .map_err(|flow| match flow {
@@ -791,6 +2063,196 @@ mod tests {
             Flow::Error(d) => d,
             Flow::Return(_) => panic!("return が関数境界を越えた"),
         })
+    }
+
+    fn checked_run(src: &str, entry: &str) -> Result<Value, Diag> {
+        let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
+        let hir = crate::typecheck::check_and_lower(&program)
+            .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
+        let checked =
+            crate::ownership::check(hir).unwrap_or_else(|d| panic!("所有権検査を通るはず: {d:?}"));
+        Interp::new_checked(&checked)
+            .run(entry)
+            .map_err(|f| match f {
+                Flow::Error(d) => d,
+                Flow::Return(_) => panic!("return が関数境界を越えた"),
+            })
+    }
+
+    #[test]
+    fn ownership検査済み入口は計画に対応する式を評価する() {
+        let src = "fn main(-> int) { let n = 40\n n + 2 }\n";
+        let parsed = parse::parse(&join(lex(src).unwrap())).expect("パースできる");
+        let hir = crate::typecheck::check_and_lower(&parsed).expect("型検査を通る");
+        let checked = crate::ownership::check(hir).expect("所有権検査を通る");
+        let interp = Interp::new_checked(&checked);
+        assert!(matches!(interp.run("main"), Ok(Value::Int(42))));
+    }
+
+    #[test]
+    fn ownership検査済み評価器はcloneとfield更新をstoreで実行する() {
+        let src = "struct User { score: int }\n\
+fn main(-> int) {\n\
+  let mut original = User { score = 1 }\n\
+  let copied = original.clone()\n\
+  original.score = 9\n\
+  copied.score\n\
+}\n";
+        let parsed = parse::parse(&join(lex(src).unwrap())).expect("パースできる");
+        let hir = crate::typecheck::check_and_lower(&parsed).expect("型検査を通る");
+        let checked = crate::ownership::check(hir).expect("所有権検査を通る");
+        assert!(matches!(
+            Interp::new_checked(&checked).run("main"),
+            Ok(Value::Int(1))
+        ));
+    }
+
+    #[test]
+    fn checked評価器の排他借用は呼び出し境界を越えて元を更新する() {
+        let src = "struct User { score: int }\n\
+fn edit(user: &mut User) { user.score = 7 }\n\
+fn main(-> int) { let mut user = User { score = 1 }\n\
+ edit(&mut user)\n user.score }\n";
+        let value = checked_run(src, "main").unwrap_or_else(|d| panic!("{d:?}"));
+        assert!(matches!(value, Value::Int(7)), "{value:?}");
+    }
+
+    #[test]
+    fn checked評価器は消費matchとforを所有値で実行する() {
+        let src = "struct User { score: int }\n\
+enum Box { Full(User) Empty }\n\
+fn take(user: User -> int) { user.score }\n\
+fn main(-> int) {\n\
+ let boxed = Box::Full(User { score = 2 })\n\
+ let from_box = match move boxed { Box::Full(user): take(move user)\n\
+   Box::Empty: 0 }\n\
+ let users = [User { score = 3 }, User { score = 4 }]\n\
+ let mut total = from_box\n\
+ for user in move users { total = total + take(move user) }\n\
+ total\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(9))));
+    }
+
+    #[test]
+    fn checked評価器はcoalesceとproviderを所有モードどおり実行する() {
+        let src = "struct User { score: int }\n\
+trait Reader { fn read(&self -> int) }\n\
+impl Reader for User { fn read(&self -> int) { self.score } }\n\
+effect reader: Reader\n\
+fn from_reader(-> int) { reader.read() }\n\
+fn take(user: User -> int) { user.score }\n\
+fn main(-> int) {\n\
+ let maybe: User? = User { score = 5 }\n\
+ let chosen = move maybe ?? User { score = 0 }\n\
+ let provider = User { score = 6 }\n\
+ let provided = with reader(move provider) { from_reader() }\n\
+ take(move chosen) + provided\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(11))));
+    }
+
+    #[test]
+    fn checked評価器は返された排他参照の出自を呼び出し元へ戻す() {
+        let src = "struct User { score: int }\n\
+fn identity(user: &mut User -> &mut User) { user }\n\
+fn main(-> int) {\n\
+ let mut user = User { score = 1 }\n\
+ let edit = identity(&mut user)\n\
+ edit.score = 8\n\
+ user.score\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(8))));
+    }
+
+    #[test]
+    fn checked評価器は借用matchでpayloadを更新する() {
+        let src = "struct User { score: int }\n\
+enum Box { Full(User) Empty }\n\
+fn main(-> int) {\n\
+ let mut boxed = Box::Full(User { score = 1 })\n\
+ match &mut boxed { Box::Full(user): user.score = 9\n\
+   Box::Empty: assert true }\n\
+ match boxed { Box::Full(user): user.score\n\
+   Box::Empty: 0 }\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(9))));
+    }
+
+    #[test]
+    fn checked評価器はearly_returnと失敗でも実行文脈を破棄する() {
+        let success = "struct User { name: str }\n\
+fn choose(-> int) { let user = User { name = \"a\" }\n return 3 }\n\
+fn main(-> int) { choose() }\n";
+        assert!(matches!(checked_run(success, "main"), Ok(Value::Int(3))));
+
+        let failure = "struct User { name: str }\n\
+fn main(-> int) { let user = User { name = \"a\" }\n assert false\n 0 }\n";
+        assert!(checked_run(failure, "main").is_err());
+
+        // The first argument is an unrooted owned temporary when evaluation of
+        // the second fails. Context disposal must sweep it as well as slots.
+        let partial_argument = "struct User { score: int }\n\
+fn consume(user: User, n: int) {}\n\
+fn main(-> int) { consume(User { score = 1 }, 1 / 0)\n 0 }\n";
+        assert!(checked_run(partial_argument, "main").is_err());
+    }
+
+    #[test]
+    fn checked評価器はindirect所有グラフをcloneして再帰dropする() {
+        let src = "struct Node { value: int, indirect next: Node? }\n\
+fn main(-> int) {\n\
+ let leaf = Node { value = 2, next = nil }\n\
+ let root = Node { value = 1, next = leaf }\n\
+ let copied = root.clone()\n\
+ copied.value + root.value\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(2))));
+    }
+
+    #[test]
+    fn checked評価器はfieldless_enumをcopyして所有を重ねない() {
+        let src = "enum Rank { Gold Silver }\n\
+fn main(-> bool) {\n\
+ let rank = Gold\n\
+ let copied = rank\n\
+ copied == rank\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Bool(true))));
+    }
+
+    #[test]
+    fn checked評価器は一時structの非copy_fieldを所有として取り出す() {
+        let src = "struct Inner { score: int }\n\
+struct Outer { inner: Inner, other: Inner }\n\
+fn take(inner: Inner -> int) { inner.score }\n\
+fn main(-> int) {\n\
+ let selected = Outer { inner = Inner { score = 7 }, other = Inner { score = 9 } }.inner\n\
+ take(move selected)\n}\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(7))));
+    }
+
+    #[test]
+    fn owned_storeのcloneは配列を独立locationへ複製する() {
+        let mut store = Store::default();
+        let original = store.alloc(StoredValue::Array(vec![OwnedValue::Int(1)]));
+        let cloned = store.clone_value(&original);
+        let (OwnedValue::Location(original), OwnedValue::Location(cloned)) = (original, cloned)
+        else {
+            panic!("compound values are locations");
+        };
+        assert_ne!(original, cloned);
+        let StoredValue::Array(values) = store.get_mut(original) else {
+            panic!("array expected");
+        };
+        values[0] = OwnedValue::Int(9);
+        let StoredValue::Array(values) = store.get(cloned) else {
+            panic!("array expected");
+        };
+        assert_eq!(values, &[OwnedValue::Int(1)]);
+    }
+
+    #[test]
+    fn owned_storeのdropは子locationも解放する() {
+        let mut store = Store::default();
+        let child = store.alloc(StoredValue::Array(vec![OwnedValue::Int(1)]));
+        let parent = store.alloc(StoredValue::Array(vec![child]));
+        store.drop_value(parent);
+        assert!(store.locations.iter().all(Option::is_none));
     }
 
     /// 走らせた結果の綴り。値が名前を持たなくなったので、表示は

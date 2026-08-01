@@ -152,22 +152,22 @@
 
 ## 7. Make the Interpreter the Owned Reference Implementation
 
-- [ ] 7.1 Replace semantic compound-value aliasing with an interpreter-owned
+- [x] 7.1 Replace semantic compound-value aliasing with an interpreter-owned
   location store, owned environment slots, statically checked reference places,
   and debug assertions for impossible ownership-plan violations
-- [ ] 7.2 Evaluate Copy, move, shared borrow, mutable borrow, reborrow, owned
+- [x] 7.2 Evaluate Copy, move, shared borrow, mutable borrow, reborrow, owned
   return, field replacement, and consuming projection from the ownership plan
   without runtime borrow counters
-- [ ] 7.3 Evaluate owned strings, arrays, structs, payload enums, optionals,
+- [x] 7.3 Evaluate owned strings, arrays, structs, payload enums, optionals,
   indirect values, all three `match`/`for` modes, and ownership-aware provider
   scopes with preserved left-to-right order
-- [ ] 7.4 Implement deep clone, structural equality, reverse-order recursive drop,
+- [x] 7.4 Implement deep clone, structural equality, reverse-order recursive drop,
   early-return cleanup, move suppression, and execution-context disposal after
   runtime failure
-- [ ] 7.5 Add interpreter regressions proving no implicit aliases, borrow-based
+- [x] 7.5 Add interpreter regressions proving no implicit aliases, borrow-based
   mutation visibility, clone independence, returned-reference behavior,
   recursive indirect clone/drop, and unchanged successful scalar results
-- [ ] 7.6 Run formatting, the full unit suite, focused interpreter success/failure
+- [x] 7.6 Run formatting, the full unit suite, focused interpreter success/failure
   corpus, leak/drop instrumentation tests, and strict OpenSpec validation, then
   commit the owned interpreter as a stable snapshot
 
