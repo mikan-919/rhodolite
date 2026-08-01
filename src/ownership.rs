@@ -264,6 +264,10 @@ pub enum Exit {
     LoopBack(hir::ExprId),
     /// `while` の条件が偽で抜ける
     LoopExit(hir::ExprId),
+    /// `match` の arm が本体を終えて合流へ入る
+    MatchArm { at: hir::ExprId, arm: usize },
+    /// `match` の guard が偽で、その arm のスコープを抜けて次を試す
+    MatchGuard { at: hir::ExprId, arm: usize },
 }
 
 /// 制御の辺。`exits` は抜ける字句スコープ、`drops` は解析が確定した破棄。
@@ -1395,8 +1399,8 @@ impl<'a> Build<'a> {
                 let (opened, held) = (self.plan.points.len(), self.plan.loans.len());
                 // 「ここまでの arm がどれも取らなかった」点
                 let mut fallthrough = branch;
-                let mut ends: Vec<(PointId, Vec<ScopeId>)> = Vec::new();
-                for arm in arms {
+                let mut ends: Vec<(PointId, Vec<ScopeId>, Option<Exit>)> = Vec::new();
+                for (index_of_arm, arm) in arms.iter().enumerate() {
                     let arm_scope = self.scope(Some(scope));
                     let next = self.alloc(Some(id), scope, Effect::Nop);
                     // pattern が合わなければ、この arm には入らずに次を試す
@@ -1421,20 +1425,31 @@ impl<'a> Build<'a> {
                         // guard も pattern 束縛も点を作らなかったなら、上で張った
                         // pattern 不一致の辺と同じものになるので張り直さない
                         if let Some(tested) = self.cur.filter(|at| *at != fallthrough) {
-                            self.edge(tested, next, vec![arm_scope]);
+                            let at = Exit::MatchGuard {
+                                at: id,
+                                arm: index_of_arm,
+                            };
+                            self.exit_edge(tested, next, vec![arm_scope], at);
                         }
                     }
                     self.value(arm.body, arm_scope, need);
                     self.carry_from(id, arm.body);
                     if let Some(from) = self.cur {
-                        ends.push((from, vec![arm_scope]));
+                        ends.push((
+                            from,
+                            vec![arm_scope],
+                            Some(Exit::MatchArm {
+                                at: id,
+                                arm: index_of_arm,
+                            }),
+                        ));
                     }
                     fallthrough = next;
                 }
                 // 全ての arm に guard が付いていると、どれも取らずに抜ける経路が
                 // 実在する。網羅していれば必ずどれかが取るので、その経路は無い
                 if !arms.is_empty() && arms.iter().all(|arm| arm.guard.is_some()) {
-                    ends.push((fallthrough, Vec::new()));
+                    ends.push((fallthrough, Vec::new(), None));
                 }
                 if ends.is_empty() {
                     // どの arm も抜ける。合流点は生まれないが、対象は arm の
@@ -1444,8 +1459,11 @@ impl<'a> Build<'a> {
                     return;
                 }
                 let join = self.alloc(Some(id), scope, Effect::Nop);
-                for (from, exits) in ends {
-                    self.edge(from, join, exits);
+                for (from, exits, at) in ends {
+                    match at {
+                        Some(at) => self.exit_edge(from, join, exits, at),
+                        None => self.edge(from, join, exits),
+                    }
                 }
                 // 対象は match の間ずっと借りられている(design.md 決定7)
                 self.hold_through(mark, held, opened);

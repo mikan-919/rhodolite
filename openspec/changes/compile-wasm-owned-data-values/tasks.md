@@ -41,12 +41,12 @@
 
 ## 6. Enum, optional, coalesce, and match slice
 
-- [ ] 6.1 Lower fieldless enum tags and Copy optionals in flat Wasm values without heap ownership
-- [ ] 6.2 Lower payload-enum and non-Copy optional construction with initialized tags and active payload storage
-- [ ] 6.3 Generate tag-directed drop, clone, and equality glue for payload enums and owned optionals, including indirect recursive payloads
-- [ ] 6.4 Lower borrowed and consuming `??` with short-circuited fallback and correct ownership transfer
-- [ ] 6.5 Lower exhaustive/catch-all `match`, payload bindings, guards, and shared/mutable/consuming subject modes with single subject evaluation
-- [ ] 6.6 Add engine tests for invalid inactive storage avoidance, guarded arm order, borrowed and consuming payloads, recursive enums, coalesce, clone, equality, and cleanup
+- [x] 6.1 Lower fieldless enum tags and Copy optionals in flat Wasm values without heap ownership
+- [x] 6.2 Lower payload-enum and non-Copy optional construction with initialized tags and active payload storage
+- [x] 6.3 Generate tag-directed drop, clone, and equality glue for payload enums and owned optionals, including indirect recursive payloads
+- [x] 6.4 Lower borrowed and consuming `??` with short-circuited fallback and correct ownership transfer
+- [x] 6.5 Lower exhaustive/catch-all `match`, payload bindings, guards, and shared/mutable/consuming subject modes with single subject evaluation
+- [x] 6.6 Add engine tests for invalid inactive storage avoidance, guarded arm order, borrowed and consuming payloads, recursive enums, coalesce, clone, equality, and cleanup
 
 ## 7. Array and iteration slice
 

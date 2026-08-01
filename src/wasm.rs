@@ -103,22 +103,21 @@ fn borrowed_signature(
 fn unsupported(span: crate::lex::Span, what: &str) -> Diag {
     Diag::at(span, format!("{what} は現在の Wasm ターゲットでは扱えません"))
         .label("ここが未対応")
-        .help("いまの Wasm は unit / bool / int / str / struct と、束縛・代入・フィールド・算術・比較・`clone()`・所有権修飾・if・while・直接呼び出し・return・assert を扱います")
+        .help("いまの Wasm は unit / bool / int / str / struct / enum / optional と、束縛・代入・フィールド・算術・比較・`clone()`・所有権修飾・`??`・`match`・if・while・直接呼び出し・return・assert を扱います")
 }
 
 /// この backend が下ろせる型か。
 ///
 /// 借用は検査済みの場所を指すアドレス1つなので、指す先が扱えるなら運べる。
-/// optional・struct・enum・配列は後続スライス
+/// optional は完成した所有形に 1 bit 付くだけなので、中身が扱えれば扱える。
+/// 配列だけが後続スライス
 fn supported(ty: &hir::Type) -> bool {
-    if ty.optional {
-        return false;
-    }
     matches!(
         ty.kind,
         hir::TypeKind::Builtin(
             hir::Builtin::Unit | hir::Builtin::Bool | hir::Builtin::Int | hir::Builtin::Str
         ) | hir::TypeKind::Struct(_)
+            | hir::TypeKind::Enum(_)
     )
 }
 
@@ -251,25 +250,45 @@ fn check_expr(
         hir::ExprKind::Str(_) => {}
         hir::ExprKind::Access { place, .. } => children.push(*place),
         hir::ExprKind::Clone(inner) => children.push(*inner),
-        hir::ExprKind::Nil => diagnostics.push(unsupported(expr.span, "optional の `nil`")),
+        hir::ExprKind::Nil => {}
         hir::ExprKind::UnitStruct(_) => {}
         hir::ExprKind::StructLit { fields, .. } => {
             children.extend(fields.iter().map(|(_, value)| *value))
         }
-        hir::ExprKind::Variant(_) | hir::ExprKind::Call(hir::Call::Ctor { .. }) => {
-            diagnostics.push(unsupported(expr.span, "enum の値"))
+        hir::ExprKind::Variant(_) => {}
+        hir::ExprKind::Call(hir::Call::Ctor { args, .. }) => children.extend(args.iter().copied()),
+        hir::ExprKind::Coalesce { lhs, rhs } => children.extend([*lhs, *rhs]),
+        hir::ExprKind::Match { subject, arms } => {
+            children.push(*subject);
+            for arm in arms {
+                children.extend(arm.guard);
+                children.push(arm.body);
+            }
         }
-        // `.?` は optional を伝播するので、optional のスライスまで待つ
+        // `.?` は optional を伝播するので、その下ろしは後続スライス
         hir::ExprKind::Field { optional: true, .. } => {
             diagnostics.push(unsupported(expr.span, "`.?` のフィールド参照"))
+        }
+        // `indirect` な optional は「アドレス、0 なら `nil`」として置いてある。
+        // 読み出しはその形を optional の値へ組み直すことになるので、まだ扱わない
+        // (`nil` や所有値を**入れる**側は扱える)
+        hir::ExprKind::Field { recv, field, .. }
+            if program.fields[*field].indirect && program.fields[*field].ty.optional =>
+        {
+            diagnostics.push(unsupported(
+                expr.span,
+                &format!(
+                    "`indirect` な optional フィールド `{}` の参照",
+                    program.fields[*field].name
+                ),
+            ));
+            children.push(*recv);
         }
         hir::ExprKind::Field { recv, .. } => children.push(*recv),
         hir::ExprKind::AssignField { recv, value, .. } => children.extend([*recv, *value]),
         hir::ExprKind::Array(_) => diagnostics.push(unsupported(expr.span, "配列")),
-        hir::ExprKind::Coalesce { .. } => diagnostics.push(unsupported(expr.span, "`??`")),
         hir::ExprKind::For { .. } => diagnostics.push(unsupported(expr.span, "`for`")),
         hir::ExprKind::With { .. } => diagnostics.push(unsupported(expr.span, "`with` の提供")),
-        hir::ExprKind::Match { .. } => diagnostics.push(unsupported(expr.span, "`match`")),
         hir::ExprKind::Call(hir::Call::Method { .. }) => {
             diagnostics.push(unsupported(expr.span, "メソッド呼び出し"))
         }
@@ -341,6 +360,11 @@ struct Lowered {
     flags: BTreeMap<hir::LocalId, u32>,
     /// 作業用 `i32` の区画。要る式ごとに別を配るので、入れ子でも踏み合わない
     scratch: BTreeMap<hir::ExprId, u32>,
+    /// 平らな値を一旦受ける、型の合った席(tasks 6.1)。
+    ///
+    /// Wasm の store は「アドレス、値」の順に積むが、式が産む値は上に載る。
+    /// 複数の値を持つ Copy 値(optional)を書くにはどこかで受け直すしかない
+    typed: BTreeMap<hir::ExprId, Vec<u32>>,
     /// 掃除が使う共通の作業用区画。先頭が区画の走査用、続いて射影の段ごとの器
     common: u32,
 }
@@ -417,6 +441,23 @@ fn lower_signature(
         ));
     }
 
+    // 平らな値を受け直す席。書き込み先が Copy な区画になる式と、`??` の左辺、
+    // 値が2つ以上ある等値の両辺だけが要る
+    let mut typed: BTreeMap<hir::ExprId, Vec<u32>> = BTreeMap::new();
+    for (id, values) in stash_sites(layouts, program, body) {
+        if values.is_empty() || typed.contains_key(&id) {
+            continue;
+        }
+        let seats = values
+            .iter()
+            .map(|value| {
+                extra_locals.push(*value);
+                (params.len() + extra_locals.len() - 1) as u32
+            })
+            .collect();
+        typed.insert(id, seats);
+    }
+
     // 残余の破棄は射影の段ごとに器のアドレスを1つ持つ。深さはソースから分かる
     let common = (params.len() + extra_locals.len()) as u32;
     if !owned.is_empty() || !scratch.is_empty() {
@@ -437,8 +478,66 @@ fn lower_signature(
         owned,
         flags,
         scratch,
+        typed,
         common,
     }
+}
+
+/// 平らな値を席へ受け直す必要がある式と、その席の型。
+///
+/// 記憶へ書く値(struct のフィールド・enum の payload)、`??` の左辺、そして
+/// 値を2つ以上持つ等値の両辺。scalar だけの本体には1つも出てこない。
+///
+/// 書き込み先の席は**宣言された型**で数える。`int` を `int?` の区画へ入れる
+/// 暗黙の格上げがあるので、式そのものの型では足りない
+fn stash_sites(
+    layouts: &mut Layouts,
+    program: &hir::Program,
+    body: &hir::Body,
+) -> Vec<(hir::ExprId, Vec<ValType>)> {
+    let mut sites = Vec::new();
+    for (_, expr) in body.exprs() {
+        match &expr.kind {
+            hir::ExprKind::StructLit { fields, .. } => {
+                for (field, value) in fields {
+                    let ty = program.fields[*field].ty.clone();
+                    sites.push((*value, values_of(layouts, program, &ty)));
+                }
+            }
+            hir::ExprKind::AssignField { field, value, .. } => {
+                let ty = program.fields[*field].ty.clone();
+                sites.push((*value, values_of(layouts, program, &ty)));
+            }
+            hir::ExprKind::Call(hir::Call::Ctor { variant, args }) => {
+                for (position, value) in program.variants[*variant].payload.iter().zip(args) {
+                    let ty = position.ty.clone();
+                    sites.push((*value, values_of(layouts, program, &ty)));
+                }
+            }
+            hir::ExprKind::Coalesce { lhs, .. } => {
+                if let Some(ty) = body.expr(*lhs).result.ty().cloned() {
+                    sites.push((*lhs, values_of(layouts, program, &ty)));
+                }
+            }
+            hir::ExprKind::Eq { lhs, rhs } => {
+                let wide = [*lhs, *rhs].into_iter().any(|side| {
+                    body.expr(side)
+                        .result
+                        .ty()
+                        .is_some_and(|ty| values_of(layouts, program, ty).len() > 1)
+                });
+                if wide {
+                    for side in [*lhs, *rhs] {
+                        if let Some(ty) = body.expr(side).result.ty().cloned() {
+                            sites.push((side, values_of(layouts, program, &ty)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sites
 }
 
 /// 作業用の局所が要る式か。
@@ -461,10 +560,16 @@ fn needs_scratch(
         )
     };
     match &body.expr(id).kind {
-        // フィールドの差し替えは、器のアドレスを持ち回すので常に要る
-        hir::ExprKind::AssignField { .. } => true,
+        // 器のアドレスを持ち回す式。struct や enum が居ないと出てこない
+        hir::ExprKind::AssignField { .. }
+        | hir::ExprKind::Field {
+            optional: false, ..
+        }
+        | hir::ExprKind::Match { .. } => true,
         hir::ExprKind::AssignLocal { value, .. } => owned(layouts, *value),
         hir::ExprKind::Eq { lhs, rhs } => owned(layouts, *lhs) || owned(layouts, *rhs),
+        // `??` は左辺の optional を受け直してから枝を選ぶ
+        hir::ExprKind::Coalesce { lhs, .. } => owned(layouts, id) || owned(layouts, *lhs),
         _ => owned(layouts, id),
     }
 }
@@ -571,6 +676,13 @@ struct Emitter<'a> {
     out: Body,
 }
 
+/// `match` の arm 1つ。`pattern` が `None` なら catch-all
+struct Arm {
+    pattern: Option<(hir::VariantId, Vec<Option<hir::LocalId>>)>,
+    guard: Option<hir::ExprId>,
+    body: hir::ExprId,
+}
+
 /// `int` 1つ、`bool` 1つ。scalar の演算が要求する形
 const WANT_INT: &[ValType] = &[ValType::I64];
 const WANT_BOOL: &[ValType] = &[ValType::I32];
@@ -592,14 +704,80 @@ impl Emitter<'_> {
     }
 
     /// 式の列を下ろす。値になるのは最後の式だけで、途中の値は捨てる
-    fn sequence(&mut self, exprs: &[hir::ExprId], want: &[ValType]) {
+    fn sequence(&mut self, exprs: &[hir::ExprId], want: Option<&hir::Type>) {
         let Some((last, leading)) = exprs.split_last() else {
             return;
         };
         for expr in leading {
             self.expr(*expr, &[]);
         }
-        self.expr(*last, want);
+        self.value(*last, want);
+    }
+
+    /// その位置が求める**型**で値を1つ下ろす(tasks 6.1)。
+    ///
+    /// 型検査は `int` を `int?` の位置へそのまま通す。実行時表現は違うので、
+    /// 格上げが要るならここで tag を足して包む。それ以外は値の並びで下ろす
+    fn value(&mut self, id: hir::ExprId, want: Option<&hir::Type>) {
+        let Some(want) = want else {
+            self.expr(id, &[]);
+            return;
+        };
+        let produced = self.body().expr(id).result.ty().cloned();
+        if let Some(produced) = produced
+            && want.optional
+            && want.reference.is_none()
+            && !produced.optional
+        {
+            self.wrap_optional(id, want);
+            return;
+        }
+        let values = values_of(self.layouts, self.program, want);
+        self.expr(id, &values);
+    }
+
+    /// 中身の値を optional へ包む。
+    ///
+    /// Copy な optional は `[tag, ...payload]` を積むだけ。所有する optional は
+    /// 根を1つ確保して、tag と中身を置く
+    fn wrap_optional(&mut self, id: hir::ExprId, want: &hir::Type) {
+        let layout = self
+            .layouts
+            .plan(self.program, want)
+            .expect("対応検査を通った型は 32bit に収まる");
+        let payload = match self.layouts.get(layout).shape {
+            wasm_layout::Shape::Optional { payload } => payload,
+            ref other => unreachable!("optional ではない並びです: {other:?}"),
+        };
+        if self.layouts.get(layout).copy {
+            self.push(Instruction::I32Const(wasm_layout::OPTIONAL_PRESENT as i32));
+            let values = self.produced(id);
+            self.expr(id, &values);
+            return;
+        }
+        // 中身を先に作る。作業用の席は中身の下ろしが使い終えてから借りる
+        self.expr(id, &[ValType::I32]);
+        let scratch = self.scratch(id);
+        let (root, temporary) = (scratch, scratch + 1);
+        self.out.set(temporary);
+        wasm_data::alloc_root(&mut self.out, self.indices, self.layouts, layout);
+        self.out.set(root);
+        self.out
+            .get(root)
+            .num(wasm_layout::OPTIONAL_PRESENT)
+            .ins(Instruction::I32Store8(wasm_data::tag_byte()));
+        self.out.get(temporary);
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::relocate_into(
+            &mut self.out,
+            indices,
+            layouts,
+            payload.layout,
+            root,
+            payload.offset,
+            temporary,
+        );
+        self.out.get(root);
     }
 
     /// 式を「この結果で終わる」ように下ろす。
@@ -641,8 +819,8 @@ impl Emitter<'_> {
             hir::ExprKind::Let { local, value } => {
                 let (local, value) = (*local, *value);
                 let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
-                let want = self.local_want(local);
-                self.expr(value, &want);
+                let want = self.local_type(local);
+                self.value(value, want.as_ref());
                 // stack の上は並びの最後。奥から埋めるので逆順で受ける
                 for seat in seats.iter().rev() {
                     self.push(Instruction::LocalSet(*seat));
@@ -655,8 +833,8 @@ impl Emitter<'_> {
             hir::ExprKind::AssignLocal { local, value } => {
                 let (local, value) = (*local, *value);
                 let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
-                let want = self.local_want(local);
-                self.expr(value, &want);
+                let want = self.local_type(local);
+                self.value(value, want.as_ref());
                 match self.lowered.owned.get(&local).copied() {
                     // 新しい値が出来上がってから古い値を落とす。先に落とすと、
                     // 途中で trap したときに落ちた値をもう一度落としてしまう
@@ -703,8 +881,47 @@ impl Emitter<'_> {
             } => {
                 let (recv, field) = (*recv, *field);
                 let slot = self.slot_of(recv, field);
+                let address = self.scratch(id);
                 self.expr(recv, &[ValType::I32]);
-                self.read_slot(&slot);
+                self.out.set(address);
+                self.read_slot(&slot, address);
+            }
+
+            // payload を持たない enum はタグそのもの、payload を持つ enum は
+            // 根を1つ確保して tag を書く(tasks 6.1・6.2)
+            hir::ExprKind::Variant(variant) => {
+                let variant = *variant;
+                self.construct_variant(id, variant, &[]);
+            }
+
+            hir::ExprKind::Call(hir::Call::Ctor { variant, args }) => {
+                let (variant, args) = (*variant, args.clone());
+                self.construct_variant(id, variant, &args);
+            }
+
+            hir::ExprKind::Nil => self.nil(id),
+
+            hir::ExprKind::Coalesce { lhs, rhs } => {
+                let (lhs, rhs) = (*lhs, *rhs);
+                self.coalesce(id, lhs, rhs);
+            }
+
+            hir::ExprKind::Match { subject, arms } => {
+                let subject = *subject;
+                let arms: Vec<Arm> = arms
+                    .iter()
+                    .map(|arm| Arm {
+                        pattern: match &arm.pattern {
+                            hir::Pattern::Variant { variant, bindings } => {
+                                Some((*variant, bindings.clone()))
+                            }
+                            hir::Pattern::CatchAll => None,
+                        },
+                        guard: arm.guard,
+                        body: arm.body,
+                    })
+                    .collect();
+                self.match_expr(id, subject, &arms);
             }
 
             hir::ExprKind::AssignField { recv, field, value } => {
@@ -812,6 +1029,32 @@ impl Emitter<'_> {
                 if operand.is_empty() {
                     operand = self.produced(rhs);
                 }
+                // 値を2つ以上持つ Copy 値(optional)は席へ受け直して1つずつ。
+                // 空の optional は中身を 0 で埋めてあるので、tag が同じなら
+                // 中身の比較も素直に一致する(`nil` の下ろしを参照)
+                if operand.len() > 1 {
+                    self.expr(lhs, &operand);
+                    let left = self.stash(lhs);
+                    for seat in left.iter().rev() {
+                        self.out.set(*seat);
+                    }
+                    self.expr(rhs, &operand);
+                    let right = self.stash(rhs);
+                    for seat in right.iter().rev() {
+                        self.out.set(*seat);
+                    }
+                    for (index, value) in operand.iter().enumerate() {
+                        self.out.get(left[index]).get(right[index]);
+                        match value {
+                            ValType::I64 => self.push(Instruction::I64Eq),
+                            _ => self.push(Instruction::I32Eq),
+                        }
+                        if index > 0 {
+                            self.push(Instruction::I32And);
+                        }
+                    }
+                    return;
+                }
                 self.expr(lhs, &operand);
                 self.expr(rhs, &operand);
                 match operand.as_slice() {
@@ -826,9 +1069,10 @@ impl Emitter<'_> {
             // Wasm の `return` は関数の結果型ぶんを stack から返す。以降の式は
             // 到達しないので、下ろしても validator は多相な stack で受ける
             hir::ExprKind::Return(value) => {
-                let (value, results) = (*value, self.lowered.results.clone());
+                let value = *value;
                 if let Some(value) = value {
-                    self.expr(value, &results);
+                    let want = self.program.callables[self.lowered.callable].ret.clone();
+                    self.value(value, Some(&want));
                 }
                 self.cleanup(crate::ownership::Exit::Return(id));
                 self.push(Instruction::Return);
@@ -845,24 +1089,25 @@ impl Emitter<'_> {
 
             hir::ExprKind::Block(exprs) => {
                 let exprs = exprs.clone();
-                let want = self.produced(id);
-                self.sequence(&exprs, &want);
+                let want = self.body().expr(id).result.ty().cloned();
+                self.sequence(&exprs, want.as_ref());
             }
 
             hir::ExprKind::If { cond, then, orelse } => {
                 let (cond, then, orelse) = (*cond, *then, *orelse);
                 let want = self.produced(id);
+                let want_ty = self.body().expr(id).result.ty().cloned();
                 self.expr(cond, WANT_BOOL);
                 let block = self.block_type(&want);
                 self.push(Instruction::If(block));
-                self.expr(then, &want);
+                self.value(then, want_ty.as_ref());
                 self.cleanup(crate::ownership::Exit::Join {
                     branch: id,
                     taken: true,
                 });
                 if let Some(orelse) = orelse {
                     self.push(Instruction::Else);
-                    self.expr(orelse, &want);
+                    self.value(orelse, want_ty.as_ref());
                     self.cleanup(crate::ownership::Exit::Join {
                         branch: id,
                         taken: false,
@@ -891,10 +1136,12 @@ impl Emitter<'_> {
                 let (callable, args) = (*callable, args.clone());
                 let params: Vec<hir::LocalId> = self.program.callables[callable].params.clone();
                 for (arg, param) in args.iter().zip(params) {
-                    let program = self.program;
-                    let callee = &program.callables[callable].body;
-                    let want = local_values(self.layouts, program, callee, param);
-                    self.expr(*arg, &want);
+                    let want = self.program.callables[callable]
+                        .body
+                        .local(param)
+                        .ty
+                        .clone();
+                    self.value(*arg, want.as_ref());
                 }
                 let target = self.instance.calls[&id].target;
                 self.push(Instruction::Call(target.index() as u32));
@@ -922,6 +1169,14 @@ impl Emitter<'_> {
     fn owned_layout(&mut self, id: hir::ExprId) -> Option<LayoutId> {
         match self.kind_of(id) {
             Some(ReprKind::Owned(layout)) => Some(layout),
+            _ => None,
+        }
+    }
+
+    /// その式がアドレスで運ぶ並び。所有していても借りていても同じ形を指す
+    fn compound_layout(&mut self, id: hir::ExprId) -> Option<LayoutId> {
+        match self.kind_of(id) {
+            Some(ReprKind::Owned(layout) | ReprKind::Borrowed(layout)) => Some(layout),
             _ => None,
         }
     }
@@ -1030,21 +1285,96 @@ impl Emitter<'_> {
         }
     }
 
-    /// 器のアドレスを、その区画の値か場所へ置き換える。
+    /// 器のアドレスが入った局所から、その区画の値か場所を積む。
     ///
     /// Copy な区画は読み出し、直接置かれた所有の子はその場所、`indirect` の
     /// 子は指している根が答えになる
-    fn read_slot(&mut self, slot: &wasm_layout::Slot) {
+    fn read_slot(&mut self, slot: &wasm_layout::Slot, address: u32) {
         if slot.indirect {
-            self.out.offset(slot.offset).load();
+            self.out.get(address).offset(slot.offset).load();
             return;
         }
         if self.layouts.get(slot.layout).copy {
             let (layouts, layout, offset) = (&*self.layouts, slot.layout, slot.offset);
-            wasm_data::load_copy(&mut self.out, layouts, layout, offset);
+            wasm_data::load_copy(&mut self.out, layouts, layout, address, offset);
             return;
         }
-        self.out.offset(slot.offset);
+        self.out.get(address).offset(slot.offset);
+    }
+
+    /// enum の宣言順のタグ
+    fn variant_tag(&self, variant: hir::VariantId) -> u32 {
+        let owner = self.program.variants[variant].owner;
+        self.program.enums[owner]
+            .variants
+            .iter()
+            .position(|declared| *declared == variant)
+            .expect("宣言に無い variant") as u32
+    }
+
+    /// enum の値を1つ作る(tasks 6.1・6.2)。
+    ///
+    /// payload を持たない enum はタグそのもの。payload を持つ enum は根を確保し、
+    /// tag と**その variant の payload だけ**を初期化する
+    fn construct_variant(
+        &mut self,
+        id: hir::ExprId,
+        variant: hir::VariantId,
+        args: &[hir::ExprId],
+    ) {
+        let tag = self.variant_tag(variant);
+        let Some(layout) = self.owned_layout(id) else {
+            // payload をどの variant も持たない enum。Copy なタグ1つ
+            self.push(Instruction::I32Const(tag as i32));
+            return;
+        };
+        let slots = match &self.layouts.get(layout).shape {
+            wasm_layout::Shape::Enum { variants, .. } => variants[tag as usize].clone(),
+            other => unreachable!("enum ではない並びです: {other:?}"),
+        };
+        let scratch = self.scratch(id);
+        let (root, temporary) = (scratch, scratch + 1);
+        wasm_data::alloc_root(&mut self.out, self.indices, self.layouts, layout);
+        self.out.set(root);
+        self.out
+            .get(root)
+            .num(tag)
+            .ins(Instruction::I32Store(wasm_data::tag_word()));
+        let payload_types = self.program.variants[variant]
+            .payload
+            .iter()
+            .map(|position| position.ty.clone())
+            .collect::<Vec<_>>();
+        for ((slot, value), ty) in slots.iter().zip(args).zip(&payload_types) {
+            self.install_slot(slot, *value, ty, root, temporary);
+        }
+        self.out.get(root);
+    }
+
+    /// `nil`。Copy な optional はタグと 0 埋めの中身、所有する optional は
+    /// tag だけを書いた根1つ(tasks 6.2)
+    fn nil(&mut self, id: hir::ExprId) {
+        let Some(layout) = self.owned_layout(id) else {
+            // 中身が Copy なら平ら。空を表す 0 と、読まれない 0 埋めの中身。
+            // `??` と等値がこの 0 埋めを前提にする
+            let values = self.produced(id);
+            self.push(Instruction::I32Const(wasm_layout::OPTIONAL_EMPTY as i32));
+            for value in values.iter().skip(1) {
+                match value {
+                    ValType::I64 => self.push(Instruction::I64Const(0)),
+                    _ => self.push(Instruction::I32Const(0)),
+                }
+            }
+            return;
+        };
+        let root = self.scratch(id);
+        wasm_data::alloc_root(&mut self.out, self.indices, self.layouts, layout);
+        self.out.set(root);
+        self.out
+            .get(root)
+            .num(wasm_layout::OPTIONAL_EMPTY)
+            .ins(Instruction::I32Store8(wasm_data::tag_byte()));
+        self.out.get(root);
     }
 
     /// struct の値を1つ組み立てる(tasks 5.1)
@@ -1070,22 +1400,28 @@ impl Emitter<'_> {
                 wasm_layout::Shape::Struct { fields, .. } => fields[position],
                 other => unreachable!("struct ではない並びです: {other:?}"),
             };
-            self.install_slot(&slot, *value, root, temporary);
+            let declared = self.program.fields[*field].ty.clone();
+            self.install_slot(&slot, *value, &declared, root, temporary);
         }
         self.out.get(root);
     }
 
-    /// 評価した値を区画へ収める。所有の子は一時的な根から中身ごと移す
+    /// 評価した値を区画へ収める。所有の子は一時的な根から中身ごと移す。
+    ///
+    /// `declared` はその区画の宣言型。optional への格上げと、`indirect` の
+    /// `nil` をここで見分ける
     fn install_slot(
         &mut self,
         slot: &wasm_layout::Slot,
         value: hir::ExprId,
+        declared: &hir::Type,
         container: u32,
         temporary: u32,
     ) {
         if slot.indirect {
-            // `indirect` の子は独立した根のまま。アドレスだけを収める
-            self.expr(value, &[ValType::I32]);
+            // `indirect` の子は独立した根のまま。アドレスだけを収める。
+            // 0 は `nil`(design.md 決定3)
+            self.child_address(slot, value, temporary);
             self.out.set(temporary);
             self.out
                 .get(container)
@@ -1095,14 +1431,13 @@ impl Emitter<'_> {
             return;
         }
         if self.layouts.get(slot.layout).copy {
-            self.out.get(container);
-            let want = self.produced(value);
-            self.expr(value, &want);
+            self.value(value, Some(declared));
+            let stash = self.stash(value);
             let (layouts, layout, offset) = (&*self.layouts, slot.layout, slot.offset);
-            wasm_data::store_copy(&mut self.out, layouts, layout, offset);
+            wasm_data::store_copy(&mut self.out, layouts, layout, container, offset, &stash);
             return;
         }
-        self.expr(value, &[ValType::I32]);
+        self.value(value, Some(declared));
         let (indices, layouts) = (self.indices, &*self.layouts);
         wasm_data::relocate_into(
             &mut self.out,
@@ -1113,6 +1448,79 @@ impl Emitter<'_> {
             slot.offset,
             temporary,
         );
+    }
+
+    /// 平らな値を受け直す席。無ければ確保していないので、要る側だけが呼ぶ
+    fn stash(&self, id: hir::ExprId) -> Vec<u32> {
+        self.lowered.typed.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// `indirect` な区画へ収める子のアドレスを積む(0 は `nil`)。
+    ///
+    /// 所有権検査を通っている以上、ここへ来る値は一時値か `nil` しかない。
+    /// 場所をそのまま指せる形は無いので、包み直しは要らない
+    fn child_address(&mut self, slot: &wasm_layout::Slot, value: hir::ExprId, temporary: u32) {
+        let optional = self
+            .body()
+            .expr(value)
+            .result
+            .ty()
+            .is_some_and(|ty| ty.optional);
+        // ponytail: `nil` は毎回 optional の根を作ってすぐ捨てることになる。
+        // 再帰する形の底なので、ここだけ近道する
+        if matches!(self.body().expr(value).kind, hir::ExprKind::Nil) {
+            self.push(Instruction::I32Const(0));
+            return;
+        }
+        if !optional {
+            if self.layouts.get(slot.layout).copy {
+                // Copy な子も独立した割り当てに置く。glue がそう扱う
+                let values = self.produced(value);
+                self.expr(value, &values);
+                let stash = self.stash(value);
+                let (indices, layouts, layout) = (self.indices, &*self.layouts, slot.layout);
+                wasm_data::alloc_root(&mut self.out, indices, layouts, layout);
+                self.out.set(temporary);
+                wasm_data::store_copy(&mut self.out, layouts, layout, temporary, 0, &stash);
+                self.out.get(temporary);
+                return;
+            }
+            self.expr(value, &[ValType::I32]);
+            return;
+        }
+        // optional の根から中身を取り出して、空の帳簿だけを返す
+        self.expr(value, &[ValType::I32]);
+        let optional_layout = self
+            .owned_layout(value)
+            .expect("所有する optional は根を持つ");
+        let payload = match self.layouts.get(optional_layout).shape {
+            wasm_layout::Shape::Optional { payload } => payload,
+            ref other => unreachable!("optional ではない並びです: {other:?}"),
+        };
+        self.out.tee(temporary);
+        self.out.ins(Instruction::I32Load8U(wasm_data::tag_byte()));
+        self.out
+            .ins(Instruction::If(BlockType::Result(ValType::I32)));
+        let (indices, layouts) = (self.indices, &*self.layouts);
+        wasm_data::alloc_root(&mut self.out, indices, layouts, payload.layout);
+        self.out.set(self.lowered.common);
+        self.out.get(self.lowered.common);
+        self.out.get(temporary).offset(payload.offset);
+        self.out.num(layouts.extent(payload.layout).size);
+        self.out.ins(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+        self.out
+            .get(temporary)
+            .ins(Instruction::Call(self.indices.free));
+        self.out.get(self.lowered.common);
+        self.out.ins(Instruction::Else);
+        self.out
+            .get(temporary)
+            .ins(Instruction::Call(self.indices.free));
+        self.out.num(0);
+        self.out.ins(Instruction::End);
     }
 
     /// フィールドの差し替え。新しい値が出来てから古い中身を落とす(tasks 5.2)
@@ -1129,17 +1537,21 @@ impl Emitter<'_> {
         self.expr(recv, &[ValType::I32]);
         self.out.set(container);
 
+        let declared = self.program.fields[field].ty.clone();
         if self.layouts.get(slot.layout).copy && !slot.indirect {
-            self.out.get(container);
-            let want = self.produced(value);
-            self.expr(value, &want);
+            self.value(value, Some(&declared));
+            let stash = self.stash(value);
             let (layouts, layout, offset) = (&*self.layouts, slot.layout, slot.offset);
-            wasm_data::store_copy(&mut self.out, layouts, layout, offset);
+            wasm_data::store_copy(&mut self.out, layouts, layout, container, offset, &stash);
             return;
         }
 
         // 新しい値を先に作る。落としてから作ると、途中の trap で二度落ちる
-        self.expr(value, &[ValType::I32]);
+        if slot.indirect {
+            self.child_address(&slot, value, temporary);
+        } else {
+            self.value(value, Some(&declared));
+        }
         self.out.set(temporary);
         let (indices, layouts) = (self.indices, &*self.layouts);
         wasm_data::drop_slot(
@@ -1197,6 +1609,251 @@ impl Emitter<'_> {
             slot.offset,
             fresh,
         );
+    }
+
+    /// `lhs ?? rhs`(tasks 6.4)。
+    ///
+    /// 左辺が空のときだけ右辺が走る。結果は必ず**持ち主のこちらにある値**に
+    /// する。左辺を借りているだけの `??` は中身を複製するので、片方の経路だけ
+    /// 借用・もう片方だけ所有、という揺れが起きない
+    fn coalesce(&mut self, id: hir::ExprId, lhs: hir::ExprId, rhs: hir::ExprId) {
+        let result_ty = self.body().expr(id).result.ty().cloned();
+        let want = self.produced(id);
+        // Copy な optional は平ら。tag を席へ受け直してから枝を選ぶ
+        if !matches!(self.kind_of(lhs), Some(ReprKind::Owned(_))) {
+            let stash = self.stash(lhs);
+            let values = self.produced(lhs);
+            self.expr(lhs, &values);
+            for slot in stash.iter().rev() {
+                self.out.set(*slot);
+            }
+            self.out.get(stash[0]);
+            let block = self.block_type(&want);
+            self.push(Instruction::If(block));
+            for slot in stash.iter().skip(1) {
+                self.out.get(*slot);
+            }
+            self.push(Instruction::Else);
+            self.value(rhs, result_ty.as_ref());
+            self.push(Instruction::End);
+            return;
+        }
+
+        let optional = self
+            .owned_layout(lhs)
+            .expect("所有する optional は根を持つ");
+        let payload = match self.layouts.get(optional).shape {
+            wasm_layout::Shape::Optional { payload } => payload,
+            ref other => unreachable!("optional ではない並びです: {other:?}"),
+        };
+        let owning = self.temporary(lhs).is_some();
+        let scratch = self.scratch(id);
+        let (root, fresh) = (scratch, scratch + 1);
+
+        self.expr(lhs, &[ValType::I32]);
+        self.out.tee(root);
+        self.out.ins(Instruction::I32Load8U(wasm_data::tag_byte()));
+        let block = self.block_type(&want);
+        self.push(Instruction::If(block));
+        {
+            let (indices, layouts) = (self.indices, &*self.layouts);
+            wasm_data::alloc_root(&mut self.out, indices, layouts, payload.layout);
+            self.out.set(fresh);
+            if owning {
+                // 中身ごと引き取って、空になった帳簿を返す
+                self.out.get(fresh);
+                self.out.get(root).offset(payload.offset);
+                self.out.num(layouts.extent(payload.layout).size);
+                self.out.ins(Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+                self.out.get(root).ins(Instruction::Call(self.indices.free));
+            } else {
+                // 借りているだけなので写す。所有者は元のまま
+                self.out.get(root).offset(payload.offset);
+                self.out.get(fresh);
+                self.out
+                    .ins(Instruction::Call(self.indices.of(payload.layout).clone));
+            }
+            self.out.get(fresh);
+        }
+        self.push(Instruction::Else);
+        {
+            if owning {
+                // 空の帳簿。中身は無いので根だけ返す
+                self.out.get(root).ins(Instruction::Call(self.indices.free));
+            }
+            self.value(rhs, result_ty.as_ref());
+            // 右辺が場所なら、結果を持ち主のある値へ揃えるために複製する
+            if self.temporary(rhs).is_none()
+                && let Some(layout) = self.owned_layout(rhs)
+            {
+                let (indices, layouts) = (self.indices, &*self.layouts);
+                wasm_data::alloc_root(&mut self.out, indices, layouts, layout);
+                self.out.tee(fresh);
+                self.push(Instruction::Call(self.indices.of(layout).clone));
+                self.out.get(fresh);
+            }
+        }
+        self.push(Instruction::End);
+    }
+
+    /// `match`(tasks 6.5)。
+    ///
+    /// 対象は一度だけ評価して局所に置く。arm は宣言順に tag を試し、guard が
+    /// 偽なら次へ落ちる。消費する対象では、選ばれた arm が payload を独立させ、
+    /// 束ねなかった区画を落としてから器の根を返す
+    fn match_expr(&mut self, id: hir::ExprId, subject: hir::ExprId, arms: &[Arm]) {
+        let want = self.produced(id);
+        let result_ty = self.body().expr(id).result.ty().cloned();
+        let scratch = self.scratch(id);
+        let (subj, fresh, scan) = (scratch, scratch + 1, scratch + 2);
+
+        self.expr(subject, &[ValType::I32]);
+        self.out.set(subj);
+        // 対象が payload を持たない enum なら、値そのものがタグ
+        let flat = matches!(self.kind_of(subject), Some(ReprKind::Flat));
+        // 借りた対象も並びは要る。`match &mut l` の payload は器の中に居る
+        let subject_layout = self.compound_layout(subject);
+        // 所有を持ち込んだか、payload まで渡すのかは検査済みのアクセスが決める
+        let holds = self.temporary(subject).is_some();
+        let hands_over = matches!(
+            self.plan.access(subject).map(|access| access.mode),
+            Some(crate::ownership::Mode::Move)
+        );
+
+        let block = self.block_type(&want);
+        self.push(Instruction::Block(block));
+        for (index, arm) in arms.iter().enumerate() {
+            self.push(Instruction::Block(BlockType::Empty));
+            if let Some((variant, bindings)) = &arm.pattern {
+                let tag = self.variant_tag(*variant);
+                if flat {
+                    self.out.get(subj);
+                } else {
+                    self.out
+                        .get(subj)
+                        .ins(Instruction::I32Load(wasm_data::tag_word()));
+                }
+                self.out.num(tag).ins(Instruction::I32Ne);
+                self.push(Instruction::BrIf(0));
+                let slots = self.payload_slots(subject_layout, tag);
+                // guard は束縛を読めるので、まず借りた形で置く
+                for (position, bound) in bindings.iter().enumerate() {
+                    let Some(local) = bound else { continue };
+                    self.bind_payload(*local, &slots[position], subj);
+                }
+                if let Some(guard) = arm.guard {
+                    self.expr(guard, WANT_BOOL);
+                    self.push(Instruction::I32Eqz);
+                    self.push(Instruction::If(BlockType::Empty));
+                    self.cleanup(crate::ownership::Exit::MatchGuard { at: id, arm: index });
+                    self.push(Instruction::Br(1));
+                    self.push(Instruction::End);
+                }
+                if hands_over {
+                    self.hand_over_payloads(bindings, &slots, subj, fresh, scan);
+                }
+            } else if hands_over || holds {
+                // catch-all は中身を受け取らない。器はまだ全部持っている
+                if let Some(layout) = subject_layout
+                    && hands_over
+                {
+                    let (indices, glue) = (self.indices, self.indices.of(layout));
+                    wasm_data::drop_root(&mut self.out, indices, glue, subj);
+                }
+            }
+            self.value(arm.body, result_ty.as_ref());
+            self.cleanup(crate::ownership::Exit::MatchArm { at: id, arm: index });
+            self.push(Instruction::Br(1));
+            self.push(Instruction::End);
+        }
+        // どの arm も取らなかった。網羅していれば到達しないし、guard で全部
+        // 外れたときはインタプリタも実行時に失敗する
+        self.push(Instruction::Unreachable);
+        self.push(Instruction::End);
+
+        // 借りた形で回した一時値は、arm を抜けてから返す
+        if holds
+            && !hands_over
+            && let Some(layout) = subject_layout
+        {
+            let (indices, glue) = (self.indices, self.indices.of(layout));
+            wasm_data::drop_root(&mut self.out, indices, glue, subj);
+        }
+    }
+
+    /// その variant の payload 区画
+    fn payload_slots(&mut self, subject: Option<LayoutId>, tag: u32) -> Vec<wasm_layout::Slot> {
+        let Some(layout) = subject else {
+            return Vec::new();
+        };
+        match &self.layouts.get(layout).shape {
+            wasm_layout::Shape::Enum { variants, .. } => variants[tag as usize].clone(),
+            other => unreachable!("enum ではない並びです: {other:?}"),
+        }
+    }
+
+    /// payload を借りた形で束縛へ置く。所有はまだ器のまま
+    fn bind_payload(&mut self, local: hir::LocalId, slot: &wasm_layout::Slot, subj: u32) {
+        let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
+        if seats.is_empty() {
+            return;
+        }
+        self.read_slot(slot, subj);
+        for seat in seats.iter().rev() {
+            self.out.set(*seat);
+        }
+    }
+
+    /// 消費する `match` で、選ばれた arm へ payload の所有を渡す(tasks 6.5)。
+    ///
+    /// 束ねた区画は独立した根へ移し、束ねなかった区画は落とす。最後に器の根
+    /// だけを返す — 中身はもう器のものではないので glue は通さない
+    fn hand_over_payloads(
+        &mut self,
+        bindings: &[Option<hir::LocalId>],
+        slots: &[wasm_layout::Slot],
+        subj: u32,
+        fresh: u32,
+        scan: u32,
+    ) {
+        for (position, slot) in slots.iter().enumerate() {
+            let bound = bindings.get(position).copied().flatten();
+            let Some(local) = bound else {
+                // `_` で受けた区画は誰のものにもならないので落とす
+                let (indices, layouts) = (self.indices, &*self.layouts);
+                wasm_data::drop_slot(&mut self.out, indices, layouts, slot, subj, scan);
+                continue;
+            };
+            if self.layouts.get(slot.layout).copy && !slot.indirect {
+                // Copy は借りた形のまま値を持っている。移すものが無い
+                continue;
+            }
+            let seats = self.lowered.slots.get(&local).cloned().unwrap_or_default();
+            if slot.indirect {
+                // 既に子の根を指している。器の側を空にして所有を渡す
+                self.out.get(subj).offset(slot.offset).num(0).store();
+            } else {
+                self.out.get(subj);
+                let (indices, layouts) = (self.indices, &*self.layouts);
+                wasm_data::extract_root(
+                    &mut self.out,
+                    indices,
+                    layouts,
+                    slot.layout,
+                    subj,
+                    slot.offset,
+                    fresh,
+                );
+                self.out.set(seats[0]);
+            }
+            if let Some(flag) = self.lowered.flags.get(&local).copied() {
+                wasm_data::mark_initialized(&mut self.out, flag);
+            }
+        }
+        self.out.get(subj).ins(Instruction::Call(self.indices.free));
     }
 
     /// 射影を消費した直後の残余を出す。取り出した値は stack に載ったままだが、
@@ -1288,11 +1945,9 @@ impl Emitter<'_> {
         }
     }
 
-    /// 束縛が受ける値の並び
-    fn local_want(&mut self, local: hir::LocalId) -> Vec<ValType> {
-        let program = self.program;
-        let body = &program.callables[self.lowered.callable].body;
-        local_values(self.layouts, program, body, local)
+    /// 束縛の宣言型。読めない束縛(初期化子が発散した `let`)は `None`
+    fn local_type(&self, local: hir::LocalId) -> Option<hir::Type> {
+        self.body().local(local).ty.clone()
     }
 
     /// 値を1つも産まない・1つだけ産むブロックは即値で書ける。複数の値を
@@ -1387,8 +2042,8 @@ fn build(
             }
         }
         let root = program.callables[lowered.callable].body.root.clone();
-        let want = lowered.results.clone();
-        emitter.sequence(&root, &want);
+        let want = program.callables[lowered.callable].ret.clone();
+        emitter.sequence(&root, Some(&want));
         emitter.cleanup(crate::ownership::Exit::Fallthrough);
         // `finish` が関数の `end` を付ける
         code.function(&emitter.out.finish());
@@ -2545,6 +3200,533 @@ pub(crate) mod tests {
                 _ => {}
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // enum・optional・`??`・`match`(tasks 6.1〜6.6)
+    // -----------------------------------------------------------------------
+
+    /// payload を持たない enum はタグだけ。heap を使わない
+    #[test]
+    fn payloadのないenumはタグだけで回る() {
+        assert_eq!(
+            same_as_interpreter(
+                "enum Color { Red\n Green\n Blue }\n\
+                 fn rank(c: Color -> int) {\n\
+                 \x20 match c {\n\
+                 \x20   Color::Red: 1\n\
+                 \x20   Color::Green: 2\n\
+                 \x20   Color::Blue: 3\n\
+                 \x20 }\n\
+                 }\n\
+                 fn main(-> int) { rank(Color::Green) + rank(Color::Blue) }\n"
+            ),
+            5
+        );
+        // タグだけの enum を使うプログラムには allocator が載らない
+        let bytes = compile(
+            "enum Color { Red\n Green }\n\
+             fn main(-> int) {\n let c = Color::Red\n if c == Color::Red: 1 else: 0\n}\n",
+            &[],
+        )
+        .expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            if let wasmparser::Payload::MemorySection(_) = payload.expect("読めるはず") {
+                panic!("タグだけの enum にメモリが載っている");
+            }
+        }
+    }
+
+    /// Copy な optional は平らな値。`??` も等値も heap を使わない
+    #[test]
+    fn copyなoptionalは平らなまま扱える() {
+        for (init, expected) in [("5", 5), ("nil", 7)] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "fn main(-> int) {{\n let x: int? = {init}\n x ?? 7\n}}\n"
+                )),
+                expected,
+                "{init}"
+            );
+        }
+        // 等値は tag と中身の両方を見る
+        for (left, right, expected) in [
+            ("5", "5", 1),
+            ("5", "6", 0),
+            ("nil", "nil", 1),
+            ("5", "nil", 0),
+            ("nil", "5", 0),
+        ] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "fn main(-> int) {{\n\
+                     \x20 let a: int? = {left}\n\
+                     \x20 let b: int? = {right}\n\
+                     \x20 if a == b: 1 else: 0\n\
+                     }}\n"
+                )),
+                expected,
+                "{left} == {right}"
+            );
+        }
+    }
+
+    /// 所有する optional は `{tag, 中身}` の根1つ。借りた `??` は元を残す
+    #[test]
+    fn 所有するoptionalは借りても消費しても取り出せる() {
+        for (init, expected) in [("\"a\"", 1), ("nil", 0)] {
+            // 借りた `??`。元の束縛はそのまま生きている
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "fn main(-> int) {{\n\
+                     \x20 let s: str? = {init}\n\
+                     \x20 let first = if (s ?? \"d\") == \"a\": 1 else: 0\n\
+                     \x20 let second = if (s ?? \"d\") == \"a\": 1 else: 0\n\
+                     \x20 first * second\n\
+                     }}\n"
+                )),
+                expected,
+                "借用 {init}"
+            );
+            // 消費する `??`。中身の所有がそのまま渡る
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "fn take(s: str -> int) {{ if s == \"a\": 1 else: 0 }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let s: str? = {init}\n\
+                     \x20 take(move s ?? \"d\")\n\
+                     }}\n"
+                )),
+                expected,
+                "消費 {init}"
+            );
+        }
+    }
+
+    /// 活きていない payload には触らない。
+    ///
+    /// `Nil` の側には中身が無いので、そこを読んだり落としたりすれば壊れる
+    #[test]
+    fn 活きていないpayloadは読まれも落とされもしない() {
+        assert_eq!(
+            same_as_interpreter(
+                "enum L { N\n C(str) }\n\
+                 fn label(v: L -> int) {\n\
+                 \x20 match v {\n\
+                 \x20   L::C(t): if t == \"a\": 1 else: 2\n\
+                 \x20   L::N: 0\n\
+                 \x20 }\n\
+                 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let empty = L::N\n\
+                 \x20 let full = L::C(\"a\")\n\
+                 \x20 label(move empty) * 10 + label(move full)\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// guard は宣言順に試され、外れたら次の arm へ落ちる
+    #[test]
+    fn guardは宣言順に試される() {
+        for (value, expected) in [(1, 10), (2, 99), (9, 99)] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "enum L {{ N\n C(int) }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let v = L::C({value})\n\
+                     \x20 match v {{\n\
+                     \x20   L::C(n) if n == 1: 10\n\
+                     \x20   L::N: 30\n\
+                     \x20   _: 99\n\
+                     \x20 }}\n\
+                     }}\n"
+                )),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    /// guard が外れた arm の束縛も、そこで落ちる
+    #[test]
+    fn guardが外れたarmの束縛も落ちる() {
+        let src = "enum L { N\n C(str) }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 2000) == false {\n\
+                   \x20   let v = L::C(\"guarded\")\n\
+                   \x20   n = n + match move v {\n\
+                   \x20     L::C(t) if t == \"other\": 0\n\
+                   \x20     _: 1\n\
+                   \x20   }\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![2000]));
+    }
+
+    /// 借りた payload は元の値を消費しない。何度でも見られる
+    #[test]
+    fn 借りたpayloadは対象を残す() {
+        assert_eq!(
+            same_as_interpreter(
+                "enum L { N\n C(str) }\n\
+                 fn main(-> int) {\n\
+                 \x20 let v = L::C(\"a\")\n\
+                 \x20 let first = match v {\n\
+                 \x20   L::C(t): if t == \"a\": 1 else: 0\n\
+                 \x20   L::N: 0\n\
+                 \x20 }\n\
+                 \x20 let second = match v {\n\
+                 \x20   L::C(t): if t == \"a\": 1 else: 0\n\
+                 \x20   L::N: 0\n\
+                 \x20 }\n\
+                 \x20 first + second\n\
+                 }\n"
+            ),
+            2
+        );
+    }
+
+    /// 一時値を借りた形で `match` しても、arm を抜けたところで落ちる
+    #[test]
+    fn 一時値を対象にしたmatchも掃除される() {
+        let src = "enum L { N\n C(str) }\n\
+                   fn make(-> L) { L::C(\"made\") }\n\
+                   fn scored(b: bool -> int) { if b: 1 else: 0 }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 2000) == false {\n\
+                   \x20   n = n + match make() {\n\
+                   \x20     L::C(t): scored(t == \"made\")\n\
+                   \x20     L::N: 0\n\
+                   \x20   }\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![2000]));
+    }
+
+    /// Copy な optional は struct の区画にも直に置ける
+    #[test]
+    fn copyなoptionalはstructの区画にも置ける() {
+        for (init, expected) in [("5", 5), ("nil", 7)] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "struct Row {{ id: int, mark: int? }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let mut r = Row {{ id = 1, mark = {init} }}\n\
+                     \x20 let first = r.mark ?? 7\n\
+                     \x20 r.mark = 9\n\
+                     \x20 first * 100 + (r.mark ?? 0)\n\
+                     }}\n"
+                )),
+                expected * 100 + 9,
+                "{init}"
+            );
+        }
+        // 区画に置いた optional も、等値は tag と中身の両方を見る
+        for (left, right, expected) in [("5", "5", 1), ("5", "nil", 0), ("nil", "nil", 1)] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "struct Row {{ mark: int? }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let a = Row {{ mark = {left} }}\n\
+                     \x20 let b = Row {{ mark = {right} }}\n\
+                     \x20 if a == b: 1 else: 0\n\
+                     }}\n"
+                )),
+                expected,
+                "{left} == {right}"
+            );
+        }
+    }
+
+    /// 消費する `match` は payload の所有を arm へ渡し、束ねなかった区画を落とす
+    #[test]
+    fn 消費するmatchはpayloadの所有を渡す() {
+        assert_eq!(
+            same_as_interpreter(
+                "enum L { N\n C(str, str) }\n\
+                 fn take(s: str -> int) { if s == \"kept\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let v = L::C(\"kept\", \"dropped\")\n\
+                 \x20 match move v {\n\
+                 \x20   L::C(kept, _): take(move kept)\n\
+                 \x20   L::N: 0\n\
+                 \x20 }\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// enum も optional も、深い複製は元と記憶を共有しない
+    #[test]
+    fn enumとoptionalのcloneは独立する() {
+        assert_eq!(
+            same_as_interpreter(
+                "enum L { N\n C(str) }\n\
+                 fn main(-> int) {\n\
+                 \x20 let a = L::C(\"same\")\n\
+                 \x20 let b = a.clone()\n\
+                 \x20 if a == b: 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let a: str? = \"same\"\n\
+                 \x20 let b = a.clone()\n\
+                 \x20 if a == b: 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// 等値は tag を先に見る。同じ tag のときだけ中身へ潜る
+    #[test]
+    fn enumとoptionalの等値はタグから決まる() {
+        for (left, right, expected) in [
+            ("L::C(\"a\")", "L::C(\"a\")", 1),
+            ("L::C(\"a\")", "L::C(\"b\")", 0),
+            ("L::N", "L::N", 1),
+            ("L::N", "L::C(\"a\")", 0),
+        ] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "enum L {{ N\n C(str) }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let a = {left}\n\
+                     \x20 let b = {right}\n\
+                     \x20 if a == b: 1 else: 0\n\
+                     }}\n"
+                )),
+                expected,
+                "{left} == {right}"
+            );
+        }
+        for (left, right, expected) in [
+            ("\"a\"", "\"a\"", 1),
+            ("\"a\"", "\"b\"", 0),
+            ("nil", "nil", 1),
+            ("nil", "\"a\"", 0),
+        ] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "fn main(-> int) {{\n\
+                     \x20 let a: str? = {left}\n\
+                     \x20 let b: str? = {right}\n\
+                     \x20 if a == b: 1 else: 0\n\
+                     }}\n"
+                )),
+                expected,
+                "optional {left} == {right}"
+            );
+        }
+    }
+
+    /// `indirect` な payload は再帰する形を作る。鎖を辿っても根の大きさは一定
+    #[test]
+    fn 再帰するenumを辿れる() {
+        assert_eq!(
+            same_as_interpreter(
+                "enum List { Nil\n Cons(int, indirect List) }\n\
+                 fn total(l: List -> int) {\n\
+                 \x20 match move l {\n\
+                 \x20   List::Cons(head, rest): head + total(move rest)\n\
+                 \x20   List::Nil: 0\n\
+                 \x20 }\n\
+                 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let l = List::Cons(1, List::Cons(2, List::Cons(3, List::Nil)))\n\
+                 \x20 total(move l)\n\
+                 }\n"
+            ),
+            6
+        );
+        // 深く複製しても、元と複製は別々に生き死にする
+        assert_eq!(
+            same_as_interpreter(
+                "enum List { Nil\n Cons(int, indirect List) }\n\
+                 fn main(-> int) {\n\
+                 \x20 let l = List::Cons(1, List::Cons(2, List::Nil))\n\
+                 \x20 let copy = l.clone()\n\
+                 \x20 if l == copy: 1 else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// `indirect next: Node?` の鎖も組める。`nil` は割り当てを作らない
+    #[test]
+    fn indirectなoptionalの鎖を組める() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Node { value: int, indirect next: Node? }\n\
+                 fn main(-> int) {\n\
+                 \x20 let tail = Node { value = 3, next = nil }\n\
+                 \x20 let mid = Node { value = 2, next = move tail }\n\
+                 \x20 let head = Node { value = 1, next = move mid }\n\
+                 \x20 let same = head.clone()\n\
+                 \x20 if head == same: head.value else: 0\n\
+                 }\n"
+            ),
+            1
+        );
+    }
+
+    /// enum も optional も、有界なループなら記憶を使い回す
+    #[test]
+    fn enumとoptionalのループは記憶を使い回す() {
+        for src in [
+            // 消費する match
+            "enum L { N\n C(str) }\n\
+             fn take(s: str -> int) { if s == \"looped\": 1 else: 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 2000) == false {\n\
+             \x20   let v = L::C(\"looped\")\n\
+             \x20   n = n + match move v {\n\
+             \x20     L::C(t): take(move t)\n\
+             \x20     L::N: 0\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+            // 借りた match。対象は毎周回で落ちる
+            "enum L { N\n C(str) }\n\
+             fn scored(b: bool -> int) { if b: 1 else: 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 2000) == false {\n\
+             \x20   let v = L::C(\"looped\")\n\
+             \x20   n = n + match v {\n\
+             \x20     L::C(t): scored(t == \"looped\")\n\
+             \x20     L::N: 0\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+            // 借りた `??` と消費する `??`
+            "fn scored(b: bool -> int) { if b: 1 else: 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 2000) == false {\n\
+             \x20   let s: str? = \"looped\"\n\
+             \x20   n = n + scored((s ?? \"d\") == \"looped\")\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+            "fn take(s: str -> int) { if s == \"looped\": 1 else: 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 2000) == false {\n\
+             \x20   let s: str? = \"looped\"\n\
+             \x20   n = n + take(move s ?? \"d\")\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+            // 再帰する enum を作って捨てる
+            "enum List { Nil\n Cons(str, indirect List) }\n\
+             fn scored(b: bool -> int) { if b: 1 else: 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut n = 0\n\
+             \x20 while (n == 500) == false {\n\
+             \x20   let l = List::Cons(\"a\", List::Cons(\"b\", List::Nil))\n\
+             \x20   let copy = l.clone()\n\
+             \x20   n = n + scored(l == copy)\n\
+             \x20 }\n\
+             \x20 n\n\
+             }\n",
+        ] {
+            let bytes = compile(src, &[]).expect("生成できるはず");
+            validate(&bytes).expect("検証を通るはず");
+            let expected = if src.contains("500") { 500 } else { 2000 };
+            assert_eq!(
+                invoke_capped(&bytes, ENTRY_EXPORT, 1),
+                Ok(vec![expected]),
+                "{src}"
+            );
+        }
+    }
+
+    /// 排他で束ねた payload は、対象の中身をその場で書き換えられる。
+    ///
+    /// 借用は署名に出せないので、書き換えは arm の中で直に行う
+    #[test]
+    fn 排他のmatchはpayloadを書き換える() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { rank: int }\n\
+                 enum Lookup { Missing\n Found(User) }\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut l = Lookup::Found(User { rank = 1 })\n\
+                 \x20 let first = match &mut l {\n\
+                 \x20   Lookup::Found(u) { u.rank = u.rank + 1\n u.rank }\n\
+                 \x20   Lookup::Missing: 0\n\
+                 \x20 }\n\
+                 \x20 let second = match &mut l {\n\
+                 \x20   Lookup::Found(u) { u.rank = u.rank + 1\n u.rank }\n\
+                 \x20   Lookup::Missing: 0\n\
+                 \x20 }\n\
+                 \x20 first * 10 + second\n\
+                 }\n"
+            ),
+            23
+        );
+    }
+
+    /// catch-all の arm は、名指ししなかった variant を全部受ける
+    #[test]
+    fn catch_allのarmが残りを受ける() {
+        for (value, expected) in [("A", 1), ("B", 9), ("C", 9)] {
+            assert_eq!(
+                same_as_interpreter(&format!(
+                    "enum Kind {{ A\n B\n C }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let k = Kind::{value}\n\
+                     \x20 match k {{\n\
+                     \x20   Kind::A: 1\n\
+                     \x20   _: 9\n\
+                     \x20 }}\n\
+                     }}\n"
+                )),
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    /// `indirect` な optional を**読む**形はまだ扱えない。黙って壊れず止まる
+    #[test]
+    fn indirectなoptionalの参照はビルドを止める() {
+        let errors = compile(
+            "struct Node { value: int, indirect next: Node? }\n\
+             fn main(-> int) {\n\
+             \x20 let head = Node { value = 1, next = nil }\n\
+             \x20 let peeked = head.next\n\
+             \x20 1\n\
+             }\n",
+            &[],
+        )
+        .expect_err("止まるはず");
+        assert!(
+            messages(&errors).contains("`indirect` な optional フィールド `next` の参照"),
+            "{}",
+            messages(&errors)
+        );
     }
 
     /// メタデータを知らないエンジンでも検証・実行できる

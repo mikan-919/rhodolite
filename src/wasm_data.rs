@@ -12,7 +12,8 @@
 //! 割り当てと解放は `wasm_runtime`、記憶の並びは `wasm_layout` が決める。
 
 use crate::wasm_layout::{
-    BUFFER_CAPACITY, BUFFER_DATA, BUFFER_LEN, BUFFER_SIZE, LayoutId, Layouts, Shape, Slot,
+    BUFFER_CAPACITY, BUFFER_DATA, BUFFER_LEN, BUFFER_SIZE, LayoutId, Layouts, OPTIONAL_PRESENT,
+    Shape, Slot,
 };
 use crate::wasm_runtime::{Body, Helper};
 use std::collections::BTreeMap;
@@ -89,44 +90,178 @@ fn byte(offset: u32) -> MemArg {
     }
 }
 
+fn wide(offset: u32) -> MemArg {
+    MemArg {
+        offset: u64::from(offset),
+        align: 3,
+        memory_index: 0,
+    }
+}
+
 /// 式1つが使える作業用の局所の数。入れ子になっても踏まないよう、要る式ごとに
 /// 別の区画を配る
 pub const SCRATCH: u32 = 3;
 
-// ---------------------------------------------------------------------------
-// Copy な値の読み書き(tasks 3.3)
-// ---------------------------------------------------------------------------
+/// enum と optional の tag はどちらも先頭に置く
+pub const TAG: u32 = 0;
 
-/// Copy な並びを記憶から読む。stack のアドレスを、平らな値の並びへ置き換える
-pub fn load_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, offset: u32) {
-    match &layouts.get(layout).shape {
-        // 値を持たないので、アドレスも要らない
-        Shape::Unit => b.ins(Instruction::Drop),
-        Shape::Bool => b.ins(Instruction::I32Load8U(byte(offset))),
-        Shape::Tag(_) => b.ins(Instruction::I32Load(word(offset))),
-        Shape::Int => b.ins(Instruction::I64Load(MemArg {
-            offset: u64::from(offset),
-            align: 3,
-            memory_index: 0,
-        })),
-        other => unreachable!("Copy ではない並びを読もうとしました: {other:?}"),
-    };
+/// optional の tag は 1 byte、enum の tag は 4 byte
+pub fn tag_byte() -> MemArg {
+    byte(TAG)
 }
 
-/// Copy な並びを記憶へ書く。アドレスと値をこの順に積んでおくこと
-pub fn store_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, offset: u32) {
+pub fn tag_word() -> MemArg {
+    word(TAG)
+}
+
+// ---------------------------------------------------------------------------
+// Copy な値の読み書き(tasks 3.3・6.1)
+// ---------------------------------------------------------------------------
+
+/// Copy な並びを記憶から読んで、平らな値の並びを積む。
+///
+/// Copy な optional は `[tag, ...payload]` の順(design.md 決定2)。器の
+/// アドレスは何度も要るので局所から取る
+pub fn load_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, address: u32, offset: u32) {
     match &layouts.get(layout).shape {
-        // アドレスだけが積まれている。書くものが無いので落とす
-        Shape::Unit => b.ins(Instruction::Drop),
-        Shape::Bool => b.ins(Instruction::I32Store8(byte(offset))),
-        Shape::Tag(_) => b.ins(Instruction::I32Store(word(offset))),
-        Shape::Int => b.ins(Instruction::I64Store(MemArg {
-            offset: u64::from(offset),
-            align: 3,
-            memory_index: 0,
-        })),
+        // 値を持たない
+        Shape::Unit => {}
+        Shape::Bool => {
+            b.get(address).ins(Instruction::I32Load8U(byte(offset)));
+        }
+        Shape::Tag(_) => {
+            b.get(address).ins(Instruction::I32Load(word(offset)));
+        }
+        Shape::Int => {
+            b.get(address).ins(Instruction::I64Load(wide(offset)));
+        }
+        Shape::Optional { payload } => {
+            let payload = *payload;
+            b.get(address).ins(Instruction::I32Load8U(byte(offset)));
+            load_copy(b, layouts, payload.layout, address, offset + payload.offset);
+        }
+        other => unreachable!("Copy ではない並びを読もうとしました: {other:?}"),
+    }
+}
+
+/// 平らな値の並びを記憶へ書く。
+///
+/// `stash` はその並びと同じ型の局所。stack の上から順に受けてから書くので、
+/// 器のアドレスと値の順を気にしなくてよい
+pub fn store_copy(
+    b: &mut Body,
+    layouts: &Layouts,
+    layout: LayoutId,
+    address: u32,
+    offset: u32,
+    stash: &[u32],
+) {
+    for slot in stash.iter().rev() {
+        b.set(*slot);
+    }
+    store_stashed(b, layouts, layout, address, offset, stash);
+}
+
+fn store_stashed(
+    b: &mut Body,
+    layouts: &Layouts,
+    layout: LayoutId,
+    address: u32,
+    offset: u32,
+    stash: &[u32],
+) {
+    match &layouts.get(layout).shape {
+        Shape::Unit => {}
+        Shape::Bool => {
+            b.get(address)
+                .get(stash[0])
+                .ins(Instruction::I32Store8(byte(offset)));
+        }
+        Shape::Tag(_) => {
+            b.get(address)
+                .get(stash[0])
+                .ins(Instruction::I32Store(word(offset)));
+        }
+        Shape::Int => {
+            b.get(address)
+                .get(stash[0])
+                .ins(Instruction::I64Store(wide(offset)));
+        }
+        Shape::Optional { payload } => {
+            let payload = *payload;
+            b.get(address)
+                .get(stash[0])
+                .ins(Instruction::I32Store8(byte(offset)));
+            store_stashed(
+                b,
+                layouts,
+                payload.layout,
+                address,
+                offset + payload.offset,
+                &stash[1..],
+            );
+        }
         other => unreachable!("Copy ではない並びを書こうとしました: {other:?}"),
-    };
+    }
+}
+
+/// Copy な区画2つを記憶の上で比べて、結果を `i32` で残す。
+///
+/// optional は tag を先に見て、両方 present のときだけ中身へ潜る
+pub fn equal_copy(
+    b: &mut Body,
+    layouts: &Layouts,
+    layout: LayoutId,
+    left: u32,
+    right: u32,
+    offset: u32,
+) {
+    match &layouts.get(layout).shape {
+        // 値を持たないので常に等しい
+        Shape::Unit => {
+            b.num(1);
+        }
+        Shape::Bool => {
+            b.get(left).ins(Instruction::I32Load8U(byte(offset)));
+            b.get(right).ins(Instruction::I32Load8U(byte(offset)));
+            b.ins(Instruction::I32Eq);
+        }
+        Shape::Tag(_) => {
+            b.get(left).ins(Instruction::I32Load(word(offset)));
+            b.get(right).ins(Instruction::I32Load(word(offset)));
+            b.ins(Instruction::I32Eq);
+        }
+        Shape::Int => {
+            b.get(left).ins(Instruction::I64Load(wide(offset)));
+            b.get(right).ins(Instruction::I64Load(wide(offset)));
+            b.ins(Instruction::I64Eq);
+        }
+        Shape::Optional { payload } => {
+            let payload = *payload;
+            b.get(left).ins(Instruction::I32Load8U(byte(offset)));
+            b.get(right).ins(Instruction::I32Load8U(byte(offset)));
+            b.ins(Instruction::I32Eq);
+            b.ins(Instruction::If(BlockType::Result(ValType::I32)));
+            // tag は同じ。present なら中身も比べる
+            b.get(left).ins(Instruction::I32Load8U(byte(offset)));
+            b.ins(Instruction::If(BlockType::Result(ValType::I32)));
+            equal_copy(
+                b,
+                layouts,
+                payload.layout,
+                left,
+                right,
+                offset + payload.offset,
+            );
+            b.ins(Instruction::Else);
+            b.num(1);
+            b.ins(Instruction::End);
+            b.ins(Instruction::Else);
+            b.num(0);
+            b.ins(Instruction::End);
+        }
+        other => unreachable!("Copy ではない並びを比べようとしました: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +326,10 @@ pub fn relocate_into(
     b.get(temporary).ins(Instruction::Call(indices.free));
 }
 
-/// 器の中の区画を、独立した根へ取り出す(tasks 5.4)。
+/// 器の中の区画を、独立した根へ取り出す(tasks 5.4・6.5)。
 ///
-/// 直接置かれたフィールドを消費するときに使う。器そのものの後始末は、計画が
-/// 出した残余の破棄が受け持つ
+/// 直接置かれたフィールドや enum の payload を消費するときに使う。器そのものの
+/// 後始末は呼ぶ側が受け持つ
 pub fn extract_root(
     b: &mut Body,
     indices: &Indices,
@@ -291,10 +426,32 @@ pub fn glue_functions(layouts: &Layouts, indices: &Indices) -> Vec<Helper> {
         let (drop, clone, eq) = match &layout.shape {
             Shape::Str => (str_drop(indices), str_clone(indices), str_eq()),
             Shape::Struct { fields, .. } => (
-                compound_drop(indices, layouts, fields),
-                compound_clone(indices, layouts, id, fields),
-                compound_eq(indices, layouts, fields),
+                struct_drop(indices, layouts, fields),
+                struct_clone(indices, layouts, id, fields),
+                struct_eq(indices, layouts, fields),
             ),
+            // optional は tag が 1 のときだけ中身を持つ。`{u8 tag, 詰め物, payload}`
+            // の payload は非 Copy(Copy なら optional 全体が Copy になる)
+            Shape::Optional { payload } => {
+                let slots = std::slice::from_ref(payload);
+                (
+                    tagged_drop(indices, layouts, &[(OPTIONAL_PRESENT, slots)], true),
+                    tagged_clone(indices, layouts, id, &[(OPTIONAL_PRESENT, slots)], true),
+                    tagged_eq(indices, layouts, &[(OPTIONAL_PRESENT, slots)], true),
+                )
+            }
+            Shape::Enum { variants, .. } => {
+                let arms: Vec<(u32, &[Slot])> = variants
+                    .iter()
+                    .enumerate()
+                    .map(|(index, slots)| (index as u32, slots.as_slice()))
+                    .collect();
+                (
+                    tagged_drop(indices, layouts, &arms, false),
+                    tagged_clone(indices, layouts, id, &arms, false),
+                    tagged_eq(indices, layouts, &arms, false),
+                )
+            }
             // 対応検査が先に止めるので、ここへ来たら検査の抜け
             other => unreachable!("glue を出せない並びです: {other:?} ({id:?})"),
         };
@@ -314,6 +471,15 @@ fn one(params: Vec<ValType>, results: Vec<ValType>, body: Function) -> Helper {
         params,
         results,
         body,
+    }
+}
+
+/// tag をその場所から読む。optional は 1 byte、enum は 4 byte
+fn load_tag(b: &mut Body, address: u32, narrow: bool) {
+    if narrow {
+        b.get(address).ins(Instruction::I32Load8U(byte(TAG)));
+    } else {
+        b.get(address).ins(Instruction::I32Load(word(TAG)));
     }
 }
 
@@ -391,17 +557,28 @@ fn str_eq() -> Function {
 }
 
 /// 直接置かれた子は中身だけ、`indirect` の子は根ごと落とす
-fn compound_drop(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
+fn struct_drop(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
     // 1: 子のアドレス
     let mut b = Body::new(1);
-    for slot in slots {
-        drop_slot(&mut b, indices, layouts, slot, 0, 1);
-    }
+    drop_slots(&mut b, indices, layouts, slots, 0, 1);
     b.finish()
 }
 
+fn drop_slots(
+    b: &mut Body,
+    indices: &Indices,
+    layouts: &Layouts,
+    slots: &[Slot],
+    container: u32,
+    scratch: u32,
+) {
+    for slot in slots {
+        drop_slot(b, indices, layouts, slot, container, scratch);
+    }
+}
+
 /// まず浅く写してから、所有している子だけを作り直して上書きする
-fn compound_clone(
+fn struct_clone(
     indices: &Indices,
     layouts: &Layouts,
     layout: LayoutId,
@@ -409,34 +586,51 @@ fn compound_clone(
 ) -> Function {
     // 2: 元の子, 3: 新しい子
     let mut b = Body::new(2);
-    b.get(1).get(0).num(layouts.extent(layout).size);
+    shallow_copy(&mut b, layouts, layout, 0, 1);
+    clone_slots(&mut b, indices, layouts, slots, 0, 1, 2, 3);
+    b.finish()
+}
+
+/// `src` の中身を `dst` へそのまま写す。tag も詰め物も含めて丸ごと
+fn shallow_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, src: u32, dst: u32) {
+    b.get(dst).get(src).num(layouts.extent(layout).size);
     b.ins(Instruction::MemoryCopy {
         src_mem: 0,
         dst_mem: 0,
     });
+}
 
+fn clone_slots(
+    b: &mut Body,
+    indices: &Indices,
+    layouts: &Layouts,
+    slots: &[Slot],
+    src: u32,
+    dst: u32,
+    old: u32,
+    new: u32,
+) {
     for slot in slots {
         let child = layouts.get(slot.layout);
         if slot.indirect {
-            b.get(0).offset(slot.offset).load().tee(2);
+            b.get(src).offset(slot.offset).load().tee(old);
             b.ins(Instruction::If(BlockType::Empty));
-            b.num(layouts.extent(slot.layout).size)
-                .ins(Instruction::Call(indices.alloc))
-                .set(3);
+            alloc_root(b, indices, layouts, slot.layout);
+            b.set(new);
             if child.copy {
-                b.get(3).get(2).num(layouts.extent(slot.layout).size);
+                b.get(new).get(old).num(layouts.extent(slot.layout).size);
                 b.ins(Instruction::MemoryCopy {
                     src_mem: 0,
                     dst_mem: 0,
                 });
             } else {
-                b.get(2)
-                    .get(3)
+                b.get(old)
+                    .get(new)
                     .ins(Instruction::Call(indices.of(slot.layout).clone));
             }
-            b.get(1)
+            b.get(dst)
                 .offset(slot.offset)
-                .get(3)
+                .get(new)
                 .ins(Instruction::I32Store(word(0)));
             b.ins(Instruction::End);
             continue;
@@ -445,40 +639,51 @@ fn compound_clone(
         if child.copy {
             continue;
         }
-        b.get(0).offset(slot.offset);
-        b.get(1).offset(slot.offset);
+        b.get(src).offset(slot.offset);
+        b.get(dst).offset(slot.offset);
         b.ins(Instruction::Call(indices.of(slot.layout).clone));
     }
-    b.finish()
 }
 
 /// 宣言順に比べて、違いを見つけたところで打ち切る
-fn compound_eq(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
+fn struct_eq(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
     // 2: 左の子, 3: 右の子
     let mut b = Body::new(2);
+    eq_slots(&mut b, indices, layouts, slots, 0, 1, 2, 3);
+    b.num(1);
+    b.finish()
+}
+
+/// 区画を順に比べ、違えばその場で `0` を返す
+fn eq_slots(
+    b: &mut Body,
+    indices: &Indices,
+    layouts: &Layouts,
+    slots: &[Slot],
+    left: u32,
+    right: u32,
+    a: u32,
+    c: u32,
+) {
     for slot in slots {
         let child = layouts.get(slot.layout);
         if slot.indirect {
-            b.get(0).offset(slot.offset).load().set(2);
-            b.get(1).offset(slot.offset).load().set(3);
-            // 片方だけが `nil` なら違う。両方 `nil` なら次のフィールドへ
-            b.get(2).ins(Instruction::I32Eqz);
-            b.get(3).ins(Instruction::I32Eqz);
+            b.get(left).offset(slot.offset).load().set(a);
+            b.get(right).offset(slot.offset).load().set(c);
+            // 片方だけが `nil` なら違う。両方 `nil` なら次の区画へ
+            b.get(a).ins(Instruction::I32Eqz);
+            b.get(c).ins(Instruction::I32Eqz);
             b.ins(Instruction::I32Ne);
             b.ins(Instruction::If(BlockType::Empty));
             b.num(0).ins(Instruction::Return);
             b.ins(Instruction::End);
-            b.get(2);
+            b.get(a);
             b.ins(Instruction::If(BlockType::Empty));
             if child.copy {
-                b.get(2);
-                load_copy(&mut b, layouts, slot.layout, 0);
-                b.get(3);
-                load_copy(&mut b, layouts, slot.layout, 0);
-                equal_flat(&mut b, layouts, slot.layout);
+                equal_copy(b, layouts, slot.layout, a, c, 0);
             } else {
-                b.get(2)
-                    .get(3)
+                b.get(a)
+                    .get(c)
                     .ins(Instruction::Call(indices.of(slot.layout).eq));
             }
             b.ins(Instruction::I32Eqz);
@@ -489,18 +694,10 @@ fn compound_eq(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function
             continue;
         }
         if child.copy {
-            // `unit` は値を持たないので常に等しい
-            if matches!(child.shape, Shape::Unit) {
-                continue;
-            }
-            b.get(0);
-            load_copy(&mut b, layouts, slot.layout, slot.offset);
-            b.get(1);
-            load_copy(&mut b, layouts, slot.layout, slot.offset);
-            equal_flat(&mut b, layouts, slot.layout);
+            equal_copy(b, layouts, slot.layout, left, right, slot.offset);
         } else {
-            b.get(0).offset(slot.offset);
-            b.get(1).offset(slot.offset);
+            b.get(left).offset(slot.offset);
+            b.get(right).offset(slot.offset);
             b.ins(Instruction::Call(indices.of(slot.layout).eq));
         }
         b.ins(Instruction::I32Eqz);
@@ -508,15 +705,87 @@ fn compound_eq(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function
         b.num(0).ins(Instruction::Return);
         b.ins(Instruction::End);
     }
-    b.num(1);
+}
+
+/// tag で中身が変わる並びの破棄(tasks 6.3)。
+///
+/// 活きている tag の区画だけを落とす。初期化されていない payload には触らない
+fn tagged_drop(
+    indices: &Indices,
+    layouts: &Layouts,
+    arms: &[(u32, &[Slot])],
+    narrow: bool,
+) -> Function {
+    // 1: 子のアドレス
+    let mut b = Body::new(1);
+    for (tag, slots) in arms {
+        if slots.iter().all(|slot| trivial(layouts, slot)) {
+            continue;
+        }
+        load_tag(&mut b, 0, narrow);
+        b.num(*tag).ins(Instruction::I32Eq);
+        b.ins(Instruction::If(BlockType::Empty));
+        drop_slots(&mut b, indices, layouts, slots, 0, 1);
+        b.ins(Instruction::End);
+    }
     b.finish()
 }
 
-/// 平らに積んだ Copy 値2つを比べる
-fn equal_flat(b: &mut Body, layouts: &Layouts, layout: LayoutId) {
-    match &layouts.get(layout).shape {
-        Shape::Int => b.ins(Instruction::I64Eq),
-        Shape::Bool | Shape::Tag(_) => b.ins(Instruction::I32Eq),
-        other => unreachable!("平らに比べられない並びです: {other:?}"),
-    };
+/// 落とすものも作り直すものも無い区画か
+fn trivial(layouts: &Layouts, slot: &Slot) -> bool {
+    !slot.indirect && layouts.get(slot.layout).copy
+}
+
+fn tagged_clone(
+    indices: &Indices,
+    layouts: &Layouts,
+    layout: LayoutId,
+    arms: &[(u32, &[Slot])],
+    narrow: bool,
+) -> Function {
+    // 2: 元の子, 3: 新しい子
+    let mut b = Body::new(2);
+    // tag も詰め物も含めて浅く写る。活きていない payload の中身も写るが、
+    // 誰も読まないので害はない
+    shallow_copy(&mut b, layouts, layout, 0, 1);
+    for (tag, slots) in arms {
+        if slots.iter().all(|slot| trivial(layouts, slot)) {
+            continue;
+        }
+        load_tag(&mut b, 0, narrow);
+        b.num(*tag).ins(Instruction::I32Eq);
+        b.ins(Instruction::If(BlockType::Empty));
+        clone_slots(&mut b, indices, layouts, slots, 0, 1, 2, 3);
+        b.ins(Instruction::End);
+    }
+    b.finish()
+}
+
+fn tagged_eq(
+    indices: &Indices,
+    layouts: &Layouts,
+    arms: &[(u32, &[Slot])],
+    narrow: bool,
+) -> Function {
+    // 2: 左の子, 3: 右の子
+    let mut b = Body::new(2);
+    load_tag(&mut b, 0, narrow);
+    load_tag(&mut b, 1, narrow);
+    b.ins(Instruction::I32Ne);
+    b.ins(Instruction::If(BlockType::Empty));
+    b.num(0).ins(Instruction::Return);
+    b.ins(Instruction::End);
+
+    for (tag, slots) in arms {
+        if slots.is_empty() {
+            continue;
+        }
+        load_tag(&mut b, 0, narrow);
+        b.num(*tag).ins(Instruction::I32Eq);
+        b.ins(Instruction::If(BlockType::Empty));
+        eq_slots(&mut b, indices, layouts, slots, 0, 1, 2, 3);
+        b.ins(Instruction::End);
+    }
+    b.num(1);
+    b.finish()
 }
