@@ -97,25 +97,27 @@
 
 ## 5. Integrate Calls, Receivers, and Providers
 
-- [ ] 5.1 Enforce owned, shared, and mutable direct-function parameters after
+- [x] 5.1 Enforce owned, shared, and mutable direct-function parameters after
   ordinary arity/type resolution, inserting only shared auto-borrows and keeping
   mutation/consumption visible
-- [ ] 5.2 Enforce `&self`, `&mut self`, and consuming `self` on inherent and trait
+- [x] 5.2 Enforce `&self`, `&mut self`, and consuming `self` on inherent and trait
   methods, exact receiver-mode conformance, and the receiver-qualified postfix
   call syntax
-- [ ] 5.3 Propagate access mode and borrowed-result provenance through direct,
+- [x] 5.3 Propagate access mode and borrowed-result provenance through direct,
   associated, concrete-method, trait-method, and slot-call HIR without repeating
   candidate lookup
-- [ ] 5.4 Add shared, mutable, moved, temporary-owned, and type-only modes to
+- [x] 5.4 Add shared, mutable, moved, temporary-owned, and type-only modes to
   `with` providers; constrain their lifetime to the provision body and preserve
   nested provider shadowing
 - [ ] 5.5 Update requirement and ambient planning inputs to consume checked HIR
   and provider modes while preserving callable/slot identities and every
   ownership-independent canonical plan fact
-- [ ] 5.6 Add cross-module and recursive tests for each parameter/receiver mode,
+  (provider modes resolved and proven not to move any requirement/ambient fact;
+  routing the inputs through `ownership::CheckedProgram` is 8.1's own text)
+- [x] 5.6 Add cross-module and recursive tests for each parameter/receiver mode,
   temporary arguments, missing modifiers, returned borrows, provider conflicts,
   trait conformance, and source-aware related diagnostics
-- [ ] 5.7 Run formatting, the full test suite, requirement/ambient plan snapshots,
+- [x] 5.7 Run formatting, the full test suite, requirement/ambient plan snapshots,
   call/provider failure fixtures, and strict OpenSpec validation, then commit
   ownership-aware calls and provisions as a stable snapshot
 

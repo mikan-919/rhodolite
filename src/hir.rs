@@ -444,6 +444,23 @@ impl Body {
     pub fn locals(&self) -> impl Iterator<Item = (LocalId, &LocalDecl)> {
         self.locals.iter()
     }
+
+    /// 場所として書けている式か。局所束縛とその非 optional なフィールド射影だけ
+    /// が場所で、呼び出しや構築の結果は一時値(design.md 決定5)。
+    ///
+    /// 所有権解析の `place_of` は同じ形から射影の列まで組み立てる。ここは
+    /// 「借用を挿してよいか」を決めるだけなので根の有無しか見ない
+    pub fn is_place(&self, id: ExprId) -> bool {
+        match &self.expr(id).kind {
+            ExprKind::Local(_) => true,
+            ExprKind::Field {
+                recv,
+                optional: false,
+                ..
+            } => self.is_place(*recv),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]

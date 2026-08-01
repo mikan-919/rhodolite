@@ -302,8 +302,11 @@ fn scan(
             walk!(recv);
             walk!(value);
         }
-        // ponytail: 修飾は要求を変えない(場所を辿るだけ)。提供のモードを
-        // 要求解析へ載せるのは introduce-ownership-and-borrowing のフェーズ5
+        // 所有権修飾は要求を変えない。修飾が包めるのは場所(局所束縛とその
+        // フィールド射影)だけで、場所の中に呼び出しも提供も現れないため
+        // (tasks 5.5)。提供の所有モードも同じ理由で要求に効かない —
+        // スロットが立っているかどうかだけが要求で、実体をどう運ぶかは
+        // 所有権解析が閉じる(design.md 決定11)
         hir::ExprKind::Neg(inner)
         | hir::ExprKind::Assert(inner)
         | hir::ExprKind::Access { place: inner, .. }

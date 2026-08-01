@@ -1386,6 +1386,8 @@ enum Site<'a> {
     What(&'a str),
     /// 呼び出しの実引数
     Arg { callee: &'a str, index: usize },
+    /// メソッド呼び出しのレシーバ(tasks 5.2)
+    Receiver { callee: &'a str },
     /// struct リテラルのフィールド値と、フィールドへの代入
     Field { type_name: &'a str, field: &'a str },
     /// 明示 `return` と本体の最後の式
@@ -1399,6 +1401,9 @@ impl Site<'_> {
             Site::Arg { callee, index } => format!(
                 "{ctx}: `{callee}` の第 {} 引数は `{expected}` ですが、`{actual}` を渡しています",
                 index + 1
+            ),
+            Site::Receiver { callee } => format!(
+                "{ctx}: `{callee}` のレシーバは `{expected}` ですが、`{actual}` を渡しています"
             ),
             Site::Field { type_name, field } => format!(
                 "{ctx}: `{type_name}` のフィールド `{field}` は `{expected}` ですが、`{actual}` を与えています"
@@ -2227,6 +2232,126 @@ enum CallTarget {
     Unresolvable,
 }
 
+/// 実引数とレシーバの所有モードの照合(tasks 5.1 / 5.2)。
+///
+/// 通常の型の照合と同じ規則を使い、合わないときだけ**共有借用を1つ**自動で挿す
+/// (design.md 決定2)。`&mut`・`move`・`clone` は観測できる状態・所有・費用を
+/// 動かすので、決して補わない。
+///
+/// 挿すのは場所のときだけ。挿さない2つの場合はどちらも所有権解析が同じ結論を
+/// 出す — 参照はそのまま共有として再借用され(`bare_place` の再借用)、一時値は
+/// 呼び出しの間だけ借りられる所有の値で別名が存在しない。ノードは「ソースに
+/// 書いていない借用」を HIR とスナップショットに見せるためのもので、
+/// 分類そのものは `Need` から決まる(design.md リスク「Render ... the inserted
+/// shared borrow in diagnostics and HIR snapshots」)。
+fn conform(
+    checked: &Checked,
+    expected: &KnownType,
+    site: &Site,
+    span: Span,
+    cx: &Cx,
+    out: &mut Out,
+) -> hir::ExprId {
+    // 値を産まない式。理由は式の側にある
+    let Some(actual) = checked.outcome.ty().cloned() else {
+        return checked.id;
+    };
+    if fits(&actual, expected) {
+        return checked.id;
+    }
+    // `&T` の位置は、借用先の所有の形が同じなら所有の場所からも埋まる。
+    // 既に参照で持っているものは、そのまま共有として再借用される
+    if expected.reference == Some(hir::RefKind::Shared)
+        && actual.kind == expected.kind
+        && actual.optional == expected.optional
+    {
+        // `move` して共有借用を渡すと、呼び出し側は値を失うのに渡るのは借用
+        // だけになる。自動借用があるので修飾そのものが要らない
+        if let hir::ExprKind::Access {
+            mode: AccessMode::Move,
+            ..
+        } = out.body.expr(checked.id).kind
+        {
+            out.diagnostics.push(
+                Diag::at(
+                    span,
+                    format!(
+                        "{}: 共有借用を受け取る位置に `move` は掛けられません",
+                        cx.ctx
+                    ),
+                )
+                .label("共有借用の位置への `move`")
+                .help("`move` を外してください。共有借用は自動で挿さります"),
+            );
+            return checked.id;
+        }
+        return match actual.reference {
+            Some(_) => checked.id,
+            // 一時値は既に所有者で、呼び出しの間だけ借りられる。借用を挿すと
+            // 「場所ではない値への修飾」になってしまうので、場所にだけ挿す
+            None if !out.body.is_place(checked.id) => checked.id,
+            None => shared_borrow(checked.id, &actual, span, cx, out),
+        };
+    }
+    let mut diagnostic = Diag::at(span, site.message(cx.ctx, expected, &actual.to_string()));
+    // 所有の値を排他の位置へ渡している = 呼び出し側の修飾が抜けている
+    if expected.reference == Some(hir::RefKind::Mutable) && actual.reference.is_none() {
+        diagnostic = diagnostic.help("`&mut` を付けて排他借用を渡してください");
+    }
+    out.diagnostics.push(diagnostic);
+    checked.id
+}
+
+/// 自動で挿す共有借用。ソースに `&place` と書いたときと同じ形になる。
+fn shared_borrow(
+    place: hir::ExprId,
+    ty: &KnownType,
+    span: Span,
+    cx: &Cx,
+    out: &mut Out,
+) -> hir::ExprId {
+    let borrowed = KnownType {
+        reference: Some(hir::RefKind::Shared),
+        ..ty.clone()
+    };
+    out.body.alloc_expr(hir::Expr {
+        result: hir::ExprResult::Value(lower_known(&borrowed, &cx.decls.nominal)),
+        kind: hir::ExprKind::Access {
+            mode: AccessMode::Shared,
+            place,
+        },
+        span,
+    })
+}
+
+/// 実引数1つ。共有借用を受け取る位置だけは所有の値も収まるので、期待型を
+/// 配らずに走査してから照合する(tasks 5.1)。
+fn argument(
+    arg: &Expr,
+    expected: &KnownType,
+    site: &Site,
+    cx: &Cx,
+    locals: &mut Locals,
+    out: &mut Out,
+) -> hir::ExprId {
+    // `nil` は期待型が無いと型を出せない。参照にはなれないので、照合も
+    // 従来どおり `walk` の出口に任せる
+    if expected.reference != Some(hir::RefKind::Shared) || matches!(arg.kind, ExprKind::Nil) {
+        return walk(arg, Some((expected, site)), cx, locals, out).id;
+    }
+    // 配列リテラルは要素型を期待型から取る。リテラルが参照になることは無いので、
+    // 借用先の所有の形をそのまま配れば推論も照合も従来どおり閉じる
+    if matches!(arg.kind, ExprKind::Array(_)) {
+        let owned = KnownType {
+            reference: None,
+            ..expected.clone()
+        };
+        return walk(arg, Some((&owned, site)), cx, locals, out).id;
+    }
+    let checked = walk(arg, None, cx, locals, out);
+    conform(&checked, expected, site, arg.span, cx, out)
+}
+
 /// 呼び出し。解決した署名から個数・引数型・結果型が決まる(design.md 決定6)。
 fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Out) -> Lowered {
     let resolved = match resolve(callee, cx, locals, out) {
@@ -2260,7 +2385,7 @@ fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Ou
             callee: &name,
             index,
         };
-        ids.push(walk(arg, Some((expected, &site)), cx, locals, out).id);
+        ids.push(argument(arg, expected, &site, cx, locals, out));
     }
     let kind = match resolved.target {
         CallTarget::Direct(callable) => hir::ExprKind::Call(hir::Call::Direct {
@@ -2348,15 +2473,17 @@ fn resolve<'d>(
                     Outcome::Typed(ty) => match ty.name().filter(|_| !ty.optional) {
                         Some(type_name) => from_type(type_name, name, true, decls).map(|found| {
                             found.map(|sig| {
+                                // レシーバの所有モードを署名と突き合わせる。
+                                // `&self` へは共有借用を1つ挿す(tasks 5.2)
+                                let recv = conform_receiver(
+                                    sig, type_name, name, &receiver, recv.span, cx, out,
+                                );
                                 (
                                     sig,
-                                    concrete_target(type_name, name, decls).map_or(
-                                        CallTarget::Unresolvable,
-                                        |callable| CallTarget::Method {
-                                            callable,
-                                            recv: receiver.id,
-                                        },
-                                    ),
+                                    concrete_target(type_name, name, decls)
+                                        .map_or(CallTarget::Unresolvable, |callable| {
+                                            CallTarget::Method { callable, recv }
+                                        }),
                                 )
                             })
                         }),
@@ -2437,6 +2564,36 @@ fn resolve<'d>(
             Err(poison())
         }
     }
+}
+
+/// レシーバの所有モードを署名と突き合わせる(tasks 5.2)。
+///
+/// `&self` には所有の場所から共有借用を1つ挿す。`&mut self` と消費 `self` は
+/// 状態と所有を動かすので、呼び出し側に `&mut` / `move` が書かれていなければ
+/// ここで断る(design.md 決定2)。消費レシーバに `move` が要ることは静的型では
+/// 言い分けられないので、その1件だけは所有権解析が見る。
+fn conform_receiver(
+    sig: &FnSig,
+    type_name: &str,
+    method: &str,
+    receiver: &Checked,
+    span: Span,
+    cx: &Cx,
+    out: &mut Out,
+) -> hir::ExprId {
+    let Some(mode) = sig.receiver else {
+        return receiver.id;
+    };
+    let callee = format!("{type_name}::{method}");
+    let site = Site::Receiver { callee: &callee };
+    conform(
+        receiver,
+        &receiver_type(mode, type_name),
+        &site,
+        span,
+        cx,
+        out,
+    )
 }
 
 /// スロット経由の宛先。実行する本体はその場の提供が決めるので、ここでは
@@ -6439,20 +6596,14 @@ rank: Rank }
     }
 
     /// 所有 `T`・共有 `&T`・排他 `&mut T` は別の静的型
-    /// (ownership-and-borrowing spec)。この版では自動借用をまだ入れないので、
-    /// 食い違いは宛先の照合でそのまま出る
+    /// (ownership-and-borrowing spec)。宛先の照合はそのままで、緩むのは
+    /// 「共有借用を受け取る位置」だけ(tasks 5.1)
     #[test]
     fn 所有と共有と排他は別の型() {
         const DECL: &str = "struct User { name: str }\n\
                             fn shared(u: &User) { assert true }\n\
                             fn owned(u: User) { assert true }\n";
-        let e = only(&format!(
-            "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n shared(u) }}\n"
-        ));
-        assert_eq!(
-            e,
-            "main: `shared` の第 1 引数は `&User` ですが、`User` を渡しています"
-        );
+        // 共有借用を所有の引数へは渡せない
         let e = only(&format!(
             "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n owned(&u) }}\n"
         ));
@@ -6460,13 +6611,83 @@ rank: Rank }
             e,
             "main: `owned` の第 1 引数は `User` ですが、`&User` を渡しています"
         );
+        // 注釈の位置は緩まない。自動借用が入るのは呼び出しの引数とレシーバだけ
         let e = only(&format!(
-            "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n shared(&mut u) }}\n"
+            "{DECL}fn main() {{ let u = User {{ name = \"a\" }}\n let r: &User = u\n assert true }}\n"
         ));
-        assert_eq!(
-            e,
-            "main: `shared` の第 1 引数は `&User` ですが、`&mut User` を渡しています"
-        );
+        assert_eq!(e, "main: `r` の初期化子は `&User` ですが、`User` です");
+    }
+
+    /// 共有借用を受け取る引数は、所有の場所からも `&mut` からも埋まる
+    /// (tasks 5.1、function-signature-type-checking「Shared parameter is concise」)
+    #[test]
+    fn 共有借用の引数は自動で借りる() {
+        const DECL: &str = "struct User { name: str }\n\
+                            fn shared(u: &User -> int) { 1 }\n\
+                            fn make(-> User) { User { name = \"a\" } }\n";
+        for arg in ["u", "&u", "&mut u", "make()"] {
+            let src =
+                format!("{DECL}fn main() {{ let mut u = make()\n assert shared({arg}) == 1 }}\n");
+            let errors = errors(&src);
+            assert!(errors.is_empty(), "{arg}: {errors:?}");
+        }
+    }
+
+    /// 共有借用の位置でも、要素型が期待型から降りてくる形は従来どおり通る。
+    /// 空の配列リテラルは宛先が要素型を与えなければ型を出せない
+    #[test]
+    fn 共有借用の配列引数も要素型が届く() {
+        const DECL: &str = "fn total(xs: &[int] -> int) { 0 }\n";
+        for arg in ["[]", "[1, 2]", "xs", "&xs"] {
+            let src = format!("{DECL}fn main() {{ let xs = [1]\n assert total({arg}) == 0 }}\n");
+            let errors = errors(&src);
+            assert!(errors.is_empty(), "{arg}: {errors:?}");
+        }
+        let e = only(&format!(
+            "{DECL}fn main() {{ assert total([\"a\"]) == 0 }}\n"
+        ));
+        assert_eq!(e, "main: 配列の第 1 要素は `int` ですが、`str` です");
+    }
+
+    /// 共有借用の位置に `move` を書くと、値を失うのに渡るのは借用だけになる。
+    /// 自動借用があるので修飾そのものが要らない(design.md 決定2)
+    #[test]
+    fn 共有借用の位置へのmoveを断る() {
+        const DECL: &str = "struct User { name: str }\n\
+                            impl User { fn look(&self -> int) { 1 } }\n\
+                            fn shared(u: &User -> int) { 1 }\n\
+                            fn make(-> User) { User { name = \"a\" } }\n";
+        for body in ["assert shared(move u) == 1", "assert move u.look() == 1"] {
+            let src = format!("{DECL}fn main() {{ let u = make()\n {body} }}\n");
+            let found = diagnostics(&src);
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert_eq!(
+                found[0].msg, "main: 共有借用を受け取る位置に `move` は掛けられません",
+                "{body}"
+            );
+            assert_eq!(
+                found[0].help.as_deref(),
+                Some("`move` を外してください。共有借用は自動で挿さります")
+            );
+        }
+    }
+
+    /// 挿した共有借用は HIR に残る。所有の場所のときだけで、一時値には挿さない
+    #[test]
+    fn 自動の共有借用はhirに残る() {
+        const DECL: &str = "struct User { name: str }\n\
+                            fn shared(u: &User -> int) { 1 }\n\
+                            fn make(-> User) { User { name = \"a\" } }\n";
+        let dumped = lowered(&format!(
+            "{DECL}fn main() {{ let u = make()\n assert shared(u) == 1 }}\n"
+        ))
+        .dump();
+        assert!(dumped.contains(": &User = &#"), "{dumped}");
+        let dumped = lowered(&format!(
+            "{DECL}fn main() {{ assert shared(make()) == 1 }}\n"
+        ))
+        .dump();
+        assert!(!dumped.contains("= &#"), "一時値には挿さない: {dumped}");
     }
 
     /// 参照を所有の中に置く形は全部断る(tasks 2.3)
@@ -6603,6 +6824,87 @@ rank: Rank }
              fn main() {{ assert true }}\n"
         ));
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// レシーバの所有モードは呼び出し地点でも契約(tasks 5.2)
+    const RECEIVERS: &str = "struct User { n: int }\n\
+                             struct Account { user: User }\n\
+                             impl User {\n\
+                             \x20 fn look(&self -> int) { self.n }\n\
+                             \x20 fn bump(&mut self -> int) { self.n = self.n + 1\n self.n }\n\
+                             \x20 fn finish(self -> int) { self.n }\n\
+                             }\n\
+                             fn user(-> User) { User { n = 1 } }\n\
+                             fn account(-> Account) { Account { user = user() } }\n";
+
+    /// `&self` は修飾なしで借りる。`&mut` からも共有として再借用できる
+    #[test]
+    fn 共有レシーバは修飾なしで借りる() {
+        for body in [
+            "let u = user()\n assert u.look() == 1",
+            "let u = user()\n assert (&u).look() == 1",
+            "let mut u = user()\n let r = &mut u\n assert r.look() == 1",
+            "assert user().look() == 1",
+        ] {
+            let errors = errors(&format!("{RECEIVERS}fn main() {{ {body} }}\n"));
+            assert!(errors.is_empty(), "{body}: {errors:?}");
+        }
+    }
+
+    /// `&mut self` と消費 `self` は修飾が要る。修飾を書けば通る
+    #[test]
+    fn 排他と消費のレシーバは修飾で見える() {
+        for body in [
+            "let mut u = user()\n assert &mut u.bump() == 2",
+            "let u = user()\n assert move u.finish() == 1",
+            "let mut a = account()\n assert &mut a.user.bump() == 2",
+        ] {
+            let errors = errors(&format!("{RECEIVERS}fn main() {{ {body} }}\n"));
+            assert!(errors.is_empty(), "{body}: {errors:?}");
+        }
+    }
+
+    /// 修飾を書かない排他レシーバと、借用越しの消費レシーバは断る
+    #[test]
+    fn レシーバの所有モードの食い違いを報告する() {
+        for (body, expected, help) in [
+            (
+                "let mut u = user()\n assert u.bump() == 2",
+                "main: `User::bump` のレシーバは `&mut User` ですが、`User` を渡しています",
+                Some("`&mut` を付けて排他借用を渡してください"),
+            ),
+            (
+                "let mut u = user()\n assert &u.bump() == 2",
+                "main: `User::bump` のレシーバは `&mut User` ですが、`&User` を渡しています",
+                None,
+            ),
+            (
+                "let u = user()\n assert &u.finish() == 1",
+                "main: `User::finish` のレシーバは `User` ですが、`&User` を渡しています",
+                None,
+            ),
+            (
+                "let mut a = account()\n assert a.user.bump() == 2",
+                "main: `User::bump` のレシーバは `&mut User` ですが、`User` を渡しています",
+                Some("`&mut` を付けて排他借用を渡してください"),
+            ),
+        ] {
+            let src = format!("{RECEIVERS}fn main() {{ {body} }}\n");
+            let found = diagnostics(&src);
+            assert_eq!(found.len(), 1, "{body}: {found:?}");
+            assert_eq!(found[0].msg, expected, "{body}");
+            assert_eq!(found[0].help.as_deref(), help, "{body}");
+        }
+    }
+
+    /// 後置の修飾はレシーバの場所を指す。`&a.user.bump()` の診断が指すのは
+    /// `&a.user` で、`a` でも呼び出し全体でもない(design.md 決定2)
+    #[test]
+    fn レシーバ修飾は場所を指す() {
+        let src = format!(
+            "{RECEIVERS}fn main() {{ let mut a = account()\n assert &a.user.bump() == 2 }}\n"
+        );
+        assert_eq!(spanned(&src, "のレシーバは"), "&a.user");
     }
 
     /// 所有の内包に `indirect` の無い循環があれば、循環の辺を related で示して落とす

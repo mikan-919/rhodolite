@@ -36,8 +36,7 @@
 //!
 //! # まだやらないこと
 //!
-//! `match`/`for`/`??` の所有モード(phase 6)、提供値の所有モード(phase 5)、
-//! 評価器の所有(phase 7)。
+//! `match`/`for`/`??` の所有モード(phase 6)、評価器の所有(phase 7)。
 
 use crate::diag::Diag;
 use crate::hir::{self, AccessMode, Id as _, ReceiverMode};
@@ -479,8 +478,42 @@ enum Origin {
 enum Unrooted {
     /// 一時値からの借用。所有者が式の中で終わる
     Temporary,
-    /// スロットのレシーバ = 提供された実体。提供の所有モードは phase 5(5.4)
+    /// スロットのレシーバ = 提供された実体で、その所有をこの本体で名指せない。
+    /// 提供が外側の本体にあるか、提供そのものが一時値のとき(tasks 5.4)
     Provider,
+}
+
+/// 実体を運ぶ提供の運び方(design.md 決定11、tasks 5.4)。
+///
+/// 型だけの提供(`with db<Postgres>`)は実体を運ばないので、`Provision::value`
+/// が `None` であることがそのままそのモードになる。それ以外はソースの修飾と
+/// 「値が場所か」だけで決まるので、HIR に別の欄を持たない。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Provider {
+    /// `with db(store)` — 修飾を書かない束縛済みの場所は共有借用
+    Shared,
+    /// `with db(&mut store)`
+    Mutable,
+    /// `with db(move store)`
+    Moved,
+    /// `with db(Postgres::new(...))` — 提供スコープが持つ一時値
+    Temporary,
+}
+
+impl Provider {
+    fn spelling(self) -> &'static str {
+        match self {
+            Provider::Shared => "共有借用",
+            Provider::Mutable => "排他借用",
+            Provider::Moved => "move した所有",
+            Provider::Temporary => "一時値の所有",
+        }
+    }
+
+    /// 提供スコープが所有を握っているか
+    fn owns(self) -> bool {
+        matches!(self, Provider::Moved | Provider::Temporary)
+    }
 }
 
 /// 呼び出し1つ。結果の provenance を実引数へ置き換えるのに要る
@@ -524,6 +557,9 @@ struct Build<'a> {
     /// 名前で参照できる束縛とその出自。ここに無いのは「知らない名前への代入」が
     /// 作った書き込み専用の束縛で、代入は初期化として扱う
     bindings: BTreeMap<hir::LocalId, Bound>,
+    /// いま効いている提供のスタック。内側が外側を隠すので後ろから引く
+    /// (tasks 5.4 の入れ子の提供)
+    provided: Vec<(hir::SlotId, Option<hir::ExprId>)>,
     /// いま解決中の呼び出し先の表示名(`Need::Argument` の診断に使う)
     callee: Option<String>,
     /// 所有を要求されたのに `move` が書かれていなかった場所式と、その位置の綴り
@@ -553,6 +589,7 @@ impl<'a> Build<'a> {
             returned: BTreeSet::new(),
             unrooted: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            provided: Vec::new(),
             callee: None,
             demanded: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -621,11 +658,29 @@ impl<'a> Build<'a> {
 
     /// `mark` 以降に作った借用を、`at` まで生かす。
     ///
-    /// 呼び出しの実引数と、`for`/`match` が対象を借りている区間に使う。区間の
-    /// 出口を要求点にすると、そこへ到達できる点が全部リージョンに入る
+    /// 呼び出しの実引数だけに使う。`at` は呼び出しの点で、実引数が枝を抜けて
+    /// いても必ず作られる(`point` は `cur` が無くても点を確保する)ので、
+    /// 要求点が消えることがない。消えうる合流点には `hold_through` を使う
     fn hold_until(&mut self, mark: usize, at: PointId) {
         for loan in mark..self.plan.loans.len() {
             self.loan_uses[loan].insert(at);
+        }
+    }
+
+    /// `mark` 以降に作った借用を、`from` 以降に作った点**すべて**で生かす。
+    ///
+    /// `for` / `match` / `with` は構文の区間そのものが借用の区間なので、合流点や
+    /// 背辺の行き先を1つだけ要求点にすると、その区間を `return` で抜ける経路を
+    /// 取りこぼす(合流点が生まれず、背辺も張られない)。区間の点は `alloc` の順に
+    /// 連続しているので、区間を丸ごと要求点にできる。到達しない点はリージョンの
+    /// 交わり(生誕から到達できる)で落ちるので、要求点を増やす側は**必ず拒否が
+    /// 増える**だけになる
+    fn hold_through(&mut self, mark: usize, from: usize) {
+        let through: Vec<PointId> = (from..self.plan.points.len())
+            .map(|p| PointId(p as u32))
+            .collect();
+        for loan in mark..self.plan.loans.len() {
+            self.loan_uses[loan].extend(through.iter().copied());
         }
     }
 
@@ -844,11 +899,12 @@ impl<'a> Build<'a> {
             // 場所として畳めなかった読み(一時値のフィールド、`.?`)
             hir::ExprKind::Field { recv, .. } => self.value(*recv, scope, Need::Read),
 
-            // ponytail: 構築(struct リテラル・配列リテラル・enum 構築・`with` の
-            // 提供値)は所有を暗黙に受け取る。仕様が `move` を要求しているのは
-            // 「所有の引数」と「消費レシーバ」だけなので、構築位置は4つとも
-            // 揃えて暗黙にしてある。構築にも要求するなら phase 6(6.1/6.3/6.4)
-            // と phase 5(5.4)で一緒に変える
+            // ponytail: 構築(struct リテラル・配列リテラル・enum 構築)は所有を
+            // 暗黙に受け取る。仕様が `move` を要求しているのは「所有の引数」と
+            // 「消費レシーバ」だけなので、構築位置は3つとも揃えて暗黙にしてある。
+            // 構築にも要求するなら phase 6(6.1/6.3/6.4)で一緒に変える。
+            // `with` の提供値は所有モードを持つようになったので、ここには居ない
+            // (tasks 5.4)
             hir::ExprKind::StructLit { fields, .. } => {
                 for (_, value) in fields {
                     self.value(*value, scope, Need::Take);
@@ -1003,39 +1059,53 @@ impl<'a> Build<'a> {
                 let inner_scope = self.scope(Some(scope));
                 self.declare(*var, inner_scope, Bound::Borrowed);
                 // ループ変数は要素の借用。対象の借用を持ち回るので、周回中は
-                // 対象を排他的に触れない。本体は背辺で head へ戻るので、
-                // head を要求点にすれば周回中ずっと生きる
+                // 対象を排他的に触れない
                 self.flow(*var, *iter);
-                self.hold_until(mark, head);
                 self.cur = Some(head);
+                let opened = self.plan.points.len();
                 self.point(Some(id), inner_scope, Effect::Init(*var));
                 self.value(*inner, inner_scope, Need::Read);
                 if let Some(from) = self.cur {
                     self.edge(from, head, vec![inner_scope]);
                 }
                 self.edge(head, after, Vec::new());
+                // 対象は周回中ずっと借りられている。`head` だけを要求点にすると
+                // 背辺の張られない本体(全経路が抜ける)を取りこぼす
+                self.hold_through(mark, opened);
                 self.cur = Some(after);
             }
 
-            // ponytail: 提供値の所有モード(共有・排他・move・一時所有)は
-            // phase 5(5.4)。ここでは提供のスコープだけを作る
+            // 提供値の所有モードは `Need::Read` がそのまま表す(tasks 5.4)。
+            // 修飾を書かない束縛済みの場所は共有借用になり、所有者は `with` の
+            // 後も残る。一時値は場所ではないので提供スコープの所有のまま。
+            // 明示の `&mut` / `move` は `Access` としてそのまま通る
             hir::ExprKind::With {
                 provisions,
                 body: inner,
             } => {
+                let mark = self.plan.loans.len();
                 for provision in provisions {
                     if let Some(value) = provision.value {
-                        self.value(value, scope, Need::Take);
+                        self.value(value, scope, Need::Read);
                     }
+                }
+                let opened = self.plan.points.len();
+                // 同じ `with` の提供は互いを見ない。全部評価してから積む
+                let depth = self.provided.len();
+                for provision in provisions {
+                    self.provided.push((provision.slot, provision.value));
                 }
                 let inner_scope = self.scope(Some(scope));
                 self.value(*inner, inner_scope, need);
                 self.carry_from(id, *inner);
+                self.provided.truncate(depth);
                 if let Some(from) = self.cur {
                     let join = self.alloc(Some(id), scope, Effect::Nop);
                     self.edge(from, join, vec![inner_scope]);
                     self.cur = Some(join);
                 }
+                // 提供の借用は提供本体の間ずっと生きている(tasks 5.4)
+                self.hold_through(mark, opened);
             }
 
             // arm は上から順に試される。pattern が外れても guard が偽でも次の
@@ -1048,6 +1118,7 @@ impl<'a> Build<'a> {
                 let mark = self.plan.loans.len();
                 self.value(*subject, scope, Need::Read);
                 let branch = self.point(Some(id), scope, Effect::Nop);
+                let opened = self.plan.points.len();
                 // 「ここまでの arm がどれも取らなかった」点
                 let mut fallthrough = branch;
                 let mut ends: Vec<(PointId, Vec<ScopeId>)> = Vec::new();
@@ -1088,6 +1159,9 @@ impl<'a> Build<'a> {
                     ends.push((fallthrough, Vec::new()));
                 }
                 if ends.is_empty() {
+                    // どの arm も抜ける。合流点は生まれないが、対象は arm の
+                    // 間ずっと借りられている
+                    self.hold_through(mark, opened);
                     self.cur = None;
                     return;
                 }
@@ -1095,9 +1169,8 @@ impl<'a> Build<'a> {
                 for (from, exits) in ends {
                     self.edge(from, join, exits);
                 }
-                // 対象は match の間ずっと借りられている(design.md 決定7)。
-                // 合流点を要求点にすると、そこへ到達できる arm が全部入る
-                self.hold_until(mark, join);
+                // 対象は match の間ずっと借りられている(design.md 決定7)
+                self.hold_through(mark, opened);
                 self.cur = Some(join);
             }
 
@@ -1131,6 +1204,8 @@ impl<'a> Build<'a> {
                         };
                         self.value(*recv, scope, need);
                         let params = self.declared_params(*callable);
+                        // レシーバの中に呼び出しがあると、その `arguments` が
+                        // 表示名を消していく。実引数のために置き直す
                         self.callee = Some(program.show_callable(*callable));
                         self.arguments(scope, &params, args);
                         Some(CallSite {
@@ -1139,7 +1214,9 @@ impl<'a> Build<'a> {
                             args: args.clone(),
                         })
                     }
-                    hir::Call::Slot { method, args, .. } => {
+                    hir::Call::Slot {
+                        slot, method, args, ..
+                    } => {
                         self.callee = Some(program.show_trait_method(*method));
                         let params: Vec<Option<hir::Type>> = program.trait_methods[*method]
                             .params
@@ -1147,11 +1224,13 @@ impl<'a> Build<'a> {
                             .map(|ty| Some(ty.clone()))
                             .collect();
                         self.arguments(scope, &params, args);
+                        self.check_provider(id, *slot, *method);
                         Some(CallSite {
                             callee: Callee::Trait(*method),
-                            // スロットのレシーバは提供が持つ実体で、この本体の
-                            // 場所ではない。provenance の根にはならない
-                            recv: None,
+                            // レシーバは提供が持つ実体。この本体の `with` が
+                            // 置いたものなら、その提供値がそのまま借用元になる
+                            // (tasks 5.4)
+                            recv: self.provision(*slot).flatten(),
                             args: args.clone(),
                         })
                     }
@@ -1180,6 +1259,111 @@ impl<'a> Build<'a> {
                 }
             }
         }
+    }
+
+    // ---- 提供(tasks 5.4) ----
+
+    /// このスロットへいま効いている提供。内側の `with` が外側を隠す。
+    /// 外側の `Option` は「この本体が提供しているか」、内側は「実体を運ぶか」
+    fn provision(&self, slot: hir::SlotId) -> Option<Option<hir::ExprId>> {
+        self.provided
+            .iter()
+            .rev()
+            .find(|(s, _)| *s == slot)
+            .map(|(_, value)| *value)
+    }
+
+    /// 実体を運ぶ提供の運び方。
+    ///
+    /// 判定はソースの形ではなく**走査が実際に何をしたか**から取る。構文だけを
+    /// 見ると、場所を素通しする形(`{ s }`、枝の末尾)や参照を返す呼び出しが
+    /// 「一時値 = 提供スコープの所有」に落ちて、借用しか無い実体に消費レシーバを
+    /// 通してしまう。
+    ///
+    /// 順に:明示の修飾 → 結果が参照型ならその強さ → **借用を運んでいるか**
+    /// (`carriers` は「この値は誰かの記憶を指している」の唯一の定義)。
+    /// どれでもなければ、この式が作った所有の一時値。
+    fn provider_mode(&self, value: hir::ExprId) -> Provider {
+        match &self.body.expr(value).kind {
+            hir::ExprKind::Access {
+                mode: AccessMode::Shared,
+                ..
+            } => return Provider::Shared,
+            hir::ExprKind::Access {
+                mode: AccessMode::Mutable,
+                ..
+            } => return Provider::Mutable,
+            hir::ExprKind::Access {
+                mode: AccessMode::Move,
+                ..
+            } => return Provider::Moved,
+            _ => {}
+        }
+        match self
+            .body
+            .expr(value)
+            .result
+            .ty()
+            .and_then(|ty| ty.reference)
+        {
+            Some(hir::RefKind::Shared) => Provider::Shared,
+            Some(hir::RefKind::Mutable) => Provider::Mutable,
+            // 所有の形をしていても、借用を運んでいるなら実体は他人のもの
+            None if self.carriers.contains_key(&value) => Provider::Shared,
+            None => Provider::Temporary,
+        }
+    }
+
+    /// 契約のレシーバが要る強さを、いま効いている提供が満たしているか
+    /// (with-provision-type-checking「Shared provider」/「Mutable provider」)。
+    ///
+    /// 提供がこの本体に無ければ、強さを決めたのは呼び出し元の `with` なので
+    /// そちらで見る。型だけの提供に値レシーバを呼ぶ食い違いは要求解析が報告する。
+    ///
+    /// ponytail: 所有を握る提供を消費レシーバ(`self`)で消費した**後の使用**を
+    /// 一切検出しない。二度目の消費も、消費後の `&self` / `&mut self` も通る。
+    /// 提供された実体に局所束縛が無く、move 済みを覚える場所が無いため。これは
+    /// 現状(何も見ていない)より受理を狭めることはないが、狭め切ってもいない。
+    /// 提供の実体に場所を与えるのは提供の破棄計画と同じ phase 6(6.6)
+    fn check_provider(&mut self, at: hir::ExprId, slot: hir::SlotId, method: hir::TraitMethodId) {
+        let Some(Some(value)) = self.provision(slot) else {
+            return;
+        };
+        let Some(receiver) = self.program.trait_methods[method].receiver else {
+            return;
+        };
+        let mode = self.provider_mode(value);
+        let (enough, want, fix) = match receiver {
+            // 所有からも排他からも共有は取れる
+            ReceiverMode::Shared => (true, "&self", "&"),
+            ReceiverMode::Mutable => (
+                mode == Provider::Mutable || mode.owns(),
+                "&mut self",
+                "&mut",
+            ),
+            ReceiverMode::Owned => (mode.owns(), "self", "move"),
+        };
+        if enough {
+            return;
+        }
+        let name = &self.program.slots[slot].name;
+        self.diagnostics.push(
+            Diag::at(
+                self.body.expr(at).span,
+                format!(
+                    "{}: `{}` のレシーバは `{want}` ですが、`{name}` への提供は{}です",
+                    self.ctx,
+                    self.program.show_trait_method(method),
+                    mode.spelling()
+                ),
+            )
+            .label("提供の所有モードが足りない")
+            .help(format!("`with {name}({fix} ...)` と書いてください"))
+            .related(vec![Diag::at(
+                self.body.expr(value).span,
+                format!("`{name}` はここで提供されています"),
+            )]),
+        );
     }
 
     /// 呼び出し先の宣言引数型。引数の局所束縛は呼び出し**先**の本体にある
@@ -1246,17 +1430,27 @@ impl<'a> Build<'a> {
                         // 借りたことにする。親の場所は子と重なる全てと重なる
                         // (`overlaps` は接頭辞判定)ので、狭めない方は必ず
                         // より多く拒否する。狭めるのは後の最適化
+                        // スロットのレシーバ。提供がこの本体の `with` に無ければ
+                        // 借用元を名指せない(tasks 5.4)
+                        let provided = place.input == Input::Receiver
+                            && matches!(site.callee, Callee::Trait(_));
                         let Some(arg) = arg else {
-                            // スロットのレシーバは提供された実体。この本体に
-                            // 場所が無いので借用元を追えない
                             unrooted.insert(*expr, Unrooted::Provider);
                             continue;
                         };
                         let found = origins.get(&arg).cloned().unwrap_or_default();
                         // 場所でない実引数から借りたのに借用が付いていない =
-                        // 借用元は評価の途中で作られた一時値
+                        // 借用元は評価の途中で作られた一時値。提供の実体なら
+                        // 直し方が違うので言い分ける
                         if found.is_empty() && self.place_of(arg).is_none() {
-                            unrooted.insert(*expr, Unrooted::Temporary);
+                            unrooted.insert(
+                                *expr,
+                                if provided {
+                                    Unrooted::Provider
+                                } else {
+                                    Unrooted::Temporary
+                                },
+                            );
                         }
                         out.extend(found);
                     }
@@ -1627,9 +1821,9 @@ impl Build<'_> {
                     "借用元を先に束縛してから渡してください",
                 ),
                 Unrooted::Provider => (
-                    "スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の所有はこの版では追えません",
+                    "スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の借用元をこの本体では名指せません",
                     "提供された実体からの借用",
-                    "借用を返さない契約にするか、実装を直接呼んでください",
+                    "束縛した値を同じ本体の `with` で提供するか、借用を返さない契約にしてください",
                 ),
             };
             found.push(
@@ -3191,6 +3385,59 @@ fn main(-> int) {
         );
     }
 
+    /// arm が全部抜けても対象は借りられたまま。合流点が生まれない経路で
+    /// 借用が縮まないこと(CFG の端の穴を塞ぐ回帰)
+    #[test]
+    fn 抜けるarmでも対象は借りられたまま() {
+        let src = "enum Lookup { Found(int) Missing }
+struct Holder { r: Lookup, n: int }
+fn main(-> int) {
+  let mut h = Holder { r = Lookup::Missing, n = 1 }
+  match h.r {
+    Lookup::Found(x): return x
+    Lookup::Missing {
+      h.r = Lookup::Missing
+      return h.n
+    }
+  }
+}
+";
+        let diagnostic = only(src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `h.r` は共有借用されている間は排他的に触れません"
+        );
+        assert_eq!(
+            related(src, &diagnostic),
+            vec![("ここで共有借用しています".to_string(), "h.r")]
+        );
+    }
+
+    /// `for` の本体が全経路で抜けると背辺が張られない。対象の借用を背辺の
+    /// 行き先に繋いでいると、そこで借用が死ぬ(`match` と同じ端の穴の回帰)
+    #[test]
+    fn 抜けるループ本体でも対象は借りられたまま() {
+        let src = "struct Holder { xs: [int] }
+fn eat(h: Holder -> int) { 0 }
+fn main(-> int) {
+  let h = Holder { xs = [1, 2] }
+  for x in h.xs {
+    return eat(move h)
+  }
+  0
+}
+";
+        let diagnostic = only(src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `h` は借用されているので move できません"
+        );
+        assert_eq!(
+            related(src, &diagnostic),
+            vec![("ここで借用しています".to_string(), "h.xs")]
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 4.2 場所の重なり
     // -----------------------------------------------------------------------
@@ -3427,10 +3674,10 @@ fn main(-> int) {{ peek(pair().first()) }}
         assert_eq!(diagnostic.label.as_deref(), Some("一時値からの借用"));
     }
 
-    /// スロット経由でレシーバから借りて返す契約は、提供の所有モードが
-    /// 決まるまで追えない(phase 5)
+    /// 一時値を提供したスロットからレシーバを借りて返すと、借用元が提供の
+    /// 実体で、この本体に場所が無い(tasks 5.4)
     #[test]
-    fn スロット経由の借用返しを拒否する() {
+    fn 一時値の提供からの借用返しを拒否する() {
         let src = "struct Inner { n: int }
 struct Store { one: Inner }
 trait Peek { fn look(&self -> &Inner) }
@@ -3441,7 +3688,89 @@ fn main(-> int) { with store(Store { one = Inner { n = 1 } }) { store.look().n }
         let diagnostic = only(src);
         assert_eq!(
             diagnostic.msg,
-            "main: スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の所有はこの版では追えません"
+            "main: スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の借用元をこの本体では名指せません"
+        );
+    }
+
+    /// 提供がこの本体の外にあるときも同じ。借用元を名指す `with` が無い
+    #[test]
+    fn 外側の提供からの借用返しを拒否する() {
+        let src = "struct Inner { n: int }
+struct Store { one: Inner }
+trait Peek { fn look(&self -> &Inner) }
+impl Peek for Store { fn look(&self -> &Inner) { &self.one } }
+effect store: Peek
+fn borrowed(-> &Inner) { store.look() }
+";
+        let diagnostic = only(src);
+        assert_eq!(
+            diagnostic.msg,
+            "borrowed: スロット経由の呼び出しはレシーバから借りて返しますが、提供された実体の借用元をこの本体では名指せません"
+        );
+    }
+
+    /// 束縛を提供すれば借用元を名指せる。共有借用の提供から借りて返す形は
+    /// そのまま通る(phase 4 が丸ごと拒否していた穴、tasks 5.4)
+    #[test]
+    fn 束縛を提供したスロットからは借りて返せる() {
+        accepted(
+            "struct Inner { n: int }
+struct Store { one: Inner }
+trait Peek { fn look(&self -> &Inner) }
+impl Peek for Store { fn look(&self -> &Inner) { &self.one } }
+effect store: Peek
+fn main(-> int) {
+  let s = Store { one = Inner { n = 1 } }
+  with store(s) { store.look().n }
+}
+",
+        );
+    }
+
+    /// 借用元を名指せるようになった分、その借用は他の使用と衝突しなければ
+    /// ならない。受理だけ増えて拒否が付いてこないと穴になる(tasks 5.4)
+    #[test]
+    fn 提供から借りた結果は借用元を塞ぐ() {
+        const PEEK: &str = "struct Inner { n: int }
+struct Store { one: Inner }
+trait Peek { fn look(&self -> &Inner) }
+impl Peek for Store { fn look(&self -> &Inner) { &self.one } }
+effect store: Peek
+fn read(x: &Inner -> int) { x.n }
+fn eat(s: Store -> int) { s.one.n }
+fn make(-> Store) { Store { one = Inner { n = 1 } } }
+";
+        // 提供の借用は `with` で終わるが、そこから借りて返った結果は生き残る。
+        // その間、借用元は move できない
+        let src = format!(
+            "{PEEK}fn main(-> int) {{
+  let s = make()
+  let got = with store(s) {{ store.look() }}
+  let n = eat(move s)
+  n + read(got)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `s` は借用されているので move できません"
+        );
+
+        // 書き換えることもできない
+        let src = format!(
+            "{PEEK}fn main(-> int) {{
+  let mut s = make()
+  let got = with store(s) {{ store.look() }}
+  s.one.n = 5
+  read(got)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `s.one.n` は共有借用されている間は排他的に触れません"
         );
     }
 
@@ -3470,6 +3799,631 @@ fn main(-> int) { with store(Store { one = Inner { n = 1 } }) { store.look().n }
         assert_eq!(
             diagnostic.help.as_deref(),
             Some("一時値は既に所有者なので `move` は要りません。修飾を外してください")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5.1 / 5.2 引数とレシーバの所有モード
+    // -----------------------------------------------------------------------
+
+    /// 引数3種とレシーバ3種の道具立て
+    const MODES: &str = "struct User { n: int }
+impl User {
+  fn look(&self -> int) { self.n }
+  fn bump(&mut self -> int) { self.n = self.n + 1
+    self.n }
+  fn finish(self -> int) { self.n }
+}
+fn read(u: &User -> int) { u.n }
+fn write(u: &mut User -> int) { u.n = 1
+  u.n }
+fn own(u: User -> int) { u.n }
+fn make(-> User) { User { n = 1 } }
+";
+
+    /// 引数とレシーバで選ばれた所有モードが、そのまま計画に出る。共有だけが
+    /// 自動で挿さり、排他と消費は書いたときにしか現れない
+    /// (design.md 決定2、tasks 5.1 / 5.2)
+    #[test]
+    fn 選ばれた所有モードが計画に出る() {
+        let src = format!(
+            "{MODES}fn main(-> int) {{
+  let mut u = make()
+  let a = read(u)
+  let b = write(&mut u)
+  let c = u.look()
+  let d = &mut u.bump()
+  let e = own(move u)
+  a + b + c + d + e
+}}
+"
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        let modes: Vec<&str> = main
+            .lines()
+            .filter_map(|line| line.split(" scope#0 ").nth(1))
+            .filter(|effect| effect.contains("local#0(u)"))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                // `read(u)` — 共有借用が自動で挿さる
+                "& local#0(u)",
+                // `write(&mut u)` — 排他は書いたところにだけ
+                "&mut local#0(u)",
+                // `u.look()` — `&self` レシーバも自動の共有借用
+                "& local#0(u)",
+                // `&mut u.bump()` — `&mut self` は修飾が要る
+                "&mut local#0(u)",
+                // `own(move u)` — 所有の引数は `move` が要る
+                "move local#0(u)",
+            ],
+            "{dumped}"
+        );
+    }
+
+    /// 共有借用は所有者を残す。同じ束縛を何度でも読める
+    #[test]
+    fn 自動の共有借用は所有者を残す() {
+        accepted(&format!(
+            "{MODES}fn main(-> int) {{
+  let u = make()
+  read(u) + u.look() + own(move u)
+}}
+"
+        ));
+    }
+
+    /// 排他レシーバの修飾が抜けていれば型検査が断るので、所有権解析まで来ない。
+    /// 消費レシーバだけは静的型で言い分けられないのでここが見る
+    #[test]
+    fn 消費レシーバの_move_忘れをここで断る() {
+        let src = format!("{MODES}fn main(-> int) {{ let u = make()\n u.finish() }}\n");
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `impl User::finish` のレシーバは所有を受け取りますが、束縛済みの `u` をそのまま渡しています"
+        );
+    }
+
+    /// レシーバの中の呼び出しが表示名を消していかないこと。消えると `move` の
+    /// 欠落が空の呼び出し先を名指す
+    #[test]
+    fn レシーバに呼び出しが挟まっても呼び出し先を名指す() {
+        let src = format!(
+            "{MODES}impl User {{ fn eat(&self, other: User -> int) {{ other.n }} }}
+fn wrap(u: User -> User) {{ u }}
+fn main(-> int) {{
+  let a = make()
+  let b = make()
+  wrap(move a).eat(b)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `impl User::eat` の第 1 引数は所有を受け取りますが、束縛済みの `b` をそのまま渡しています"
+        );
+    }
+
+    /// 一時値のレシーバと実引数は既に所有者なので、修飾はどこにも要らない
+    #[test]
+    fn 一時値のレシーバと引数は修飾を要らない() {
+        accepted(&format!(
+            "{MODES}fn main(-> int) {{ make().look() + make().finish() + read(make()) + own(make()) }}\n"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // 5.3 呼び出しの形ごとの伝播
+    // -----------------------------------------------------------------------
+
+    /// 直接・関連・具体メソッド・trait 実装メソッド・スロットの5形すべてで
+    /// 同じ道具立てを共有する。呼び出し先は型検査が既に選んでいるので、ここは
+    /// `hir::Call` の解決済み ID しか見ない(tasks 5.3)
+    const FORMS: &str = "struct Inner { n: int }
+struct Pair { left: Inner, right: Inner }
+trait Peek { fn look(&self -> &Inner) }
+impl Peek for Pair { fn look(&self -> &Inner) { &self.left } }
+impl Pair {
+  fn first(&self -> &Inner) { &self.left }
+  fn of(p: &Pair -> &Inner) { &p.left }
+}
+effect peek: Peek
+fn direct(p: &Pair -> &Inner) { &p.left }
+fn read(x: &Inner -> int) { x.n }
+fn pair(-> Pair) { Pair { left = Inner { n = 1 }, right = Inner { n = 2 } } }
+";
+
+    /// どの形でも、返った借用が生きている間は借用元が借りられたまま。
+    /// 実引数とレシーバはどちらも自動の共有借用で埋まる
+    #[test]
+    fn 借用を返す呼び出しは形を問わず出自を引き継ぐ() {
+        for call in [
+            "direct(p)",
+            "Pair::of(p)",
+            "p.first()",
+            // trait 実装のメソッドを具体型から直接呼ぶ形
+            "p.look()",
+        ] {
+            let src = format!(
+                "{FORMS}fn main(-> int) {{
+  let mut p = pair()
+  let got = {call}
+  p.left.n = 5
+  read(got)
+}}
+"
+            );
+            let diagnostic = only(&src);
+            assert_eq!(
+                diagnostic.msg, "main: `p.left.n` は共有借用されている間は排他的に触れません",
+                "{call}"
+            );
+        }
+    }
+
+    /// 借用を使い終わっていれば、同じ形でも後の排他アクセスは通る
+    #[test]
+    fn 使い終わった借用は形を問わず塞がない() {
+        for call in ["direct(p)", "Pair::of(p)", "p.first()", "p.look()"] {
+            accepted(&format!(
+                "{FORMS}fn main(-> int) {{
+  let mut p = pair()
+  let got = {call}
+  let n = read(got)
+  p.left.n = 5
+  n
+}}
+"
+            ));
+        }
+    }
+
+    /// 契約メソッドの provenance は、それを実装する全ての本体の合流。
+    /// スロット経由の呼び出しは提供の場所へ置き換わる(tasks 5.3 / 5.4)
+    #[test]
+    fn スロット経由でも出自は提供へ置き換わる() {
+        let src = format!(
+            "{FORMS}fn main(-> int) {{
+  let p = pair()
+  with peek(p) {{
+    let got = peek.look()
+    read(got)
+  }}
+}}
+"
+        );
+        accepted(&src);
+    }
+
+    // -----------------------------------------------------------------------
+    // 5.4 提供の所有モード
+    // -----------------------------------------------------------------------
+
+    /// 共有・排他・消費の3つの契約を持つスロット1つ分の道具立て
+    const SLOT: &str = "struct Store { n: int }
+trait Ops {
+  fn look(&self -> int)
+  fn bump(&mut self -> int)
+  fn finish(self -> int)
+  fn zero(-> int)
+}
+impl Ops for Store {
+  fn look(&self -> int) { self.n }
+  fn bump(&mut self -> int) { self.n = self.n + 1
+    self.n }
+  fn finish(self -> int) { self.n }
+  fn zero(-> int) { 0 }
+}
+effect store: Ops
+fn take(s: Store -> int) { s.n }
+fn peek(s: &Store -> int) { s.n }
+fn make(-> Store) { Store { n = 1 } }
+fn borrow(s: &Store -> &Store) { s }
+fn borrow_mut(s: &mut Store -> &mut Store) { s }
+";
+
+    /// 修飾を書かない束縛済みの提供は共有借用。所有者は `with` の後も残る
+    #[test]
+    fn 束縛の提供は共有借用で所有者が残る() {
+        accepted(&format!(
+            "{SLOT}fn main(-> int) {{
+  let s = make()
+  let a = with store(s) {{ store.look() }}
+  a + take(move s)
+}}
+"
+        ));
+    }
+
+    /// 一時値の提供は提供スコープの所有。`move` は要らない
+    #[test]
+    fn 一時値の提供はmoveを要らない() {
+        accepted(&format!(
+            "{SLOT}fn main(-> int) {{ with store(make()) {{ store.finish() }} }}\n"
+        ));
+    }
+
+    /// `move` した提供は提供スコープへ所有が移る。元の束縛はもう使えない
+    #[test]
+    fn moveした提供は元の束縛を消費する() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let s = make()
+  let a = with store(move s) {{ store.finish() }}
+  a + take(move s)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `s` は既に move されているので使えません"
+        );
+    }
+
+    /// 排他の提供は提供本体の間ずっと生きている。その間、外から触れない
+    #[test]
+    fn 排他の提供は提供本体の間ずっと塞ぐ() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let mut s = make()
+  with store(&mut s) {{ store.bump() + peek(&s) }}
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `s` は排他借用されている間は読めません"
+        );
+        assert_eq!(
+            related(&src, &diagnostic),
+            vec![("ここで排他借用しています".to_string(), "&mut s")]
+        );
+    }
+
+    /// 本体が `return` で抜けても提供の借用は塞ぐ。合流点が生まれない経路で
+    /// 借用が縮まないこと(CFG の端の穴を塞ぐ回帰)
+    #[test]
+    fn 抜ける提供本体でも排他の提供は塞ぐ() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let mut s = make()
+  with store(&mut s) {{ return peek(&s) }}
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `s` は排他借用されている間は読めません"
+        );
+    }
+
+    /// 逆に共有の提供なら、提供本体の中でも外からの読みは通る
+    #[test]
+    fn 共有の提供は本体の中の読みを塞がない() {
+        accepted(&format!(
+            "{SLOT}fn main(-> int) {{
+  let s = make()
+  with store(s) {{ store.look() + peek(&s) }}
+}}
+"
+        ));
+    }
+
+    /// 型だけの提供は実体を運ばないので、借用も所有も動かない
+    #[test]
+    fn 型だけの提供は実体を持たない() {
+        let checked = accepted(&format!(
+            "{SLOT}fn main(-> int) {{ with store<Store> {{ store::zero() }} }}\n"
+        ));
+        let dumped = checked.plan.dump(&checked.hir);
+        let main = dumped.split("body main").nth(1).expect("main の計画がある");
+        assert!(!main.contains("loan#"), "借用は生まれない: {dumped}");
+    }
+
+    /// 契約が要る強さを提供が満たしていなければ断る
+    #[test]
+    fn 提供の所有モードが足りなければ断る() {
+        for (provision, call, expected, fix) in [
+            (
+                "s",
+                "store.bump()",
+                "main: `impl Ops::bump` のレシーバは `&mut self` ですが、`store` への提供は共有借用です",
+                "`with store(&mut ...)` と書いてください",
+            ),
+            (
+                "s",
+                "store.finish()",
+                "main: `impl Ops::finish` のレシーバは `self` ですが、`store` への提供は共有借用です",
+                "`with store(move ...)` と書いてください",
+            ),
+            (
+                "&mut s",
+                "store.finish()",
+                "main: `impl Ops::finish` のレシーバは `self` ですが、`store` への提供は排他借用です",
+                "`with store(move ...)` と書いてください",
+            ),
+        ] {
+            let src = format!(
+                "{SLOT}fn main(-> int) {{
+  let mut s = make()
+  with store({provision}) {{ {call} }}
+}}
+"
+            );
+            let diagnostic = only(&src);
+            assert_eq!(diagnostic.msg, expected);
+            assert_eq!(diagnostic.help.as_deref(), Some(fix));
+            assert_eq!(at(&src, &diagnostic), call);
+            assert_eq!(
+                related(&src, &diagnostic),
+                vec![("`store` はここで提供されています".to_string(), provision)]
+            );
+        }
+    }
+
+    /// 満たしていれば通る。所有を握る提供はどの契約にも足りる
+    #[test]
+    fn 満たす提供は通る() {
+        for (provision, call) in [
+            ("s", "store.look()"),
+            ("&mut s", "store.look()"),
+            ("&mut s", "store.bump()"),
+            ("move s", "store.finish()"),
+            ("make()", "store.bump()"),
+        ] {
+            accepted(&format!(
+                "{SLOT}fn main(-> int) {{
+  let mut s = make()
+  with store({provision}) {{ {call} }}
+}}
+"
+            ));
+        }
+    }
+
+    /// 提供の強さは構文ではなく走査の結果から決まる。所有の形をしていても
+    /// 借用を運んでいれば実体は他人のもので、消費レシーバには足りない
+    #[test]
+    fn 借用を運ぶ提供は所有として扱わない() {
+        for (provision, call, mode) in [
+            // 参照を返す呼び出し。結果型が `&Store`
+            ("borrow(&s)", "store.finish()", "共有借用"),
+            ("borrow(&s)", "store.bump()", "共有借用"),
+            // 排他を返す呼び出しは消費には足りない
+            ("borrow_mut(&mut s)", "store.finish()", "排他借用"),
+            // 場所を素通しするブロック。所有の型だが借用しか取っていない
+            ("{ s }", "store.finish()", "共有借用"),
+            ("{ s }", "store.bump()", "共有借用"),
+        ] {
+            let src = format!(
+                "{SLOT}fn main(-> int) {{
+  let mut s = make()
+  let a = with store({provision}) {{ {call} }}
+  a + peek(&s)
+}}
+"
+            );
+            let messages: Vec<String> = rejected(&src).into_iter().map(|d| d.msg).collect();
+            let want = format!("`store` への提供は{mode}です");
+            assert!(
+                messages.iter().any(|m| m.contains(&want)),
+                "{provision} / {call}: {messages:?}"
+            );
+        }
+    }
+
+    /// 参照の束縛をそのまま提供したら、その参照の強さがそのまま提供の強さ
+    #[test]
+    fn 参照の束縛の提供はその強さで通る() {
+        accepted(&format!(
+            "{SLOT}fn main(-> int) {{
+  let mut s = make()
+  let r = &mut s
+  with store(r) {{ store.bump() }}
+}}
+"
+        ));
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let s = make()
+  let r = &s
+  with store(r) {{ store.bump() }}
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `impl Ops::bump` のレシーバは `&mut self` ですが、`store` への提供は共有借用です"
+        );
+    }
+
+    /// 内側の提供が外側を隠す。外側だけを見ていたら `&mut self` に足りない
+    #[test]
+    fn 内側の提供が外側を隠す() {
+        accepted(&format!(
+            "{SLOT}fn main(-> int) {{
+  let outer = make()
+  let mut inner = make()
+  with store(outer) {{
+    let a = store.look()
+    let b = with store(&mut inner) {{ store.bump() }}
+    a + b
+  }}
+}}
+"
+        ));
+    }
+
+    /// 隠した提供は `with` を抜けたら戻る。戻った先は共有借用のまま
+    #[test]
+    fn 隠した提供は抜けたら戻る() {
+        let src = format!(
+            "{SLOT}fn main(-> int) {{
+  let outer = make()
+  let mut inner = make()
+  with store(outer) {{
+    let a = with store(&mut inner) {{ store.bump() }}
+    a + store.bump()
+  }}
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `impl Ops::bump` のレシーバは `&mut self` ですが、`store` への提供は共有借用です"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5.6 モジュールを跨ぐ形と再帰
+    // -----------------------------------------------------------------------
+
+    /// 複数モジュールをまとめて検査する。所有権解析はプログラム全体で1回
+    fn analyze_files(files: &[(&str, &str)]) -> Result<CheckedProgram, Vec<Diag>> {
+        let loaded = crate::module::load_files(files).expect("ロードできる");
+        let hir = typecheck::check_and_lower(&loaded.program).expect("型検査を通るはず");
+        check(hir)
+    }
+
+    /// 別モジュールの署名でも所有モードは同じ契約。共有は自動で借り、所有には
+    /// `move` が要り、排他には `&mut` が要る(tasks 5.6)
+    #[test]
+    fn モジュールを跨いでも所有モードは同じ契約() {
+        const DEP: &str = "struct User { n: int }\n\
+                           impl User {\n\
+                           \x20 fn look(&self -> int) { self.n }\n\
+                           \x20 fn finish(self -> int) { self.n }\n\
+                           }\n\
+                           fn read(u: &User -> int) { u.n }\n\
+                           fn own(u: User -> int) { u.n }\n\
+                           fn make(-> User) { User { n = 1 } }\n";
+        analyze_files(&[
+            (
+                "main.rd",
+                "use dep::{User, read, own, make}\n\
+                 fn main(-> int) {\n\
+                 \x20 let u = make()\n\
+                 \x20 read(u) + u.look() + own(move u)\n\
+                 }\n",
+            ),
+            ("dep.rd", DEP),
+        ])
+        .expect("受理されるはず");
+
+        let Err(errors) = analyze_files(&[
+            (
+                "main.rd",
+                "use dep::{User, own, make}\n\
+                 fn main(-> int) {\n\
+                 \x20 let u = make()\n\
+                 \x20 own(u)\n\
+                 }\n",
+            ),
+            ("dep.rd", DEP),
+        ]) else {
+            panic!("拒否されるはず")
+        };
+        let messages: Vec<String> = errors.iter().map(|d| d.msg.clone()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "main::main: `dep::own` の第 1 引数は所有を受け取りますが、束縛済みの `u` をそのまま渡しています"
+            ]
+        );
+        // 主 span は呼び出し側、related は束縛側。どちらも main.rd
+        assert_eq!(errors[0].span.expect("位置を持つ").src, 0);
+        assert_eq!(errors[0].related.len(), 1);
+    }
+
+    /// 別モジュールの提供でも所有モードの照合は効く
+    #[test]
+    fn モジュールを跨ぐ提供の所有モードも照合する() {
+        let Err(errors) = analyze_files(&[
+            (
+                "main.rd",
+                "use dep::{Store, make, store}\n\
+                 fn main(-> int) {\n\
+                 \x20 let s = make()\n\
+                 \x20 with store(s) { store.bump() }\n\
+                 }\n",
+            ),
+            (
+                "dep.rd",
+                "struct Store { n: int }\n\
+                 trait Ops { fn bump(&mut self -> int) }\n\
+                 impl Ops for Store { fn bump(&mut self -> int) { self.n = self.n + 1\n self.n } }\n\
+                 effect store: Ops\n\
+                 fn make(-> Store) { Store { n = 1 } }\n",
+            ),
+        ]) else {
+            panic!("拒否されるはず")
+        };
+        let messages: Vec<String> = errors.iter().map(|d| d.msg.clone()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "main::main: `impl dep::Ops::bump` のレシーバは `&mut self` ですが、`dep::store` への提供は共有借用です"
+            ]
+        );
+    }
+
+    /// 再帰する本体でも、引数の自動借用と `move` の要求はそのまま効く
+    #[test]
+    fn 再帰でも引数の所有モードは効く() {
+        accepted(&format!(
+            "{MODES}fn walk(u: &User, n: int -> int) {{
+  if n == 0: read(u)
+  else: walk(u, n - 1)
+}}
+fn main(-> int) {{ let u = make()\n walk(u, 3) }}
+"
+        ));
+        let src = format!(
+            "{MODES}fn drain(u: User, n: int -> int) {{
+  if n == 0: own(move u)
+  else: drain(u, n - 1)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "drain: `drain` の第 1 引数は所有を受け取りますが、束縛済みの `u` をそのまま渡しています"
+        );
+    }
+
+    /// 相互再帰する借用返しも不動点で閉じる。呼び出し側では実引数へ置き換わる
+    #[test]
+    fn 相互再帰する借用返しも呼び出し側で塞ぐ() {
+        let src = format!(
+            "{FORMS}fn ping(p: &Pair, n: int -> &Inner) {{
+  if n == 0 {{ &p.left }} else {{ pong(p, n - 1) }}
+}}
+fn pong(p: &Pair, n: int -> &Inner) {{
+  if n == 0 {{ &p.right }} else {{ ping(p, n - 1) }}
+}}
+fn main(-> int) {{
+  let mut p = pair()
+  let got = ping(p, 3)
+  p.left.n = 5
+  read(got)
+}}
+"
+        );
+        let diagnostic = only(&src);
+        assert_eq!(
+            diagnostic.msg,
+            "main: `p.left.n` は共有借用されている間は排他的に触れません"
         );
     }
 
@@ -3786,7 +4740,10 @@ fn main(-> int) {{
                 // 素の `for` はループ変数を借用で束ねるので、要素を返せない
                 "impl InMemoryDb::find: `u` は借用で束ねた名前なので move できません",
                 "test \"昇格すると Gold になり時刻が刻まれる\": `alice.id` は既に move されているので使えません",
-                "test \"昇格すると Gold になり時刻が刻まれる\": `store` は既に move されているので使えません",
+                // `with db(store)` は共有借用の提供なので `store` は残るが、
+                // 所有を取る関連関数へはそのまま渡せない(tasks 5.4)
+                "test \"昇格すると Gold になり時刻が刻まれる\": `impl InMemoryDb::get` の第 1 引数は所有を受け取りますが、束縛済みの `store` をそのまま渡しています",
+                "test \"昇格すると Gold になり時刻が刻まれる\": `store` は借用されているので move できません",
                 "test \"昇格すると Gold になり時刻が刻まれる\": `alice.id` は既に move されているので使えません",
             ]
         );

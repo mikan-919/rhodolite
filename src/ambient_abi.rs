@@ -437,8 +437,11 @@ impl<'a> Planner<'a> {
             };
         }
         match &expr.kind {
-            // ponytail: 所有権修飾は場所を包むだけ。提供の運び方をモードで
-            // 変えるのは introduce-ownership-and-borrowing のフェーズ5
+            // 所有権修飾は場所を包むだけなので、計画は変わらない。場所の中に
+            // 呼び出しも提供も現れない(tasks 5.5)。提供の所有モード(共有・
+            // 排他・move・一時所有)は所有権解析が閉じるもので、provider の
+            // 選択にも slot/callable の同一性にも効かない。所有か借用かを
+            // record の欄に載せるのはデータ下ろしの段(design.md 決定11)
             hir::ExprKind::Access { place, .. } => walk!(place),
 
             hir::ExprKind::With {
