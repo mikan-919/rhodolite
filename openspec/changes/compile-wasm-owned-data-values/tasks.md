@@ -73,4 +73,4 @@
 - [x] 9.1 Add maintained owned-data Wasm fixtures that cover every new construct and compare results/final mutation state with the HIR interpreter
 - [x] 9.2 Run the full Rust test suite, strict OpenSpec validation, independent Wasm validation/execution, repeated byte-determinism builds, and formatter/lint checks
 - [x] 9.3 Update README and compiler roadmap to describe the owned-data backend, ABI v0/v1 selection, remaining trait/ambient limitation, and the next change
-- [ ] 9.4 Mark every verified task complete and leave the change apply-complete for spec sync and archive
+- [x] 9.4 Mark every verified task complete and leave the change apply-complete for spec sync and archive
