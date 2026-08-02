@@ -25,6 +25,7 @@ mod wasm_abi;
 mod wasm_data;
 mod wasm_layout;
 mod wasm_runtime;
+mod wasm_wire;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

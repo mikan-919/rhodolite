@@ -123,6 +123,17 @@ ABI v1 のメタデータは `version` / `entry` / 名前順の `exports` に続
 **公開署名から到達した型だけ**を載せる。読み込んだ全部を載せる案は却下した。
 非公開の宣言はホストとの契約ではなく、無関係な編集がメタデータを動かしてしまう。
 
+型の記述は宣言の形をそのまま写す。`{"id":"t0","kind":"struct","name":"User",
+"fields":[{"name":"id","type":"int"}]}`、`{"kind":"optional","payload":"t1"}`、
+`{"kind":"array","element":"t2"}`、`{"kind":"enum","name":"List","variants":
+[{"name":"Nil","payload":[]}]}`、`{"kind":"str"}` の5種類。`unit` / `bool` /
+`int` は綴りのまま書くので表に載らない。ID は**子を訪ねる前に押さえる**ので、
+並びは宣言を深さ優先で辿った順になり、再帰型も自分の ID へ戻って閉じる。
+
+内部の並びが `indirect` をどう畳んでいるかは載せない。`indirect next: Node?` は
+宣言どおり optional として記述され、wire 上も `u8 tag + 中身`。ホストは
+子アドレスという実装の都合を知らないままで読み書きできる。
+
 ## Consequences
 
 - 生成モジュールは自前の allocator と glue を抱えるので、scalar だけのときより

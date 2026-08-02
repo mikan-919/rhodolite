@@ -68,6 +68,11 @@ impl Indices {
         }
     }
 
+    /// 予約した glue の本数。後ろへ番号を積む側が使う
+    pub fn glue_count(&self) -> u32 {
+        self.glue.len() as u32 * 3
+    }
+
     pub fn of(&self, layout: LayoutId) -> Glue {
         self.glue[&layout]
     }

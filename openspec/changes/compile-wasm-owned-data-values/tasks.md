@@ -59,14 +59,14 @@
 
 ## 8. Serialized Rhodolite ABI v1
 
-- [ ] 8.1 Generalize ABI signature planning so scalar-only public surfaces retain ABI v0 and any owned public type selects ABI v1 module-wide
-- [ ] 8.2 Reserve the `memory` and `__rhodolite_abi_reserve` export names and emit a tracked exchange allocation with the specified invalidation lifetime
-- [ ] 8.3 Implement canonical encoders for scalars, strings, structs, enums, optionals, arrays, and recursive indirect values
-- [ ] 8.4 Implement bounded canonical decoders that reject overflow, out-of-range slices, invalid Boolean/UTF-8/tags, truncation, and trailing bytes before body execution
-- [ ] 8.5 Emit ABI v1 wrappers with mixed scalar and rich parameters, rich multi-value results, fresh internal ownership on decode, and result cleanup after encoding
-- [ ] 8.6 Extend canonical ABI metadata with deterministic public type-graph IDs, recursive references, wire schemas, and flattened Core Wasm signatures
-- [ ] 8.7 Add host-style engine tests for staging, mixed signatures, nested/recursive round trips, malformed inputs, result invalidation, private-type omission, and metadata determinism
-- [ ] 8.8 Prove with regression snapshots that scalar-only public modules still select ABI v0 and preserve their scalar signatures and metadata
+- [x] 8.1 Generalize ABI signature planning so scalar-only public surfaces retain ABI v0 and any owned public type selects ABI v1 module-wide
+- [x] 8.2 Reserve the `memory` and `__rhodolite_abi_reserve` export names and emit a tracked exchange allocation with the specified invalidation lifetime
+- [x] 8.3 Implement canonical encoders for scalars, strings, structs, enums, optionals, arrays, and recursive indirect values
+- [x] 8.4 Implement bounded canonical decoders that reject overflow, out-of-range slices, invalid Boolean/UTF-8/tags, truncation, and trailing bytes before body execution
+- [x] 8.5 Emit ABI v1 wrappers with mixed scalar and rich parameters, rich multi-value results, fresh internal ownership on decode, and result cleanup after encoding
+- [x] 8.6 Extend canonical ABI metadata with deterministic public type-graph IDs, recursive references, wire schemas, and flattened Core Wasm signatures
+- [x] 8.7 Add host-style engine tests for staging, mixed signatures, nested/recursive round trips, malformed inputs, result invalidation, private-type omission, and metadata determinism
+- [x] 8.8 Prove with regression snapshots that scalar-only public modules still select ABI v0 and preserve their scalar signatures and metadata
 
 ## 9. End-to-end verification and documentation
 

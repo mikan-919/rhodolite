@@ -53,13 +53,15 @@ const MAX_PAGES: u32 = 0xFFFF;
 const MAX_HEAP_END: u32 = MAX_PAGES << 16;
 
 /// ランタイムが出す関数の本数
-pub const COUNT: u32 = 4;
+pub const COUNT: u32 = 5;
 
 /// `base` を先頭にした関数番号。並びは固定
 pub const ALLOC: u32 = 0;
 pub const FREE: u32 = 1;
 const FREE_INSERT: u32 = 2;
 const EXTEND: u32 = 3;
+/// ホストが受け渡し領域を取り直す入口。export するのは ABI v1 のときだけ
+pub const RESERVE: u32 = 4;
 
 /// 4 byte 揃えの load/store。前置きもヘッダも `u32` しか置かない
 const WORD: MemArg = MemArg {
@@ -147,6 +149,11 @@ impl Runtime {
                 params: vec![ValType::I32],
                 results: vec![],
                 body: extend(base),
+            },
+            Helper {
+                params: vec![ValType::I32],
+                results: vec![ValType::I32],
+                body: reserve(base),
             },
         ]
     }
@@ -236,6 +243,28 @@ impl Body {
         self.0.instruction(&Instruction::End);
         self.0
     }
+}
+
+/// `reserve(size) -> ptr`。ホストが引数を置く受け渡し領域を取り直す。
+///
+/// 前の領域はここで返る。だから返した結果の bytes は「次に予約するか、次の
+/// export を呼ぶまで」しか読めない(rhodolite-wasm-abi spec)。追跡している
+/// アドレスは alloc の前に消す ― 途中で trap しても、返した先を指したままに
+/// しないため
+fn reserve(base: u32) -> Function {
+    // 1: 前の領域 / 取り直した領域
+    let mut b = Body::new(1);
+    b.num(EXCHANGE).load().set(1);
+    b.get(1);
+    b.ins(Instruction::If(BlockType::Empty));
+    b.get(1).ins(Instruction::Call(base + FREE));
+    b.ins(Instruction::End);
+    b.num(EXCHANGE).num(0).store();
+
+    b.get(0).ins(Instruction::Call(base + ALLOC)).set(1);
+    b.num(EXCHANGE).get(1).store();
+    b.get(1);
+    b.finish()
 }
 
 /// `alloc(size) -> ptr`。first-fit で空きリストから取り、無ければ heap を伸ばす

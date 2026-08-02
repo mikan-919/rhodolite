@@ -21,6 +21,7 @@ use crate::ownership::CheckedProgram;
 use crate::wasm_data::{self, Indices};
 use crate::wasm_layout::{self, LayoutId, Layouts, ReprKind};
 use crate::wasm_runtime::{self, Body, Runtime};
+use crate::wasm_wire;
 use std::collections::BTreeMap;
 use wasm_encoder::{
     BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
@@ -32,9 +33,6 @@ pub const ENTRY_EXPORT: &str = "__rhodolite_main";
 
 /// 埋め込むインタフェース記述のセクション名
 pub const ABI_SECTION: &str = "rhodolite.abi";
-
-/// 埋め込むインタフェース記述の版
-pub const ABI_VERSION: u32 = 0;
 
 /// ABI v0 が境界で運べる型。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,7 +53,7 @@ impl Scalar {
     }
 
     /// 値を運ぶ Wasm の型。`unit` は実行時表現を持たない
-    fn val_type(self) -> Option<ValType> {
+    pub fn val_type(self) -> Option<ValType> {
         match self {
             Scalar::Unit => None,
             Scalar::Bool => Some(ValType::I32),
@@ -111,7 +109,7 @@ fn unsupported(span: crate::lex::Span, what: &str) -> Diag {
 /// 借用は検査済みの場所を指すアドレス1つなので、指す先が扱えるなら運べる。
 /// optional は完成した所有形に 1 bit 付くだけなので、中身が扱えれば扱える。
 /// 配列だけが後続スライス
-fn supported(ty: &hir::Type) -> bool {
+pub fn supported(ty: &hir::Type) -> bool {
     matches!(
         ty.kind,
         hir::TypeKind::Builtin(
@@ -2359,12 +2357,39 @@ impl Emitter<'_> {
 // モジュールの組み立て
 // ---------------------------------------------------------------------------
 
+/// 公開面が境界で運ぶ値1つ。
+///
+/// scalar は ABI v0 の表現のまま。所有型は直列化した bytes を指す
+/// `(i32 ptr, i32 len)` になる(design.md 決定8)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Port {
+    Scalar(Scalar),
+    Rich(hir::Type),
+}
+
+impl Port {
+    /// 境界で占める Core Wasm の値
+    pub fn val_types(&self) -> Vec<ValType> {
+        match self {
+            Port::Scalar(scalar) => scalar.val_type().into_iter().collect(),
+            Port::Rich(_) => vec![ValType::I32, ValType::I32],
+        }
+    }
+
+    pub fn rich(&self) -> Option<&hir::Type> {
+        match self {
+            Port::Rich(ty) => Some(ty),
+            Port::Scalar(_) => None,
+        }
+    }
+}
+
 /// 公開面1つ分の署名。ABI メタデータと入口の検査に使う
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Signature {
     pub name: String,
-    pub params: Vec<Scalar>,
-    pub result: Scalar,
+    pub params: Vec<Port>,
+    pub result: Port,
 }
 
 /// 計画された instance を Core Wasm モジュールへ落とす。
@@ -2400,9 +2425,20 @@ fn build(
     let statics = collect_literals(program, plan);
     let wrappers = signatures.wrappers().count() as u32;
     let runtime_base = lowered.len() as u32 + wrappers;
-    let mut indices = Indices::reserve(&layouts, runtime_base + wasm_runtime::COUNT);
+    let glue_base = runtime_base + wasm_runtime::COUNT;
+    let mut indices = Indices::reserve(&layouts, glue_base);
     indices.alloc = runtime_base + wasm_runtime::ALLOC;
     indices.free = runtime_base + wasm_runtime::FREE;
+
+    // 公開署名に出た型だけが直列化関数を持つ。内部の型は境界に出ない
+    let version = signatures.version();
+    let roots: Vec<LayoutId> = signatures
+        .rich_types()
+        .iter()
+        .map(|ty| layouts.plan(program, ty).expect("公開型は 32bit に収まる"))
+        .collect();
+    let wires = wasm_wire::Wires::reserve(&layouts, &roots, glue_base + indices.glue_count());
+    let reserve_index = runtime_base + wasm_runtime::RESERVE;
 
     let mut types = Types::default();
     let mut functions = FunctionSection::new();
@@ -2448,16 +2484,30 @@ fn build(
     let mut exports = ExportSection::new();
     let mut next_index = lowered.len() as u32;
     for (signature, instance) in signatures.wrappers() {
-        let params: Vec<ValType> = signature
-            .params
-            .iter()
-            .filter_map(|scalar| scalar.val_type())
-            .collect();
-        let results: Vec<ValType> = signature.result.val_type().into_iter().collect();
+        let params: Vec<ValType> = signature.params.iter().flat_map(Port::val_types).collect();
+        let results: Vec<ValType> = signature.result.val_types();
         functions.function(types.intern(&params, &results));
-        code.function(&wrapper(&params, signature, instance.index() as u32));
+        code.function(&wrapper(
+            Boundary {
+                program,
+                layouts: &mut layouts,
+                wires: &wires,
+                indices: &indices,
+                reserve: reserve_index,
+            },
+            signature,
+            instance.index() as u32,
+        ));
         exports.export(&signature.name, ExportKind::Func, next_index);
         next_index += 1;
+    }
+    if version >= 1 {
+        exports.export(crate::wasm_abi::MEMORY_EXPORT, ExportKind::Memory, 0);
+        exports.export(
+            crate::wasm_abi::RESERVE_EXPORT,
+            ExportKind::Func,
+            reserve_index,
+        );
     }
 
     // ランタイムと glue は公開しない実装の後ろ。番号は `indices` の予約と同じ順
@@ -2467,6 +2517,9 @@ fn build(
         for helper in Runtime::helpers(runtime_base)
             .into_iter()
             .chain(wasm_data::glue_functions(&layouts, &indices))
+            .chain(wasm_wire::wire_functions(
+                program, &layouts, &wires, &indices,
+            ))
         {
             functions.function(types.intern(&helper.params, &helper.results));
             code.function(&helper.body);
@@ -2486,43 +2539,175 @@ fn build(
     }
     module.section(&CustomSection {
         name: ABI_SECTION.into(),
-        data: signatures.metadata().into_bytes().into(),
+        data: signatures.metadata(program).into_bytes().into(),
     });
 
     module.finish()
 }
 
+/// ラッパを出すのに要る、モジュール側の道具立て
+struct Boundary<'a> {
+    program: &'a hir::Program,
+    layouts: &'a mut Layouts,
+    wires: &'a wasm_wire::Wires,
+    indices: &'a Indices,
+    /// `__rhodolite_abi_reserve` の関数番号
+    reserve: u32,
+}
+
 /// ホスト境界のラッパ1つ。
 ///
-/// bool 引数は 0/1 だけを受ける。本体へ入る前に trap するので、内部の
-/// 関数はどこも「bool は 0 か 1」を前提にできる
-fn wrapper(params: &[ValType], signature: &Signature, target: u32) -> Function {
-    let mut function = Function::new([]);
-    let mut index = 0u32;
-    for scalar in &signature.params {
-        if *scalar == Scalar::Bool {
-            function.instruction(&Instruction::LocalGet(index));
-            function.instruction(&Instruction::I32Const(2));
-            function.instruction(&Instruction::I32GeU);
-            function.instruction(&Instruction::If(BlockType::Empty));
-            function.instruction(&Instruction::Unreachable);
-            function.instruction(&Instruction::End);
+/// scalar はそのまま渡す。bool 引数は 0/1 だけを受け、本体へ入る前に trap
+/// するので、内部の関数はどこも「bool は 0 か 1」を前提にできる。
+///
+/// 豊かな値は `(ptr, len)` で受け取り、**本体が走る前に**受け渡し領域の中に
+/// あることを確かめてから復号する。復号は新しい所有を作るので、その後にホストが
+/// 同じ bytes を書き換えても中身は動かない。豊かな戻り値は領域を取り直して
+/// 符号化し、内部の持ち主はそこで落とす(rhodolite-wasm-abi spec)
+fn wrapper(at: Boundary<'_>, signature: &Signature, target: u32) -> Function {
+    let rich: Vec<&hir::Type> = signature.params.iter().filter_map(Port::rich).collect();
+    let flat: Vec<ValType> = signature.params.iter().flat_map(Port::val_types).collect();
+    let base = flat.len() as u32;
+    // 復号した引数の根、続いて結果の根・大きさ・領域・作業用。scalar だけの
+    // 署名は1つも取らないので、v0 のモジュールはバイト列が変わらない
+    let extra = if signature.ports().any(|port| port.rich().is_some()) {
+        rich.len() as u32 + 4
+    } else {
+        0
+    };
+    let mut b = if extra == 0 {
+        Body::with_locals(Vec::new())
+    } else {
+        Body::with_locals(vec![(extra, ValType::I32)])
+    };
+    let (result_root, size, area, scratch) = (
+        base + rich.len() as u32,
+        base + rich.len() as u32 + 1,
+        base + rich.len() as u32 + 2,
+        base + rich.len() as u32 + 3,
+    );
+
+    // bool は 0/1 以外を受けない
+    let mut slot = 0u32;
+    for port in &signature.params {
+        if let Port::Scalar(Scalar::Bool) = port {
+            b.get(slot).num(2).ins(Instruction::I32GeU);
+            b.trap_if();
         }
-        if scalar.val_type().is_some() {
-            index += 1;
+        slot += port.val_types().len() as u32;
+    }
+
+    // 豊かな引数は、渡された slice が受け渡し領域に収まっているかを先に見る
+    let mut pointer = 0u32;
+    let mut which = 0usize;
+    for port in &signature.params {
+        let width = port.val_types().len() as u32;
+        if let Port::Rich(ty) = port {
+            let layout = at.layouts.plan(at.program, ty).expect("公開型は収まる");
+            let root = base + which as u32;
+            wasm_wire::check_slice(
+                &mut b,
+                wasm_runtime::EXCHANGE,
+                pointer,
+                pointer + 1,
+                scratch,
+            );
+            // 復号先は新しい割り当て。ホストの bytes とは記憶を共有しない
+            wasm_data::alloc_root(&mut b, at.indices, at.layouts, layout);
+            b.set(root);
+            b.get(pointer);
+            b.get(pointer).get(pointer + 1).ins(Instruction::I32Add);
+            b.get(root);
+            b.ins(Instruction::Call(at.wires.of(layout).decode));
+            // 余りが残る並びは正準ではない
+            b.get(pointer)
+                .get(pointer + 1)
+                .ins(Instruction::I32Add)
+                .ins(Instruction::I32Ne);
+            b.trap_if();
+            which += 1;
+        }
+        pointer += width;
+    }
+
+    // 本体へ渡す形へ組み直す
+    let mut slot = 0u32;
+    let mut which = 0usize;
+    for port in &signature.params {
+        let width = port.val_types().len() as u32;
+        match port {
+            Port::Scalar(_) => {
+                for offset in 0..width {
+                    b.get(slot + offset);
+                }
+            }
+            Port::Rich(ty) => {
+                let layout = at.layouts.plan(at.program, ty).expect("公開型は収まる");
+                let root = base + which as u32;
+                match at
+                    .layouts
+                    .repr(at.program, ty)
+                    .expect("公開型は収まる")
+                    .kind
+                {
+                    // 所有する値は根のアドレスがそのまま内部の表現
+                    ReprKind::Owned(_) => b.get(root),
+                    // Copy な値は平ら。読み出したら帳簿は要らない
+                    _ => {
+                        let layouts = &*at.layouts;
+                        wasm_data::load_copy(&mut b, layouts, layout, root, 0);
+                        b.get(root).ins(Instruction::Call(at.indices.free))
+                    }
+                };
+                which += 1;
+            }
+        }
+        slot += width;
+    }
+    b.ins(Instruction::Call(target));
+
+    match &signature.result {
+        Port::Scalar(Scalar::Bool) => {
+            // 内部の bool は構成上 0/1 だが、公開する値は境界でも正規化する
+            b.ins(Instruction::I32Eqz).ins(Instruction::I32Eqz);
+        }
+        Port::Scalar(_) => {}
+        Port::Rich(ty) => {
+            let ty = ty.clone();
+            let layout = at.layouts.plan(at.program, &ty).expect("公開型は収まる");
+            let owned = matches!(
+                at.layouts
+                    .repr(at.program, &ty)
+                    .expect("公開型は収まる")
+                    .kind,
+                ReprKind::Owned(_)
+            );
+            if owned {
+                b.set(result_root);
+            } else {
+                // 平らな値はいったん帳簿へ置く。符号化は記憶の上で行う
+                let stash: Vec<u32> = Vec::new();
+                wasm_data::alloc_root(&mut b, at.indices, at.layouts, layout);
+                b.set(result_root);
+                let layouts = &*at.layouts;
+                wasm_data::store_copy(&mut b, layouts, layout, result_root, 0, &stash);
+            }
+            b.get(result_root)
+                .ins(Instruction::Call(at.wires.of(layout).size))
+                .set(size);
+            // 領域を取り直す。前の領域(引数を置いた場所)はここで返る
+            b.get(size).ins(Instruction::Call(at.reserve)).set(area);
+            b.get(result_root)
+                .get(area)
+                .ins(Instruction::Call(at.wires.of(layout).encode))
+                .ins(Instruction::Drop);
+            // 符号化し終えたので内部の持ち主は落とす
+            let (indices, glue) = (at.indices, at.indices.of(layout));
+            wasm_data::drop_root(&mut b, indices, glue, result_root);
+            b.get(area).get(size);
         }
     }
-    for slot in 0..params.len() as u32 {
-        function.instruction(&Instruction::LocalGet(slot));
-    }
-    function.instruction(&Instruction::Call(target));
-    // 内部の bool は構成上 0/1 だが、公開する値は境界でも正規化しておく
-    if signature.result == Scalar::Bool {
-        function.instruction(&Instruction::I32Eqz);
-        function.instruction(&Instruction::I32Eqz);
-    }
-    function.instruction(&Instruction::End);
-    function
+    b.finish()
 }
 
 /// 生成した bytes を独立に検証する。生成器と同じ知識を使わないための一手間
@@ -3123,18 +3308,26 @@ pub(crate) mod tests {
             &["nothing"],
         );
         assert!(
-            message.contains("引数を ABI v0 では表せません"),
+            message.contains("`unit` 引数は境界に出せません"),
             "{message}"
         );
     }
 
     /// 公開できない型は公開面でだけ拒否する。同じ型の非公開宣言は縛らない
     #[test]
-    fn 公開面の豊かな型は拒否するが非公開は縛らない() {
+    fn 公開面の借用は拒否するが所有は境界に出せる() {
         let src = "struct User { name: str }\n\
                    fn rich(-> User) { User { name = \"a\" } }\n\
+                   fn peek(u: &User -> int) { 1 }\n\
                    fn main(-> int) { 0 }\n";
-        assert!(abi_error(src, &["rich"]).contains("戻り値の型 `User` を ABI v0 では表せません"));
+        // 所有型は ABI v1 として通る
+        compile(src, &["rich"]).expect("生成できるはず");
+        // 借用は境界を越えられない
+        assert!(
+            abi_error(src, &["peek"]).contains("公開面の借用 `&User` は Wasm の署名には出せません"),
+            "{}",
+            abi_error(src, &["peek"])
+        );
         // 同じ宣言があっても、公開せず到達もしなければビルドは通る
         compile(src, &[]).expect("生成できるはず");
     }
@@ -4535,6 +4728,396 @@ pub(crate) mod tests {
         let bytes = compile(SURFACE, &["touch"]).expect("生成できるはず");
         validate(&bytes).expect("検証を通るはず");
         assert_eq!(scalars(&invoke(&bytes, ENTRY_EXPORT, &[]).unwrap()), [3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rhodolite Wasm ABI v1(tasks 8.1〜8.8)
+    // -----------------------------------------------------------------------
+
+    /// ホストの役。`memory` を直に読み書きして、正準 bytes を受け渡し領域へ置く
+    struct Host {
+        store: wasmi::Store<()>,
+        instance: wasmi::Instance,
+        memory: wasmi::Memory,
+    }
+
+    impl Host {
+        fn new(bytes: &[u8]) -> Host {
+            validate(bytes).expect("検証を通るはず");
+            let engine = wasmi::Engine::default();
+            let module = wasmi::Module::new(&engine, bytes).expect("読めるはず");
+            let mut store = wasmi::Store::new(&engine, ());
+            let instance = wasmi::Linker::new(&engine)
+                .instantiate_and_start(&mut store, &module)
+                .expect("立ち上がるはず");
+            let memory = instance
+                .get_memory(&store, "memory")
+                .expect("ABI v1 は memory を出す");
+            Host {
+                store,
+                instance,
+                memory,
+            }
+        }
+
+        fn call(
+            &mut self,
+            name: &str,
+            args: &[wasmi::Val],
+            results: usize,
+        ) -> Result<Vec<i64>, String> {
+            let func = self
+                .instance
+                .get_func(&self.store, name)
+                .ok_or_else(|| format!("`{name}` が無い"))?;
+            let mut out = vec![wasmi::Val::I32(0); results];
+            func.call(&mut self.store, args, &mut out)
+                .map_err(|e| e.to_string())?;
+            Ok(scalars(&out))
+        }
+
+        /// 受け渡し領域を取り直して、そこへ bytes を書く
+        fn stage(&mut self, bytes: &[u8]) -> i32 {
+            let area = self
+                .call(
+                    "__rhodolite_abi_reserve",
+                    &[wasmi::Val::I32(bytes.len() as i32)],
+                    1,
+                )
+                .expect("予約できるはず")[0] as i32;
+            self.memory
+                .write(&mut self.store, area as usize, bytes)
+                .expect("書けるはず");
+            area
+        }
+
+        fn read(&self, at: i32, len: i32) -> Vec<u8> {
+            let mut buf = vec![0u8; len as usize];
+            self.memory
+                .read(&self.store, at as usize, &mut buf)
+                .expect("読めるはず");
+            buf
+        }
+    }
+
+    /// wire 形式の組み立て。ホスト側は仕様だけを見て書ける
+    fn wire_str(text: &str) -> Vec<u8> {
+        let mut out = (text.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    /// 所有する値が境界を往復する。復号は新しい所有を作る
+    #[test]
+    fn 豊かな値は正準bytesで往復する() {
+        let bytes = compile(
+            "fn echo(s: str -> str) { s }\n\
+             fn main(-> int) { 0 }\n",
+            &["echo"],
+        )
+        .expect("生成できるはず");
+        let mut host = Host::new(&bytes);
+        let area = host.stage(&wire_str("こんにちは"));
+        let out = host
+            .call(
+                "echo",
+                &[
+                    wasmi::Val::I32(area),
+                    wasmi::Val::I32(wire_str("こんにちは").len() as i32),
+                ],
+                2,
+            )
+            .expect("走るはず");
+        let (at, len) = (out[0] as i32, out[1] as i32);
+        assert_eq!(host.read(at, len), wire_str("こんにちは"));
+    }
+
+    /// scalar と豊かな値が混ざった署名も、順番どおりに渡る
+    #[test]
+    fn 混ざった署名も渡る() {
+        let bytes = compile(
+            "struct User { id: int, name: str }\n\
+             fn pick(flag: bool, u: User, bump: int -> int) {\n\
+             \x20 if flag: u.id + bump else: 0\n\
+             }\n\
+             fn main(-> int) { 0 }\n",
+            &["pick"],
+        )
+        .expect("生成できるはず");
+        let mut host = Host::new(&bytes);
+        let mut encoded = 7i64.to_le_bytes().to_vec();
+        encoded.extend(wire_str("u"));
+        let area = host.stage(&encoded);
+        assert_eq!(
+            host.call(
+                "pick",
+                &[
+                    wasmi::Val::I32(1),
+                    wasmi::Val::I32(area),
+                    wasmi::Val::I32(encoded.len() as i32),
+                    wasmi::Val::I64(5),
+                ],
+                1,
+            )
+            .expect("走るはず"),
+            [12]
+        );
+    }
+
+    /// 入れ子と再帰も、宣言の型どおりに往復する
+    #[test]
+    fn 入れ子と再帰も往復する() {
+        let bytes = compile(
+            "enum List { Nil\n Cons(int, indirect List) }\n\
+             fn total(l: List -> int) {\n\
+             \x20 match move l {\n\
+             \x20   List::Cons(head, rest): head + total(move rest)\n\
+             \x20   List::Nil: 0\n\
+             \x20 }\n\
+             }\n\
+             fn main(-> int) { 0 }\n",
+            &["total"],
+        )
+        .expect("生成できるはず");
+        let mut host = Host::new(&bytes);
+        // Cons(1, Cons(2, Nil)) — tag は宣言順で Nil=0, Cons=1
+        let mut encoded = Vec::new();
+        for value in [1i64, 2] {
+            encoded.extend(1u32.to_le_bytes());
+            encoded.extend(value.to_le_bytes());
+        }
+        encoded.extend(0u32.to_le_bytes());
+        let area = host.stage(&encoded);
+        assert_eq!(
+            host.call(
+                "total",
+                &[wasmi::Val::I32(area), wasmi::Val::I32(encoded.len() as i32)],
+                1,
+            )
+            .expect("走るはず"),
+            [3]
+        );
+    }
+
+    /// 壊れた入力は本体が走る前に trap する
+    #[test]
+    fn 壊れた入力は本体の前でtrapする() {
+        let bytes = compile(
+            "fn echo(s: str -> str) { s }\n\
+             fn main(-> int) { 0 }\n",
+            &["echo"],
+        )
+        .expect("生成できるはず");
+
+        for (what, encoded) in [
+            // 長さが slice からはみ出す
+            ("はみ出す長さ", vec![9, 0, 0, 0, b'a']),
+            // 途中で切れている
+            ("途中切れ", vec![4, 0, 0]),
+            // UTF-8 として不正
+            ("不正な UTF-8", vec![1, 0, 0, 0, 0xFF]),
+            // 余分な bytes が付いている
+            ("余りがある", vec![1, 0, 0, 0, b'a', b'x']),
+            // overlong な符号化
+            ("overlong", vec![2, 0, 0, 0, 0xC0, 0x80]),
+            // surrogate
+            ("surrogate", vec![3, 0, 0, 0, 0xED, 0xA0, 0x80]),
+        ] {
+            let mut host = Host::new(&bytes);
+            let area = host.stage(&encoded);
+            assert!(
+                host.call(
+                    "echo",
+                    &[wasmi::Val::I32(area), wasmi::Val::I32(encoded.len() as i32)],
+                    2,
+                )
+                .is_err(),
+                "{what}"
+            );
+        }
+    }
+
+    /// 受け渡し領域の外を指す slice は受け取らない
+    #[test]
+    fn 領域の外を指すsliceは拒否される() {
+        let bytes = compile(
+            "fn echo(s: str -> str) { s }\n\
+             fn main(-> int) { 0 }\n",
+            &["echo"],
+        )
+        .expect("生成できるはず");
+        let mut host = Host::new(&bytes);
+        let area = host.stage(&wire_str("a"));
+        for (what, at, len) in [
+            ("領域の手前", area - 8, 5),
+            ("領域の後ろへ伸びる", area, 4096),
+            ("そもそも別の場所", 0, 5),
+        ] {
+            assert!(
+                host.call("echo", &[wasmi::Val::I32(at), wasmi::Val::I32(len)], 2)
+                    .is_err(),
+                "{what}"
+            );
+        }
+    }
+
+    /// 予約する前に呼ばれたら、正しい slice はあり得ない
+    #[test]
+    fn 予約前の呼び出しは拒否される() {
+        let bytes = compile(
+            "fn echo(s: str -> str) { s }\n\
+             fn main(-> int) { 0 }\n",
+            &["echo"],
+        )
+        .expect("生成できるはず");
+        let mut host = Host::new(&bytes);
+        assert!(
+            host.call("echo", &[wasmi::Val::I32(64), wasmi::Val::I32(1)], 2)
+                .is_err()
+        );
+    }
+
+    /// 結果の bytes は次の予約まで。取り直せば前の中身は保証されない
+    #[test]
+    fn 結果は次の予約で無効になる() {
+        let bytes = compile(
+            "fn echo(s: str -> str) { s }\n\
+             fn main(-> int) { 0 }\n",
+            &["echo"],
+        )
+        .expect("生成できるはず");
+        let mut host = Host::new(&bytes);
+        let encoded = wire_str("first");
+        let area = host.stage(&encoded);
+        let out = host
+            .call(
+                "echo",
+                &[wasmi::Val::I32(area), wasmi::Val::I32(encoded.len() as i32)],
+                2,
+            )
+            .expect("走るはず");
+        assert_eq!(host.read(out[0] as i32, out[1] as i32), wire_str("first"));
+        // 取り直すと同じ場所が別の用途で使われる
+        host.stage(&wire_str("second"));
+        assert_ne!(host.read(out[0] as i32, out[1] as i32), wire_str("first"));
+    }
+
+    /// scalar だけの公開面は今も ABI v0。メモリも予約入口も出さない
+    #[test]
+    fn scalarだけの公開面はabi_v0のまま() {
+        let bytes = compile(SURFACE, &["find_user=find", "touch"]).expect("生成できるはず");
+        assert!(abi_metadata(&bytes).starts_with("{\"version\":0,"));
+        assert_eq!(export_names(&bytes), [ENTRY_EXPORT, "find_user", "touch"]);
+    }
+
+    /// 豊かな公開面は v1 を選び、メモリと予約入口を出す
+    #[test]
+    fn 豊かな公開面はabi_v1を選ぶ() {
+        let bytes = compile(
+            "fn echo(s: str -> str) { s }\n\
+             fn main(-> int) { 0 }\n",
+            &["echo"],
+        )
+        .expect("生成できるはず");
+        assert!(abi_metadata(&bytes).starts_with("{\"version\":1,"));
+        assert_eq!(
+            export_names(&bytes),
+            [ENTRY_EXPORT, "echo", "memory", "__rhodolite_abi_reserve"]
+        );
+    }
+
+    /// メタデータは公開署名から辿れる型グラフを載せる。再帰も閉じる
+    #[test]
+    fn abi_v1のメタデータは型グラフを載せる() {
+        let bytes = compile(
+            "struct Profile { handle: str }\n\
+             struct User { id: int, profile: Profile?, tags: [str] }\n\
+             fn lookup(u: User -> User) { u }\n\
+             fn main(-> int) { 0 }\n",
+            &["lookup"],
+        )
+        .expect("生成できるはず");
+        assert_eq!(
+            abi_metadata(&bytes),
+            // ID は子を訪ねる前に押さえるので、宣言を深さ優先で辿った順になる
+            "{\"version\":1,\
+             \"entry\":{\"name\":\"__rhodolite_main\",\"params\":[],\"result\":\"int\"},\
+             \"exports\":[{\"name\":\"lookup\",\"params\":[\"t0\"],\"result\":\"t0\"}],\
+             \"types\":[\
+             {\"id\":\"t0\",\"kind\":\"struct\",\"name\":\"User\",\"fields\":[\
+             {\"name\":\"id\",\"type\":\"int\"},\
+             {\"name\":\"profile\",\"type\":\"t1\"},\
+             {\"name\":\"tags\",\"type\":\"t4\"}]},\
+             {\"id\":\"t1\",\"kind\":\"optional\",\"payload\":\"t2\"},\
+             {\"id\":\"t2\",\"kind\":\"struct\",\"name\":\"Profile\",\"fields\":[\
+             {\"name\":\"handle\",\"type\":\"t3\"}]},\
+             {\"id\":\"t3\",\"kind\":\"str\"},\
+             {\"id\":\"t4\",\"kind\":\"array\",\"element\":\"t3\"}]}"
+        );
+    }
+
+    /// 再帰する型は ID を先に押さえるので、辿り切って閉じる
+    #[test]
+    fn 再帰する公開型もメタデータで閉じる() {
+        let bytes = compile(
+            "struct Node { value: int, indirect next: Node? }\n\
+             fn head(n: Node -> int) { n.value }\n\
+             fn main(-> int) { 0 }\n",
+            &["head"],
+        )
+        .expect("生成できるはず");
+        assert_eq!(
+            abi_metadata(&bytes),
+            "{\"version\":1,\
+             \"entry\":{\"name\":\"__rhodolite_main\",\"params\":[],\"result\":\"int\"},\
+             \"exports\":[{\"name\":\"head\",\"params\":[\"t0\"],\"result\":\"int\"}],\
+             \"types\":[\
+             {\"id\":\"t0\",\"kind\":\"struct\",\"name\":\"Node\",\"fields\":[\
+             {\"name\":\"value\",\"type\":\"int\"},\
+             {\"name\":\"next\",\"type\":\"t1\"}]},\
+             {\"id\":\"t1\",\"kind\":\"optional\",\"payload\":\"t0\"}]}"
+        );
+    }
+
+    /// 公開署名から辿れない型は、内部で使っていても表に出ない
+    #[test]
+    fn 非公開の型はメタデータに出ない() {
+        let bytes = compile(
+            "struct Hidden { note: str }\n\
+             struct Shown { id: int }\n\
+             fn helper(-> int) {\n let h = Hidden { note = \"x\" }\n 1\n}\n\
+             fn shown(s: Shown -> int) { s.id + helper() }\n\
+             fn main(-> int) { 0 }\n",
+            &["shown"],
+        )
+        .expect("生成できるはず");
+        let metadata = abi_metadata(&bytes);
+        assert!(metadata.contains("\"name\":\"Shown\""), "{metadata}");
+        assert!(!metadata.contains("Hidden"), "{metadata}");
+    }
+
+    /// 同じ公開面からは同じメタデータ。走査の仕方に依らない
+    #[test]
+    fn abi_v1のメタデータは決定的() {
+        let src = "struct User { id: int, name: str }\n\
+                   fn one(u: User -> int) { u.id }\n\
+                   fn two(u: User -> User) { u }\n\
+                   fn main(-> int) { 0 }\n";
+        let first = compile(src, &["two", "one"]).expect("生成できるはず");
+        let second = compile(src, &["one", "two"]).expect("生成できるはず");
+        // 公開名も公開型も同じなら、書いた順が違ってもメタデータは動かない。
+        // モジュールの bytes は生産の根の並びに従うので、そこまでは揃わない
+        assert_eq!(abi_metadata(&first), abi_metadata(&second));
+        assert_eq!(export_names(&first), export_names(&second));
+    }
+
+    /// 予約名は公開名に使えない
+    #[test]
+    fn abiの予約名は公開名に使えない() {
+        for name in ["memory", "__rhodolite_abi_reserve"] {
+            let message = abi_error(SURFACE, &[&format!("{name}=touch")]);
+            assert!(message.contains("予約名"), "{name}: {message}");
+        }
     }
 
     // -----------------------------------------------------------------------
