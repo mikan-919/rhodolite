@@ -150,8 +150,8 @@ fn check_support_impl(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
                 "実行時に provider を運ぶ ambient 要求",
             ));
         }
-        if callable.receiver.is_some() {
-            diagnostics.push(unsupported(callable.span, "メソッド"));
+        if let Some(receiver) = callable.body.receiver {
+            check_local(program, &callable.body, receiver, &mut diagnostics);
         }
         if callable.ret.reference.is_some() {
             diagnostics.push(borrowed_signature(
@@ -242,8 +242,13 @@ fn check_expr(
             children.extend(orelse.iter().copied());
         }
         hir::ExprKind::While { cond, body: inner } => children.extend([*cond, *inner]),
-        hir::ExprKind::Call(hir::Call::Direct { args, .. }) => {
+        hir::ExprKind::Call(hir::Call::Direct { args, .. })
+        | hir::ExprKind::Call(hir::Call::Associated { args, .. }) => {
             children.extend(args.iter().copied())
+        }
+        hir::ExprKind::Call(hir::Call::Method { recv, args, .. }) => {
+            children.push(*recv);
+            children.extend(args.iter().copied());
         }
 
         hir::ExprKind::Str(_) => {}
@@ -293,12 +298,6 @@ fn check_expr(
             children.extend([*iter, *inner]);
         }
         hir::ExprKind::With { .. } => diagnostics.push(unsupported(expr.span, "`with` の提供")),
-        hir::ExprKind::Call(hir::Call::Method { .. }) => {
-            diagnostics.push(unsupported(expr.span, "メソッド呼び出し"))
-        }
-        hir::ExprKind::Call(hir::Call::Associated { .. }) => {
-            diagnostics.push(unsupported(expr.span, "関連関数の呼び出し"))
-        }
         hir::ExprKind::Call(hir::Call::Slot { slot_span, .. }) => {
             diagnostics.push(unsupported(*slot_span, "スロット経由の呼び出し"))
         }
@@ -719,6 +718,8 @@ impl Types {
 struct Emitter<'a> {
     program: &'a hir::Program,
     instance: &'a crate::ambient_abi::Instance,
+    /// target と ambient projection はこの production plan からだけ読む。
+    specializations: &'a Plan,
     lowered: &'a Lowered,
     /// 所有権検査が確定した掃除。ここを読むだけで、順を組み直さない
     plan: &'a crate::ownership::BodyPlan,
@@ -1213,24 +1214,67 @@ impl Emitter<'_> {
             }
 
             // 呼び先は計画が持っている。名前で引き直さない(design.md 決定5)
-            hir::ExprKind::Call(hir::Call::Direct { callable, args }) => {
-                let (callable, args) = (*callable, args.clone());
-                let params: Vec<hir::LocalId> = self.program.callables[callable].params.clone();
-                for (arg, param) in args.iter().zip(params) {
-                    let want = self.program.callables[callable]
-                        .body
-                        .local(param)
-                        .ty
-                        .clone();
-                    self.value(*arg, want.as_ref());
-                }
-                let target = self.instance.calls[&id].target;
-                self.push(Instruction::Call(target.index() as u32));
+            hir::ExprKind::Call(hir::Call::Direct { args, .. }) => {
+                self.planned_call(id, None, &args.clone());
+            }
+
+            hir::ExprKind::Call(hir::Call::Method { recv, args, .. }) => {
+                self.planned_call(id, Some(*recv), &args.clone());
+            }
+
+            hir::ExprKind::Call(hir::Call::Associated { args, .. }) => {
+                self.planned_call(id, None, &args.clone());
             }
 
             // 対応範囲の検査が先に止めているので、ここへ来たら検査の抜け
             other => unreachable!("Wasm へ下ろせない式が検査を抜けました: {other:?}"),
         }
+    }
+
+    /// ordinary / inherent / associated calls share the one physical calling
+    /// convention: concrete receiver, source-ordered declared arguments, then
+    /// the planner-recorded ambient projection.
+    fn planned_call(
+        &mut self,
+        id: hir::ExprId,
+        receiver: Option<hir::ExprId>,
+        args: &[hir::ExprId],
+    ) {
+        let planned = &self.instance.calls[&id];
+        let target_instance = self.specializations.instance(planned.target);
+        let hir::BodyId::Callable(target_id) = target_instance.key.body else {
+            unreachable!("production call target は callable")
+        };
+        let target = &self.program.callables[target_id];
+
+        match (receiver, target.body.receiver) {
+            (Some(receiver), Some(local)) => {
+                let ty = target.body.local(local).ty.clone();
+                self.value(receiver, ty.as_ref());
+            }
+            (None, None) => {}
+            _ => unreachable!("pre-emission validator が receiver shape を検査する"),
+        }
+        for (arg, parameter) in args.iter().zip(&target.params) {
+            let ty = target.body.local(*parameter).ty.clone();
+            self.value(*arg, ty.as_ref());
+        }
+        for (_, source) in &planned.projection {
+            match source {
+                crate::ambient_abi::ValueSource::Incoming(slot) => {
+                    let local = self
+                        .lowered
+                        .ambient
+                        .get(*slot)
+                        .expect("pre-emission validator が incoming field を検査する");
+                    self.out.get(local);
+                }
+                crate::ambient_abi::ValueSource::Provision(_) => {
+                    unreachable!("value provision lowering は task 5 で接続する")
+                }
+            }
+        }
+        self.push(Instruction::Call(planned.target.index() as u32));
     }
 
     /// 式の結果の実行時表現の種別
@@ -2495,6 +2539,7 @@ fn build(
         let mut emitter = Emitter {
             program,
             instance,
+            specializations: plan,
             lowered,
             plan: checked.plan.body(hir::BodyId::Callable(lowered.callable)),
             layouts: &mut layouts,
@@ -2921,14 +2966,13 @@ pub(crate) mod tests {
 
     /// 到達したら止まる。指すのは到達したその構文
     #[test]
-    fn 到達した未対応の構文はビルドを止める() {
+    fn 到達した未対応のambient構文はビルドを止める() {
         let errors = compile(
-            "struct User { rank: int }\n\
-             impl User { fn shown(&self -> int) { self.rank } }\n\
-             fn reached(-> int) {\n\
-             \x20 let u = User { rank = 1 }\n\
-             \x20 u.shown()\n\
-             }\n\
+            "trait Clock { fn now(self -> int) }\n\
+             struct Frozen {}\n\
+             impl Clock for Frozen { fn now(self -> int) { 1 } }\n\
+             effect clock: Clock\n\
+             fn reached(-> int) { with clock(Frozen {}) { clock.now() } }\n\
              fn main(-> int) { reached() }\n",
             &[],
         )
@@ -5332,6 +5376,36 @@ pub(crate) mod tests {
         assert_eq!(lowered.params, [ValType::I32, ValType::I64]);
         assert_eq!(lowered.slots[&receiver], [0]);
         assert_eq!(lowered.slots[&parameter], [1]);
+    }
+
+    #[test]
+    fn inherent_methodとassociated_functionは計画したtargetへ下りる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Counter { value: int }\n\
+                 impl Counter {\n\
+                 \x20 fn make(value: int -> Counter) { Counter { value = value } }\n\
+                 \x20 fn add(self, delta: int -> int) { self.value + delta }\n\
+                 \x20 fn read(&self -> int) { self.value }\n\
+                 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let counter = Counter::make(4)\n\
+                 \x20 move counter.add(5)\n\
+                 }\n"
+            ),
+            9
+        );
+        assert_eq!(
+            same_as_interpreter(
+                "struct Counter { value: int }\n\
+                 impl Counter {\n\
+                 \x20 fn make(value: int -> Counter) { Counter { value = value } }\n\
+                 \x20 fn read(&self -> int) { self.value }\n\
+                 }\n\
+                 fn main(-> int) { Counter::make(7).read() }\n"
+            ),
+            7
+        );
     }
 
     /// 所有データを内部で使う ABI v0 モジュールも、scalar の公開面を保ったまま

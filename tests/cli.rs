@@ -1863,12 +1863,11 @@ fn 各段の失敗で成果物を出さない() {
             "提供されていません",
         ),
         (
-            "struct User { rank: int }\n\
-             impl User { fn shown(&self -> int) { self.rank } }\n\
-             fn main(-> int) {\n\
-             \x20 let u = User { rank = 1 }\n\
-             \x20 u.shown()\n\
-             }\n",
+            "trait Clock { fn now(self -> int) }\n\
+             struct Frozen {}\n\
+             impl Clock for Frozen { fn now(self -> int) { 1 } }\n\
+             effect clock: Clock\n\
+             fn main(-> int) { with clock(Frozen {}) { clock.now() } }\n",
             "Wasm ターゲットでは扱えません",
         ),
     ] {
