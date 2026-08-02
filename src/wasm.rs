@@ -5185,6 +5185,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// 所有データを内部で使う ABI v0 モジュールも、scalar の公開面を保ったまま
+    /// 既存の allocator・glue・関数番号を出す。この fixture は struct、enum、
+    /// optional、array、clone、move、field mutation を一緒に通す。
+    #[test]
+    fn owned_data総合fixtureのバイト列は変わらない() {
+        let src = std::fs::read_to_string("tests/fixtures/wasm-owned-data/all-constructs.rd")
+            .expect("fixture を読めるはず");
+        let bytes = compile(&src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(fingerprint(&bytes), "6522:8ab1ea22a8f5b6b9");
+        assert_eq!(
+            scalars(&invoke(&bytes, ENTRY_EXPORT, &[]).expect("独立エンジンで走るはず")),
+            [2_333_116]
+        );
+    }
+
+    /// rich な公開値は ABI v1 の wrapper、wire codec、memory export を追加する。
+    /// internal calling convention を広げても、この既存境界の bytes を動かさない。
+    #[test]
+    fn owned_data_abi_v1のバイト列は変わらない() {
+        let src = "struct User { id: int, name: str }\n\
+                   fn echo(user: User -> User) { user }\n\
+                   fn main(-> int) { 0 }\n";
+        let bytes = compile(src, &["echo"]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(fingerprint(&bytes), "2177:9b7ff1cc2bcbe545");
+
+        let mut host = Host::new(&bytes);
+        let mut encoded = 7i64.to_le_bytes().to_vec();
+        encoded.extend(wire_str("snapshot"));
+        let area = host.stage(&encoded);
+        let out = host
+            .call(
+                "echo",
+                &[wasmi::Val::I32(area), wasmi::Val::I32(encoded.len() as i32)],
+                2,
+            )
+            .expect("独立エンジンで走るはず");
+        assert_eq!(host.read(out[0] as i32, out[1] as i32), encoded);
+    }
+
     /// 固定した bytes は独立エンジンでも同じ観測を返す。指紋だけでは
     /// 「壊れたまま固定した」を捕まえられない
     #[test]
