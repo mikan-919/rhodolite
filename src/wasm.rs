@@ -14,7 +14,7 @@
 //! v0 が扱うのは scalar の部分言語だけ。到達した範囲にそれ以外があれば
 //! 生成の前に診断で止める(core-wasm-build spec)。
 
-use crate::ambient_abi::{Plan, ProductionPlan};
+use crate::ambient_abi::{Instance, Plan, ProductionPlan};
 use crate::diag::Diag;
 use crate::hir;
 use crate::ownership::CheckedProgram;
@@ -356,6 +356,10 @@ struct Lowered {
     /// HIR のローカル → Wasm のローカル番号の**並び**。`unit` のローカルは空。
     /// 値を複数持つ表現(Copy な optional など)は席をその数だけ取る
     slots: BTreeMap<hir::LocalId, Vec<u32>>,
+    /// trailing hidden ambient fields。body emitter は `SlotId` からここを引き、
+    /// source-level local と混ぜない。
+    #[allow(dead_code)] // task 4.1 で projection emitter が読む
+    ambient: crate::wasm_ambient::IncomingFields,
     /// 引数の後ろに並ぶ宣言ローカルの型
     extra_locals: Vec<ValType>,
     /// 所有する非 Copy の束縛 → その並び。掃除の glue をここから引く
@@ -373,19 +377,38 @@ struct Lowered {
     common: u32,
 }
 
-/// 引数と宣言ローカルへ Wasm のローカル番号を振る。
+/// instance の receiver・引数・ambient fields と宣言ローカルへ Wasm の
+/// local 番号を振る。
 ///
 /// 番号は Wasm の規則どおり引数が先。どちらも HIR の宣言順で歩くので、
 /// 同じ入力からは同じ割り当てになる
-fn lower_signature(
+fn lower_instance_signature(
     layouts: &mut Layouts,
     program: &hir::Program,
-    callable_id: hir::CallableId,
+    plan: &Plan,
+    instance: &Instance,
 ) -> Lowered {
+    let hir::BodyId::Callable(callable_id) = instance.key.body else {
+        unreachable!("test は生産の instance にならない")
+    };
     let callable = &program.callables[callable_id];
     let body = &callable.body;
     let mut slots: BTreeMap<hir::LocalId, Vec<u32>> = BTreeMap::new();
     let mut params = Vec::new();
+
+    // receiver は source-level parameter より前。`Body::receiver` を普通の
+    // local と同じ map へ置くので、以後の所有・cleanup は既存経路を再利用する。
+    if let Some(receiver) = body.receiver {
+        let values = local_values(layouts, program, body, receiver);
+        let seats = values
+            .iter()
+            .map(|value| {
+                params.push(*value);
+                params.len() as u32 - 1
+            })
+            .collect();
+        slots.insert(receiver, seats);
+    }
 
     for local in &callable.params {
         let values = local_values(layouts, program, body, *local);
@@ -398,6 +421,18 @@ fn lower_signature(
             .collect();
         slots.insert(*local, seats);
     }
+
+    // planner の layout 順をそのまま trailing `i32` parameters にする。空 layout
+    // は何も足さないため、ambient-free instance の過去の bytes を保てる。
+    let ambient = crate::wasm_ambient::allocate(
+        instance.layout.map(|layout| plan.layout(layout)),
+        [],
+        params.len() as u32,
+    );
+    params.extend(std::iter::repeat_n(
+        ValType::I32,
+        (ambient.next - params.len() as u32) as usize,
+    ));
 
     let mut extra_locals = Vec::new();
     for (id, _) in body.locals() {
@@ -478,6 +513,7 @@ fn lower_signature(
         params,
         results: values_of(layouts, program, &callable.ret),
         slots,
+        ambient: ambient.incoming,
         extra_locals,
         owned,
         flags,
@@ -2418,8 +2454,7 @@ fn build(
     let lowered: Vec<Lowered> = plan
         .instances()
         .map(|(_, instance)| match instance.key.body {
-            hir::BodyId::Callable(id) => lower_signature(&mut layouts, program, id),
-            hir::BodyId::Test(_) => unreachable!("test は生産の根に入らない"),
+            _ => lower_instance_signature(&mut layouts, program, plan, instance),
         })
         .collect();
 
@@ -2471,8 +2506,13 @@ fn build(
         };
         // 引数は呼ばれた時点で所有を得ている。局所の初期値は 0 なので、
         // 持っていることを明示的に立てる(tasks 3.4)
-        for local in &program.callables[lowered.callable].params {
-            if let Some(flag) = lowered.flags.get(local).copied() {
+        for local in program.callables[lowered.callable]
+            .body
+            .receiver
+            .into_iter()
+            .chain(program.callables[lowered.callable].params.iter().copied())
+        {
+            if let Some(flag) = lowered.flags.get(&local).copied() {
                 wasm_data::mark_initialized(&mut emitter.out, flag);
             }
         }
@@ -5187,6 +5227,111 @@ pub(crate) mod tests {
             validate(&bytes).expect("検証を通るはず");
             assert_eq!(fingerprint(&bytes), expected, "{src}");
         }
+    }
+
+    fn instance_signature_snapshot(
+        checked: &CheckedProgram,
+        production: &ProductionPlan,
+        instance_id: crate::ambient_abi::InstanceId,
+    ) -> String {
+        let program = &checked.hir;
+        let mut layouts = Layouts::default();
+        plan_reachable(&mut layouts, program, &production.plan);
+        let instance = production.plan.instance(instance_id);
+        let lowered = lower_instance_signature(&mut layouts, program, &production.plan, instance);
+        let ambient = instance
+            .layout
+            .into_iter()
+            .flat_map(|layout| production.plan.layout(layout).fields.iter())
+            .map(|(slot, _)| {
+                format!(
+                    "{}={}",
+                    program.slots[*slot].name,
+                    lowered.ambient.get(*slot).expect("hidden field がある")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{} params={:?} ambient=[{ambient}]",
+            program.show_body(instance.key.body),
+            lowered.params
+        )
+    }
+
+    /// internal signature は callable 名ではなく specialization instance から作る。
+    /// 空/value/type-only/multiple-field record と同一 callable の複数 instance を
+    /// 一つの固定した snapshot にする。
+    #[test]
+    fn instance署名とambient_localの並びは固定される() {
+        let src = "trait Clock { fn now(self -> int)\n fn zero(-> int) }\n\
+                   trait Database { fn value(self -> int) }\n\
+                   struct FirstClock {}\n\
+                   struct SecondClock {}\n\
+                   struct FirstDb {}\n\
+                   impl Clock for FirstClock { fn now(self -> int) { 1 }\n fn zero(-> int) { 0 } }\n\
+                   impl Clock for SecondClock { fn now(self -> int) { 2 }\n fn zero(-> int) { 0 } }\n\
+                   impl Database for FirstDb { fn value(self -> int) { 3 } }\n\
+                   effect clock: Clock\n\
+                   effect db: Database\n\
+                   fn needs(-> int) { clock.now() }\n\
+                   fn zeroed(-> int) { clock::zero() }\n\
+                   fn both(-> int) { clock.now() + db.value() }\n\
+                   fn main(-> int) {\n\
+                   \x20 let first = with clock(FirstClock {}), db(FirstDb {}) { needs() + zeroed() + both() }\n\
+                   \x20 let second = with clock(SecondClock {}), db(FirstDb {}) { needs() }\n\
+                   \x20 first + second\n\
+                   }\n";
+        let (checked, production) = plan_of(src, &[]);
+        let program = &checked.hir;
+        let mut snapshots = production
+            .plan
+            .instances()
+            .filter_map(|(id, instance)| {
+                matches!(
+                    program.show_body(instance.key.body).as_str(),
+                    "main" | "needs" | "zeroed" | "both"
+                )
+                .then(|| instance_signature_snapshot(&checked, &production, id))
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        assert_eq!(
+            snapshots,
+            [
+                "both params=[I32, I32] ambient=[clock=0,db=1]",
+                "main params=[] ambient=[]",
+                "needs params=[I32] ambient=[clock=0]",
+                "needs params=[I32] ambient=[clock=0]",
+                "zeroed params=[] ambient=[]",
+            ]
+        );
+    }
+
+    #[test]
+    fn instance署名はreceiverを宣言引数より先に置く() {
+        let src = "struct Counter { value: int }\n\
+                   impl Counter { fn add(self, delta: int -> int) { self.value + delta } }\n\
+                   fn main(-> int) { Counter { value = 4 }.add(5) }\n";
+        let (checked, production) = plan_of(src, &[]);
+        let program = &checked.hir;
+        let (id, instance) = production
+            .plan
+            .instances()
+            .find(|(_, instance)| program.show_body(instance.key.body) == "impl Counter::add")
+            .expect("method instance がある");
+        let mut layouts = Layouts::default();
+        plan_reachable(&mut layouts, program, &production.plan);
+        let lowered = lower_instance_signature(&mut layouts, program, &production.plan, instance);
+        let receiver = program.callables[lowered.callable]
+            .body
+            .receiver
+            .expect("receiver がある");
+        let parameter = program.callables[lowered.callable].params[0];
+        assert_eq!(id.index(), 1, "main の次に method instance が確保される");
+        assert_eq!(lowered.params, [ValType::I32, ValType::I64]);
+        assert_eq!(lowered.slots[&receiver], [0]);
+        assert_eq!(lowered.slots[&parameter], [1]);
     }
 
     /// 所有データを内部で使う ABI v0 モジュールも、scalar の公開面を保ったまま
