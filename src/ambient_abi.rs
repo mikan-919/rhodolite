@@ -147,11 +147,27 @@ impl Plan {
             .map(|(index, instance)| (InstanceId::from_index(index), instance))
     }
 
+    /// 予約済み instance の個数。backend は `InstanceId` を関数番号へ写す前に、
+    /// 計画が範囲内を指していることを検証する。
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
     pub fn layouts(&self) -> impl Iterator<Item = (RecordLayoutId, &RecordLayout)> {
         self.layouts
             .iter()
             .enumerate()
             .map(|(index, layout)| (RecordLayoutId::from_index(index), layout))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instance_mut_for_test(&mut self, id: InstanceId) -> &mut Instance {
+        &mut self.instances[id.index()]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instance_id_for_test(index: usize) -> InstanceId {
+        InstanceId::from_index(index)
     }
 
     /// 鍵を instance へ寄せる。**本体を歩く前に**確保するので、再帰の辺は

@@ -2397,6 +2397,10 @@ pub struct Signature {
 /// 呼ぶ前に `check_support` と ABI 署名の検査を通しておくこと。ここは
 /// 「通った計画を決定的な bytes にする」ことだけを受け持つ
 pub fn emit(checked: &CheckedProgram, production: &ProductionPlan) -> Result<Vec<u8>, Vec<Diag>> {
+    let plan_errors = crate::wasm_ambient::validate_plan(&checked.hir, &production.plan);
+    if !plan_errors.is_empty() {
+        return Err(plan_errors);
+    }
     let signatures = crate::wasm_abi::signatures(checked, production)?;
     Ok(build(checked, production, &signatures))
 }
