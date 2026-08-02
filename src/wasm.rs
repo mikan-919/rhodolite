@@ -5376,6 +5376,49 @@ pub(crate) mod tests {
         assert_eq!(lowered.slots[&parameter], [1]);
     }
 
+    /// 契約メソッドの本体も通常の specialized callable instance として下ろす。
+    /// `with` / slot の呼び出し自体の data lowering は後続 task で接続するが、
+    /// 到達した trait implementation の署名はここで既に ordinary method と同じ。
+    #[test]
+    fn trait_impl_instanceはreceiverを宣言引数より先に置く() {
+        let src = "trait Score { fn add(self, delta: int -> int) }\n\
+                   struct Counter { value: int }\n\
+                   impl Score for Counter { fn add(self, delta: int -> int) { self.value + delta } }\n\
+                   effect score: Score\n\
+                   fn main(-> int) { with score(Counter { value = 4 }) { score.add(5) } }\n";
+        let (checked, production) = plan_of(src, &[]);
+        let program = &checked.hir;
+        let (id, instance) = production
+            .plan
+            .instances()
+            .find(|(_, instance)| {
+                let hir::BodyId::Callable(callable) = instance.key.body else {
+                    return false;
+                };
+                matches!(
+                    program.callables[callable].owner,
+                    hir::CallableOwner::TraitImpl(_)
+                )
+            })
+            .expect("trait implementation instance がある");
+        let mut layouts = Layouts::default();
+        plan_reachable(&mut layouts, program, &production.plan);
+        let lowered = lower_instance_signature(&mut layouts, program, &production.plan, instance);
+        let receiver = program.callables[lowered.callable]
+            .body
+            .receiver
+            .expect("receiver がある");
+        let parameter = program.callables[lowered.callable].params[0];
+        assert_eq!(
+            id.index(),
+            1,
+            "main の次に trait implementation instance が確保される"
+        );
+        assert_eq!(lowered.params, [ValType::I32, ValType::I64]);
+        assert_eq!(lowered.slots[&receiver], [0]);
+        assert_eq!(lowered.slots[&parameter], [1]);
+    }
+
     #[test]
     fn inherent_methodとassociated_functionは計画したtargetへ下りる() {
         assert_eq!(

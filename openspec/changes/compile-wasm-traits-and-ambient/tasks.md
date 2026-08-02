@@ -16,7 +16,7 @@
 
 ## 3. Trait implementation and direct target slice
 
-- [ ] 3.1 Emit reachable `CallableOwner::TraitImpl` bodies as ordinary specialized instances using the same receiver and parameter convention
+- [x] 3.1 Emit reachable `CallableOwner::TraitImpl` bodies as ordinary specialized instances using the same receiver and parameter convention
 - [ ] 3.2 Lower planned trait implementation targets without callable-name, trait-ID, implementation-ID, vtable, or runtime-switch lookup in the emitter
 - [ ] 3.3 Add plan/function-index snapshots proving one shared instance is emitted once and different provider implementation keys produce distinct deterministic instances
 - [ ] 3.4 Add engine tests for shared, mutable, and consuming trait receivers with scalar and owned-data parameters/results, including recursive implementation calls
