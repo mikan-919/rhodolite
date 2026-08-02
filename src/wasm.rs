@@ -2482,8 +2482,7 @@ fn build(
 
     // ラッパは実装関数の後ろ。エントリ、続いて公開名の昇順
     let mut exports = ExportSection::new();
-    let mut next_index = lowered.len() as u32;
-    for (signature, instance) in signatures.wrappers() {
+    for (next_index, (signature, instance)) in (lowered.len() as u32..).zip(signatures.wrappers()) {
         let params: Vec<ValType> = signature.params.iter().flat_map(Port::val_types).collect();
         let results: Vec<ValType> = signature.result.val_types();
         functions.function(types.intern(&params, &results));
@@ -2499,7 +2498,6 @@ fn build(
             instance.index() as u32,
         ));
         exports.export(&signature.name, ExportKind::Func, next_index);
-        next_index += 1;
     }
     if version >= 1 {
         exports.export(crate::wasm_abi::MEMORY_EXPORT, ExportKind::Memory, 0);

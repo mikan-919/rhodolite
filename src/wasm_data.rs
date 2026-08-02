@@ -625,6 +625,7 @@ fn shallow_copy(b: &mut Body, layouts: &Layouts, layout: LayoutId, src: u32, dst
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn clone_slots(
     b: &mut Body,
     indices: &Indices,
@@ -680,6 +681,7 @@ fn struct_eq(indices: &Indices, layouts: &Layouts, slots: &[Slot]) -> Function {
 }
 
 /// 区画を順に比べ、違えばその場で `0` を返す
+#[allow(clippy::too_many_arguments)]
 fn eq_slots(
     b: &mut Body,
     indices: &Indices,

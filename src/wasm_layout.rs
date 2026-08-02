@@ -181,7 +181,7 @@ impl Layouts {
     /// 剥がしておくこと
     pub fn plan(&mut self, program: &hir::Program, ty: &hir::Type) -> Result<LayoutId, Overflow> {
         debug_assert!(ty.reference.is_none(), "借用に記憶の並びは無い");
-        let key = self.key(program, ty)?;
+        let key = Self::key(ty)?;
         self.plan_key(program, &key)
     }
 
@@ -243,7 +243,7 @@ impl Layouts {
             .map(|(index, entry)| (LayoutId(index as u32), entry.as_ref().expect("計画済み")))
     }
 
-    fn key(&self, program: &hir::Program, ty: &hir::Type) -> Result<Key, Overflow> {
+    fn key(ty: &hir::Type) -> Result<Key, Overflow> {
         let inner = match &ty.kind {
             hir::TypeKind::Builtin(hir::Builtin::Unit) => Key::Unit,
             hir::TypeKind::Builtin(hir::Builtin::Bool) => Key::Bool,
@@ -251,7 +251,7 @@ impl Layouts {
             hir::TypeKind::Builtin(hir::Builtin::Str) => Key::Str,
             hir::TypeKind::Struct(id) => Key::Struct(*id),
             hir::TypeKind::Enum(id) => Key::Enum(*id),
-            hir::TypeKind::Array(element) => Key::Array(Box::new(self.key(program, element)?)),
+            hir::TypeKind::Array(element) => Key::Array(Box::new(Self::key(element)?)),
             // poison は診断を伴うときだけ存在する。生成まで来ないはず
             hir::TypeKind::Poison => {
                 return Err(Overflow("診断済みの型に記憶の並びはありません".into()));

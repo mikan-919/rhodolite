@@ -494,8 +494,8 @@ fn resolve(
         let mut changed = false;
         for (owner, name, member) in additions {
             let table = publics.entry(owner).or_default();
-            if !table.contains_key(&name) {
-                table.insert(name, member);
+            if let std::collections::btree_map::Entry::Vacant(entry) = table.entry(name) {
+                entry.insert(member);
                 changed = true;
             }
         }
@@ -2150,8 +2150,7 @@ mod tests {
 
     fn load_err(files: &[(&str, &str)]) -> String {
         load_files(files)
-            .err()
-            .expect("読み込みは失敗するはず")
+            .expect_err("読み込みは失敗するはず")
             .diagnostics
             .into_iter()
             .map(|d| d.msg)

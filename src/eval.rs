@@ -283,7 +283,7 @@ impl<'p> CheckedInterp<'p> {
                 return Err(error);
             }
         };
-        let shown = self.into_public_value(&value)?;
+        let shown = self.checked_public_value(&value)?;
         self.drop_checked(value);
         self.dispose();
         Ok(shown)
@@ -306,7 +306,7 @@ impl<'p> CheckedInterp<'p> {
             }
         };
         self.cleanup_frame(frame);
-        let shown = self.into_public_value(&value)?;
+        let shown = self.checked_public_value(&value)?;
         self.drop_checked(value);
         self.dispose();
         Ok(shown)
@@ -552,7 +552,7 @@ impl<'p> CheckedInterp<'p> {
                     None => CheckedValue::Owned(OwnedValue::Unit),
                 };
                 self.returned = Some(value);
-                return Err(Flow::Return);
+                Err(Flow::Return)
             }
             hir::ExprKind::Assert(inner) => {
                 let evaluated = self.eval(body, *inner, env)?;
@@ -828,12 +828,10 @@ impl<'p> CheckedInterp<'p> {
         if let Some(slot) = temporary {
             self.drop_slot(slot);
         }
-        if let CheckedValue::Owned(value) = subject {
-            if let OwnedValue::Location(id) = value {
-                if self.store.locations.get(id.0).is_some_and(Option::is_some) {
-                    self.store.drop_value(OwnedValue::Location(id));
-                }
-            }
+        if let CheckedValue::Owned(OwnedValue::Location(id)) = subject
+            && self.store.locations.get(id.0).is_some_and(Option::is_some)
+        {
+            self.store.drop_value(OwnedValue::Location(id));
         }
         result
     }
@@ -1283,7 +1281,7 @@ impl<'p> CheckedInterp<'p> {
         }
     }
 
-    fn into_public_value(&self, value: &CheckedValue) -> Eval {
+    fn checked_public_value(&self, value: &CheckedValue) -> Eval {
         let value = self.owned_ref(value)?;
         self.public_value(&value)
     }

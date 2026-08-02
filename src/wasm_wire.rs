@@ -512,8 +512,8 @@ fn decode(
             b.get(0).ins(Instruction::I32Load(loose(0))).set(3);
             b.get(0).num(4).ins(Instruction::I32Add).set(0);
             // 要素の刻み × 個数が 32bit を越えるなら、その配列は存在しない
-            if stride != 0 {
-                b.get(3).num(u32::MAX / stride).ins(Instruction::I32GtU);
+            if let Some(max_elements) = u32::MAX.checked_div(stride) {
+                b.get(3).num(max_elements).ins(Instruction::I32GtU);
                 b.trap_if();
             }
             b.get(3).num(stride).ins(Instruction::I32Mul).set(5);

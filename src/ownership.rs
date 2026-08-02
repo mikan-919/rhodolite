@@ -253,6 +253,7 @@ pub enum Drop {
 /// 組み直すと、move と合流の答えを2箇所で解くことになって必ずずれるので、
 /// 「この出口を通るとき何を落とすか」だけをここを鍵に引かせる。
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum Exit {
     /// 本体の末尾から関数を抜ける
     Fallthrough,
