@@ -4,8 +4,9 @@ Rhodolite は、言語の意味をインタプリタで固め、型付き HIR �
 **Core WebAssembly** バックエンドを追加する。インタプリタは捨てず、生成コードの
 振る舞いを照合する参照実装として残す。
 
-成果物を Core Wasm にした理由と、その上のホスト契約(Rhodolite ABI v0)は
-[ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。Component Model・
+成果物を Core Wasm にした理由と、その上のホスト契約は
+[ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md) と
+[ADR-0011](./adr/0011-owned-data-layout-and-abi-v1.md)。Component Model・
 WIT・WASI・JavaScript は言語の契約に入れず、必要なフレームワークが下流で包む。
 
 この文書は**順序と完了線の地図**であり、個々の機能仕様ではない。OpenSpec change は
@@ -48,10 +49,10 @@ emit-core-wasm-programs（完了）
 introduce-ownership-and-borrowing（完了）
         │
         ▼
-compile-wasm-owned-data-values
+compile-wasm-owned-data-values（完了）
         │
         ▼
-compile-wasm-traits-and-ambient
+compile-wasm-traits-and-ambient（次）
         │
         ▼
 add-differential-execution
@@ -67,9 +68,9 @@ compiled v1
 | 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
 | 3 | 完了 | archived `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 完了 | archived `emit-core-wasm-programs` | スカラーと制御フローの Core Wasm 生成 |
-| 5 | 完了 | `introduce-ownership-and-borrowing` | 単独所有、借用推論、決定的 drop、checked HIR 境界 |
-| 6 | 次 | `compile-wasm-owned-data-values` | owned struct・enum・optional・配列の Wasm 表現 |
-| 7 | 未着手 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
+| 5 | 完了 | archived `introduce-ownership-and-borrowing` | 単独所有、借用推論、決定的 drop、checked HIR 境界 |
+| 6 | 完了 | `compile-wasm-owned-data-values` | owned data の Wasm 表現、allocator、ABI v1 |
+| 7 | 次 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
 | 8 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
 
 同時に進行中にするのは原則として一段階だけとする。前段の完了線を満たし、change を
@@ -182,7 +183,7 @@ OpenSpec capability として定義した。
 
 ## 5. 所有・借用を Wasm より先に閉じる
 
-OpenSpec: `introduce-ownership-and-borrowing` /
+OpenSpec: archived `introduce-ownership-and-borrowing` /
 ADR: [0010](./adr/0010-owned-values-and-inferred-borrows.md)
 
 型付き HIR のあとに ownership pass を置く。非 Copy 値は単独所有、`&T` は共有 read、
@@ -203,21 +204,27 @@ ABI と reachable non-scalar data は build 前に拒否する。
 
 ## 6. owned data の Wasm 表現と小さなランタイムを作る
 
-想定 change: `compile-wasm-owned-data-values`
+OpenSpec: `compile-wasm-owned-data-values` /
+ADR: [0011](./adr/0011-owned-data-layout-and-abi-v1.md)
 
-追加する順序は、`str`、owned struct、enum payload、optional、`match`、配列、`for` と
-する。aggregate borrow と shared ownership はこの段階の前提にしない。
+`str`、owned struct、enum payload、optional、`match`、配列、`for` の順に追加した。
+aggregate borrow と shared ownership はこの段階の前提にしていない。
 
-線形メモリの allocator、データ layout、drop flag、OOM の扱いをここで決める。WasmGC、
-RC、tracing GC は既定解にせず、所有権契約と実測を踏まえて change の ADR で選ぶ。
-rich public ABI も owned layout が定まった後にだけ広げる。
+生成モジュールは import-free の coalescing allocator、決定的なデータ layout、drop flag、
+clone/drop/equality glue、OOM trap を持つ。公開面は scalar だけなら ABI v0 を維持し、
+owned data を含めばモジュール全体で ABI v1 を選ぶ。ABI v1 は内部 heap pointer ではなく、
+検証付きの正準 bytes を export memory と予約済み exchange area 経由で運ぶ。
 
-完了条件:
+完了条件(すべて達成):
 
 - 現在のデータ型と値操作を Wasm 側で表現できる
 - owned struct と配列の変更が参照実装と一致する
 - enum、optional、`match` の結果が参照実装と一致する
 - 公開 ABI が scalar 以外の値を運べるようになる
+
+意図的に残したのは、aggregate に格納する borrow、shared ownership、到達した inherent
+method・trait・slot・`with`・空でない ambient record の生成である。次は
+`compile-wasm-traits-and-ambient` で、ADR-0008 の計画をこの owned runtime へ接続する。
 
 ## 7. trait と ambient をコンパイルする
 

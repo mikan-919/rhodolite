@@ -114,10 +114,14 @@ ambient の低水準契約も決まった。到達した本体を**実装の組�
 `rhodolite build app.rd --target wasm` は、`main` と `pub use` で明示選択した
 公開関数を根に、到達した instance だけを決定的な `.wasm` へ落とす。成果物は
 import も start section も持たず、`__rhodolite_main` と公開名を export し、
-インタフェース記述を `rhodolite.abi` custom section に埋め込む。v0 が扱うのは
-`unit` / `bool` / `int` の部分言語で、到達しない豊かな宣言はビルドを止めない
-(`src/wasm.rs`、[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md))。
-インタプリタは参照実装として残る。
+インタフェース記述を `rhodolite.abi` custom section に埋め込む。`str`、owned struct、
+payload enum、optional、配列と、それらの field 操作・`clone()`・`??`・`match`・`for` は、
+組み込み allocator と ownership の drop plan を使って線形メモリへ生成される。scalar
+だけの公開面は既存の ABI v0 のまま、owned data が1つでも公開署名にあればモジュール
+全体が ABI v1 を選び、正準 bytes を export memory 経由で受け渡す。内部 layout と
+公開 wire format は分離している
+([ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md)、
+[ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md))。インタプリタは参照実装として残る。
 
 所有権検査も型付き HIR の次の境界として動いている。非 Copy 値は単独所有、`&T` の
 読み取り呼び出しだけは自動借用、変更は `&mut`、既存 local の移譲は `move`、複製は
@@ -134,9 +138,11 @@ let backup = user.clone()
 persist(move user)
 ```
 
-この時点のインタプリタは所有 compound value を store で実行し、検査済みの borrow
-だけを使う。逆に Wasm v0 は到達した `unit` / `bool` / `int` だけで、非 scalar 値、
-borrow、public borrowed signature を拒否する。データの Wasm layout と allocator は
-次段で決める。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
-[ADR-0010](./docs/adr/0010-owned-values-and-inferred-borrows.md)、順序は
+インタプリタは所有 compound value を store で実行し、Wasm backend は同じ検査済み
+アクセスモードと drop plan を消費する。公開署名の borrow と aggregate に格納する borrow
+は引き続き拒否する。また、到達した inherent method、trait、slot、`with`、空でない
+ambient record の Wasm 生成はまだ未対応で、次の `compile-wasm-traits-and-ambient` で
+接続する。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
+[ADR-0010](./docs/adr/0010-owned-values-and-inferred-borrows.md) と
+[ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md)、順序は
 [docs/compiler-roadmap.md](./docs/compiler-roadmap.md)。
