@@ -5419,6 +5419,67 @@ pub(crate) mod tests {
         assert_eq!(lowered.slots[&parameter], [1]);
     }
 
+    /// trait call は emitter が名前や trait ID を引き直さず、計画の instance
+    /// 番号をそのまま function index として使う。実装の選択が違う instance は
+    /// 分け、同じ選択に対する繰り返し呼び出しは1つに寄せる。
+    #[test]
+    fn trait_targetとfunction_indexは計画どおり固定される() {
+        let src = "trait Clock { fn now(self -> int) }\n\
+                   struct Frozen { at: int }\n\
+                   struct Zero {}\n\
+                   impl Clock for Frozen { fn now(self -> int) { self.at } }\n\
+                   impl Clock for Zero { fn now(self -> int) { 0 } }\n\
+                   effect clock: Clock\n\
+                   fn ticks(-> int) { clock.now() }\n\
+                   fn main(-> int) {\n\
+                   \x20 let frozen = with clock(Frozen { at = 7 }) { ticks() + ticks() }\n\
+                   \x20 let zero = with clock(Zero {}) { ticks() }\n\
+                   \x20 frozen + zero\n\
+                   }\n";
+        let (checked, production) = plan_of(src, &[]);
+        let program = &checked.hir;
+        let snapshot = production
+            .plan
+            .instances()
+            .map(|(id, instance)| {
+                let providers = instance
+                    .key
+                    .providers
+                    .iter()
+                    .map(|(slot, implementation)| {
+                        format!(
+                            "{}={}",
+                            program.slots[*slot].name,
+                            program.structs[program.trait_impls[*implementation].type_].name
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let targets = instance
+                    .calls
+                    .values()
+                    .map(|call| call.target.index().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "function#{} {} [{providers}] -> [{targets}]",
+                    id.index(),
+                    program.show_body(instance.key.body)
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot,
+            [
+                "function#0 main [] -> [1,1,2]",
+                "function#1 ticks [clock=Frozen] -> [3]",
+                "function#2 ticks [clock=Zero] -> [4]",
+                "function#3 impl Frozen::now [] -> []",
+                "function#4 impl Zero::now [] -> []",
+            ]
+        );
+    }
+
     #[test]
     fn inherent_methodとassociated_functionは計画したtargetへ下りる() {
         assert_eq!(
