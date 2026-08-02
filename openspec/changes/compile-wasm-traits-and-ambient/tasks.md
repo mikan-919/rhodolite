@@ -11,8 +11,8 @@
 - [x] 2.1 Map a callable receiver into `Body::receiver` before declared parameters and apply existing owned-address, borrowed-address, initialization-flag, and cleanup behavior
 - [x] 2.2 Introduce one planned-call emission path that evaluates a concrete receiver before source-ordered arguments, appends the planned projection, and calls the target `InstanceId`
 - [x] 2.3 Lower inherent `Method` and receiver-free `Associated` calls through the planned-call path and remove their reachable unsupported diagnostics
-- [ ] 2.4 Add independent-engine/interpreter comparison tests for `self`, `&self`, `&mut self`, associated functions, owned-data arguments/results, recursion, early return, mutation, and exact drop behavior
-- [ ] 2.5 Run the full suite, strict lints, validation, and repeated-byte checks and preserve the verified inherent-method slice as a git snapshot
+- [x] 2.4 Add independent-engine/interpreter comparison tests for `self`, `&self`, `&mut self`, associated functions, owned-data arguments/results, recursion, early return, mutation, and exact drop behavior
+- [x] 2.5 Run the full suite, strict lints, validation, and repeated-byte checks and preserve the verified inherent-method slice as a git snapshot
 
 ## 3. Trait implementation and direct target slice
 

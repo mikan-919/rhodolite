@@ -2497,9 +2497,7 @@ fn build(
     plan_reachable(&mut layouts, program, plan);
     let lowered: Vec<Lowered> = plan
         .instances()
-        .map(|(_, instance)| match instance.key.body {
-            _ => lower_instance_signature(&mut layouts, program, plan, instance),
-        })
+        .map(|(_, instance)| lower_instance_signature(&mut layouts, program, plan, instance))
         .collect();
 
     // 所有データが1つも到達していないなら、ランタイムも glue も載せない。
@@ -5331,13 +5329,13 @@ pub(crate) mod tests {
         let mut snapshots = production
             .plan
             .instances()
-            .filter_map(|(id, instance)| {
+            .filter(|(_, instance)| {
                 matches!(
                     program.show_body(instance.key.body).as_str(),
                     "main" | "needs" | "zeroed" | "both"
                 )
-                .then(|| instance_signature_snapshot(&checked, &production, id))
             })
+            .map(|(id, _)| instance_signature_snapshot(&checked, &production, id))
             .collect::<Vec<_>>();
         snapshots.sort();
         assert_eq!(
@@ -5406,6 +5404,46 @@ pub(crate) mod tests {
             ),
             7
         );
+    }
+
+    #[test]
+    fn inherent_methodのreceiverとowned_dataはインタプリタと一致する() {
+        let src = "struct Counter { label: str, value: int }\n\
+                   impl Counter {\n\
+                   \x20 fn new(label: str -> Counter) { Counter { label = label, value = 0 } }\n\
+                   \x20 fn inspect(&self -> int) { self.value }\n\
+                   \x20 fn bump(&mut self, by: int) { self.value = self.value + by }\n\
+                   \x20 fn descend(&self, depth: int -> int) { if depth == 0: self.value else: self.descend(depth - 1) }\n\
+                   \x20 fn early(&self, stop: bool -> int) { if stop { return self.value }\n 0 }\n\
+                   \x20 fn replace(self, next: str -> str) { next }\n\
+                   }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut counter = Counter::new(\"before\")\n\
+                   \x20 &mut counter.bump(3)\n\
+                   \x20 let score = counter.inspect() + counter.descend(2) + counter.early(true)\n\
+                   \x20 let replacement = move counter.replace(\"after\")\n\
+                   \x20 if replacement == \"after\": score else: 0\n\
+                   }\n";
+        assert_eq!(same_as_interpreter(src), 9);
+
+        let looping = "struct Item { label: str }\n\
+                       impl Item {\n\
+                       \x20 fn new(label: str -> Item) { Item { label = label } }\n\
+                       \x20 fn take(self, replacement: str -> str) { replacement }\n\
+                       }\n\
+                       fn main(-> int) {\n\
+                       \x20 let mut n = 0\n\
+                       \x20 while (n == 3000) == false {\n\
+                       \x20   let item = Item::new(\"old\")\n\
+                       \x20   let replacement = move item.take(\"new\")\n\
+                       \x20   assert replacement == \"new\"\n\
+                       \x20   n = n + 1\n\
+                       \x20 }\n\
+                       \x20 n\n\
+                       }\n";
+        let bytes = compile(looping, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![3000]));
     }
 
     /// 所有データを内部で使う ABI v0 モジュールも、scalar の公開面を保ったまま
