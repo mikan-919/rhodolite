@@ -22,6 +22,10 @@ mod requirement;
 mod typecheck;
 mod wasm;
 mod wasm_abi;
+// ambient record の物理表現は段階的に wasm emitter へ接続する。土台の local
+// allocator は先に単体テストで固定するので、接続前の unused 警告を抑える。
+#[allow(dead_code)]
+mod wasm_ambient;
 mod wasm_data;
 mod wasm_layout;
 mod wasm_runtime;

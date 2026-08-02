@@ -1,7 +1,7 @@
 ## 1. Baseline and instance calling convention
 
 - [x] 1.1 Add pre-change byte snapshots and independent-engine fixtures for scalar and owned-data programs so method/ambient plumbing cannot silently change existing ABI v0/v1 output
-- [ ] 1.2 Add `wasm_ambient.rs` with deterministic incoming-field and provision-seat allocation keyed by `RecordLayout` slots and provision expression IDs
+- [x] 1.2 Add `wasm_ambient.rs` with deterministic incoming-field and provision-seat allocation keyed by `RecordLayout` slots and provision expression IDs
 - [ ] 1.3 Add a pre-emission validator for planned call targets, receiver presence, projection order/type, and callee hidden-parameter width, with tests for rejected inconsistent plans
 - [ ] 1.4 Replace callable-only signature lowering with instance signature lowering that orders receiver, declared parameters, and flattened `i32` ambient fields deterministically
 - [ ] 1.5 Extend signature/local snapshots to cover empty records, value records, type-only requirements, multiple slots, and two specializations of one callable
