@@ -1864,10 +1864,10 @@ fn 各段の失敗で成果物を出さない() {
         ),
         (
             "struct User { rank: int }\n\
+             impl User { fn shown(&self -> int) { self.rank } }\n\
              fn main(-> int) {\n\
-             \x20 let u: User? = User { rank = 1 }\n\
-             \x20 let n = u.?rank\n\
-             \x20 1\n\
+             \x20 let u = User { rank = 1 }\n\
+             \x20 u.shown()\n\
              }\n",
             "Wasm ターゲットでは扱えません",
         ),

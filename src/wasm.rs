@@ -266,9 +266,22 @@ fn check_expr(
                 children.push(arm.body);
             }
         }
-        // `.?` は optional を伝播するので、その下ろしは後続スライス
-        hir::ExprKind::Field { optional: true, .. } => {
-            diagnostics.push(unsupported(expr.span, "`.?` のフィールド参照"))
+        // ponytail: `.?` は毎回 optional の帳簿を組み立てる。`indirect` の区画は
+        // 子アドレス1つなので、包み直しに1段よけいな確保が要る。使う形が出て
+        // きたら `optional_field` に indirect の枝を足す
+        hir::ExprKind::Field {
+            recv,
+            field,
+            optional: true,
+        } if program.fields[*field].indirect => {
+            diagnostics.push(unsupported(
+                expr.span,
+                &format!(
+                    "`indirect` なフィールド `{}` の `.?` 参照",
+                    program.fields[*field].name
+                ),
+            ));
+            children.push(*recv);
         }
         hir::ExprKind::Field { recv, .. } => children.push(*recv),
         hir::ExprKind::AssignField { recv, value, .. } => children.extend([*recv, *value]),
@@ -568,9 +581,7 @@ fn needs_scratch(
     match &body.expr(id).kind {
         // 器のアドレスを持ち回す式。struct や enum が居ないと出てこない
         hir::ExprKind::AssignField { .. }
-        | hir::ExprKind::Field {
-            optional: false, ..
-        }
+        | hir::ExprKind::Field { .. }
         | hir::ExprKind::Match { .. }
         // 対象・buffer・長さ・添字・要素・取り出した根を持ち回す
         | hir::ExprKind::For { .. } => true,
@@ -896,6 +907,15 @@ impl Emitter<'_> {
                 self.expr(recv, &[ValType::I32]);
                 self.out.set(address);
                 self.read_slot(&slot, address);
+            }
+
+            hir::ExprKind::Field {
+                recv,
+                field,
+                optional: true,
+            } => {
+                let (recv, field) = (*recv, *field);
+                self.optional_field(id, recv, field);
             }
 
             // payload を持たない enum はタグそのもの、payload を持つ enum は
@@ -1270,6 +1290,10 @@ impl Emitter<'_> {
     /// 場所を読んだだけなら持ち主は元のまま。構築・呼び出し・`clone()`・
     /// `move` は新しい持ち主をこちらへ渡すので、使い終えたら落とす責任が付く
     fn temporary(&mut self, id: hir::ExprId) -> Option<LayoutId> {
+        // `.?` の結果は記憶の上に元が無く、読むたびに確保する。持ち主は使い手
+        if let hir::ExprKind::Field { optional: true, .. } = self.body().expr(id).kind {
+            return self.owned_layout(id);
+        }
         let layout = match self.kind_of(id) {
             Some(ReprKind::Owned(layout)) => layout,
             _ => return None,
@@ -1293,19 +1317,20 @@ impl Emitter<'_> {
 
     /// レシーバの並びの中で、そのフィールドが占める区画
     fn slot_of(&mut self, recv: hir::ExprId, field: hir::FieldId) -> wasm_layout::Slot {
+        let layout = self
+            .compound_layout(recv)
+            .expect("フィールドのレシーバは器のアドレス");
+        self.struct_slot(layout, field)
+    }
+
+    /// struct の並びの中で、そのフィールドが占める区画
+    fn struct_slot(&self, layout: LayoutId, field: hir::FieldId) -> wasm_layout::Slot {
         let owner = self.program.fields[field].owner;
         let position = self.program.structs[owner]
             .fields
             .iter()
             .position(|declared| *declared == field)
             .expect("宣言に無いフィールド");
-        let layout = self
-            .kind_of(recv)
-            .and_then(|kind| match kind {
-                ReprKind::Owned(layout) | ReprKind::Borrowed(layout) => Some(layout),
-                ReprKind::Flat => None,
-            })
-            .expect("フィールドのレシーバは器のアドレス");
         match &self.layouts.get(layout).shape {
             wasm_layout::Shape::Struct { fields, .. } => fields[position],
             other => unreachable!("フィールドを持たない並びです: {other:?}"),
@@ -1327,6 +1352,107 @@ impl Emitter<'_> {
             return;
         }
         self.out.get(address).offset(slot.offset);
+    }
+
+    /// `.?` — optional なレシーバからフィールドを読む(tasks 5.2)。
+    ///
+    /// レシーバが `nil` なら結果も `nil`。そうでなければフィールドを optional へ
+    /// 包む。宣言型が既に optional なら 1 bit は増えないので(typecheck)、
+    /// フィールドの帳簿がそのまま結果になる。
+    ///
+    /// 記憶の上に「そのフィールドの optional」という帳簿は無い。optional 性は
+    /// レシーバの tag が持っているので、読むたびに新しく組み立てる。だから
+    /// 結果は必ず持ち主の居ない一時値になる(`temporary` がそう答える)
+    fn optional_field(&mut self, id: hir::ExprId, recv: hir::ExprId, field: hir::FieldId) {
+        let recv_layout = self
+            .compound_layout(recv)
+            .expect("`.?` のレシーバは optional の根");
+        let recv_payload = match self.layouts.get(recv_layout).shape {
+            wasm_layout::Shape::Optional { payload } => payload,
+            ref other => unreachable!("optional ではない並びです: {other:?}"),
+        };
+        let slot = self.struct_slot(recv_payload.layout, field);
+        // 宣言型が既に optional なら、区画の帳簿がそのまま結果の形
+        let declared_optional = self.program.fields[field].ty.optional;
+        let want = self.produced(id);
+        let result = self.owned_layout(id);
+        let scratch = self.scratch(id);
+        let (root, inner, fresh) = (scratch, scratch + 1, scratch + 2);
+        let carried = self.temporary(recv);
+
+        self.expr(recv, &[ValType::I32]);
+        self.out.set(root);
+        self.out.get(root).offset(recv_payload.offset);
+        self.out.set(inner);
+
+        match result {
+            // 所有する結果は帳簿を1つ確保して、活きているときだけ中身を写す
+            Some(result) => {
+                let payload = match self.layouts.get(result).shape {
+                    wasm_layout::Shape::Optional { payload } => payload,
+                    ref other => unreachable!("optional ではない並びです: {other:?}"),
+                };
+                let (indices, layouts) = (self.indices, &*self.layouts);
+                wasm_data::alloc_root(&mut self.out, indices, layouts, result);
+                self.out.set(fresh);
+
+                self.out
+                    .get(root)
+                    .ins(Instruction::I32Load8U(wasm_data::tag_byte()));
+                self.out.ins(Instruction::If(BlockType::Empty));
+                if declared_optional {
+                    // 区画そのものが結果の帳簿。丸ごと深く写す
+                    self.out.get(inner).offset(slot.offset);
+                    self.out.get(fresh);
+                    self.out
+                        .ins(Instruction::Call(self.indices.of(result).clone));
+                } else {
+                    self.out
+                        .get(fresh)
+                        .num(wasm_layout::OPTIONAL_PRESENT)
+                        .ins(Instruction::I32Store8(wasm_data::tag_byte()));
+                    self.out.get(inner).offset(slot.offset);
+                    self.out.get(fresh).offset(payload.offset);
+                    self.out
+                        .ins(Instruction::Call(self.indices.of(slot.layout).clone));
+                }
+                self.out.ins(Instruction::Else);
+                self.out
+                    .get(fresh)
+                    .num(wasm_layout::OPTIONAL_EMPTY)
+                    .ins(Instruction::I32Store8(wasm_data::tag_byte()));
+                self.out.ins(Instruction::End);
+                self.out.get(fresh);
+            }
+            // Copy な結果は平ら。tag を先頭に、続けて中身を積む
+            None => {
+                self.out
+                    .get(root)
+                    .ins(Instruction::I32Load8U(wasm_data::tag_byte()));
+                let block = self.block_type(&want);
+                self.push(Instruction::If(block));
+                if !declared_optional {
+                    self.push(Instruction::I32Const(wasm_layout::OPTIONAL_PRESENT as i32));
+                }
+                self.read_slot(&slot, inner);
+                self.push(Instruction::Else);
+                self.push(Instruction::I32Const(wasm_layout::OPTIONAL_EMPTY as i32));
+                // 空のときの中身は読まれない。`??` と等値がこの 0 埋めを前提にする
+                for value in want.iter().skip(1) {
+                    match value {
+                        ValType::I64 => self.push(Instruction::I64Const(0)),
+                        _ => self.push(Instruction::I32Const(0)),
+                    }
+                }
+                self.push(Instruction::End);
+            }
+        }
+
+        // レシーバを持ち込んでいたなら、写し終えたここで返す
+        if let Some(layout) = carried {
+            let (indices, glue) = (self.indices, self.indices.of(layout));
+            wasm_data::drop_root(&mut self.out, indices, glue, root);
+        }
     }
 
     /// enum の宣言順のタグ
@@ -2571,10 +2697,10 @@ pub(crate) mod tests {
     fn 到達した未対応の構文はビルドを止める() {
         let errors = compile(
             "struct User { rank: int }\n\
+             impl User { fn shown(&self -> int) { self.rank } }\n\
              fn reached(-> int) {\n\
-             \x20 let u: User? = User { rank = 1 }\n\
-             \x20 let n = u.?rank\n\
-             \x20 1\n\
+             \x20 let u = User { rank = 1 }\n\
+             \x20 u.shown()\n\
              }\n\
              fn main(-> int) { reached() }\n",
             &[],
@@ -4275,6 +4401,132 @@ pub(crate) mod tests {
                 "{src}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `.?` の伝播(tasks 5.2)
+    // -----------------------------------------------------------------------
+
+    /// `nil` のレシーバはインタプリタが受け付けない(「compound value の
+    /// location が必要です」)ので、そちらは Wasm 単体で見る。インタプリタ側の
+    /// 欠陥はこの change の範囲外
+    #[test]
+    fn optionalフィールドは伝播する() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { rank: int }\n\
+                 fn main(-> int) {\n\
+                 \x20 let u: User? = User { rank = 7 }\n\
+                 \x20 u.?rank ?? 0\n\
+                 }\n"
+            ),
+            7
+        );
+        assert_eq!(
+            run_int(
+                "struct User { rank: int }\n\
+                 fn main(-> int) {\n\
+                 \x20 let u: User? = nil\n\
+                 \x20 u.?rank ?? 0\n\
+                 }\n"
+            ),
+            0
+        );
+    }
+
+    /// 宣言型が既に optional なら 1 bit は増えない。鎖のどこが切れても伝わる
+    #[test]
+    fn optionalフィールドの鎖はどこで切れても伝わる() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct Inner { n: int }\n\
+                 struct Outer { inner: Inner? }\n\
+                 fn main(-> int) {\n\
+                 \x20 let o: Outer? = Outer { inner = Inner { n = 5 } }\n\
+                 \x20 o.?inner.?n ?? 0\n\
+                 }\n"
+            ),
+            5
+        );
+        for outer in ["Outer { inner = nil }", "nil"] {
+            assert_eq!(
+                run_int(&format!(
+                    "struct Inner {{ n: int }}\n\
+                     struct Outer {{ inner: Inner? }}\n\
+                     fn main(-> int) {{\n\
+                     \x20 let o: Outer? = {outer}\n\
+                     \x20 o.?inner.?n ?? 0\n\
+                     }}\n"
+                )),
+                0,
+                "{outer}"
+            );
+        }
+    }
+
+    /// 所有するフィールドも読める。読むたびに帳簿を組み立てるので持ち主が付く
+    #[test]
+    fn 所有するoptionalフィールドも読める() {
+        assert_eq!(
+            same_as_interpreter(
+                "struct User { name: str }\n\
+                 fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let u: User? = User { name = \"a\" }\n\
+                 \x20 take(u.?name.clone() ?? \"b\")\n\
+                 }\n"
+            ),
+            1
+        );
+        assert_eq!(
+            run_int(
+                "struct User { name: str }\n\
+                 fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+                 fn main(-> int) {\n\
+                 \x20 let u: User? = nil\n\
+                 \x20 take(u.?name.clone() ?? \"b\")\n\
+                 }\n"
+            ),
+            0
+        );
+    }
+
+    /// `.?` は毎回帳簿を確保する。有界ループで記憶が増えないこと
+    #[test]
+    fn optionalフィールドのループは記憶を使い回す() {
+        let src = "struct User { name: str }\n\
+                   fn take(s: str -> int) { if s == \"a\": 1 else: 0 }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 1000) == false {\n\
+                   \x20   let u: User? = User { name = \"a\" }\n\
+                   \x20   n = n + take(u.?name.clone() ?? \"b\")\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![1000]));
+    }
+
+    /// `indirect` の区画への `.?` は、黙って壊れず止まる
+    #[test]
+    fn indirectへのoptionalフィールド参照はビルドを止める() {
+        let errors = compile(
+            "struct Node { value: int, indirect next: Node? }\n\
+             fn main(-> int) {\n\
+             \x20 let n: Node? = Node { value = 1, next = nil }\n\
+             \x20 let tail = n.?next.clone() ?? Node { value = 2, next = nil }\n\
+             \x20 tail.value\n\
+             }\n",
+            &[],
+        )
+        .expect_err("止まるはず");
+        assert!(
+            messages(&errors).contains("`indirect` なフィールド `next` の `.?` 参照"),
+            "{}",
+            messages(&errors)
+        );
     }
 
     /// メタデータを知らないエンジンでも検証・実行できる
