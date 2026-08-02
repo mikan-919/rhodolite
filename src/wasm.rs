@@ -4702,6 +4702,27 @@ pub(crate) mod tests {
         assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![1000]));
     }
 
+    // -----------------------------------------------------------------------
+    // 維持する owned-data 総合 fixture(task 9.1)
+    // -----------------------------------------------------------------------
+
+    /// 小さな単機能テストとは別に、owned-data の対応面を実ファイルで維持する。
+    /// 戻り値は各操作と変更後の状態から組み立てるため、参照インタプリタとの比較が
+    /// 最終 mutation state の差も検出する。
+    #[test]
+    fn owned_data総合fixtureはインタプリタと一致する() {
+        for (path, expected) in [
+            (
+                "tests/fixtures/wasm-owned-data/all-constructs.rd",
+                2_333_116,
+            ),
+            ("tests/fixtures/wasm-owned-data/final-mutation-state.rd", 23),
+        ] {
+            let src = std::fs::read_to_string(path).expect("fixture を読めるはず");
+            assert_eq!(same_as_interpreter(&src), expected, "{path}");
+        }
+    }
+
     /// `indirect` の区画への `.?` は、黙って壊れず止まる
     #[test]
     fn indirectへのoptionalフィールド参照はビルドを止める() {
