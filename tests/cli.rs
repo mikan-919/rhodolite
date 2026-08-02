@@ -1863,11 +1863,12 @@ fn 各段の失敗で成果物を出さない() {
             "提供されていません",
         ),
         (
-            "trait Clock { fn now(self -> int) }\n\
-             struct Frozen {}\n\
-             impl Clock for Frozen { fn now(self -> int) { 1 } }\n\
-             effect clock: Clock\n\
-             fn main(-> int) { with clock(Frozen {}) { clock.now() } }\n",
+            "struct Node { value: int, indirect next: Node? }\n\
+             fn main(-> int) {\n\
+             \x20 let n: Node? = Node { value = 1, next = nil }\n\
+             \x20 let tail = n.?next.clone() ?? Node { value = 2, next = nil }\n\
+             \x20 tail.value\n\
+             }\n",
             "Wasm ターゲットでは扱えません",
         ),
     ] {

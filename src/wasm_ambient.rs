@@ -24,6 +24,11 @@ impl IncomingFields {
     pub fn get(&self, slot: hir::SlotId) -> Option<u32> {
         self.locals.get(&slot).copied()
     }
+
+    /// hidden parameter の個数。
+    pub fn len(&self) -> usize {
+        self.locals.len()
+    }
 }
 
 /// `with slot(value)` の値を留める local 番号。
@@ -39,6 +44,11 @@ impl ProvisionSeats {
     /// provision expression に対応する local 番号。
     pub fn get(&self, expression: hir::ExprId) -> Option<u32> {
         self.locals.get(&expression).copied()
+    }
+
+    /// provision seat の個数。
+    pub fn len(&self) -> usize {
+        self.locals.len()
     }
 }
 

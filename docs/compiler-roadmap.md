@@ -52,10 +52,10 @@ introduce-ownership-and-borrowing（完了）
 compile-wasm-owned-data-values（完了）
         │
         ▼
-compile-wasm-traits-and-ambient（次）
+compile-wasm-traits-and-ambient（完了）
         │
         ▼
-add-differential-execution
+add-differential-execution（次）
         │
         ▼
 compiled v1
@@ -70,8 +70,8 @@ compiled v1
 | 4 | 完了 | archived `emit-core-wasm-programs` | スカラーと制御フローの Core Wasm 生成 |
 | 5 | 完了 | archived `introduce-ownership-and-borrowing` | 単独所有、借用推論、決定的 drop、checked HIR 境界 |
 | 6 | 完了 | `compile-wasm-owned-data-values` | owned data の Wasm 表現、allocator、ABI v1 |
-| 7 | 次 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
-| 8 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
+| 7 | 完了 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
+| 8 | 次 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
 
 同時に進行中にするのは原則として一段階だけとする。前段の完了線を満たし、change を
 archive してから次段の提案を作る。
@@ -222,13 +222,13 @@ owned data を含めばモジュール全体で ABI v1 を選ぶ。ABI v1 は内
 - enum、optional、`match` の結果が参照実装と一致する
 - 公開 ABI が scalar 以外の値を運べるようになる
 
-意図的に残したのは、aggregate に格納する borrow、shared ownership、到達した inherent
-method・trait・slot・`with`・空でない ambient record の生成である。次は
-`compile-wasm-traits-and-ambient` で、ADR-0008 の計画をこの owned runtime へ接続する。
+意図的に残した aggregate に格納する borrow と shared ownership は、引き続きこの段階の外に
+置く。到達した inherent method・trait・slot・`with`・空でない ambient record の生成は次段で
+ADR-0008 の計画へ接続し、完了した。
 
 ## 7. trait と ambient をコンパイルする
 
-想定 change: `compile-wasm-traits-and-ambient`
+OpenSpec: `compile-wasm-traits-and-ambient`（完了）
 
 Rhodolite 固有の意味を Wasm バックエンドへ接続する段階。ADR-0008 の隠し ambient
 record を、空でない layout も運べる実行時表現として初めて実装する。
@@ -244,7 +244,7 @@ record を、空でない layout も運べる実行時表現として初めて�
 7. 要求推論から生成する隠し ambient 引数
 8. ネストした提供
 
-完了条件:
+完了条件(すべて達成):
 
 - `examples/canonical.rd` の Wasm を生成できる
 - 生成モジュールで正典テストが成功する

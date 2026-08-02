@@ -22,7 +22,7 @@ use crate::wasm_data::{self, Indices};
 use crate::wasm_layout::{self, LayoutId, Layouts, ReprKind};
 use crate::wasm_runtime::{self, Body, Runtime};
 use crate::wasm_wire;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::{
     BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
     Instruction, Module, TypeSection, ValType,
@@ -144,12 +144,6 @@ fn check_support_impl(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
         };
         let callable = &program.callables[callable_id];
 
-        if instance.layout.is_some() {
-            diagnostics.push(unsupported(
-                callable.span,
-                "実行時に provider を運ぶ ambient 要求",
-            ));
-        }
         if let Some(receiver) = callable.body.receiver {
             check_local(program, &callable.body, receiver, &mut diagnostics);
         }
@@ -169,16 +163,10 @@ fn check_support_impl(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
 
         let body = &callable.body;
         for local in &callable.params {
-            let decl = body.local(*local);
-            match decl.ty.as_ref().filter(|ty| ty.reference.is_some()) {
-                Some(ty) => diagnostics.push(borrowed_signature(
-                    program,
-                    decl.span,
-                    &format!("引数 `{}`", decl.name),
-                    ty,
-                )),
-                None => check_local(program, body, *local, &mut diagnostics),
-            }
+            // internal calls carry checked borrows as the same root address as
+            // owned values. Public ABI validation is intentionally later in
+            // wasm_abi, where only exported signatures are rejected.
+            check_local(program, body, *local, &mut diagnostics);
         }
         for expr in &body.root {
             check_expr(program, body, *expr, &mut diagnostics);
@@ -297,10 +285,14 @@ fn check_expr(
             check_local(program, body, *var, diagnostics);
             children.extend([*iter, *inner]);
         }
-        hir::ExprKind::With { .. } => diagnostics.push(unsupported(expr.span, "`with` の提供")),
-        hir::ExprKind::Call(hir::Call::Slot { slot_span, .. }) => {
-            diagnostics.push(unsupported(*slot_span, "スロット経由の呼び出し"))
+        hir::ExprKind::With {
+            provisions,
+            body: inner,
+        } => {
+            children.extend(provisions.iter().filter_map(|provision| provision.value));
+            children.push(*inner);
         }
+        hir::ExprKind::Call(hir::Call::Slot { args, .. }) => children.extend(args.iter().copied()),
         hir::ExprKind::Poison => diagnostics.push(unsupported(expr.span, "この式")),
     }
 
@@ -357,8 +349,11 @@ struct Lowered {
     slots: BTreeMap<hir::LocalId, Vec<u32>>,
     /// trailing hidden ambient fields。body emitter は `SlotId` からここを引き、
     /// source-level local と混ぜない。
-    #[allow(dead_code)] // task 4.1 で projection emitter が読む
     ambient: crate::wasm_ambient::IncomingFields,
+    /// `with slot(value)` の provider handle を一度だけ留める局所。
+    provisions: crate::wasm_ambient::ProvisionSeats,
+    /// provision temporary / moved provider の初期化フラグ。
+    provision_flags: BTreeMap<hir::ExprId, u32>,
     /// 引数の後ろに並ぶ宣言ローカルの型
     extra_locals: Vec<ValType>,
     /// 所有する非 Copy の束縛 → その並び。掃除の glue をここから引く
@@ -423,17 +418,28 @@ fn lower_instance_signature(
 
     // planner の layout 順をそのまま trailing `i32` parameters にする。空 layout
     // は何も足さないため、ambient-free instance の過去の bytes を保てる。
+    let mut provision_ids = BTreeSet::new();
+    for (_, expr) in body.exprs() {
+        if let hir::ExprKind::With { provisions, .. } = &expr.kind {
+            provision_ids.extend(provisions.iter().filter_map(|provision| provision.value));
+        }
+    }
     let ambient = crate::wasm_ambient::allocate(
         instance.layout.map(|layout| plan.layout(layout)),
-        [],
+        provision_ids.iter().copied(),
         params.len() as u32,
     );
-    params.extend(std::iter::repeat_n(
-        ValType::I32,
-        (ambient.next - params.len() as u32) as usize,
-    ));
+    params.extend(std::iter::repeat_n(ValType::I32, ambient.incoming.len()));
 
     let mut extra_locals = Vec::new();
+    // provision handle は hidden parameters の直後の ordinary local。planner が
+    // `ValueSource::Provision` に記録した expression ID からだけ引く。
+    extra_locals.extend(std::iter::repeat_n(ValType::I32, ambient.provisions.len()));
+    let mut provision_flags = BTreeMap::new();
+    for id in provision_ids {
+        provision_flags.insert(id, (params.len() + extra_locals.len()) as u32);
+        extra_locals.push(ValType::I32);
+    }
     for (id, _) in body.locals() {
         if slots.contains_key(&id) {
             continue;
@@ -513,6 +519,8 @@ fn lower_instance_signature(
         results: values_of(layouts, program, &callable.ret),
         slots,
         ambient: ambient.incoming,
+        provisions: ambient.provisions,
+        provision_flags,
         extra_locals,
         owned,
         flags,
@@ -730,7 +738,51 @@ struct Emitter<'a> {
     /// いま一時値を握っている構文の入れ子(内側が後ろ)。所有権検査は束縛だけを
     /// 追うので、`for` が抱えた対象のような持ち主のない値はここで覚える
     live: Vec<(LayoutId, u32)>,
+    /// `with` が保持する temporary / moved provider。return では lexical end に
+    /// 到達しないため、ここから reverse order で guarded drop を出す。
+    live_provisions: Vec<(hir::ExprId, LayoutId)>,
     out: Body,
+}
+
+#[derive(Clone, Copy)]
+enum PlannedReceiver {
+    Expr(hir::ExprId),
+    Provider,
+}
+
+/// instance が受け取った hidden field を、下流の slot receiver へ所有として
+/// 渡すか。provider selection を作り直さず、planner が持つ direct edges だけを
+/// 辿る。循環は「この経路ではまだ消費を見つけていない」として閉じる。
+fn consumes_incoming(
+    program: &hir::Program,
+    plan: &Plan,
+    instance: crate::ambient_abi::InstanceId,
+    slot: hir::SlotId,
+    visiting: &mut BTreeSet<(usize, hir::SlotId)>,
+) -> bool {
+    if !visiting.insert((instance.index(), slot)) {
+        return false;
+    }
+    let consumes = plan.instance(instance).calls.values().any(|call| {
+        let target = plan.instance(call.target);
+        let target_receiver_is_owned = match target.key.body {
+            hir::BodyId::Callable(callable) => {
+                program.callables[callable].receiver == Some(hir::ReceiverMode::Owned)
+            }
+            hir::BodyId::Test(_) => false,
+        };
+        if call.receiver == Some(crate::ambient_abi::ValueSource::Incoming(slot))
+            && target_receiver_is_owned
+        {
+            return true;
+        }
+        call.projection.iter().any(|(target_slot, source)| {
+            *source == crate::ambient_abi::ValueSource::Incoming(slot)
+                && consumes_incoming(program, plan, call.target, *target_slot, visiting)
+        })
+    });
+    visiting.remove(&(instance.index(), slot));
+    consumes
 }
 
 /// `match` の arm 1つ。`pattern` が `None` なら catch-all
@@ -1213,17 +1265,34 @@ impl Emitter<'_> {
                 self.cleanup(crate::ownership::Exit::LoopExit(id));
             }
 
+            hir::ExprKind::With {
+                provisions,
+                body: inner,
+            } => {
+                let values = provisions
+                    .iter()
+                    .filter_map(|provision| provision.value)
+                    .collect::<Vec<_>>();
+                self.with(id, &values, *inner);
+            }
+
             // 呼び先は計画が持っている。名前で引き直さない(design.md 決定5)
             hir::ExprKind::Call(hir::Call::Direct { args, .. }) => {
                 self.planned_call(id, None, &args.clone());
             }
 
             hir::ExprKind::Call(hir::Call::Method { recv, args, .. }) => {
-                self.planned_call(id, Some(*recv), &args.clone());
+                self.planned_call(id, Some(PlannedReceiver::Expr(*recv)), &args.clone());
             }
 
             hir::ExprKind::Call(hir::Call::Associated { args, .. }) => {
                 self.planned_call(id, None, &args.clone());
+            }
+
+            hir::ExprKind::Call(hir::Call::Slot { receiver, args, .. }) => {
+                let receiver = matches!(receiver, hir::SlotReceiver::Value)
+                    .then_some(PlannedReceiver::Provider);
+                self.planned_call(id, receiver, &args.clone());
             }
 
             // 対応範囲の検査が先に止めているので、ここへ来たら検査の抜け
@@ -1237,7 +1306,7 @@ impl Emitter<'_> {
     fn planned_call(
         &mut self,
         id: hir::ExprId,
-        receiver: Option<hir::ExprId>,
+        receiver: Option<PlannedReceiver>,
         args: &[hir::ExprId],
     ) {
         let planned = &self.instance.calls[&id];
@@ -1248,9 +1317,20 @@ impl Emitter<'_> {
         let target = &self.program.callables[target_id];
 
         match (receiver, target.body.receiver) {
-            (Some(receiver), Some(local)) => {
+            (Some(PlannedReceiver::Expr(receiver)), Some(local)) => {
                 let ty = target.body.local(local).ty.clone();
                 self.value(receiver, ty.as_ref());
+            }
+            (Some(PlannedReceiver::Provider), Some(_)) => {
+                let source = planned
+                    .receiver
+                    .expect("pre-emission validator が provider receiver を検査する");
+                self.provider(source);
+                if target.receiver == Some(hir::ReceiverMode::Owned)
+                    && let crate::ambient_abi::ValueSource::Provision(id) = source
+                {
+                    self.mark_provision_moved(id);
+                }
             }
             (None, None) => {}
             _ => unreachable!("pre-emission validator が receiver shape を検査する"),
@@ -1259,22 +1339,89 @@ impl Emitter<'_> {
             let ty = target.body.local(*parameter).ty.clone();
             self.value(*arg, ty.as_ref());
         }
-        for (_, source) in &planned.projection {
-            match source {
-                crate::ambient_abi::ValueSource::Incoming(slot) => {
-                    let local = self
-                        .lowered
-                        .ambient
-                        .get(*slot)
-                        .expect("pre-emission validator が incoming field を検査する");
-                    self.out.get(local);
-                }
-                crate::ambient_abi::ValueSource::Provision(_) => {
-                    unreachable!("value provision lowering は task 5 で接続する")
-                }
+        for (slot, source) in &planned.projection {
+            self.provider(*source);
+            if let crate::ambient_abi::ValueSource::Provision(id) = source
+                && consumes_incoming(
+                    self.program,
+                    self.specializations,
+                    planned.target,
+                    *slot,
+                    &mut BTreeSet::new(),
+                )
+            {
+                self.mark_provision_moved(*id);
             }
         }
         self.push(Instruction::Call(planned.target.index() as u32));
+    }
+
+    /// planner が選んだ provider handle を読み出す。ここで provider selection を
+    /// 行わないので、forwarding も slot receiver も単なる local get になる。
+    fn provider(&mut self, source: crate::ambient_abi::ValueSource) {
+        match source {
+            crate::ambient_abi::ValueSource::Incoming(slot) => {
+                let local = self
+                    .lowered
+                    .ambient
+                    .get(slot)
+                    .expect("pre-emission validator が incoming field を検査する");
+                self.out.get(local);
+            }
+            crate::ambient_abi::ValueSource::Provision(id) => {
+                let local = self
+                    .lowered
+                    .provisions
+                    .get(id)
+                    .expect("pre-emission validator が provision seat を検査する");
+                self.out.get(local);
+            }
+        }
+    }
+
+    fn mark_provision_moved(&mut self, id: hir::ExprId) {
+        let flag = self.lowered.provision_flags[&id];
+        wasm_data::mark_moved(&mut self.out, flag);
+    }
+
+    /// value provisions are evaluated under the outer instance before any
+    /// provider is installed. A seat is then reused by every planned call in
+    /// the body, and owned temporaries are released at this lexical boundary.
+    fn with(&mut self, id: hir::ExprId, provisions: &[hir::ExprId], inner: hir::ExprId) {
+        let live_at = self.live_provisions.len();
+        for value in provisions {
+            let ty = self.body().expr(*value).result.ty().cloned();
+            self.value(*value, ty.as_ref());
+            let seat = self
+                .lowered
+                .provisions
+                .get(*value)
+                .expect("reachable value provision has a reserved seat");
+            self.out.set(seat);
+            if let Some(layout) = self.temporary(*value) {
+                let flag = self.lowered.provision_flags[value];
+                wasm_data::mark_initialized(&mut self.out, flag);
+                self.live_provisions.push((*value, layout));
+            }
+        }
+        let want = self.body().expr(id).result.ty().cloned();
+        self.value(inner, want.as_ref());
+        self.release_provisions_from(live_at);
+    }
+
+    fn release_provisions_from(&mut self, start: usize) {
+        while self.live_provisions.len() > start {
+            let (id, layout) = self.live_provisions.pop().expect("length を検査済み");
+            let seat = self.lowered.provisions.get(id).expect("seat がある");
+            let flag = self.lowered.provision_flags[&id];
+            wasm_data::drop_guarded(
+                &mut self.out,
+                self.indices,
+                self.indices.of(layout),
+                seat,
+                flag,
+            );
+        }
     }
 
     /// 式の結果の実行時表現の種別
@@ -1900,6 +2047,7 @@ impl Emitter<'_> {
             let (indices, glue) = (self.indices, self.indices.of(layout));
             wasm_data::drop_root(&mut self.out, indices, glue, slot);
         }
+        self.release_provisions_from(0);
     }
 
     /// 配列リテラル(tasks 7.1)。
@@ -2545,6 +2693,7 @@ fn build(
             indices: &indices,
             statics: &statics.at,
             live: Vec::new(),
+            live_provisions: Vec::new(),
             out: Body::with_locals(locals),
         };
         // 引数は呼ばれた時点で所有を得ている。局所の初期値は 0 なので、
@@ -2924,6 +3073,22 @@ pub(crate) mod tests {
         validate(&bytes).expect("検証を通るはず");
     }
 
+    #[test]
+    fn canonical_fixtureは独立engineで検証実行できる() {
+        let src = std::fs::read_to_string("examples/canonical.rd").expect("fixture を読めるはず");
+        let bytes = compile(&src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(
+            scalars(&invoke(&bytes, ENTRY_EXPORT, &[]).expect("走るはず")),
+            [0]
+        );
+        assert_eq!(
+            bytes,
+            compile(&src, &[]).expect("同じ bytes を生成できるはず"),
+            "canonical build は決定的"
+        );
+    }
+
     /// 生成物は host import も start section も持たない。instantiate だけでは
     /// main は走らない
     #[test]
@@ -2962,20 +3127,159 @@ pub(crate) mod tests {
         validate(&bytes).expect("検証を通るはず");
     }
 
-    /// 到達したら止まる。指すのは到達したその構文
+    /// 具体的な provider は planner が選んだ implementation instance に直結する。
     #[test]
-    fn 到達した未対応のambient構文はビルドを止める() {
-        let errors = compile(
-            "trait Clock { fn now(self -> int) }\n\
+    fn 到達したambient_slot_callは実行できる() {
+        assert_eq!(
+            same_as_interpreter(
+                "trait Clock { fn now(self -> int) }\n\
              struct Frozen {}\n\
              impl Clock for Frozen { fn now(self -> int) { 1 } }\n\
              effect clock: Clock\n\
              fn reached(-> int) { with clock(Frozen {}) { clock.now() } }\n\
              fn main(-> int) { reached() }\n",
-            &[],
-        )
-        .expect_err("止まるはず");
-        assert!(messages(&errors).contains("Wasm ターゲットでは扱えません"));
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn trait_receiverのshared_mutable_ownedと再帰はインタプリタと一致する() {
+        assert_eq!(
+            same_as_interpreter(
+                "trait Counter { fn read(&self -> int)\n\
+                 fn bump(&mut self, by: int)\n\
+                 fn descend(&self, depth: int -> int)\n\
+                 fn take(self, next: str -> str) }\n\
+                 struct Cell { label: str, value: int }\n\
+                 impl Counter for Cell {\n\
+                 \x20 fn read(&self -> int) { self.value }\n\
+                 \x20 fn bump(&mut self, by: int) { self.value = self.value + by }\n\
+                 \x20 fn descend(&self, depth: int -> int) { if depth == 0: self.value else: self.descend(depth - 1) }\n\
+                 \x20 fn take(self, next: str -> str) { next }\n\
+                 }\n\
+                 effect counter: Counter\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut cell = Cell { label = \"before\", value = 2 }\n\
+                 \x20 let shared = with counter(&cell) { counter.read() + counter.descend(2) }\n\
+                 \x20 let changed = with counter(&mut cell) { counter.bump(3)\n counter.read() }\n\
+                 \x20 let result = with counter(move cell) { counter.take(\"after\") }\n\
+                 \x20 if result == \"after\": shared + changed else: 0\n\
+                 }\n"
+            ),
+            9
+        );
+    }
+
+    #[test]
+    fn ambient_projectionはvalueとtypeのslotをforwardする() {
+        assert_eq!(
+            same_as_interpreter(
+                "trait Clock { fn now(&self -> int) }\n\
+                 trait Answer { fn get(-> int) }\n\
+                 struct Frozen { at: int }\n\
+                 struct Zero {}\n\
+                 struct FortyTwo {}\n\
+                 impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+                 impl Clock for Zero { fn now(&self -> int) { 0 } }\n\
+                 impl Answer for FortyTwo { fn get(-> int) { 42 } }\n\
+                 effect clock: Clock\n\
+                 effect answer: Answer\n\
+                 fn relay(-> int) { clock.now() + answer::get() }\n\
+                 fn main(-> int) {\n\
+                 \x20 let frozen = with clock(Frozen { at = 7 }), answer<FortyTwo> { relay() }\n\
+                 \x20 let zero = with clock(Zero {}), answer<FortyTwo> { relay() }\n\
+                 \x20 frozen + zero\n\
+                 }\n"
+            ),
+            91
+        );
+    }
+
+    #[test]
+    fn temporary_providerはloopのたびに一度だけ破棄される() {
+        let src = "trait Probe { fn size(&self -> int) }\n\
+                   struct Item { label: str }\n\
+                   impl Probe for Item { fn size(&self -> int) { if self.label == \"x\": 1 else: 0 } }\n\
+                   effect probe: Probe\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 3000) == false {\n\
+                   \x20   let size = with probe(Item { label = \"x\" }) { probe.size() }\n\
+                   \x20   assert size == 1\n\
+                   \x20   n = n + 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![3000]));
+    }
+
+    #[test]
+    fn forwarded_owned_providerはcalleeへ所有を移す() {
+        let src = "trait Consume { fn take(self -> int) }\n\
+                   struct Item { label: str }\n\
+                   impl Consume for Item { fn take(self -> int) { if self.label == \"x\": 1 else: 0 } }\n\
+                   effect item: Consume\n\
+                   fn relay(-> int) { item.take() }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 3000) == false {\n\
+                   \x20   let result = with item(Item { label = \"x\" }) { relay() }\n\
+                   \x20   assert result == 1\n\
+                   \x20   n = n + 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        assert_eq!(same_as_interpreter(src), 3000);
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![3000]));
+    }
+
+    #[test]
+    fn nested_withはouter_contextで値を評価してshadowを復元する() {
+        assert_eq!(
+            same_as_interpreter(
+                "trait Clock { fn now(&self -> int) }\n\
+                 struct ClockValue { at: int }\n\
+                 impl Clock for ClockValue { fn now(&self -> int) { self.at } }\n\
+                 effect clock: Clock\n\
+                 fn relay(-> int) { clock.now() }\n\
+                 fn main(-> int) {\n\
+                 \x20 with clock(ClockValue { at = 3 }) {\n\
+                 \x20   let derived = with clock(ClockValue { at = clock.now() + 1 }) { relay() }\n\
+                 \x20   let shadowed = with clock(ClockValue { at = 0 }) { relay() }\n\
+                 \x20   derived + shadowed + relay()\n\
+                 \x20 }\n\
+                 }\n"
+            ),
+            7
+        );
+    }
+
+    #[test]
+    fn multi_provision_headの値はすべてouter_contextを見る() {
+        assert_eq!(
+            same_as_interpreter(
+                "trait Left { fn now(&self -> int) }\n\
+                 trait Right { fn now(&self -> int) }\n\
+                 struct LeftValue { at: int }\n\
+                 struct RightValue { at: int }\n\
+                 impl Left for LeftValue { fn now(&self -> int) { self.at } }\n\
+                 impl Right for RightValue { fn now(&self -> int) { self.at } }\n\
+                 effect left: Left\n\
+                 effect right: Right\n\
+                 fn main(-> int) {\n\
+                 \x20 with left(LeftValue { at = 2 }), right(RightValue { at = 3 }) {\n\
+                 \x20   with left(LeftValue { at = left.now() + 1 }), right(RightValue { at = right.now() + 1 }) {\n\
+                 \x20     left.now() + right.now()\n\
+                 \x20   }\n\
+                 \x20 }\n\
+                 }\n"
+            ),
+            7
+        );
     }
 
     /// 借用は境界を越えられない。署名に出たら名指して止める(tasks 4.6)
@@ -2991,10 +3295,6 @@ pub(crate) mod tests {
         let found = messages(&errors);
         assert!(
             found.contains("戻り値の借用 `&User` は Wasm の署名には出せません"),
-            "{found}"
-        );
-        assert!(
-            found.contains("引数 `u`の借用 `&User` は Wasm の署名には出せません"),
             "{found}"
         );
     }
