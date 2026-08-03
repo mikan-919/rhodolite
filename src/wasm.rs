@@ -3085,6 +3085,71 @@ pub(crate) mod tests {
             .join(" / ")
     }
 
+    // ---- 名前付き関数の値(tasks 4.3) ----
+
+    const CALLBACK_SRC: &str = "fn double(value: int -> int) { value * 2 }\n\
+         fn negate(value: int -> int) { 0 - value }\n\
+         fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n";
+
+    #[test]
+    fn callbackの戻り値はインタプリタと一致する() {
+        assert_eq!(
+            same_as_interpreter(&format!(
+                "{CALLBACK_SRC}fn main(-> int) {{ let f = double\n\
+                 \x20 apply(f, 21) + apply(negate, 5) }}\n"
+            )),
+            37
+        );
+    }
+
+    /// slot を要る callback と要らない callback で、隠れた ambient record の
+    /// 有無が分かれても両方が正しく走る
+    #[test]
+    fn 隠れたambient記録はcallbackごとに分かれる() {
+        let src = "trait Clock { fn now(&self -> int) }\n\
+             struct Frozen { at: int }\n\
+             impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+             effect clock: Clock\n\
+             fn ticked(value: int -> int) { value + clock.now() }\n\
+             fn plain(value: int -> int) { value + 1 }\n\
+             fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n\
+             fn main(-> int) {\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(Frozen { at = 1000 }) { apply(ticked, quiet) }\n\
+             }\n";
+        assert_eq!(same_as_interpreter(src), 1002);
+    }
+
+    /// 表も funcref も使わない。間接呼び出しは直接呼び出しへ落ちる
+    #[test]
+    fn 間接呼び出しはtableもfuncrefも使わない() {
+        let src = format!("{CALLBACK_SRC}fn main(-> int) {{ apply(double, 21) }}\n");
+        let bytes = compile(&src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        let parsed = wasmparser::Parser::new(0).parse_all(&bytes);
+        for payload in parsed {
+            assert!(
+                !matches!(
+                    payload.expect("解析できるはず"),
+                    wasmparser::Payload::TableSection(_) | wasmparser::Payload::ElementSection(_)
+                ),
+                "table / element section が出ている"
+            );
+        }
+    }
+
+    #[test]
+    fn callbackを含むbuildは決定的() {
+        let src =
+            format!("{CALLBACK_SRC}fn main(-> int) {{ apply(double, 1) + apply(negate, 2) }}\n");
+        let bytes = compile(&src, &[]).expect("生成できるはず");
+        assert_eq!(
+            bytes,
+            compile(&src, &[]).expect("同じ bytes を生成できるはず"),
+            "callback を含む build は決定的"
+        );
+    }
+
     #[test]
     fn 最小のプログラムが検証を通る() {
         let bytes = compile("fn main(-> int) { 41 + 1 }\n", &[]).expect("生成できるはず");

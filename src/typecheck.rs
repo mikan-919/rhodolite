@@ -195,12 +195,8 @@ impl std::fmt::Display for KnownType {
             KnownKind::Named(name) => write!(f, "{name}")?,
             KnownKind::Array(element) => write!(f, "[{element}]")?,
             KnownKind::Callable { params, result } => {
-                let params = params
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(f, "fn({params} -> {result})")?;
+                let params: Vec<String> = params.iter().map(ToString::to_string).collect();
+                write!(f, "fn({}-> {result})", crate::hir::spelled_params(&params))?;
             }
         }
         if self.optional {
@@ -3755,6 +3751,128 @@ mod tests {
         src[span.start as usize..span.end as usize].to_string()
     }
 
+    // ---- 名前付き関数の値(tasks 1.3 / 2.1 / 2.2) ----
+
+    const CALLBACK_SRC: &str = "fn double(value: int -> int) { value * 2 }
+fn apply(f: fn(int -> int), value: int -> int) { f(value) }
+";
+
+    #[test]
+    fn 名前付き関数はcallable値として渡せる() {
+        let src = format!("{CALLBACK_SRC}fn main(-> int) {{ apply(double, 21) }}\n");
+        assert_eq!(errors(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn callable値は不変localへ束縛して何度でも使える() {
+        let src = format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ let f = double
+ let g: fn(int -> int) = f
+ apply(f, 1) + apply(g, 2) + f(3) }}\n"
+        );
+        assert_eq!(errors(&src), Vec::<String>::new());
+    }
+
+    /// 署名は完全一致でだけ適合する。所有モードの違いも別の型
+    #[test]
+    fn callable署名が合わないと落ちる() {
+        let src = format!("{CALLBACK_SRC}fn main(-> int) {{ apply(apply, 1) }}\n");
+        assert!(only(&src).contains("fn(int -> int)"), "{}", only(&src));
+    }
+
+    #[test]
+    fn 結果型の違うcallableは渡せない() {
+        let src = format!(
+            "fn flag(value: int -> bool) {{ value == 0 }}
+{CALLBACK_SRC}fn main(-> int) {{ apply(flag, 1) }}\n"
+        );
+        assert!(only(&src).contains("fn(int -> bool)"), "{}", only(&src));
+    }
+
+    #[test]
+    fn 引数の個数が違うcallableは渡せない() {
+        let src = format!(
+            "fn pair(a: int, b: int -> int) {{ a + b }}
+{CALLBACK_SRC}fn main(-> int) {{ apply(pair, 1) }}\n"
+        );
+        assert!(!errors(&src).is_empty());
+    }
+
+    #[test]
+    fn callableを戻り値型に書けない() {
+        let src = "fn pick(-> fn(int -> int)) { pick }\n";
+        assert!(
+            errors(src).iter().any(|e| e.contains("戻り値型")),
+            "{:?}",
+            errors(src)
+        );
+    }
+
+    #[test]
+    fn callableをフィールドに置けない() {
+        assert!(
+            only("struct Box { f: fn(int -> int) }\n").contains("フィールド"),
+            "{:?}",
+            errors("struct Box { f: fn(int -> int) }\n")
+        );
+    }
+
+    #[test]
+    fn callableをpayloadに置けない() {
+        assert!(
+            only("enum Hold { One(fn(int -> int)) }\n").contains("payload"),
+            "{:?}",
+            errors("enum Hold { One(fn(int -> int)) }\n")
+        );
+    }
+
+    #[test]
+    fn callableを可変localに置けない() {
+        let src = format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ let mut f = double
+ apply(f, 1) }}\n"
+        );
+        assert!(
+            errors(&src).iter().any(|e| e.contains("可変 local")),
+            "{:?}",
+            errors(&src)
+        );
+    }
+
+    #[test]
+    fn callableを配列に包めない() {
+        let src = format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ let fs = [double]
+ apply(double, 1) }}\n"
+        );
+        assert!(
+            errors(&src).iter().any(|e| e.contains("包んで")),
+            "{:?}",
+            errors(&src)
+        );
+    }
+
+    /// メソッド・関連関数・スロットは値にならない。レシーバの取り決めが要る
+    #[test]
+    fn メソッド名はcallable値にならない() {
+        let src = "struct Counter { value: int }
+impl Counter { fn read(&self -> int) { self.value } }
+fn apply(f: fn(int -> int), value: int -> int) { f(value) }
+fn main(-> int) { apply(read, 1) }
+";
+        assert!(!errors(src).is_empty());
+    }
+
+    /// trait 契約は callable を受け取れない
+    #[test]
+    fn trait契約はcallableを受け取れない() {
+        assert!(
+            only("trait Run { fn go(&self, f: fn(int -> int) -> int) }\n").contains("callable 型"),
+            "{:?}",
+            errors("trait Run { fn go(&self, f: fn(int -> int) -> int) }\n")
+        );
+    }
+
     // ---- 組み込みの clone(tasks 6.5) ----
 
     /// `clone()` は所有を産む。`&T` からは借用先の所有の形へ
@@ -6822,6 +6940,20 @@ rank: Rank }
         let dumped = lowered("fn main() { let mut n = 1\n let k = 2\n assert n == k }\n").dump();
         assert!(dumped.contains("local#0 mut n: int"), "{dumped}");
         assert!(dumped.contains("local#1 k: int"), "{dumped}");
+    }
+
+    /// callable 値と間接呼び出しは HIR の形として残る(tasks 1.2)
+    #[test]
+    fn callable値と間接呼び出しは下ろしに残る() {
+        let dumped = lowered(
+            "fn double(value: int -> int) { value * 2 }\n\
+             fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n\
+             fn main(-> int) { let g = double\n apply(g, 21) }\n",
+        )
+        .dump();
+        assert!(dumped.contains("function callable#0"), "{dumped}");
+        assert!(dumped.contains("call indirect"), "{dumped}");
+        assert!(dumped.contains("fn(int -> int)"), "{dumped}");
     }
 
     /// 期待型は借用でもそのまま枝の中へ配られる(tasks 2.2)

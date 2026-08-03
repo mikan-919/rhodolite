@@ -133,16 +133,12 @@ impl Analysis {
             .expect("歩いた特殊化には要求の表がある")
     }
 
-    /// 本体1つ分の人向けの要約。全特殊化の決定的な合併で、提供検査には使わない
-    fn summary(&self, body: hir::BodyId) -> BodyReqs {
-        summary_of(&self.semantic, body)
-    }
-
     /// 全本体を決定的な順で。並びは `BodyId` の順(callable が先、各々宣言順)
     #[cfg(test)]
     pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, BodyReqs)> {
         let ids: BTreeSet<hir::BodyId> = self.semantic.keys().map(|(id, _)| *id).collect();
-        ids.into_iter().map(|id| (id, self.summary(id)))
+        ids.into_iter()
+            .map(|id| (id, summary_of(&self.semantic, id)))
     }
 }
 
@@ -868,6 +864,135 @@ mod tests {
                 .map(|call| show_key(&lowered, &call.callee))
                 .collect(),
         )
+    }
+
+    // ---- callback 特殊化(tasks 3.1 / 3.4) ----
+
+    const CALLBACK_PRELUDE: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n";
+
+    /// 特殊化ごとの要求を、束縛を名前で与えて読む
+    fn specialized(
+        program: &hir::Program,
+        analysis: &Analysis,
+        helper: &str,
+        callback: &str,
+    ) -> BTreeSet<String> {
+        let helper_id = program.free_callable(helper).expect("helper がある");
+        let callback_id = program.free_callable(callback).expect("callback がある");
+        let param = program.callables[helper_id].params[0];
+        let bindings: hir::Bindings = [(param, callback_id)].into_iter().collect();
+        analysis
+            .requirements(hir::BodyId::Callable(helper_id), &bindings)
+            .keys()
+            .map(|slot| program.slots[*slot].name.clone())
+            .collect()
+    }
+
+    /// 同じ helper でも、選ばれた callback ごとに要求が別々に出る
+    #[test]
+    fn callback特殊化ごとに要求が分かれる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "plain"),
+            BTreeSet::new()
+        );
+    }
+
+    /// 束縛が同じなら同じ特殊化。呼び出しの回数だけ増えたりしない
+    #[test]
+    fn 同じcallbackの特殊化は1つに畳まれる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, 1) + apply(ticked, 2) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let apply = program.free_callable("apply").expect("apply がある");
+        let count = analysis
+            .bodies()
+            .filter(|(id, _)| *id == hir::BodyId::Callable(apply))
+            .count();
+        // 一覧は本体ごとに1行。特殊化は要約に畳まれる
+        assert_eq!(count, 1);
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+    }
+
+    /// 不変 local の別名を通しても同じ名前付き関数を指す
+    #[test]
+    fn callableの別名も同じ特殊化になる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let f = ticked\n\
+             \x20 let g = f\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(g, 1) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+    }
+
+    /// 提供忘れの経路は helper と選ばれた callback の両方を通る
+    #[test]
+    fn 間接呼び出しの提供忘れは経路にhelperとcallbackを出す() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let errors = analysis.unsatisfied();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let path: Vec<String> = analysis.reqs["main"]["clock"]
+            .path_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(path.iter().any(|hop| hop.ends_with("apply")), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("ticked")), "{path:?}");
+    }
+
+    /// 入れ子の `with` は内側が外側を隠す。callback 越しでも同じ
+    #[test]
+    fn 入れ子のwithはcallback越しでも要求を止める() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{\n\
+             \x20   with clock(SystemClock {{}}) {{ apply(ticked, 1) }}\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    /// 再帰する helper でも特殊化は有限個で止まる
+    #[test]
+    fn callback特殊化は再帰でも止まる() {
+        let program = lowered_of(
+            "fn step(value: int -> int) { value - 1 }\n\
+             fn loop_(f: fn(int -> int), value: int -> int) {\n\
+             \x20 if value == 0: 0 else: loop_(f, f(value))\n\
+             }\n\
+             fn main(-> int) { loop_(step, 3) }\n",
+        );
+        let analysis = analyze_hir_for_test(&program);
+        assert!(analysis.unsatisfied().is_empty());
     }
 
     /// provider の運び方は所有権検査が閉じる。要求はスロットが提供されたかと

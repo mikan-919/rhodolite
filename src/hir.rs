@@ -706,12 +706,12 @@ impl Program {
             TypeKind::Enum(id) => self.enums[*id].name.clone(),
             TypeKind::Array(element) => format!("[{}]", self.show_type(element)),
             TypeKind::Callable { params, result } => {
-                let params = params
-                    .iter()
-                    .map(|p| self.show_type(p))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("fn({params} -> {})", self.show_type(result))
+                let params: Vec<String> = params.iter().map(|p| self.show_type(p)).collect();
+                format!(
+                    "fn({}-> {})",
+                    spelled_params(&params),
+                    self.show_type(result)
+                )
             }
             TypeKind::Poison => "?".to_string(),
         };
@@ -1239,6 +1239,67 @@ impl Program {
     }
 }
 
+// ---------------------------------------------------------------------------
+// callback 束縛(named function values)
+// ---------------------------------------------------------------------------
+
+/// `fn(P -> R)` の引数の並びの綴り。引数が無ければ `fn(-> R)` になる
+pub fn spelled_params(params: &[String]) -> String {
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", params.join(", "))
+    }
+}
+
+/// callable な場所 → その場所が指す名前付き関数。
+///
+/// この版の callable 値は不変 local か引数にしか置けないので、1つの本体の
+/// 中では場所と関数が1対1に決まる。呼び出し特殊化の鍵はこの表そのもの
+/// (design.md 決定3)。
+pub type Bindings = std::collections::BTreeMap<LocalId, CallableId>;
+
+/// 式が指す名前付き関数。callable 値でなければ `None`。
+pub fn callable_of(body: &Body, id: ExprId, bindings: &Bindings) -> Option<CallableId> {
+    match &body.expr(id).kind {
+        ExprKind::Function(callable) => Some(*callable),
+        ExprKind::Local(local) => bindings.get(local).copied(),
+        _ => None,
+    }
+}
+
+/// 引数の束縛から、この本体で見える callable な場所を全部求める。
+///
+/// 不変 local の別名 `let g = f` を辿る。`Let` の式 ID は初期化子より後に
+/// 確保されるので、arena 順の1パスで別名の連なりも閉じる。
+pub fn resolve_bindings(body: &Body, params: &Bindings) -> Bindings {
+    let mut bindings = params.clone();
+    for (_, expr) in body.exprs() {
+        if let ExprKind::Let { local, value } = &expr.kind
+            && let Some(callable) = callable_of(body, *value, &bindings)
+        {
+            bindings.insert(*local, callable);
+        }
+    }
+    bindings
+}
+
+/// 呼び出し先の引数の束縛。実引数が callable 値のものだけが入る。
+pub fn callee_bindings(
+    program: &Program,
+    body: &Body,
+    callee: CallableId,
+    args: &[ExprId],
+    bindings: &Bindings,
+) -> Bindings {
+    program.callables[callee]
+        .params
+        .iter()
+        .zip(args)
+        .filter_map(|(param, arg)| Some((*param, callable_of(body, *arg, bindings)?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1367,56 +1428,4 @@ mod tests {
         assert!(dumped.contains("callable#0 fn main() -> int"), "{dumped}");
         assert!(dumped.contains("expr#0 : int = int 1"), "{dumped}");
     }
-}
-
-// ---------------------------------------------------------------------------
-// callback 束縛(named function values)
-// ---------------------------------------------------------------------------
-
-/// callable な場所 → その場所が指す名前付き関数。
-///
-/// この版の callable 値は不変 local か引数にしか置けないので、1つの本体の
-/// 中では場所と関数が1対1に決まる。呼び出し特殊化の鍵はこの表そのもの
-/// (design.md 決定3)。
-pub type Bindings = std::collections::BTreeMap<LocalId, CallableId>;
-
-/// 式が指す名前付き関数。callable 値でなければ `None`。
-pub fn callable_of(body: &Body, id: ExprId, bindings: &Bindings) -> Option<CallableId> {
-    match &body.expr(id).kind {
-        ExprKind::Function(callable) => Some(*callable),
-        ExprKind::Local(local) => bindings.get(local).copied(),
-        _ => None,
-    }
-}
-
-/// 引数の束縛から、この本体で見える callable な場所を全部求める。
-///
-/// 不変 local の別名 `let g = f` を辿る。`Let` の式 ID は初期化子より後に
-/// 確保されるので、arena 順の1パスで別名の連なりも閉じる。
-pub fn resolve_bindings(body: &Body, params: &Bindings) -> Bindings {
-    let mut bindings = params.clone();
-    for (_, expr) in body.exprs() {
-        if let ExprKind::Let { local, value } = &expr.kind
-            && let Some(callable) = callable_of(body, *value, &bindings)
-        {
-            bindings.insert(*local, callable);
-        }
-    }
-    bindings
-}
-
-/// 呼び出し先の引数の束縛。実引数が callable 値のものだけが入る。
-pub fn callee_bindings(
-    program: &Program,
-    body: &Body,
-    callee: CallableId,
-    args: &[ExprId],
-    bindings: &Bindings,
-) -> Bindings {
-    program.callables[callee]
-        .params
-        .iter()
-        .zip(args)
-        .filter_map(|(param, arg)| Some((*param, callable_of(body, *arg, bindings)?)))
-        .collect()
 }

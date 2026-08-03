@@ -1431,6 +1431,42 @@ mod tests {
             })
     }
 
+    // ---- 名前付き関数の値(tasks 4.1) ----
+
+    const CALLBACK_SRC: &str = "fn double(value: int -> int) { value * 2 }
+fn negate(value: int -> int) { 0 - value }
+fn apply(f: fn(int -> int), value: int -> int) { f(value) }
+";
+
+    #[test]
+    fn callback引数を通した呼び出しが走る() {
+        let src = format!("{CALLBACK_SRC}fn main(-> int) {{ apply(double, 21) }}\n");
+        assert!(matches!(run(&src, "main"), Ok(Value::Int(42))));
+    }
+
+    /// 別名で写しても同じ名前付き関数を指す(Copy)
+    #[test]
+    fn callable値の別名は同じ関数を指す() {
+        let src = format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ let f = double
+ let g = f
+ apply(f, 1) + apply(g, 2) + g(3) }}
+"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Int(12))));
+    }
+
+    /// callback は helper を通して何段でも渡せる
+    #[test]
+    fn callbackはhelperを跨いで渡せる() {
+        let src = format!(
+            "{CALLBACK_SRC}fn twice(f: fn(int -> int), value: int -> int) {{ apply(f, apply(f, value)) }}
+fn main(-> int) {{ twice(double, 3) + twice(negate, 4) }}
+"
+        );
+        assert!(matches!(run(&src, "main"), Ok(Value::Int(16))));
+    }
+
     #[test]
     fn ownership検査済み入口は計画に対応する式を評価する() {
         let src = "fn main(-> int) { let n = 40\n n + 2 }\n";

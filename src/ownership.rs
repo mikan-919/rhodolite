@@ -2764,6 +2764,57 @@ mod tests {
         errors.pop().unwrap()
     }
 
+    // ---- callable 値は Copy(tasks 2.3) ----
+
+    const CALLBACK_SRC: &str = "fn double(value: int -> int) { value * 2 }
+fn apply(f: fn(int -> int), value: int -> int) { f(value) }
+";
+
+    /// callable 値は複製できる。同じ名前を何度渡しても move にならない
+    #[test]
+    fn callable値は複数回使える() {
+        accepted(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ let f = double
+ apply(f, 1) + apply(f, 2) + f(3) }}
+"
+        ));
+    }
+
+    /// 別名も複製。元の束縛は生きたまま
+    #[test]
+    fn callable値の別名は元を消費しない() {
+        accepted(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ let f = double
+ let g = f
+ apply(f, 1) + apply(g, 2) }}
+"
+        ));
+    }
+
+    /// 非 Copy の値は従来どおり。callable を足しても move 規則は緩まない
+    #[test]
+    fn 非copyの値は従来どおり移動する() {
+        let src = "struct User { id: int }
+fn take(u: User -> int) { u.id }
+fn main(-> int) { let u = User { id = 1 }
+ take(move u) + take(move u) }
+";
+        assert!(!rejected(src).is_empty());
+    }
+
+    /// callback を通した借用引数も、直接呼び出しと同じ衝突を見る
+    #[test]
+    fn callback越しの借用も衝突を見る() {
+        let src = "struct User { id: int }
+fn bump(u: &mut User, by: int -> int) { u.id = u.id + by
+ u.id }
+fn apply(f: fn(&mut User, int -> int), u: &mut User -> int) { f(u, 1) }
+fn main(-> int) { let mut user = User { id = 0 }
+ apply(bump, &mut user) }
+";
+        accepted(src);
+    }
+
     fn slice(src: &str, span: Span) -> &str {
         &src[span.start as usize..span.end as usize]
     }

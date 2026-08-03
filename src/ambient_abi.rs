@@ -843,6 +843,95 @@ mod tests {
             .hir
     }
 
+    // ---- callback 特殊化の計画(tasks 3.3 / 3.4) ----
+
+    const CALLBACK_SRC: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n";
+
+    /// 名前で instance を全部拾い、それぞれの ambient layout の有無を返す
+    fn callback_instances(program: &hir::Program, plan: &Plan, name: &str) -> Vec<bool> {
+        plan.instances()
+            .filter(|(_, instance)| program.show_body(instance.key.body).ends_with(name))
+            .map(|(_, instance)| instance.layout.is_some())
+            .collect()
+    }
+
+    /// slot を要る callback と要らない callback で、`apply` の instance が割れる。
+    /// no-slot 側は ambient record を持たない
+    #[test]
+    fn callbackごとにapplyのinstanceが分かれる() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(Frozen {{ t = 1000 }}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let mut ambient = callback_instances(&program, &plan, "apply");
+        ambient.sort_unstable();
+        assert_eq!(ambient, vec![false, true]);
+    }
+
+    /// 同じ callback・同じ provider なら instance は1つに畳まれる
+    #[test]
+    fn 同じcallbackの計画は1つに畳まれる() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 with clock(Frozen {{ t = 1 }}) {{ apply(ticked, 1) + apply(ticked, 2) }}\n\
+             }}\n"
+        ));
+        assert_eq!(callback_instances(&program, &plan, "apply").len(), 1);
+    }
+
+    /// provider が違えば、同じ callback でも instance は分かれる(既存の規則)
+    #[test]
+    fn callbackが同じでもproviderが違えば分かれる() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 let a = with clock(Frozen {{ t = 1 }}) {{ apply(ticked, 1) }}\n\
+             \x20 let b = with clock(Zero {{}}) {{ apply(ticked, 2) }}\n\
+             \x20 a + b\n\
+             }}\n"
+        ));
+        assert_eq!(callback_instances(&program, &plan, "apply").len(), 2);
+    }
+
+    /// 間接呼び出しにも `PlannedCall` が付き、行き先は選ばれた callback
+    #[test]
+    fn 間接呼び出しは選ばれたcallbackへ向かう() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ apply(plain, 1) }}\n"
+        ));
+        let targets: BTreeSet<String> = plan
+            .instances()
+            .filter(|(_, instance)| program.show_body(instance.key.body).ends_with("apply"))
+            .flat_map(|(_, instance)| instance.calls.values())
+            .map(|call| program.show_body(plan.instance(call.target).key.body))
+            .collect();
+        assert!(
+            targets.iter().any(|name| name.ends_with("plain")),
+            "{targets:?}"
+        );
+    }
+
+    /// 提供忘れは計画の前段(要求解析)で止まる。ここでは計画が通らないこと
+    #[test]
+    fn callback越しの提供忘れは計画で落ちる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
+        let entry = program.free_callable("main").expect("main がない");
+        let clock = slot(&program, "clock");
+        assert_eq!(
+            plan_hir_for_test(&program, &analysis, entry),
+            Err(PlanError::MissingProvider {
+                body: hir::BodyId::Callable(entry),
+                slot: clock
+            })
+        );
+    }
+
     pub(super) fn slot(program: &hir::Program, name: &str) -> hir::SlotId {
         program
             .slots

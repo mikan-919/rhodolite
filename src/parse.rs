@@ -1384,8 +1384,12 @@ mod tests {
             TypeKind::Named(name) => name.clone(),
             TypeKind::Array(element) => format!("[{}]", show_type(element)),
             TypeKind::Callable { params, result } => {
-                let params = params.iter().map(show_type).collect::<Vec<_>>().join(", ");
-                format!("fn({params} -> {})", show_type(result))
+                let params: Vec<String> = params.iter().map(show_type).collect();
+                format!(
+                    "fn({}-> {})",
+                    crate::hir::spelled_params(&params),
+                    show_type(result)
+                )
             }
         };
         let base = if ty.optional {
@@ -1477,6 +1481,64 @@ mod tests {
                 ),
                 ("Skipped".to_string(), Vec::new()),
             ]
+        );
+    }
+
+    /// 引数の型の綴りを取り出す(tasks 1.3)
+    fn param_types(src: &str) -> Vec<String> {
+        let p = ok(src);
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない: {:?}", p.items[0])
+        };
+        sig.params.iter().map(|p| show_type(&p.ty)).collect()
+    }
+
+    #[test]
+    fn callable型は引数位置に書ける() {
+        assert_eq!(
+            param_types("fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n"),
+            vec!["fn(int -> int)".to_string(), "int".to_string()]
+        );
+    }
+
+    #[test]
+    fn callable型は引数を0個でも複数でも取れる() {
+        assert_eq!(
+            param_types("fn run(a: fn(-> int), b: fn(&User, int -> bool) -> int) { 0 }\n"),
+            vec![
+                "fn(-> int)".to_string(),
+                "fn(&User, int -> bool)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn callable型の結果は省略できない() {
+        let e = parse_src("fn apply(f: fn(int) -> int) { 0 }\n").unwrap_err();
+        assert!(e.msg.contains("`->`"), "{}", e.msg);
+    }
+
+    #[test]
+    fn 局所束縛にもcallable注釈を書ける() {
+        let p = ok("fn main(-> int) { let f: fn(int -> int) = double\n f(1) }\n");
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        let ExprKind::Let { annotation, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        assert_eq!(
+            show_type(annotation.as_ref().expect("注釈がある")),
+            "fn(int -> int)"
+        );
+    }
+
+    /// 既存の直接呼び出しの綴りは何も変わらない(tasks 1.3)
+    #[test]
+    fn 直接呼び出しの綴りは変わらない() {
+        assert_eq!(
+            param_types("fn stamp(u: &mut User, at: int) { u.at = at }\n"),
+            vec!["&mut User".to_string(), "int".to_string()]
         );
     }
 
