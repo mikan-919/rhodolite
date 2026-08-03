@@ -193,12 +193,57 @@ const PROVIDER_SUBSTITUTION_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+const SCALAR_CALLBACK_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "fn double(value: int -> int) { value * 2 }\n\
+             fn negate(value: int -> int) { 0 - value }\n\
+             fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n\
+             fn twice(f: fn(int -> int), value: int -> int) { apply(f, apply(f, value)) }\n\
+             fn main(-> int) {\n\
+               let d = double\n\
+               let alias = d\n\
+               apply(alias, 21) + twice(double, 3) + apply(negate, 5)\n\
+             }\n",
+}];
+
+/// 同じ helper が、slot を要る callback と要らない callback の両方で呼ばれる。
+/// no-slot 側が隠れた ambient 欄を持たないことを実行の結果で押さえる
+const AMBIENT_CALLBACK_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Clock { fn now(&self -> int) }\n\
+             struct Frozen { at: int }\n\
+             impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+             effect clock: Clock\n\
+             fn ticked(value: int -> int) { value + clock.now() }\n\
+             fn plain(value: int -> int) { value + 1 }\n\
+             fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n\
+             fn main(-> int) {\n\
+               let quiet = apply(plain, 1)\n\
+               with clock(Frozen { at = 1000 }) {\n\
+                 let inner = with clock(Frozen { at = 7 }) { apply(ticked, 0) }\n\
+                 apply(ticked, quiet) + inner\n\
+               }\n\
+             }\n",
+}];
+
 const CANONICAL_FILES: &[FixtureFile] = &[FixtureFile {
     path: "main.rd",
     source: include_str!("../examples/canonical.rd"),
 }];
 
 const FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "scalar-callbacks",
+        files: SCALAR_CALLBACK_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "ambient-callbacks",
+        files: AMBIENT_CALLBACK_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
     Fixture {
         name: "scalar-control-flow",
         files: SCALAR_FILES,

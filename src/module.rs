@@ -904,6 +904,17 @@ fn resolve_type(
             imported_modules,
             declarations,
         ),
+        TypeKind::Callable { params, result } => {
+            for param in params.iter_mut().chain(std::iter::once(&mut **result)) {
+                resolve_type(
+                    param,
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                );
+            }
+        }
     }
 }
 
@@ -1469,6 +1480,12 @@ fn collect_type_paths(ty: &Type, paths: &mut Vec<Vec<String>>) {
     match &ty.kind {
         TypeKind::Named(name) => collect_name_path(name, paths),
         TypeKind::Array(element) => collect_type_paths(element, paths),
+        TypeKind::Callable { params, result } => {
+            for param in params {
+                collect_type_paths(param, paths);
+            }
+            collect_type_paths(result, paths);
+        }
     }
 }
 

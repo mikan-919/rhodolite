@@ -63,6 +63,9 @@ plan_ids!(InstanceId, RecordLayoutId);
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct InstanceKey {
     pub body: hir::BodyId,
+    /// この呼び出しで選ばれた callback。同じ本体でも callback が違えば
+    /// 要求も生成コードも別物になる(design.md 決定3)
+    pub bindings: hir::Bindings,
     /// `SlotId` 順。その本体の要求に制限したものだけが入る
     pub providers: Vec<(hir::SlotId, hir::TraitImplId)>,
 }
@@ -229,6 +232,9 @@ pub enum PlanError {
         implementation: hir::TraitImplId,
         method: hir::TraitMethodId,
     },
+    /// 間接呼び出しの呼び先が、この特殊化の callback 束縛から決まらない。
+    /// 型検査が callable 値の置き場所を絞っているので通常は起きない
+    UnresolvedCallback { body: hir::BodyId },
 }
 
 impl PlanError {
@@ -252,6 +258,10 @@ impl PlanError {
                 "impl {} は `{}` を実装していません",
                 program.structs[program.trait_impls[*implementation].type_].name,
                 program.trait_methods[*method].name
+            ),
+            PlanError::UnresolvedCallback { body } => format!(
+                "{}: 間接呼び出しの呼び先が決まりません",
+                program.show_body(*body)
             ),
         }
     }
@@ -385,16 +395,17 @@ fn plan_roots(
     };
 
     for (root, context) in roots {
-        let (instance, _) = planner.request(*root, context, *root)?;
+        let (instance, _) = planner.request(*root, hir::Bindings::new(), context, *root)?;
         planner.plan.roots.push((*root, instance));
     }
 
     // 確保だけして中身が空の instance を、確保順に片づける
     while let Some((instance, context)) = planner.pending.pop_front() {
-        let body_id = planner.plan.instance(instance).key.body;
-        let body = planner.program.body(body_id);
+        let key = planner.plan.instance(instance).key.clone();
+        let body = planner.program.body(key.body);
+        let bindings = hir::resolve_bindings(body, &key.bindings);
         for root in &body.root {
-            planner.walk(instance, body, *root, &context)?;
+            planner.walk(instance, body, *root, &context, &bindings)?;
         }
     }
 
@@ -421,6 +432,7 @@ impl<'a> Planner<'a> {
     fn request(
         &mut self,
         callee: hir::BodyId,
+        bindings: hir::Bindings,
         caller: &ProviderContext,
         caller_body: hir::BodyId,
     ) -> Result<(InstanceId, Vec<(hir::SlotId, ValueSource)>), PlanError> {
@@ -430,7 +442,7 @@ impl<'a> Planner<'a> {
         let mut inner = ProviderContext::new();
 
         // 要求は `SlotId` 順。layout・鍵・射影の並びはここで一度に決まる
-        for (slot, requirement) in self.analysis.requirements(callee) {
+        for (slot, requirement) in self.analysis.requirements(callee, &bindings) {
             let Some(binding) = caller.get(slot) else {
                 return Err(PlanError::MissingProvider {
                     body: caller_body,
@@ -470,6 +482,7 @@ impl<'a> Planner<'a> {
         let (instance, fresh) = self.plan.intern(
             InstanceKey {
                 body: callee,
+                bindings,
                 providers,
             },
             layout,
@@ -488,11 +501,12 @@ impl<'a> Planner<'a> {
         body: &'a hir::Body,
         id: hir::ExprId,
         context: &ProviderContext,
+        bindings: &hir::Bindings,
     ) -> Result<(), PlanError> {
         let expr = body.expr(id);
         macro_rules! walk {
             ($child:expr) => {
-                self.walk(instance, body, *$child, context)?
+                self.walk(instance, body, *$child, context, bindings)?
             };
         }
         match &expr.kind {
@@ -524,11 +538,11 @@ impl<'a> Planner<'a> {
                         },
                     );
                 }
-                self.walk(instance, body, *inner, &replaced)?;
+                self.walk(instance, body, *inner, &replaced, bindings)?;
             }
 
             hir::ExprKind::Call(call) => {
-                self.plan_call(instance, id, call, context)?;
+                self.plan_call(instance, id, call, context, bindings)?;
                 if let hir::Call::Method { recv, .. } = call {
                     walk!(recv);
                 }
@@ -554,6 +568,7 @@ impl<'a> Planner<'a> {
             | hir::ExprKind::Local(_)
             | hir::ExprKind::UnitStruct(_)
             | hir::ExprKind::Variant(_)
+            | hir::ExprKind::Function(_)
             | hir::ExprKind::Return(None)
             | hir::ExprKind::Poison => {}
 
@@ -616,12 +631,19 @@ impl<'a> Planner<'a> {
         id: hir::ExprId,
         call: &hir::Call,
         context: &ProviderContext,
+        bindings: &hir::Bindings,
     ) -> Result<(), PlanError> {
+        let body = self.program.body(self.plan.instance(instance).key.body);
         let caller = self.plan.instance(instance).key.body;
         let (callee, receiver) = match call {
             hir::Call::Direct { callable, .. }
             | hir::Call::Associated { callable, .. }
             | hir::Call::Method { callable, .. } => (*callable, None),
+            // 間接呼び出しは、この特殊化で選ばれている名前付き関数へ直に向かう
+            hir::Call::Indirect { callee, .. } => match hir::callable_of(body, *callee, bindings) {
+                Some(callable) => (callable, None),
+                None => return Err(PlanError::UnresolvedCallback { body: caller }),
+            },
             hir::Call::Slot {
                 slot,
                 method,
@@ -662,7 +684,9 @@ impl<'a> Planner<'a> {
             hir::Call::Ctor { .. } => return Ok(()),
         };
 
-        let (target, projection) = self.request(hir::BodyId::Callable(callee), context, caller)?;
+        let inner = hir::callee_bindings(self.program, body, callee, call_args(call), bindings);
+        let (target, projection) =
+            self.request(hir::BodyId::Callable(callee), inner, context, caller)?;
         self.plan.instances[instance.index()].calls.insert(
             id,
             PlannedCall {
@@ -681,6 +705,7 @@ fn call_args(call: &hir::Call) -> &[hir::ExprId] {
         | hir::Call::Associated { args, .. }
         | hir::Call::Method { args, .. }
         | hir::Call::Slot { args, .. }
+        | hir::Call::Indirect { args, .. }
         | hir::Call::Ctor { args, .. } => args,
     }
 }
@@ -880,6 +905,7 @@ mod tests {
         providers.sort();
         InstanceKey {
             body: body(program, name),
+            bindings: hir::Bindings::new(),
             providers,
         }
     }
@@ -1113,7 +1139,7 @@ mod tests {
 
         let empty = ProviderContext::new();
         assert_eq!(
-            planner.request(ticks, &empty, ticks),
+            planner.request(ticks, hir::Bindings::new(), &empty, ticks),
             Err(PlanError::MissingProvider {
                 body: ticks,
                 slot: clock
@@ -1130,7 +1156,7 @@ mod tests {
             },
         );
         assert_eq!(
-            planner.request(ticks, &type_only, ticks),
+            planner.request(ticks, hir::Bindings::new(), &type_only, ticks),
             Err(PlanError::TypeOnlyProvider {
                 body: ticks,
                 slot: clock

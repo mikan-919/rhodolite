@@ -226,6 +226,11 @@ pub enum TypeKind {
     Struct(StructId),
     Enum(EnumId),
     Array(Box<Type>),
+    /// `fn(P -> R)` — 名前付きトップレベル関数の値型。Copy で、捕捉を持たない
+    Callable {
+        params: Vec<Type>,
+        result: Box<Type>,
+    },
     /// 型注釈が宣言されていない名前を指していた型。`ExprKind::Poison` と同じで
     /// **診断を伴うときだけ**存在する(`Program::poisoned` が検査する)
     Poison,
@@ -482,6 +487,8 @@ pub enum ExprKind {
     Local(LocalId),
     /// フィールド0個の struct は名前だけで値になる
     UnitStruct(StructId),
+    /// 値位置に書かれたトップレベル関数の名前。callable 値そのもの
+    Function(CallableId),
     /// payload 0個の variant は名前だけで値になる
     Variant(VariantId),
     /// `u.rank` / `u.?rank`。所属は `FieldId` が持つ
@@ -643,6 +650,9 @@ pub enum Call {
         slot_span: Span,
         args: Vec<ExprId>,
     },
+    /// `f(value)` — callable 値を持つ不変 local / 引数を通した呼び出し。
+    /// 呼び出し先はその呼び出し特殊化の callback 束縛から静的に決まる
+    Indirect { callee: ExprId, args: Vec<ExprId> },
     /// `Lookup::Found(user)` — enum の構築
     Ctor {
         variant: VariantId,
@@ -695,6 +705,14 @@ impl Program {
             TypeKind::Struct(id) => self.structs[*id].name.clone(),
             TypeKind::Enum(id) => self.enums[*id].name.clone(),
             TypeKind::Array(element) => format!("[{}]", self.show_type(element)),
+            TypeKind::Callable { params, result } => {
+                let params = params
+                    .iter()
+                    .map(|p| self.show_type(p))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("fn({params} -> {})", self.show_type(result))
+            }
             TypeKind::Poison => "?".to_string(),
         };
         if ty.optional {
@@ -729,6 +747,8 @@ impl Program {
                 .iter()
                 .all(|v| self.variants[*v].payload.is_empty()),
             TypeKind::Array(_) => false,
+            // 名前付き関数の同一性だけを持つので、借用も後始末も要らない
+            TypeKind::Callable { .. } => true,
             TypeKind::Poison => false,
         }
     }
@@ -833,6 +853,10 @@ fn poisoned_type(ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::Poison => true,
         TypeKind::Array(element) => poisoned_type(element),
+        TypeKind::Callable { params, result } => params
+            .iter()
+            .chain(std::iter::once(&**result))
+            .any(poisoned_type),
         TypeKind::Builtin(_) | TypeKind::Struct(_) | TypeKind::Enum(_) => false,
     }
 }
@@ -1044,6 +1068,7 @@ impl Program {
             ExprKind::Nil => "nil".to_string(),
             ExprKind::Local(local) => format!("local#{}", local.index()),
             ExprKind::UnitStruct(id) => format!("unit-struct {}", self.structs[*id].name),
+            ExprKind::Function(id) => format!("function callable#{}", id.index()),
             ExprKind::Variant(id) => format!("variant {}", self.variants[*id].name),
             ExprKind::Field {
                 recv,
@@ -1185,6 +1210,9 @@ impl Program {
                 ),
                 Call::Associated { callable, args: a } => {
                     format!("call ::callable#{}({})", callable.index(), args(a))
+                }
+                Call::Indirect { callee, args: a } => {
+                    format!("call indirect #{}({})", callee.index(), args(a))
                 }
                 Call::Slot {
                     slot,
@@ -1339,4 +1367,56 @@ mod tests {
         assert!(dumped.contains("callable#0 fn main() -> int"), "{dumped}");
         assert!(dumped.contains("expr#0 : int = int 1"), "{dumped}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// callback 束縛(named function values)
+// ---------------------------------------------------------------------------
+
+/// callable な場所 → その場所が指す名前付き関数。
+///
+/// この版の callable 値は不変 local か引数にしか置けないので、1つの本体の
+/// 中では場所と関数が1対1に決まる。呼び出し特殊化の鍵はこの表そのもの
+/// (design.md 決定3)。
+pub type Bindings = std::collections::BTreeMap<LocalId, CallableId>;
+
+/// 式が指す名前付き関数。callable 値でなければ `None`。
+pub fn callable_of(body: &Body, id: ExprId, bindings: &Bindings) -> Option<CallableId> {
+    match &body.expr(id).kind {
+        ExprKind::Function(callable) => Some(*callable),
+        ExprKind::Local(local) => bindings.get(local).copied(),
+        _ => None,
+    }
+}
+
+/// 引数の束縛から、この本体で見える callable な場所を全部求める。
+///
+/// 不変 local の別名 `let g = f` を辿る。`Let` の式 ID は初期化子より後に
+/// 確保されるので、arena 順の1パスで別名の連なりも閉じる。
+pub fn resolve_bindings(body: &Body, params: &Bindings) -> Bindings {
+    let mut bindings = params.clone();
+    for (_, expr) in body.exprs() {
+        if let ExprKind::Let { local, value } = &expr.kind
+            && let Some(callable) = callable_of(body, *value, &bindings)
+        {
+            bindings.insert(*local, callable);
+        }
+    }
+    bindings
+}
+
+/// 呼び出し先の引数の束縛。実引数が callable 値のものだけが入る。
+pub fn callee_bindings(
+    program: &Program,
+    body: &Body,
+    callee: CallableId,
+    args: &[ExprId],
+    bindings: &Bindings,
+) -> Bindings {
+    program.callables[callee]
+        .params
+        .iter()
+        .zip(args)
+        .filter_map(|(param, arg)| Some((*param, callable_of(body, *arg, bindings)?)))
+        .collect()
 }

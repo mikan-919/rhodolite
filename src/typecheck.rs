@@ -162,6 +162,10 @@ struct KnownType {
 enum KnownKind {
     Named(String),
     Array(Box<KnownType>),
+    Callable {
+        params: Vec<KnownType>,
+        result: Box<KnownType>,
+    },
 }
 
 impl KnownType {
@@ -169,7 +173,7 @@ impl KnownType {
     fn name(&self) -> Option<&str> {
         match &self.kind {
             KnownKind::Named(name) => Some(name),
-            KnownKind::Array(_) => None,
+            KnownKind::Array(_) | KnownKind::Callable { .. } => None,
         }
     }
 
@@ -177,7 +181,7 @@ impl KnownType {
     fn element(&self) -> Option<&KnownType> {
         match &self.kind {
             KnownKind::Array(element) => Some(element),
-            KnownKind::Named(_) => None,
+            KnownKind::Named(_) | KnownKind::Callable { .. } => None,
         }
     }
 }
@@ -190,6 +194,14 @@ impl std::fmt::Display for KnownType {
         match &self.kind {
             KnownKind::Named(name) => write!(f, "{name}")?,
             KnownKind::Array(element) => write!(f, "[{element}]")?,
+            KnownKind::Callable { params, result } => {
+                let params = params
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "fn({params} -> {result})")?;
+            }
         }
         if self.optional {
             write!(f, "?")?;
@@ -203,7 +215,7 @@ impl std::fmt::Display for KnownType {
 ///
 /// 戻り値型は常に一つ決まる。注釈があればそれ、無ければ `unit`
 /// (design.md 決定1)。「戻り値型が分からない呼び出し」は存在しない
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct FnSig {
     /// `self` / `&self` / `&mut self`。取らないなら `None`(design.md 決定2)。
     /// trait 実装はここまで含めて契約と一致していなければならない
@@ -264,6 +276,10 @@ fn known(ty: &Type) -> KnownType {
     let kind = match &ty.kind {
         TypeKind::Named(name) => KnownKind::Named(name.clone()),
         TypeKind::Array(element) => KnownKind::Array(Box::new(known(element))),
+        TypeKind::Callable { params, result } => KnownKind::Callable {
+            params: params.iter().map(known).collect(),
+            result: Box::new(known(result)),
+        },
     };
     KnownType {
         reference: ref_kind(ty.mode),
@@ -556,6 +572,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                         &format!("struct `{name}` のフィールド `{field}`"),
                         out,
                     );
+                    reject_callable(ty, &format!("struct `{name}` のフィールド `{field}`"), out);
                     // フィールド単体の span は構文木が持たないので宣言全体を指す
                     let id = lowered.fields.alloc(hir::FieldDecl {
                         name: field.clone(),
@@ -614,7 +631,14 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                             .payload
                             .iter()
                             .map(|p| hir::PayloadDecl {
-                                ty: lower_type(&p.ty, &nominal, out),
+                                ty: {
+                                    reject_callable(
+                                        &p.ty,
+                                        &format!("variant `{}` の payload", variant.name),
+                                        out,
+                                    );
+                                    lower_type(&p.ty, &nominal, out)
+                                },
                                 indirect: p.indirect,
                             })
                             .collect(),
@@ -632,7 +656,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 let owner = nominal.traits[name];
                 ids.traits.insert(name.clone(), owner);
                 for sig in methods {
-                    check_signature_shape(sig, &format!("trait {name}::{}", sig.name), out);
+                    check_signature_shape(sig, &format!("trait {name}::{}", sig.name), false, out);
                     let id = lowered.trait_methods.alloc(hir::TraitMethodDecl {
                         name: sig.name.clone(),
                         owner,
@@ -682,7 +706,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
             Item::Fn { sig, span, .. } => {
                 others.insert(sig.name.clone());
                 fns.insert(sig.name.clone(), signature(sig));
-                check_signature_shape(sig, &sig.name, out);
+                check_signature_shape(sig, &sig.name, true, out);
                 let id = lowered.callables.alloc(callable_shell(
                     sig,
                     hir::CallableOwner::Free,
@@ -824,6 +848,43 @@ fn collect_nominal(program: &Program, lowered: &mut hir::Program) -> Nominal {
     nominal
 }
 
+/// 型の木のどこかに callable 型があるか。
+fn has_callable(ty: &Type) -> bool {
+    match &ty.kind {
+        TypeKind::Callable { .. } => true,
+        TypeKind::Array(element) => has_callable(element),
+        TypeKind::Named(_) => false,
+    }
+}
+
+/// callable 値を置けない型位置を断る(design.md 決定2)。
+///
+/// この版の callable 値は不変 local か引数にしか置けない。フィールド・payload・
+/// 配列要素・戻り値に置けると、呼び出し先が1つの静的な同一性でなくなる。
+fn reject_callable(ty: &Type, place: &str, out: &mut Out) {
+    if has_callable(ty) {
+        out.push(format!(
+            "{place} には callable 型 `fn(...)` を置けません。この版の callable 値は不変 local か引数にだけ置けます"
+        ));
+    }
+}
+
+/// callable を置いてよい位置(引数・不変 local の注釈)の追加検査。
+/// 外側1段だけを許し、入れ子・optional・参照は断る。
+fn reject_nested_callable(ty: &Type, place: &str, out: &mut Out) {
+    match &ty.kind {
+        TypeKind::Callable { params, result } => {
+            if ty.optional || ty.mode != TypeMode::Owned {
+                out.push(format!("{place}: callable 型に `?` や参照は付けられません"));
+            }
+            for inner in params.iter().chain(std::iter::once(&**result)) {
+                reject_callable(inner, place, out);
+            }
+        }
+        _ => reject_callable(ty, place, out),
+    }
+}
+
 /// 型注釈を HIR の型へ。宣言されていない名前を報告するのはここだけ。
 fn lower_type(ty: &Type, nominal: &Nominal, out: &mut Out) -> hir::Type {
     report_unknown(ty, nominal, out);
@@ -838,6 +899,11 @@ fn lower_type(ty: &Type, nominal: &Nominal, out: &mut Out) -> hir::Type {
 fn report_unknown(ty: &Type, nominal: &Nominal, out: &mut Out) {
     match &ty.kind {
         TypeKind::Array(element) => report_unknown(element, nominal, out),
+        TypeKind::Callable { params, result } => {
+            for ty in params.iter().chain(std::iter::once(&**result)) {
+                report_unknown(ty, nominal, out);
+            }
+        }
         TypeKind::Named(name) => {
             if builtin(name).is_none()
                 && !nominal.types.contains_key(name)
@@ -850,6 +916,43 @@ fn report_unknown(ty: &Type, nominal: &Nominal, out: &mut Out) {
     }
 }
 
+/// 推論・注釈で決まった型の中に callable があるか。
+fn known_has_callable(ty: &KnownType) -> bool {
+    match &ty.kind {
+        KnownKind::Callable { .. } => true,
+        KnownKind::Array(element) => known_has_callable(element),
+        KnownKind::Named(_) => false,
+    }
+}
+
+/// 局所束縛に callable 値を置けるのは**不変 local ちょうど1つ**の形だけ。
+/// 可変 local と集約の中に入ると、呼び出し先が1つの静的な同一性でなくなる。
+fn reject_callable_binding(ty: &KnownType, name: &str, mutable: bool, ctx: &str, out: &mut Out) {
+    let top = matches!(ty.kind, KnownKind::Callable { .. }) && !ty.optional;
+    if top && mutable {
+        out.push(format!(
+            "{ctx}: 可変 local `{name}` に callable 値は置けません。`let {name} = ...` と不変で束縛してください"
+        ));
+    } else if !top && known_has_callable(ty) {
+        out.push(format!(
+            "{ctx}: `{name}` の型 `{ty}` は callable 値を包んでいます。callable 値は不変 local か引数にだけ置けます"
+        ));
+    }
+}
+
+/// 宣言署名から callable 値の型へ。所有モードもそのまま持つので、照合は
+/// 既存の型の一致だけで足りる。
+fn callable_type(sig: &FnSig) -> KnownType {
+    KnownType {
+        reference: None,
+        kind: KnownKind::Callable {
+            params: sig.params.clone(),
+            result: Box::new(sig.ret.clone()),
+        },
+        optional: false,
+    }
+}
+
 /// 分かっている型を HIR の型へ。
 ///
 /// 解決できない名前は `Poison` になる。式の型の名前はどれも注釈か宣言から
@@ -858,6 +961,10 @@ fn report_unknown(ty: &Type, nominal: &Nominal, out: &mut Out) {
 fn lower_known(ty: &KnownType, nominal: &Nominal) -> hir::Type {
     let kind = match &ty.kind {
         KnownKind::Array(element) => hir::TypeKind::Array(Box::new(lower_known(element, nominal))),
+        KnownKind::Callable { params, result } => hir::TypeKind::Callable {
+            params: params.iter().map(|p| lower_known(p, nominal)).collect(),
+            result: Box::new(lower_known(result, nominal)),
+        },
         KnownKind::Named(name) => match builtin(name) {
             Some(builtin) => hir::TypeKind::Builtin(builtin),
             None => nominal
@@ -915,7 +1022,10 @@ fn optional_reference(ty: &KnownType) -> String {
 /// 宣言の実効戻り値型を HIR へ。注釈の省略は `unit` を返す宣言と同じ意味。
 fn lower_ret(sig: &Sig, nominal: &Nominal, out: &mut Out) -> hir::Type {
     match &sig.ret {
-        Some(ty) => lower_type(ty, nominal, out),
+        Some(ty) => {
+            reject_callable(ty, &format!("`{}` の戻り値型", sig.name), out);
+            lower_type(ty, nominal, out)
+        }
         None => hir::Type::unit(),
     }
 }
@@ -953,14 +1063,17 @@ fn callable_shell(
 
 /// 署名の引数と戻り値に書かれた参照の位置を見る。参照そのものは受理する位置
 /// なので、見るのは入れ子と optional だけ(tasks 2.3)。
-fn check_signature_shape(sig: &Sig, ctx: &str, out: &mut Out) {
+fn check_signature_shape(sig: &Sig, ctx: &str, callback_ok: bool, out: &mut Out) {
     for param in &sig.params {
-        check_type_shape(
-            &param.ty,
-            &RefSite::Outermost,
-            &format!("{ctx} の引数 `{}`", param.name),
-            out,
-        );
+        let place = format!("{ctx} の引数 `{}`", param.name);
+        check_type_shape(&param.ty, &RefSite::Outermost, &place, out);
+        // callable を受け取れるのはトップレベル関数の引数だけ。メソッドと
+        // trait 契約はレシーバやスロット越しに来るので静的に解けない
+        if callback_ok {
+            reject_nested_callable(&param.ty, &place, out);
+        } else {
+            reject_callable(&param.ty, &place, out);
+        }
     }
     if let Some(ret) = &sig.ret {
         check_type_shape(ret, &RefSite::Outermost, &format!("{ctx} の戻り値"), out);
@@ -1014,7 +1127,7 @@ fn lower_impl(
         (None, _) => None,
     };
     for (sig, _) in methods {
-        check_signature_shape(sig, &format!("impl {type_name}::{}", sig.name), out);
+        check_signature_shape(sig, &format!("impl {type_name}::{}", sig.name), false, out);
         let Some(owner) = owner else {
             targets.push(Target::Discard);
             continue;
@@ -1169,6 +1282,8 @@ fn inline_targets(ty: &hir::Type) -> Vec<Node> {
         hir::TypeKind::Struct(id) => vec![Node::Struct(*id)],
         hir::TypeKind::Enum(id) => vec![Node::Enum(*id)],
         hir::TypeKind::Array(element) => inline_targets(element),
+        // callable 値は名前付き関数の同一性だけで、値を内側に並べない
+        hir::TypeKind::Callable { .. } => Vec::new(),
         hir::TypeKind::Builtin(_) | hir::TypeKind::Poison => Vec::new(),
     }
 }
@@ -1792,12 +1907,9 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
         } => {
             if let Some(annotation) = annotation {
                 report_unknown(annotation, &decls.nominal, out);
-                check_type_shape(
-                    annotation,
-                    &RefSite::Outermost,
-                    &format!("{ctx}: 局所束縛 `{name}`"),
-                    out,
-                );
+                let place = format!("{ctx}: 局所束縛 `{name}`");
+                check_type_shape(annotation, &RefSite::Outermost, &place, out);
+                reject_nested_callable(annotation, &place, out);
             }
             let (ty, value_id) = match annotation.as_ref().map(known) {
                 Some(declared) => {
@@ -1832,6 +1944,9 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
                     (ty, checked.id)
                 }
             };
+            if let Some(bound) = &ty {
+                reject_callable_binding(bound, name, *mutable, ctx, out);
+            }
             let local = alloc_binding(name, ty.as_ref(), *mutable, e.span, decls, out);
             locals.insert(name.clone(), Binding::Value(ty, local));
             produces_unit(hir::ExprKind::Let {
@@ -1967,6 +2082,11 @@ fn arith(op: BinOp) -> hir::ArithOp {
 /// ローカルに隠されていない裸の名前の値。フィールド0個の struct と payload 0個の
 /// enum variant だけが名前そのままで値になる(`check_bare` が診断する側)。
 fn bare_value(name: &str, decls: &Decls) -> Lowered {
+    // 値位置のトップレベル関数名は callable 値。メソッド・関連関数・スロットは
+    // レシーバの取り決めが要るので値にならない(design.md 決定1)
+    if let (Some(sig), Some(id)) = (decls.fns.get(name), decls.ids.fns.get(name)) {
+        return typed(callable_type(sig), hir::ExprKind::Function(*id));
+    }
     if let Some(enum_name) = decls.variants.get(name) {
         return if decls.ctors[name].params.is_empty() {
             typed(
@@ -2205,8 +2325,8 @@ fn assign(
 }
 
 /// 解決した呼び出し先。署名は引数の検査に、宛先は下ろしに使う。
-struct Resolved<'d> {
-    sig: &'d FnSig,
+struct Resolved {
+    sig: FnSig,
     target: CallTarget,
 }
 
@@ -2229,6 +2349,8 @@ enum CallTarget {
         slot_span: Span,
     },
     Ctor(hir::VariantId),
+    /// `f(value)` — callable 値を持つ場所を通した呼び出し
+    Indirect(hir::ExprId),
     Unresolvable,
 }
 
@@ -2414,6 +2536,9 @@ fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Ou
             args: ids,
         }),
         CallTarget::Ctor(variant) => hir::ExprKind::Call(hir::Call::Ctor { variant, args: ids }),
+        CallTarget::Indirect(callee) => {
+            hir::ExprKind::Call(hir::Call::Indirect { callee, args: ids })
+        }
         CallTarget::Unresolvable => hir::ExprKind::Poison,
     };
     // 解決した呼び出しは実効戻り値型を持つ(design.md 決定1・6)
@@ -2427,15 +2552,32 @@ fn call(callee: &Expr, args: &[Expr], cx: &Cx, locals: &mut Locals, out: &mut Ou
 /// 最初に見てから、スロット経由なら宣言 trait の契約だけ、具体型なら inherent と
 /// trait 実装をまとめて名前で絞り一意を要求する(design.md 決定6)。
 /// `Err` はそのまま呼び出し式の下ろした形になる。
-fn resolve<'d>(
+fn resolve(
     callee: &Expr,
     arity: usize,
-    cx: &Cx<'d>,
+    cx: &Cx<'_>,
     locals: &mut Locals,
     out: &mut Out,
-) -> Result<Resolved<'d>, Lowered> {
+) -> Result<Resolved, Lowered> {
     let decls = cx.decls;
     let before = out.count();
+    // callable 型のローカル・引数は通常の呼び出し構文で呼べる。呼び出し先は
+    // 呼び出し特殊化の callback 束縛から静的に決まる(design.md 決定2)
+    if let ExprKind::Ident(name) = &callee.kind
+        && let Some(Binding::Value(Some(ty), _)) = locals.get(name)
+        && let KnownKind::Callable { params, result } = &ty.kind
+    {
+        let sig = FnSig {
+            receiver: None,
+            params: params.clone(),
+            ret: (**result).clone(),
+        };
+        let checked = synth(callee, cx, locals, out);
+        return Ok(Resolved {
+            sig,
+            target: CallTarget::Indirect(checked.id),
+        });
+    }
     let selected = match &callee.kind {
         // 直接呼び出し。名前は値として読まれない
         ExprKind::Ident(name) => Ok(decls.fns.get(name).map(|sig| {
@@ -2552,7 +2694,10 @@ fn resolve<'d>(
         }
     };
     match selected {
-        Ok(Some((sig, target))) => Ok(Resolved { sig, target }),
+        Ok(Some((sig, target))) => Ok(Resolved {
+            sig: sig.clone(),
+            target,
+        }),
         // 宣言を知らない関数・型・レシーバの形。検査済みプログラムでは
         // 呼び出し先が必ず一意に決まる(design.md 決定6)
         Ok(None) => {
@@ -6422,6 +6567,7 @@ rank: Rank }
             Local(_) => "local",
             UnitStruct(_) => "unit-struct",
             Variant(_) => "variant",
+            Function(_) => "function",
             Field { optional: true, .. } => "optional-field",
             Field { .. } => "field",
             StructLit { .. } => "struct-lit",
@@ -6448,6 +6594,7 @@ rank: Rank }
             Call(hir::Call::Associated { .. }) => "associated",
             Call(hir::Call::Slot { .. }) => "slot",
             Call(hir::Call::Ctor { .. }) => "ctor",
+            Call(hir::Call::Indirect { .. }) => "indirect",
             Poison => "poison",
         }
     }

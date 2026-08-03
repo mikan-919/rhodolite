@@ -252,6 +252,8 @@ impl Layouts {
             hir::TypeKind::Struct(id) => Key::Struct(*id),
             hir::TypeKind::Enum(id) => Key::Enum(*id),
             hir::TypeKind::Array(element) => Key::Array(Box::new(Self::key(element)?)),
+            // callable 値は静的に解決済みで、実行時の表現を持たない
+            hir::TypeKind::Callable { .. } => Key::Unit,
             // poison は診断を伴うときだけ存在する。生成まで来ないはず
             hir::TypeKind::Poison => {
                 return Err(Overflow("診断済みの型に記憶の並びはありません".into()));

@@ -117,6 +117,9 @@ pub fn supported(ty: &hir::Type) -> bool {
         ) | hir::TypeKind::Struct(_)
             | hir::TypeKind::Enum(_)
             | hir::TypeKind::Array(_)
+            // callable 値は計画が直接呼び出しへ解決済みで、実行時の表現を
+            // 持たない。局所束縛としても引数としても値は流れない
+            | hir::TypeKind::Callable { .. }
     )
 }
 
@@ -234,6 +237,12 @@ fn check_expr(
         | hir::ExprKind::Call(hir::Call::Associated { args, .. }) => {
             children.extend(args.iter().copied())
         }
+        // 呼び先は計画が決めているので、実引数だけを見る。callable 値そのものは
+        // 実行時の表現を持たない
+        hir::ExprKind::Call(hir::Call::Indirect { args, .. }) => {
+            children.extend(args.iter().copied())
+        }
+        hir::ExprKind::Function(_) => {}
         hir::ExprKind::Call(hir::Call::Method { recv, args, .. }) => {
             children.push(*recv);
             children.extend(args.iter().copied());
@@ -1288,6 +1297,15 @@ impl Emitter<'_> {
             hir::ExprKind::Call(hir::Call::Associated { args, .. }) => {
                 self.planned_call(id, None, &args.clone());
             }
+
+            // 間接呼び出しも計画が選んだ1つの直接呼び出し。表も funcref も
+            // 使わないので、直接呼び出しと同じ物理規約になる
+            hir::ExprKind::Call(hir::Call::Indirect { args, .. }) => {
+                self.planned_call(id, None, &args.clone());
+            }
+
+            // callable 値そのものは実行時の表現を持たない
+            hir::ExprKind::Function(_) => {}
 
             hir::ExprKind::Call(hir::Call::Slot { receiver, args, .. }) => {
                 let receiver = matches!(receiver, hir::SlotReceiver::Value)

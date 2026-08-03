@@ -286,6 +286,29 @@ struct Store {
 `for x in xs` は共有借用、`for x in &mut xs` は各要素への可変借用、`for x in move xs`
 は配列を消費して所有要素を順に渡す。loop variable と loop body は scope を作る。
 
+## 名前付き関数の値
+
+型注釈の `fn(P1, P2 -> R)` は名前付きトップレベル関数の値型。引数型と結果型は
+既存の具体型で、所有モードも含めて**完全一致**でだけ適合する。
+
+```rhodolite
+fn double(value: int -> int) { value * 2 }
+
+fn apply(f: fn(int -> int), value: int -> int) { f(value) }
+
+fn main(-> int) {
+    let f: fn(int -> int) = double
+    apply(f, 21)
+}
+```
+
+値になれるのはトップレベル関数の名前だけで、メソッド・関連関数・スロットの名前は
+値にならない。callable 値は Copy で、局所束縛や ambient 提供を捕捉しない。
+
+この版では、callable 値は不変 local の初期化子か関数呼び出しの引数にしか置けない。
+可変 local・フィールド・variant payload・配列要素・戻り値に置くと型検査で落ちる。
+無名関数・クロージャ・型パラメータはまだ無い。
+
 ## enum
 
 有限個の値。variant は0個以上の**型付き positional payload** を持てる。

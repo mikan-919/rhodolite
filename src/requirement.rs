@@ -120,22 +120,29 @@ pub struct Analysis {
     pub order: Vec<String>,
     /// 具体的な本体 → その本体が外へ要求するもの。契約メソッドの仮想本体は
     /// 不動点の内部鍵なのでここには出さない
-    semantic: BTreeMap<hir::BodyId, BodyReqs>,
+    semantic: BTreeMap<(hir::BodyId, hir::Bindings), BodyReqs>,
     diagnostics: Vec<Diag>,
 }
 
 impl Analysis {
-    /// 本体1つ分の意味の結果。全ての本体が表を持つ(要求が無ければ空)。
-    pub fn requirements(&self, body: hir::BodyId) -> &BodyReqs {
+    /// 呼び出し特殊化1つ分の意味の結果。計画と提供検査はこの厳密な結果だけを
+    /// 使う(design.md 決定3)。
+    pub fn requirements(&self, body: hir::BodyId, bindings: &hir::Bindings) -> &BodyReqs {
         self.semantic
-            .get(&body)
-            .expect("全ての本体に要求の表がある")
+            .get(&(body, bindings.clone()))
+            .expect("歩いた特殊化には要求の表がある")
+    }
+
+    /// 本体1つ分の人向けの要約。全特殊化の決定的な合併で、提供検査には使わない
+    fn summary(&self, body: hir::BodyId) -> BodyReqs {
+        summary_of(&self.semantic, body)
     }
 
     /// 全本体を決定的な順で。並びは `BodyId` の順(callable が先、各々宣言順)
     #[cfg(test)]
-    pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, &BodyReqs)> {
-        self.semantic.iter().map(|(id, reqs)| (*id, reqs))
+    pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, BodyReqs)> {
+        let ids: BTreeSet<hir::BodyId> = self.semantic.keys().map(|(id, _)| *id).collect();
+        ids.into_iter().map(|id| (id, self.summary(id)))
     }
 }
 
@@ -148,9 +155,11 @@ impl Analysis {
 /// スロット経由の呼び出しは、実行時にどの実装が走るかを提供が決めるので、
 /// 契約メソッドという**仮想の本体**へ向かう。その契約を実装する全ての本体の
 /// 要求がそこで合流する(design.md 決定8)。
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum BodyKey {
-    Body(hir::BodyId),
+    /// 本体と、その呼び出しに選ばれた callback の束縛。同じ本体でも別の
+    /// callback で呼ばれれば別の要求集合になる(design.md 決定3)
+    Body(hir::BodyId, hir::Bindings),
     TraitMethod(hir::TraitMethodId),
 }
 
@@ -176,11 +185,12 @@ struct Facts {
 /// AST を歩いていた頃はスロット名とローカル名を字句スコープで言い分ける必要が
 /// あったが、HIR ではスロットの使用が `Call::Slot` と `With` の提供にしか
 /// 現れない(名前は既に解決済み)。字句スコープの手当てはここには要らない。
-fn scan_body(body: &hir::Body) -> Facts {
+fn scan_body(program: &hir::Program, body: &hir::Body, params: &hir::Bindings) -> Facts {
     let mut facts = Facts::default();
     let nothing = BTreeMap::new();
+    let bindings = hir::resolve_bindings(body, params);
     for id in &body.root {
-        scan(body, *id, &nothing, &mut facts);
+        scan(program, body, *id, &nothing, &bindings, &mut facts);
     }
     facts
 }
@@ -189,16 +199,18 @@ fn scan_body(body: &hir::Body) -> Facts {
 /// 戻った時点で `inner` は消えていて、呼び出し元は元の `provided` を持ったまま。
 /// 字句スコープを呼び出しスタックがそのまま表現している。
 fn scan(
+    program: &hir::Program,
     body: &hir::Body,
     id: hir::ExprId,
     provided: &BTreeMap<hir::SlotId, SlotLevel>,
+    bindings: &hir::Bindings,
     out: &mut Facts,
 ) {
     let expr = body.expr(id);
     // 部分式をたどる。`provided` は枝ごとに差し替えて下へ運ぶ
     macro_rules! walk {
         ($child:expr) => {
-            scan(body, *$child, provided, out)
+            scan(program, body, *$child, provided, bindings, out)
         };
     }
     match &expr.kind {
@@ -221,17 +233,31 @@ fn scan(
                 };
                 inner_provided.insert(provision.slot, level);
             }
-            scan(body, *inner, &inner_provided, out);
+            scan(program, body, *inner, &inner_provided, bindings, out);
         }
 
         hir::ExprKind::Call(call) => {
             match call {
-                hir::Call::Direct { callable, .. } | hir::Call::Associated { callable, .. } => {
+                hir::Call::Direct { callable, args } | hir::Call::Associated { callable, args } => {
+                    let inner = hir::callee_bindings(program, body, *callable, args, bindings);
                     out.calls.push(Call {
-                        callee: BodyKey::Body(hir::BodyId::Callable(*callable)),
+                        callee: BodyKey::Body(hir::BodyId::Callable(*callable), inner),
                         provided: provided.clone(),
                         span: expr.span,
                     });
+                }
+                // 間接呼び出しは、この特殊化で選ばれている名前付き関数への辺。
+                // 解決できないのは束縛の無い body 単体の走査だけで、その結果は
+                // 一覧の要約にしか使わない
+                hir::Call::Indirect { callee, args } => {
+                    if let Some(callable) = hir::callable_of(body, *callee, bindings) {
+                        let inner = hir::callee_bindings(program, body, callable, args, bindings);
+                        out.calls.push(Call {
+                            callee: BodyKey::Body(hir::BodyId::Callable(callable), inner),
+                            provided: provided.clone(),
+                            span: expr.span,
+                        });
+                    }
                 }
                 // スロット経由は契約へ向かう。実行時に選ばれる実装は提供が決める
                 hir::Call::Slot {
@@ -285,6 +311,7 @@ fn scan(
         | hir::ExprKind::Local(_)
         | hir::ExprKind::UnitStruct(_)
         | hir::ExprKind::Variant(_)
+        | hir::ExprKind::Function(_)
         | hir::ExprKind::Return(None)
         | hir::ExprKind::Poison => {}
 
@@ -346,6 +373,7 @@ fn call_args(call: &hir::Call) -> &[hir::ExprId] {
         | hir::Call::Associated { args, .. }
         | hir::Call::Method { args, .. }
         | hir::Call::Slot { args, .. }
+        | hir::Call::Indirect { args, .. }
         | hir::Call::Ctor { args, .. } => args,
     }
 }
@@ -396,11 +424,26 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
     diagnostics.sort();
     diagnostics.dedup();
 
-    // 各本体を1回だけ歩く。ここから先は式を見ない
+    // 特殊化を1つずつ歩く。束縛の無い形は全ての本体にあり、callback を取る
+    // 本体はそこから呼び出しごとの特殊化が生えて、有限個で閉じる
+    // (callable 値は宣言済み関数の参照しか作れないため)
     let mut facts: BTreeMap<BodyKey, Facts> = BTreeMap::new();
-    for id in &program.bodies {
-        let body_facts = scan_body(program.body(*id));
-        merge_facts(facts.entry(BodyKey::Body(*id)).or_default(), body_facts);
+    let mut queue: Vec<BodyKey> = program
+        .bodies
+        .iter()
+        .map(|id| BodyKey::Body(*id, hir::Bindings::new()))
+        .collect();
+    while let Some(key) = queue.pop() {
+        let BodyKey::Body(id, bindings) = &key else {
+            continue;
+        };
+        if facts.contains_key(&key) {
+            continue;
+        }
+        let body_facts = scan_body(program, program.body(*id), bindings);
+        // 呼び出し先の特殊化をまだ見ていなければ後で歩く
+        queue.extend(body_facts.calls.iter().map(|call| call.callee.clone()));
+        facts.insert(key, body_facts);
     }
     // 契約メソッドは、それを実装する全ての本体の要求が合流した仮想の本体。
     // 文字列の鍵を作らずに `impl Trait::method` と `impl Type::method` の
@@ -409,7 +452,10 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
         let _ = impl_;
         for (method, callable) in &decl.methods {
             let concrete = facts
-                .get(&BodyKey::Body(hir::BodyId::Callable(*callable)))
+                .get(&BodyKey::Body(
+                    hir::BodyId::Callable(*callable),
+                    hir::Bindings::new(),
+                ))
                 .cloned()
                 .unwrap_or_default();
             merge_facts(
@@ -429,8 +475,10 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
     // ponytail: 素朴な不動点反復。呼び出しグラフを Tarjan で SCC 縮約して
     // 逆位相順に舐めれば反復を減らせる(docs/adr/0003)。プログラムが
     // 大きくなって遅くなったら、そのときに入れ替える。
-    let mut reqs: BTreeMap<BodyKey, BodyReqs> =
-        facts.keys().map(|key| (*key, BTreeMap::new())).collect();
+    let mut reqs: BTreeMap<BodyKey, BodyReqs> = facts
+        .keys()
+        .map(|key| (key.clone(), BTreeMap::new()))
+        .collect();
 
     loop {
         let mut changed = false;
@@ -461,7 +509,7 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
                     // このホップは「呼び出し元のどの呼び出しが要求を運んだか」
                     // なので、名前は呼び先、位置は呼び出し地点になる
                     let mut path = vec![Hop {
-                        name: show_key(program, site.callee),
+                        name: show_key(program, &site.callee),
                         span: site.span,
                     }];
                     path.extend(requirement.path.iter().cloned());
@@ -475,7 +523,7 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
                 }
             }
 
-            updated.insert(*key, next);
+            updated.insert(key.clone(), next);
         }
 
         reqs = updated;
@@ -485,14 +533,11 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
     }
 
     // 意味の結果。契約メソッドの仮想本体は不動点の内部鍵なので落とす
-    let semantic: BTreeMap<hir::BodyId, BodyReqs> = program
-        .bodies
-        .iter()
-        .map(|id| {
-            let found = reqs
-                .remove(&BodyKey::Body(*id))
-                .expect("全ての本体に要求の表がある");
-            (*id, found)
+    let semantic: BTreeMap<(hir::BodyId, hir::Bindings), BodyReqs> = reqs
+        .into_iter()
+        .filter_map(|(key, found)| match key {
+            BodyKey::Body(id, bindings) => Some(((id, bindings), found)),
+            BodyKey::TraitMethod(_) => None,
         })
         .collect();
 
@@ -510,7 +555,7 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
         let name = program.show_body(*id);
         public.insert(
             name.clone(),
-            semantic[id]
+            summary_of(&semantic, *id)
                 .iter()
                 .map(|(slot, req)| (program.slots[*slot].name.clone(), req.clone()))
                 .collect(),
@@ -527,6 +572,23 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
     }
 }
 
+/// 本体1つ分の人向けの要約。全特殊化の決定的な合併。
+fn summary_of(
+    semantic: &BTreeMap<(hir::BodyId, hir::Bindings), BodyReqs>,
+    body: hir::BodyId,
+) -> BodyReqs {
+    let mut merged = BodyReqs::new();
+    for ((id, _), reqs) in semantic {
+        if *id != body {
+            continue;
+        }
+        for (slot, req) in reqs {
+            merge_requirement(&mut merged, *slot, req.level, req.span, req.path.clone());
+        }
+    }
+    merged
+}
+
 /// HIR 走査そのものを対象にする単体テストだけの明示的な抜け道。
 #[cfg(test)]
 pub(crate) fn analyze_hir_for_test(program: &hir::Program) -> Analysis {
@@ -534,10 +596,10 @@ pub(crate) fn analyze_hir_for_test(program: &hir::Program) -> Analysis {
 }
 
 /// 本体の表示名。到達経路のホップに載る綴り。
-fn show_key(program: &hir::Program, key: BodyKey) -> String {
+fn show_key(program: &hir::Program, key: &BodyKey) -> String {
     match key {
-        BodyKey::Body(id) => program.show_body(id),
-        BodyKey::TraitMethod(id) => program.show_trait_method(id),
+        BodyKey::Body(id, _) => program.show_body(*id),
+        BodyKey::TraitMethod(id) => program.show_trait_method(*id),
     }
 }
 
@@ -777,7 +839,7 @@ mod tests {
 
     fn scan_of(program: &hir::Program, f: &str) -> Facts {
         let id = program.free_callable(f).expect("その名前の関数がない");
-        scan_body(&program.callables[id].body)
+        scan_body(program, &program.callables[id].body, &hir::Bindings::new())
     }
 
     fn slot_id(program: &hir::Program, name: &str) -> hir::SlotId {
@@ -803,7 +865,7 @@ mod tests {
             facts
                 .calls
                 .iter()
-                .map(|call| show_key(&lowered, call.callee))
+                .map(|call| show_key(&lowered, &call.callee))
                 .collect(),
         )
     }
@@ -1103,8 +1165,14 @@ mod tests {
 
         let make = hir::BodyId::Callable(lowered.free_callable("make").unwrap());
         let used = hir::BodyId::Callable(lowered.free_callable("used").unwrap());
-        assert_eq!(analysis.requirements(make)[&clock].level, SlotLevel::Type);
-        assert_eq!(analysis.requirements(used)[&clock].level, SlotLevel::Value);
+        assert_eq!(
+            analysis.requirements(make, &hir::Bindings::new())[&clock].level,
+            SlotLevel::Type
+        );
+        assert_eq!(
+            analysis.requirements(used, &hir::Bindings::new())[&clock].level,
+            SlotLevel::Value
+        );
     }
 
     /// 同名スロットを持つ別モジュールでも、ID なら取り違えない
@@ -1139,7 +1207,7 @@ mod tests {
         let analysis = analyze_hir_for_test(&lowered);
 
         let both = hir::BodyId::Callable(lowered.free_callable("main::both").unwrap());
-        let reqs = analysis.requirements(both);
+        let reqs = analysis.requirements(both, &hir::Bindings::new());
         assert_eq!(reqs.len(), 2, "同名でも別のスロット");
         let names: Vec<&str> = reqs
             .keys()

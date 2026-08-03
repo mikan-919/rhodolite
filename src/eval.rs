@@ -103,6 +103,8 @@ enum OwnedValue {
     Bool(bool),
     Unit,
     Nil,
+    /// 名前付き関数の値。同一性そのもので、捕捉も record も持たない
+    Function(hir::CallableId),
     Location(LocationId),
 }
 
@@ -194,6 +196,7 @@ impl Store {
             OwnedValue::Bool(value) => OwnedValue::Bool(*value),
             OwnedValue::Unit => OwnedValue::Unit,
             OwnedValue::Nil => OwnedValue::Nil,
+            OwnedValue::Function(callable) => OwnedValue::Function(*callable),
             OwnedValue::Location(id) => match self.get(*id) {
                 StoredValue::Struct { type_, fields } => {
                     let type_ = *type_;
@@ -402,6 +405,9 @@ impl<'p> CheckedInterp<'p> {
                     type_: *struct_,
                     fields: BTreeMap::new(),
                 })))
+            }
+            hir::ExprKind::Function(callable) => {
+                Ok(CheckedValue::Owned(OwnedValue::Function(*callable)))
             }
             hir::ExprKind::Variant(variant) => {
                 Ok(CheckedValue::Owned(self.store.alloc(StoredValue::Enum {
@@ -906,6 +912,17 @@ impl<'p> CheckedInterp<'p> {
                     payload,
                 })))
             }
+            // 呼び先は callable 値そのものが持っている。別名で写しても
+            // 同じ名前付き関数を指す(design.md 決定4)
+            hir::Call::Indirect { callee, args } => {
+                let callee = self.eval(body, *callee, env)?;
+                let callable = match callee {
+                    CheckedValue::Owned(OwnedValue::Function(callable)) => callable,
+                    _ => return fail("間接呼び出しの呼び先が callable 値ではありません"),
+                };
+                let args = self.args(body, args, env)?;
+                self.call(callable, None, args)
+            }
             hir::Call::Slot {
                 slot,
                 method,
@@ -1292,6 +1309,10 @@ impl<'p> CheckedInterp<'p> {
             OwnedValue::Bool(b) => Value::Bool(*b),
             OwnedValue::Unit => Value::Unit,
             OwnedValue::Nil => Value::Nil,
+            // callable 値は公開の ABI に出ない(型検査が戻り値位置を断る)
+            OwnedValue::Function(_) => {
+                return fail("callable 値は観測できる値になりません");
+            }
             OwnedValue::Location(id) => match self.store.get(*id) {
                 StoredValue::Struct { type_, .. } => new_obj(*type_),
                 StoredValue::Enum { variant, payload } => Value::Enum {

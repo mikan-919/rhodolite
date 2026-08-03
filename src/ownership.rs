@@ -1131,6 +1131,8 @@ impl<'a> Build<'a> {
             | hir::ExprKind::Nil
             | hir::ExprKind::UnitStruct(_)
             | hir::ExprKind::Variant(_)
+            // callable 値は名前付き関数の同一性だけで、所有も借用も動かさない
+            | hir::ExprKind::Function(_)
             | hir::ExprKind::Local(_)
             | hir::ExprKind::Access { .. }
             | hir::ExprKind::Poison => {}
@@ -1537,6 +1539,20 @@ impl<'a> Build<'a> {
                         for arg in args {
                             self.value(*arg, scope, Need::Take);
                         }
+                        None
+                    }
+                    // 間接呼び出し。呼び出し先の宣言は callable 型が持っている
+                    // ので、実引数の規則は直接呼び出しと同じになる
+                    hir::Call::Indirect { callee, args } => {
+                        self.value(*callee, scope, Need::Read);
+                        let params = match body.expr(*callee).result.ty().map(|ty| &ty.kind) {
+                            Some(hir::TypeKind::Callable { params, .. }) => {
+                                params.iter().map(|ty| Some(ty.clone())).collect()
+                            }
+                            _ => vec![None; args.len()],
+                        };
+                        self.callee = Some("callback".to_string());
+                        self.arguments(scope, &params, args);
                         None
                     }
                 };

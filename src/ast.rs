@@ -183,14 +183,19 @@ pub enum TypeKind {
     Named(String),
     /// `[T]`
     Array(Box<Type>),
+    /// `fn(P1, P2 -> R)` — 名前付きトップレベル関数の値型
+    Callable {
+        params: Vec<Type>,
+        result: Box<Type>,
+    },
 }
 
 impl Type {
-    /// 名前の葉。配列なら `None`
+    /// 名前の葉。配列・callable なら `None`
     pub fn name(&self) -> Option<&str> {
         match &self.kind {
             TypeKind::Named(name) => Some(name),
-            TypeKind::Array(_) => None,
+            TypeKind::Array(_) | TypeKind::Callable { .. } => None,
         }
     }
 }

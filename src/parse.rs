@@ -515,6 +515,23 @@ impl<'a> Parser<'a> {
             let element = self.ty()?;
             self.expect(&Tok::RBracket, "`]`")?;
             TypeKind::Array(Box::new(element))
+        } else if self.eat(&Tok::Fn) {
+            // `fn(P1, P2 -> R)`。宣言の署名と違い、名前も本体も持たない
+            self.expect(&Tok::LParen, "`(`")?;
+            let mut params = Vec::new();
+            while !self.at(&Tok::Arrow) {
+                params.push(self.ty()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::Arrow, "`->`")?;
+            let result = self.ty()?;
+            self.expect(&Tok::RParen, "`)`")?;
+            TypeKind::Callable {
+                params,
+                result: Box::new(result),
+            }
         } else {
             TypeKind::Named(self.name_path("型名")?)
         };
@@ -1366,6 +1383,10 @@ mod tests {
         let base = match &ty.kind {
             TypeKind::Named(name) => name.clone(),
             TypeKind::Array(element) => format!("[{}]", show_type(element)),
+            TypeKind::Callable { params, result } => {
+                let params = params.iter().map(show_type).collect::<Vec<_>>().join(", ");
+                format!("fn({params} -> {})", show_type(result))
+            }
         };
         let base = if ty.optional {
             format!("{base}?")

@@ -290,6 +290,8 @@ impl Schema {
             return;
         }
         match &ty.kind {
+            // callable 値は実行時の表現を持たないので子も無い
+            hir::TypeKind::Callable { .. } => {}
             hir::TypeKind::Struct(id) => {
                 for field in program.structs[*id].fields.clone() {
                     let field_ty = program.fields[field].ty.clone();

@@ -148,7 +148,11 @@ pub fn validate_plan(program: &hir::Program, plan: &Plan) -> Vec<Diag> {
             };
 
             let (has_receiver, needs_planned_receiver) = match source_call {
-                hir::Call::Direct { .. } | hir::Call::Associated { .. } => (false, false),
+                // 間接呼び出しは計画が選んだ直接呼び出しへ落ちる。呼び先の
+                // 形は普通のトップレベル関数と同じ
+                hir::Call::Direct { .. }
+                | hir::Call::Associated { .. }
+                | hir::Call::Indirect { .. } => (false, false),
                 hir::Call::Method { .. } => (true, false),
                 hir::Call::Slot { receiver, .. } => (
                     matches!(receiver, hir::SlotReceiver::Value),
