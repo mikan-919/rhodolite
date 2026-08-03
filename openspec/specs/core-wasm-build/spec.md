@@ -80,15 +80,11 @@ The Core Wasm backend SHALL lower reachable ownership-safe uses of `str`, owned 
 - **THEN** the generated module validates and produces the same result as the reference interpreter
 
 #### Scenario: Canonical data subset builds
-- **WHEN** the canonical program is evaluated without reaching trait or ambient operations that remain outside this change
+- **WHEN** the canonical program reaches owned-data expressions through methods and ambient slot calls
 - **THEN** its owned-data expressions no longer cause an unsupported Wasm-target diagnostic
 
 ### Requirement: Emission follows the specialization plan
-Wasm functions for Rhodolite bodies SHALL be emitted from deterministic
-specialization instances and planned direct-call targets rather than by
-performing a second name or implementation lookup. Instances whose runtime
-ambient-record layout is empty MAY be emitted. Reaching an instance that needs
-a non-empty runtime ambient record SHALL fail as unsupported in this version.
+Wasm functions for Rhodolite bodies SHALL be emitted from deterministic specialization instances and planned direct-call targets rather than by performing a second name or implementation lookup. Every instance SHALL use the provider combination in its specialization key. An instance with value-level ambient requirements SHALL receive only the provider handles in its planned runtime-record layout; an instance with an empty layout SHALL receive no hidden ambient values.
 
 #### Scenario: Shared reachable instance is emitted once
 - **WHEN** more than one production root reaches the same specialization instance
@@ -96,22 +92,30 @@ a non-empty runtime ambient record SHALL fail as unsupported in this version.
 
 #### Scenario: Runtime provider record is required
 - **WHEN** reachable code requires a specialization instance with a non-empty ambient-record layout
-- **THEN** the build fails with a source-positioned unsupported-feature diagnostic
+- **THEN** the instance is emitted with the planned provider handles and its callers pass the corresponding projected handles
+
+#### Scenario: Provider combinations differ
+- **WHEN** the same body is reachable with two different provider implementation combinations
+- **THEN** each combination has one deterministic specialization instance and calls do not dispatch between them at runtime
 
 ### Requirement: Unsupported checks are reachability-sensitive
-All loaded code SHALL still pass the ordinary whole-program static and ownership checks. Wasm-target support SHALL then be checked only for specialization instances reachable from production roots. A reachable expression, call form, value type, runtime record, or public boundary outside the supported scalar and owned-data subset SHALL cause a source-positioned diagnostic naming the unsupported construct. Unsupported unreachable code SHALL not block production emission.
+All loaded code SHALL still pass the ordinary whole-program static and ownership checks. Wasm-target support SHALL then be checked only for specialization instances reachable from production roots. A reachable expression, value type, provider ownership form, runtime record, or public boundary outside the supported scalar, owned-data, and trait-and-ambient subsets SHALL cause a source-positioned diagnostic naming the unsupported construct. Unsupported unreachable code SHALL not block production emission.
 
 #### Scenario: Unsupported declaration is unreachable
-- **WHEN** a loaded but unreachable function uses traits, ambient calls, `with`, aggregate-stored borrows, or another feature outside the supported Wasm subset
+- **WHEN** a loaded but unreachable function uses aggregate-stored borrows or another feature outside the supported Wasm subset
 - **THEN** the declaration remains statically checked but does not prevent a supported production build
 
 #### Scenario: Unsupported construct is reachable
-- **WHEN** a production root reaches a construct outside the supported scalar and owned-data subset
+- **WHEN** a production root reaches a construct outside the supported scalar, owned-data, and trait-and-ambient subsets
 - **THEN** the build fails before publishing the artifact and points to the reached construct
 
 #### Scenario: Owned data construct is reachable
 - **WHEN** a production root reaches ownership-safe strings, structs, enums, optionals, arrays, matching, or iteration
 - **THEN** the construct is checked and lowered rather than rejected merely for using a non-scalar value
+
+#### Scenario: Trait and ambient construct is reachable
+- **WHEN** a production root reaches an ownership-safe method, trait implementation, slot call, or `with` expression
+- **THEN** the construct is checked and lowered rather than rejected merely for using trait or ambient behavior
 
 ### Requirement: Wasm artifacts are valid and deterministic
 A successful build SHALL produce a valid Core WebAssembly module with no
