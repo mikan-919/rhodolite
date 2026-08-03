@@ -55,10 +55,10 @@ compile-wasm-owned-data-values（完了）
 compile-wasm-traits-and-ambient（完了）
         │
         ▼
-add-differential-execution（次）
+add-differential-execution（完了）
         │
         ▼
-compiled v1
+compiled v1（到達）
 ```
 
 | 段階 | 状態 | 想定 OpenSpec change | 成果 |
@@ -71,7 +71,7 @@ compiled v1
 | 5 | 完了 | archived `introduce-ownership-and-borrowing` | 単独所有、借用推論、決定的 drop、checked HIR 境界 |
 | 6 | 完了 | `compile-wasm-owned-data-values` | owned data の Wasm 表現、allocator、ABI v1 |
 | 7 | 完了 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
-| 8 | 次 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
+| 8 | 完了 | `add-differential-execution` | 二つの実行系の一致を継続検証し、compiled v1 に到達 |
 
 同時に進行中にするのは原則として一段階だけとする。前段の完了線を満たし、change を
 archive してから次段の提案を作る。

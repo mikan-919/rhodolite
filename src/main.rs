@@ -7,6 +7,8 @@ mod ast;
 #[allow(dead_code)]
 mod ambient_abi;
 mod diag;
+#[cfg(test)]
+mod differential;
 mod eval;
 // HIR は宣言 span と所属を語彙として全部持つ。診断と Wasm 下ろしが読むもの、
 // そして `dump` のように下ろしのテストだけが使うものがあるので、いまの3つの

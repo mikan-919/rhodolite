@@ -142,8 +142,10 @@ persist(move user)
 アクセスモードと drop plan を消費する。公開署名の borrow と aggregate に格納する borrow
 は引き続き拒否する。到達した inherent method、trait implementation、slot、`with`、値・型
 ambient record は specialization plan の直接 call と hidden handle へ下ろされ、提供の所有権と
-cleanup も保持する。次は `add-differential-execution` で、この一致を維持された fixture 群で
-継続検証する。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
+cleanup も保持する。`src/differential.rs` の維持された fixture 群が、同じ checked HIR を
+インタプリタと独立した Wasm engine に通し、結果、実行時失敗、公開 probe、宣言 test、生成 bytes
+を継続照合する。fixture を増やすときは、そこで名前付き source tree と期待する失敗分類を登録し、
+代表的な artifact 形の変更は意図して snapshot を更新する。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
 [ADR-0010](./docs/adr/0010-owned-values-and-inferred-borrows.md) と
 [ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md)、順序は
 [docs/compiler-roadmap.md](./docs/compiler-roadmap.md)。
