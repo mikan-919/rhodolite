@@ -94,7 +94,7 @@ fn fetch(id: int -> User?) {
 
 fn main(-> [User?]) {
     with db<Postgres> {
-        map([1, 2, 3], fetch)
+        [1, 2, 3].map(fetch)
     }
 }
 ```
@@ -106,14 +106,16 @@ fn main(-> [User?]) {
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
 | MAP-000 | `needs-design` | 汎用 `map` の観測可能な契約を決める | なし | M | 必要 |
-| MAP-010 | `planned` | 型パラメータの構文と型表現を追加する | MAP-000 | M | 不要 |
+| MAP-010 | `planned` | 関数・trait・impl の型パラメータ構文と型表現を追加する | MAP-000 | L | 不要 |
 | MAP-020 | `planned` | 汎用関数の型検査と呼び出し時の具体化を追加する | MAP-010 | L | 不要 |
-| MAP-030 | `planned` | 具体化された型を ownership 検査へ渡す | MAP-020 | M | 不要 |
-| MAP-040 | `planned` | 型引数を whole-program 特殊化キーに加える | MAP-020 | L | 不要 |
+| MAP-025 | `planned` | 汎用 trait / impl の契約検査と method resolution を追加する | MAP-010, MAP-020 | L | 不要 |
+| MAP-030 | `planned` | 具体化された型を ownership 検査へ渡す | MAP-020, MAP-025 | M | 不要 |
+| MAP-040 | `planned` | 型引数と trait impl を whole-program 特殊化キーに加える | MAP-020, MAP-025 | L | 不要 |
 | MAP-050 | `planned` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
-| MAP-060 | `planned` | 汎用関数の具体化を HIR インタプリタで実行する | MAP-030, MAP-040 | M | 不要 |
-| MAP-070 | `planned` | 汎用関数の具体化を Core Wasm へ生成する | MAP-030, MAP-040 | L | 不要 |
-| MAP-080 | `planned` | 汎用 `map` を実装する | MAP-050, MAP-060, MAP-070 | M | 不要 |
+| MAP-060 | `planned` | 汎用関数と trait method の具体化を HIR インタプリタで実行する | MAP-030, MAP-040 | M | 不要 |
+| MAP-070 | `planned` | 汎用関数と trait method の具体化を Core Wasm へ生成する | MAP-030, MAP-040 | L | 不要 |
+| MAP-075 | `planned` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 不要 |
+| MAP-080 | `planned` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
 | MAP-090 | `planned` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
 | MAP-100 | `planned` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
 
@@ -164,21 +166,25 @@ fn main(-> [User?]) {
 - クロージャとその実行時 ABI
 - 型に表れるエフェクト変数や effect row
 - モジュール単独型検査と汎用バイナリの配布
-- generic struct / enum / trait
+- generic struct / enum
 - 制約付き型パラメータと overload resolution
 
 ## Open Questions
 
 まだ設計判断が終わっていない問題。
 
-- **MAP-Q3:** `map` を通常の Rhodolite 関数、配列 method、コンパイラ組み込みのどれにするか
+- **MAP-Q3A:** `map` trait の名前、trait と method への型パラメータの配置、
+  および配列以外の実装を許す契約の広さをどうするか
 - **MAP-Q4:** `map` が入力配列と各要素を所有・共有借用・明示選択のどれで受け取るか
 - **MAP-Q5:** 型置換と単相化をパイプラインのどの境界で行い、再帰をどう有限化するか
 
 ## Decisions
 
-- **MAP-Q1 — 型パラメータの宣言構文:** 関数名と引数リストの間に
-  `<T, U>` を書く。例: `fn map<T, U>(...)`。今回は関数の型パラメータだけを
-  対象とし、generic struct / enum / trait には広げない。
+- **MAP-Q1 — 型パラメータの宣言構文:** 宣言名の後ろに `<T, U>` を書く。
+  例: `fn map<T, U>(...)`、`trait Map<T> { ... }`、`impl<T> Map<T> for [T] { ... }`。
+  今回は generic function / trait / impl を対象とし、generic struct / enum には広げない。
 - **MAP-Q2 — 型引数の指定:** 型引数は具体的な呼び出し引数からすべて推論する。
   明示的な型引数指定、部分的な明示指定、推論できない型パラメータは今回扱わない。
+- **MAP-Q3 — `map` の提供形態:** `map` は generic trait の method として宣言し、
+  配列用の generic impl を通常の Rhodolite コードで実装する。`xs.map(f)` は
+  コンパイル時に trait impl へ解決し、prototype chain や実行時のメソッド書き換えは導入しない。
