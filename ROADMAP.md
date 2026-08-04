@@ -173,8 +173,6 @@ fn main(-> [User?]) {
 
 まだ設計判断が終わっていない問題。
 
-- **MAP-Q3A:** `map` trait の名前、trait と method への型パラメータの配置、
-  および配列以外の実装を許す契約の広さをどうするか
 - **MAP-Q4:** `map` が入力配列と各要素を所有・共有借用・明示選択のどれで受け取るか
 - **MAP-Q5:** 型置換と単相化をパイプラインのどの境界で行い、再帰をどう有限化するか
 
@@ -188,3 +186,7 @@ fn main(-> [User?]) {
 - **MAP-Q3 — `map` の提供形態:** `map` は generic trait の method として宣言し、
   配列用の generic impl を通常の Rhodolite コードで実装する。`xs.map(f)` は
   コンパイル時に trait impl へ解決し、prototype chain や実行時のメソッド書き換えは導入しない。
+- **MAP-Q3A — `map` trait の抽象度:** 今回は `Map<T>` trait と method 側の
+  `map<U>` を持ち、どの型の impl でも結果型を `[U]` に固定する。配列以外の型が
+  将来 impl することは禁止しないが、入力と同じコンテナ形状を結果に保つ一般化、
+  associated type constructor、higher-kinded type は今回扱わない。
