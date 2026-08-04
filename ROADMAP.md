@@ -83,21 +83,96 @@ Agent は対象タスクを `in-progress` にし、1タスクずつ実装する�
 
 ## Milestones
 
-| タスクID | 状態 | タスク名 | 依存タスク | 工数 | 設計判断 | 完了条件 | 検証方法 |
-|---|---|---|---|---|---|---|---|
-| | | | | | | | |
+次の到達点は、名前付き関数値と型パラメータを使った汎用 `map` である。
+ambient を要求する関数を `map` へ渡すと、その要求が呼び出し元まで推論される。
+エフェクト変数はソース上の型に出さない。クロージャはこの到達点に含めない。
+
+```rhodolite
+fn fetch(id: int -> User?) {
+    db.find(id)
+}
+
+fn main(-> [User?]) {
+    with db<Postgres> {
+        map([1, 2, 3], fetch)
+    }
+}
+```
+
+状態は `needs-design` / `planned` / `ready` / `in-progress` / `blocked` / `done` の
+6種類とする。`needs-design` は mikan の判断待ち、`planned` は依存タスクの
+完了待ちを表す。
+
+| タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
+|---|---|---|---|---|---|
+| MAP-000 | `needs-design` | 汎用 `map` の観測可能な契約を決める | なし | M | 必要 |
+| MAP-010 | `planned` | 型パラメータの構文と型表現を追加する | MAP-000 | M | 不要 |
+| MAP-020 | `planned` | 汎用関数の型検査と呼び出し時の具体化を追加する | MAP-010 | L | 不要 |
+| MAP-030 | `planned` | 具体化された型を ownership 検査へ渡す | MAP-020 | M | 不要 |
+| MAP-040 | `planned` | 型引数を whole-program 特殊化キーに加える | MAP-020 | L | 不要 |
+| MAP-050 | `planned` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
+| MAP-060 | `planned` | 汎用関数の具体化を HIR インタプリタで実行する | MAP-030, MAP-040 | M | 不要 |
+| MAP-070 | `planned` | 汎用関数の具体化を Core Wasm へ生成する | MAP-030, MAP-040 | L | 不要 |
+| MAP-080 | `planned` | 汎用 `map` を実装する | MAP-050, MAP-060, MAP-070 | M | 不要 |
+| MAP-090 | `planned` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
+| MAP-100 | `planned` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
+
+### MAP-000 — 汎用 `map` の契約
+
+目的:
+
+- 実装が新しい構造を勝手に選ばないよう、最小の言語契約を先に固定する
+
+完了条件:
+
+- Open Questions の MAP-Q1 〜 MAP-Q5 が解決している
+- 正常系、提供忘れ、型不一致を示す正典プログラムが決まっている
+- OpenSpec の proposal / design / specs / tasks が揃い、strict validation を通る
+- 実装中に追加する新しい構造と不変条件を列挙し、mikan が承認している
+
+検証方法:
+
+- `bunx @fission-ai/openspec validate --all --strict`
+- 正典プログラムの各構文が spec の scenario と対応していることをレビューする
+
+### MAP-010 〜 MAP-100 共通の完了条件
+
+各実装タスクは MAP-000 で作る OpenSpec tasks の対応範囲を実装する。
+次の条件をすべて満たしたときだけ `done` にできる。
+
+- 対応する OpenSpec scenario に自動テストがある
+- 新規テストと既存テストが通る
+- `cargo fmt --check` と warning をエラーにした Clippy が通る
+- インタプリタと Wasm の両方に関わる振る舞いは差分検証されている
+- 同じ入力から生成する Wasm が byte 単位で決定的である
+- 検証済みの安定状態が単独のスナップショットとしてコミットされている
 
 
 ## Future Directions
 
 まだ実施を約束していない長期案。
 
+- 捕捉を持つ無名関数・クロージャ
+- callable 値の aggregate 格納と公開 ABI
+- 関数単位キャッシュと増分ビルド
+- LSP と IDE 連携
 
 ## Non-goals
 
 少なくとも現在は実装しないもの。
 
+- クロージャとその実行時 ABI
+- 型に表れるエフェクト変数や effect row
+- モジュール単独型検査と汎用バイナリの配布
+- generic struct / enum / trait
+- 制約付き型パラメータと overload resolution
 
 ## Open Questions
 
 まだ設計判断が終わっていない問題。
+
+- **MAP-Q1:** 型パラメータをどの構文で宣言するか
+- **MAP-Q2:** 型引数をすべて呼び出しから推論するか、明示構文も持つか
+- **MAP-Q3:** `map` を通常の Rhodolite 関数、配列 method、コンパイラ組み込みのどれにするか
+- **MAP-Q4:** `map` が入力配列と各要素を所有・共有借用・明示選択のどれで受け取るか
+- **MAP-Q5:** 型置換と単相化をパイプラインのどの境界で行い、再帰をどう有限化するか
