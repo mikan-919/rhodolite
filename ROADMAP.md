@@ -173,7 +173,6 @@ fn main(-> [User?]) {
 
 まだ設計判断が終わっていない問題。
 
-- **MAP-Q4:** `map` が入力配列と各要素を所有・共有借用・明示選択のどれで受け取るか
 - **MAP-Q5:** 型置換と単相化をパイプラインのどの境界で行い、再帰をどう有限化するか
 
 ## Decisions
@@ -190,3 +189,7 @@ fn main(-> [User?]) {
   `map<U>` を持ち、どの型の impl でも結果型を `[U]` に固定する。配列以外の型が
   将来 impl することは禁止しないが、入力と同じコンテナ形状を結果に保つ一般化、
   associated type constructor、higher-kinded type は今回扱わない。
+- **MAP-Q4 — `map` の ownership:** `map` は `self` で入力を消費し、
+  callback は `fn(T -> U)` で各要素の所有権を受け取る。既存 local を渡すときは
+  `move xs.map(f)` と書き、元の配列を残す利用者は `xs.clone().map(f)` を明示する。
+  `&self` / `fn(&T -> U)` の借用版は今回追加しない。
