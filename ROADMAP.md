@@ -125,7 +125,7 @@ fn main(-> [User?]) {
 
 完了条件:
 
-- Open Questions の MAP-Q1 〜 MAP-Q5 が解決している
+- MAP-000 の Open Questions がすべて Decisions へ移っている
 - 正常系、提供忘れ、型不一致を示す正典プログラムが決まっている
 - OpenSpec の proposal / design / specs / tasks が揃い、strict validation を通る
 - 実装中に追加する新しい構造と不変条件を列挙し、mikan が承認している
@@ -171,8 +171,13 @@ fn main(-> [User?]) {
 
 まだ設計判断が終わっていない問題。
 
-- **MAP-Q1:** 型パラメータをどの構文で宣言するか
 - **MAP-Q2:** 型引数をすべて呼び出しから推論するか、明示構文も持つか
 - **MAP-Q3:** `map` を通常の Rhodolite 関数、配列 method、コンパイラ組み込みのどれにするか
 - **MAP-Q4:** `map` が入力配列と各要素を所有・共有借用・明示選択のどれで受け取るか
 - **MAP-Q5:** 型置換と単相化をパイプラインのどの境界で行い、再帰をどう有限化するか
+
+## Decisions
+
+- **MAP-Q1 — 型パラメータの宣言構文:** 関数名と引数リストの間に
+  `<T, U>` を書く。例: `fn map<T, U>(...)`。今回は関数の型パラメータだけを
+  対象とし、generic struct / enum / trait には広げない。
