@@ -100,24 +100,25 @@ fn main(-> [User?]) {
 ```
 
 状態は `needs-design` / `planned` / `ready` / `in-progress` / `blocked` / `done` の
-6種類とする。`needs-design` は mikan の判断待ち、`planned` は依存タスクの
-完了待ちを表す。
+6種類とする。`needs-design` は mikan の判断待ち、`planned` はまだ
+自動実装できる粒度になっていないこと、`ready` は契約が固定済みであることを
+表す。`ready` でも依存タスクが `done` になるまでは選択されない。
 
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
-| MAP-000 | `needs-design` | 汎用 `map` の観測可能な契約を決める | なし | M | 必要 |
-| MAP-010 | `planned` | 関数・trait・impl の型パラメータ構文と型表現を追加する | MAP-000 | L | 不要 |
-| MAP-020 | `planned` | 汎用関数の型検査と呼び出し時の具体化を追加する | MAP-010 | L | 不要 |
-| MAP-025 | `planned` | 汎用 trait / impl の契約検査と method resolution を追加する | MAP-010, MAP-020 | L | 不要 |
-| MAP-030 | `planned` | 具体化された型を ownership 検査へ渡す | MAP-020, MAP-025 | M | 不要 |
-| MAP-040 | `planned` | 型引数と trait impl を whole-program 特殊化キーに加える | MAP-020, MAP-025 | L | 不要 |
-| MAP-050 | `planned` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
-| MAP-060 | `planned` | 汎用関数と trait method の具体化を HIR インタプリタで実行する | MAP-030, MAP-040 | M | 不要 |
-| MAP-070 | `planned` | 汎用関数と trait method の具体化を Core Wasm へ生成する | MAP-030, MAP-040 | L | 不要 |
-| MAP-075 | `planned` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 不要 |
-| MAP-080 | `planned` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
-| MAP-090 | `planned` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
-| MAP-100 | `planned` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
+| MAP-000 | `done` | 汎用 `map` の観測可能な契約を決める | なし | M | 必要 |
+| MAP-010 | `ready` | 関数・trait・impl の型パラメータ構文と型表現を追加する | MAP-000 | L | 不要 |
+| MAP-020 | `ready` | 汎用関数の型検査と呼び出し時の具体化を追加する | MAP-010 | L | 不要 |
+| MAP-025 | `ready` | 汎用 trait / impl の契約検査と method resolution を追加する | MAP-010, MAP-020 | L | 不要 |
+| MAP-030 | `ready` | 具体化された型を ownership 検査へ渡す | MAP-020, MAP-025 | M | 不要 |
+| MAP-040 | `ready` | 型引数と trait impl を whole-program 特殊化キーに加える | MAP-020, MAP-025 | L | 不要 |
+| MAP-050 | `ready` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
+| MAP-060 | `ready` | 汎用関数と trait method の具体化を HIR インタプリタで実行する | MAP-030, MAP-040, MAP-050 | M | 不要 |
+| MAP-070 | `ready` | 汎用関数と trait method の具体化を Core Wasm へ生成する | MAP-030, MAP-040, MAP-050 | L | 不要 |
+| MAP-075 | `needs-design` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 必要 |
+| MAP-080 | `ready` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
+| MAP-090 | `ready` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
+| MAP-100 | `ready` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
 
 ### MAP-000 — 汎用 `map` の契約
 
@@ -127,15 +128,176 @@ fn main(-> [User?]) {
 
 完了条件:
 
-- MAP-000 の Open Questions がすべて Decisions へ移っている
-- 正常系、提供忘れ、型不一致を示す正典プログラムが決まっている
-- OpenSpec の proposal / design / specs / tasks が揃い、strict validation を通る
-- 実装中に追加する新しい構造と不変条件を列挙し、mikan が承認している
+- MAP-Q1 〜 MAP-Q5 がすべて Decisions へ移っている
+- 構文、型推論、trait、ownership、単相化の境界が Decisions に明記されている
 
 検証方法:
 
+- MAP-Q1 〜 MAP-Q5 が Open Questions に残っていないことをレビューする
+- MAP-Q1 〜 MAP-Q5 の決定が Decisions にあることをレビューする
+
+### MAP-010 — 型パラメータの構文と型表現
+
+完了条件:
+
+- `fn name<T>(...)`、`trait Name<T>`、`impl<T> Name<T> for Type` を parse できる
+- 型パラメータは宣言内だけで有効な安定 ID として AST から型検査へ渡る
+- 重複する型パラメータとスコープ外の参照を source span 付きで拒否する
+- generic 本体を保持する型表現と、具体化後の HIR に型変数を残さない不変条件が検査できる
+- 既存の non-generic 宣言の AST / HIR dump と振る舞いが変わらない
+
+検証方法:
+
+- lexer / parser / module / HIR の焦点テスト
+- generic 宣言の dump snapshot と不正構文の CLI 診断テスト
+
+### MAP-020 — 汎用関数の型検査と具体化
+
+完了条件:
+
+- generic 本体を剛体型変数のまま全域検査する
+- 呼び出し引数と callable 署名からすべての型引数を一意に推論する
+- 未解決、矛盾、明示的な型引数指定を実行前に診断する
+- `identity<T>` と `apply<T, U>` を複数の具体型で検査できる
+- 呼び出されない generic 本体の型エラーも報告する
+
+検証方法:
+
+- typecheck の型推論・署名不一致・未解決の焦点テスト
+- generic `identity` / `apply` の CLI 成功・失敗テスト
+
+### MAP-025 — 汎用 trait / impl の解決
+
+完了条件:
+
+- generic trait method と generic impl の署名を型パラメータ置換後に契約検査する
+- 具体的な receiver 型と引数から trait impl と method 型引数を一意に解決する
+- impl の不足・重複・曖昧性・署名不一致を source span 付きで拒否する
+- non-generic trait / impl の現行の method resolution を保つ
+
+検証方法:
+
+- typecheck / module の generic trait 契約と method resolution の焦点テスト
+- 同名 trait method と不適合 impl の CLI 診断テスト
+
+### MAP-030 — generic と ownership の境界
+
+完了条件:
+
+- ownership pass は型引数がすべて具体化された HIR だけを受け取る
+- 具体型の Copy / owned 分類で move、borrow、clone、drop を計画する
+- `apply<T, U>` の consuming callback が non-Copy 値を一度だけ消費する
+- 型変数が ownership 以降へ漏れた場合は internal invariant violation として検出する
+
+検証方法:
+
+- ownership の generic Copy / non-Copy / move-after-use / drop 焦点テスト
+- concrete HIR / CheckedProgram に型変数がないことの invariant test
+
+### MAP-040 — whole-program 特殊化
+
+完了条件:
+
+- generic 宣言 ID、正規化した型引数、callback 束縛を特殊化キーに含める
+- 同じキーは一つの instance を共有し、異なる型引数は別 instance になる
+- 同じキーの再帰は先に枠を確保して有限に閉じる
+- polymorphic recursion は型引数の変化を示す到達経路付きで拒否する
+- 到達しない具体化 instance は生成しない
+
+検証方法:
+
+- 特殊化キーの決定性・共有・再帰・到達性の snapshot test
+- polymorphic recursion の CLI 診断テスト
+
+### MAP-050 — generic callback の ambient 要求推論
+
+完了条件:
+
+- 要求解析を generic 型引数と callback 束縛ごとの正確な特殊化に対して行う
+- ambient を要求する callback の要求が `apply<T, U>` を経由して呼び出し元へ届く
+- ambient 不要の callback の特殊化に不要な slot が混ざらない
+- 提供忘れは generic helper と callback を含む到達経路付きで診断する
+
+検証方法:
+
+- requirement / ambient ABI の型引数×callback×provider 組み合わせテスト
+- 提供忘れと不要 slot 非伝播の CLI 診断テスト
+
+### MAP-060 — HIR インタプリタ
+
+完了条件:
+
+- generic 関数と generic trait method の具体化 instance を実行できる
+- 同じ generic 本体を異なる型引数で呼び分けられる
+- consuming callback の値・drop・ambient の振る舞いが検査済み計画と一致する
+
+検証方法:
+
+- eval の generic `identity` / `apply` / generic trait method 焦点テスト
+- Copy、non-Copy、ambient callback の実行結果テスト
+
+### MAP-070 — Core Wasm 生成
+
+完了条件:
+
+- 到達した generic 関数と trait method の具体化 instance だけを生成する
+- 型引数・callback・provider が異なる instance を決定的な直接呼び出しへ下ろす
+- table、`funcref`、クロージャ確保、新しい host import を追加しない
+- インタプリタと戻り値、失敗分類、所有値の最終状態が一致する
+
+検証方法:
+
+- Wasm の generic instance、直接 call、hidden ambient record の snapshot test
+- 独立 engine による差分実行と byte-identical rebuild test
+
+### MAP-075 — 配列構築手段
+
+実装前に、通常の Rhodolite コードが `[U]` を組み立てる最小 API と
+その ownership、評価順、OOM 時の振る舞いを決める。決定後に個別の完了条件と
+検証方法を追加し、`ready` / `不要` へ変更する。
+
+### MAP-080 — `Map<T>` trait と配列 impl
+
+完了条件:
+
+- `Map<T>` が consuming `map<U>(self, f: fn(T -> U) -> [U])` を宣言する
+- `impl<T> Map<T> for [T]` の本体を通常の Rhodolite コードで記述する
+- `move xs.map(f)` が各要素を左から一度ずつ callback へ渡し、`[U]` を返す
+- `xs.clone().map(f)` は元の配列を残し、借用版 `map` は導入しない
+- callback の ambient 要求が `map` と trait dispatch を経由して正確に伝播する
+
+検証方法:
+
+- 配列の Copy / non-Copy / empty / ambient callback の焦点テスト
+- インタプリタと Wasm の差分 fixture
+
+### MAP-090 — 正典 fixture と決定性
+
+完了条件:
+
+- scalar、owned data、ambient callback、提供忘れを維持された fixture に含める
+- 戻り値、実行時失敗、最終状態、宣言 test の結果を両実行系で照合する
+- 代表的な generic `map` の Wasm snapshot を固定する
+- 同じ source tree と option から byte 単位で同じ Wasm が生成される
+
+検証方法:
+
+- differential corpus と representative snapshot test
+- 連続する2回の build の byte 比較
+
+### MAP-100 — 仕様と利用者向け文書
+
+完了条件:
+
+- OpenSpec の delta specs が main specs へ sync されている
+- README、overview、grammar、compiler roadmap が generic `map` の現在の境界を同じ言葉で説明する
+- クロージャ、明示型引数、generic data type、借用 `map` が未実装と明示される
+- Current State と Milestones が実装後の状態に更新されている
+
+検証方法:
+
+- 文書間の用語とリンクのレビュー
 - `bunx @fission-ai/openspec validate --all --strict`
-- 正典プログラムの各構文が spec の scenario と対応していることをレビューする
 
 ### MAP-010 〜 MAP-100 共通の完了条件
 
@@ -173,7 +335,7 @@ fn main(-> [User?]) {
 
 まだ設計判断が終わっていない問題。
 
-現時点ではなし。
+- **MAP-Q6:** 通常の Rhodolite コードが結果配列を組み立てる最小 API をどうするか
 
 ## Decisions
 
