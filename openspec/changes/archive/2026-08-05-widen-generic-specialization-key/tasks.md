@@ -84,7 +84,7 @@
       is not a polymorphic-recursion trigger (mirrors design.md Decision 4).
 - [x] 5.2 Update `openspec/specs/generic-trait-resolution/spec.md`'s
       `## Non-Goals` the same way.
-- [ ] 5.3 Update `ROADMAP.md`'s MAP-040 row status once complete, per the
+- [x] 5.3 Update `ROADMAP.md`'s MAP-040 row status once complete, per the
       repo's existing roadmap-tracking convention.
 
 ## 6. Quality gates
