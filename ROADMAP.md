@@ -112,7 +112,7 @@ fn main(-> [User?]) {
 | MAP-025 | `done` | 汎用 trait / impl の契約検査と method resolution を追加する | MAP-010, MAP-020 | L | 不要 |
 | MAP-030 | `done` | 具体化された型を ownership 検査へ渡す | MAP-020, MAP-025 | M | 不要 |
 | MAP-040 | `done` | 型引数と trait impl を whole-program 特殊化キーに加える | MAP-020, MAP-025 | L | 不要 |
-| MAP-050 | `in-progress` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
+| MAP-050 | `done` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
 | MAP-060 | `ready` | 汎用関数と trait method の具体化を HIR インタプリタで実行する | MAP-030, MAP-040, MAP-050 | M | 不要 |
 | MAP-070 | `ready` | 汎用関数と trait method の具体化を Core Wasm へ生成する | MAP-030, MAP-040, MAP-050 | L | 不要 |
 | MAP-075 | `needs-design` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 必要 |
