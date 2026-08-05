@@ -107,7 +107,7 @@ fn main(-> [User?]) {
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
 | MAP-000 | `done` | 汎用 `map` の観測可能な契約を決める | なし | M | 必要 |
-| MAP-010 | `in-progress` | 関数・trait・impl の型パラメータ構文と型表現を追加する | MAP-000 | L | 不要 |
+| MAP-010 | `done` | 関数・trait・impl の型パラメータ構文と型表現を追加する | MAP-000 | L | 不要 |
 | MAP-020 | `ready` | 汎用関数の型検査と呼び出し時の具体化を追加する | MAP-010 | L | 不要 |
 | MAP-025 | `ready` | 汎用 trait / impl の契約検査と method resolution を追加する | MAP-010, MAP-020 | L | 不要 |
 | MAP-030 | `ready` | 具体化された型を ownership 検査へ渡す | MAP-020, MAP-025 | M | 不要 |
