@@ -216,7 +216,5 @@ depth in this language).
   function or an immutable local alias of one, so a static recursive call
   site's callback binding is fixed for the whole cycle and cannot grow the
   way type arguments can.
-- Inferring ambient/effect requirements through a generic function's
-  callback parameters on a per-callback basis (MAP-050).
 - Diagnosing a polymorphic-recursion cycle that spans more than one distinct
   generic declaration.

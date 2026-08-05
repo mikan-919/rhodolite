@@ -74,12 +74,12 @@
 
 ## 4. Documentation touch-up
 
-- [ ] 4.1 After archiving, edit
+- [x] 4.1 After archiving, edit
       `openspec/specs/generic-function-instantiation/spec.md`'s
       `## Non-Goals` to remove the bullet "Inferring ambient/effect
       requirements through a generic function's callback parameters on a
       per-callback basis (MAP-050)", since this change fulfills it.
-- [ ] 4.2 Update `ROADMAP.md`'s MAP-050 row status to `done` once complete,
+- [x] 4.2 Update `ROADMAP.md`'s MAP-050 row status to `done` once complete,
       per the repo's existing roadmap-tracking convention.
 
 ## 5. Quality gates
