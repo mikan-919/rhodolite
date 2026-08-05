@@ -2934,4 +2934,113 @@ fn main(-> int) {
                    }\n";
         assert_eq!(shown(src, "main"), "9");
     }
+
+    // ---- 汎用宣言の具体化を走らせる(MAP-060) ----
+    //
+    // 具体化は普通の `hir::Callable` で、`CheckedInterp::call` は
+    // `CallableId` の出どころを見ない。ここはその契約を評価器の側から
+    // 押さえる焦点テスト
+    // (specs/generic-instantiation-execution)。
+
+    /// 同じ generic 本体を2つの型引数で呼ぶと、具体化ごとに独立に走る
+    #[test]
+    fn 汎用関数は型引数ごとに独立して走る() {
+        let src = "fn identity<T>(x: T -> T) { x }\n\
+                   fn main(-> int) {\n\
+                   \x20 let flag = identity(true)\n\
+                   \x20 let n = identity(41)\n\
+                   \x20 if flag: n + 1 else: 0\n\
+                   }\n";
+        assert_eq!(int(src), 42);
+    }
+
+    /// 同じ型引数でも、束縛した callback ごとに別の具体化が走る
+    #[test]
+    fn 汎用関数はcallback束縛ごとに自分のものを呼ぶ() {
+        let src = "fn double(value: int -> int) { value * 2 }\n\
+                   fn negate(value: int -> int) { 0 - value }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+                   fn main(-> int) { apply(double, 22) + apply(negate, 2) }\n";
+        assert_eq!(int(src), 42);
+    }
+
+    /// generic な `impl` のメソッドも、通常のメソッド呼び出しとして走る
+    #[test]
+    fn 汎用traitメソッドの具体化がメソッド呼び出しで走る() {
+        let src = "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+                   struct Container { tag: int }\n\
+                   impl<T> Box<T> for Container {\n\
+                   \x20 fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) }\n\
+                   }\n\
+                   fn double(value: int -> int) { value * 2 }\n\
+                   fn flip(value: bool -> bool) { value == false }\n\
+                   fn main(-> int) {\n\
+                   \x20 let c = Container { tag = 1 }\n\
+                   \x20 let flag = c.wrap(false, flip)\n\
+                   \x20 let doubled = c.wrap(21, double)\n\
+                   \x20 if flag: doubled else: 0\n\
+                   }\n";
+        assert_eq!(int(src), 42);
+    }
+
+    /// 非 Copy な値を消費する callback へ move しても走り切る。
+    /// 走り終えた `Store` に取り残しが無いことは `dispose()` の
+    /// `debug_assert!` が見ている
+    #[test]
+    fn 汎用関数越しに非copyな値をcallbackへmoveできる() {
+        let src = "struct User { id: int }\n\
+                   fn take(u: User -> int) { u.id }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(move x) }\n\
+                   fn main(-> int) {\n\
+                   \x20 let u = User { id = 42 }\n\
+                   \x20 apply(take, move u)\n\
+                   }\n";
+        assert_eq!(int(src), 42);
+    }
+
+    /// 2つの具体化がそれぞれ自分の非 Copy な値を move して drop する
+    #[test]
+    fn 具体化ごとに自分の非copyな値をmoveする() {
+        let src = "struct User { id: int }\n\
+                   struct Tag { at: int }\n\
+                   fn take_user(u: User -> int) { u.id }\n\
+                   fn take_tag(t: Tag -> int) { t.at }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(move x) }\n\
+                   fn main(-> int) {\n\
+                   \x20 let a = User { id = 40 }\n\
+                   \x20 let b = Tag { at = 2 }\n\
+                   \x20 apply(take_user, move a) + apply(take_tag, move b)\n\
+                   }\n";
+        assert_eq!(int(src), 42);
+    }
+
+    /// ambient を要る callback と要らない callback が同じ generic 宣言に
+    /// 同居する。`quiet` の側は `with` の外から呼べる
+    fn generic_ambient_src() -> String {
+        format!(
+            "{CLOCK}\
+             fn ticked(value: int -> int) {{ value + clock.now() }}\n\
+             fn plain(value: int -> int) {{ value + 1 }}\n\
+             fn apply<T, U>(f: fn(T -> U), x: T -> U) {{ f(x) }}\n\
+             fn quiet(-> int) {{ apply(plain, 1) }}\n\
+             fn main(-> int) {{\n\
+             \x20 with clock(Frozen::at(40)) {{ apply(ticked, quiet()) }}\n\
+             }}\n"
+        )
+    }
+
+    /// generic な呼び出しを跨いでも callback の ambient 要求が届く
+    #[test]
+    fn 汎用関数のcallbackがambientを受け取る() {
+        assert_eq!(int(&generic_ambient_src()), 42);
+    }
+
+    /// 同じ宣言でも ambient を要らない具体化は、提供が1つも無い所で走る
+    #[test]
+    fn ambientを要らない具体化は提供無しで走る() {
+        assert!(matches!(
+            run(&generic_ambient_src(), "quiet"),
+            Ok(Value::Int(2))
+        ));
+    }
 }
