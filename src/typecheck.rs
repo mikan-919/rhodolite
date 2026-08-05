@@ -403,15 +403,26 @@ struct Out {
     /// (design.md 決定7)で、走査の全ての関数が既にこれを可変で持って
     /// いるため。宣言ごとに `check_body` が差し替える
     body: hir::Body,
+    /// いま下ろしている本体の、callable な引数に渡ってきた名前付き関数。
+    /// 具体化した本体の中の入れ子の呼び出しが自分の callback の同一性を引く
+    /// ための種で、非 generic な本体では常に空(MAP-040 決定2)。
+    /// `body` と同じく宣言ごとに `check_body` が差し替える
+    callback_bindings: hir::Bindings,
     /// 下ろし先のプログラム全体。呼び出し地点の具体化(MAP-020 決定3)が
     /// 走査の途中で callable を1つ足すので、本体と同じ受け皿に載せてある
     lowered: hir::Program,
-    /// 具体化の索引。`(generic 宣言, 型引数の並び)` → 具体化した callable。
-    /// 型に順序を足さずに済むよう線形に走査する(MAP-020 決定3)
-    instances: Vec<(hir::GenericFnId, Vec<hir::Type>, hir::CallableId)>,
+    /// 具体化の索引。`(generic 宣言, 型引数の並び, callback の束縛)` →
+    /// 具体化した callable。型に順序を足さずに済むよう線形に走査する
+    /// (MAP-020 決定3・MAP-040 決定3)
+    instances: Vec<(
+        hir::GenericFnId,
+        Vec<hir::Type>,
+        CallbackKey,
+        hir::CallableId,
+    )>,
     /// いま本体を作っている最中の具体化。同じ宣言が別の型引数で再入したら
     /// polymorphic recursion(MAP-020 決定5)
-    building: Vec<(hir::GenericFnId, Vec<hir::Type>)>,
+    building: Vec<(hir::GenericFnId, Vec<hir::Type>, CallbackKey)>,
     /// generic `impl` の具体化が要る `TraitImplDecl`。`(struct, trait)` の組に
     /// 1つだけ、最初にその組のメソッドが解決したときに確保する(MAP-025 決定5)
     trait_impls: Vec<((hir::StructId, hir::TraitId), hir::TraitImplId)>,
@@ -457,6 +468,10 @@ impl Out {
     }
 }
 
+/// 呼び出し地点が引数ごとに渡している名前付き関数。引数と同じ並びで、
+/// callable 値でない位置は `None`。特殊化の鍵の第3成分(MAP-040 決定1)
+type CallbackKey = Vec<Option<hir::CallableId>>;
+
 /// 型検査と HIR の構築。**同じ1回の走査**で型と呼び出し先を決めながら下ろすので、
 /// 検査が知った事実を後から復元し直すことがない(design.md 決定7)。
 ///
@@ -469,6 +484,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
         unexplained: None,
         unknown_types: BTreeSet::new(),
         body: hir::Body::default(),
+        callback_bindings: hir::Bindings::new(),
         lowered: hir::Program::default(),
         instances: Vec::new(),
         building: Vec::new(),
@@ -539,6 +555,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                 check_body(
                     body,
                     &declared_params(sig),
+                    &[],
                     sig.span,
                     None,
                     &decls,
@@ -557,6 +574,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                 let ctx = format!("test \"{name}\"");
                 check_body(
                     body,
+                    &[],
                     &[],
                     ret_span(out),
                     None,
@@ -600,6 +618,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                     check_body(
                         body,
                         &declared_params(sig),
+                        &[],
                         sig.span,
                         sig.receiver.map(|mode| receiver_type(mode, &type_name)),
                         &decls,
@@ -1971,6 +1990,7 @@ fn check_rigid(
     check_body(
         body,
         &params,
+        &[],
         sig.span,
         receiver,
         decls,
@@ -2205,7 +2225,15 @@ fn generic_call(
             .iter()
             .map(|p| lower_known(&bindings[p], &cx.decls.nominal))
             .collect();
-        match instantiate(id, type_args, &bindings, cx, out) {
+        // 各引数にこの呼び出しが渡している名前付き関数。特殊化の鍵の第3成分
+        // (MAP-040 決定1)。callable 値でない引数はどの枝にも当たらないので
+        // 常に `None` になる — 位置ごとの場合分けは要らない
+        let seen = hir::resolve_bindings(&out.body, &out.callback_bindings);
+        let callback_key: CallbackKey = checked
+            .iter()
+            .map(|c| hir::callable_of(&out.body, c.id, &seen))
+            .collect();
+        match instantiate(id, type_args, callback_key, &bindings, cx, out) {
             // レシーバの所有モードの照合と `&self` への自動共有借用は
             // 非 generic なメソッド呼び出しと同じ1本を通る
             Some(callable) => match recv {
@@ -2250,31 +2278,33 @@ fn generic_call(
 
 /// 解けた型引数から具体化を1つ得る(MAP-020 決定3)。
 ///
-/// 索引は `(generic 宣言, 型引数の並び)` だけを鍵にする。callback の同一性は
-/// 入れない — この版では callback 越しに振る舞いが分かれる経路がまだ無いから
-/// で、鍵を広げるのは MAP-040(MAP-020 決定6)。
+/// 索引の鍵は `(generic 宣言, 型引数の並び, callback の束縛)` の3つ組
+/// (MAP-040 決定3)。同じ型引数でも渡す関数が違えば別の物理的な具体化になる
+/// — MAP-050 が具体化ごとに違う ambient の要求を貼れるようにするため。
 ///
 /// 本体を作り始める**前に**枠を索引へ入れるので、同じ鍵の再帰呼び出しは確保
 /// 済みの枠を共有して止まる。型引数の変わる再帰だけが `None` になる。
+/// callback の束縛だけが違う再帰は polymorphic recursion ではない(この版の
+/// callable 値は不変 local か引数にしか置けず、再帰の1周で変わりえない
+/// = MAP-040 決定4)ので、再帰の検出は `callback_key` を見ない。
 fn instantiate(
     id: hir::GenericFnId,
     type_args: Vec<hir::Type>,
+    callback_key: CallbackKey,
     bindings: &Bindings,
     cx: &Cx,
     out: &mut Out,
 ) -> Option<hir::CallableId> {
-    if let Some((_, _, callable)) = out
-        .instances
-        .iter()
-        .find(|(generic, args, _)| *generic == id && *args == type_args)
-    {
+    if let Some((_, _, _, callable)) = out.instances.iter().find(|(generic, args, key, _)| {
+        *generic == id && *args == type_args && *key == callback_key
+    }) {
         return Some(*callable);
     }
     let recursive = out
         .building
         .iter()
-        .find(|(generic, args)| *generic == id && *args != type_args)
-        .map(|(_, args)| args.clone());
+        .find(|(generic, args, _)| *generic == id && *args != type_args)
+        .map(|(_, args, _)| args.clone());
     if let Some(other) = recursive {
         let shown = |args: &[hir::Type]| {
             args.iter()
@@ -2323,8 +2353,9 @@ fn instantiate(
         span,
     });
     out.lowered.bodies.push(hir::BodyId::Callable(shell));
-    out.instances.push((id, type_args.clone(), shell));
-    out.building.push((id, type_args));
+    out.instances
+        .push((id, type_args.clone(), callback_key.clone(), shell));
+    out.building.push((id, type_args, callback_key.clone()));
 
     let params = instance_params(sig, &declared, bindings, out);
     let ret = known_generic(&declared_ret, bindings, &out.lowered);
@@ -2340,6 +2371,7 @@ fn instantiate(
     check_body(
         body,
         &params,
+        &callback_key,
         sig.span,
         receiver,
         cx.decls,
@@ -2899,10 +2931,15 @@ fn alloc_binding(
 ///
 /// 宣言パスが確保した置き場所から本体を借り出し、`self` と引数の局所束縛を
 /// 確保してから走査に入る。式は `out.body` へ溜まる。
+///
+/// `callback_key` は引数と同じ並びで「その引数に渡ってきた名前付き関数」。
+/// 具体化だけが埋めるので、非 generic な呼び出し地点は空の並びを渡す
+/// (足りない位置は `None` 扱い、MAP-040 決定2)。
 #[allow(clippy::too_many_arguments)]
 fn check_body(
     body: &[Expr],
     params: &[(String, KnownType)],
+    callback_key: &[Option<hir::CallableId>],
     span: Span,
     receiver: Option<KnownType>,
     decls: &Decls,
@@ -2927,14 +2964,20 @@ fn check_body(
         locals.insert("self".to_string(), Binding::Value(Some(ty), id));
         id
     });
+    let mut callbacks = hir::Bindings::new();
     let params: Vec<hir::LocalId> = params
         .iter()
-        .map(|(name, ty)| {
+        .enumerate()
+        .map(|(index, (name, ty))| {
             let id = alloc_local(name, Some(ty), span, decls, out);
             locals.insert(name.clone(), Binding::Value(Some(ty.clone()), id));
+            if let Some(callable) = callback_key.get(index).copied().flatten() {
+                callbacks.insert(id, callable);
+            }
             id
         })
         .collect();
+    let outer_callbacks = std::mem::replace(&mut out.callback_bindings, callbacks);
 
     let cx = Cx {
         decls,
@@ -2948,6 +2991,7 @@ fn check_body(
     out.body.receiver = receiver_local;
 
     let filled = std::mem::replace(&mut out.body, outer);
+    out.callback_bindings = outer_callbacks;
     match target {
         Target::Callable(id) => {
             let callable = out.lowered.callables.get_mut(id);
@@ -9211,6 +9255,83 @@ fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }
         assert_eq!(spanned(src, "polymorphic recursion"), "grow([x], n - 1)");
     }
 
+    // ---- callback を含む特殊化の鍵(MAP-040 tasks 4.1-4.4) ----
+
+    /// 旗艦。同じ `int -> int` の形の関数を2つ持つので、型引数だけでは
+    /// 2つの呼び出しが区別できない
+    const GENERIC_CALLBACK_SRC: &str = "fn double(value: int -> int) { value * 2 }
+fn triple(value: int -> int) { value * 3 }
+fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }
+";
+
+    /// 型引数も callback も同じなら、今までどおり1つの具体化を共有する
+    #[test]
+    fn 同じ型引数と同じcallbackの呼び出しは具体化を共有する() {
+        let program = lowered(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{ apply(double, 1) + apply(double, 2) }}\n"
+        ));
+        let calls = calls_from(&program, "main");
+        assert_eq!(calls.len(), 2, "{}", program.dump());
+        assert_eq!(calls[0], calls[1]);
+        assert_eq!(instances(&program, "apply").len(), 1);
+    }
+
+    /// 型引数が同じでも渡す関数が違えば別の具体化。呼び出し地点の宛先も分かれる
+    #[test]
+    fn 違うcallbackの呼び出しは別の具体化になる() {
+        let program = lowered(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{ apply(double, 1) + apply(triple, 1) }}\n"
+        ));
+        let made = instances(&program, "apply");
+        assert_eq!(made.len(), 2, "{}", program.dump());
+        assert_ne!(made[0], made[1]);
+        let calls = calls_from(&program, "main");
+        assert_eq!(calls.len(), 2, "{}", program.dump());
+        assert_ne!(calls[0], calls[1]);
+        // 具体化した本体そのものは今までどおり間接呼び出しのまま。分かれたのは
+        // どの物理的な callable へ向かうかだけで、どちらに何が渡ったかは
+        // 呼び出し地点の宛先が持つ(MAP-050 がここへ要求を貼る)
+        assert_eq!(calls, vec![made[0], made[1]]);
+    }
+
+    /// `let` の別名越しでも同じ関数に解決するので、具体化は共有される
+    #[test]
+    fn callbackの別名は同じ具体化に解決する() {
+        let program = lowered(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{ let g = double\n apply(g, 1) + apply(double, 2) }}\n"
+        ));
+        assert_eq!(instances(&program, "apply").len(), 1, "{}", program.dump());
+    }
+
+    /// 自分の callback 引数を再帰へ渡し直す本体は、鍵が変わらないので
+    /// 1つの具体化で閉じる(MAP-040 決定4)
+    #[test]
+    fn callbackを転送する自己再帰は1つの具体化で閉じる() {
+        let program = lowered(
+            "fn double(value: int -> int) { value * 2 }\n\
+             fn apply<T>(f: fn(T -> T), x: T, n: int -> T) { if n == 0: x else: apply(f, f(x), n - 1) }\n\
+             fn main(-> int) { apply(double, 1, 3) }\n",
+        );
+        let made = instances(&program, "apply");
+        assert_eq!(made.len(), 1, "{}", program.dump());
+        assert_eq!(calls_from(&program, "main"), vec![made[0]]);
+    }
+
+    /// callback の束縛が違う具体化が別に居ても、型引数の変わる再帰は今までどおり
+    /// 同じ綴りで落ちる
+    #[test]
+    fn 違うcallbackが居ても型引数の変わる再帰を報告する() {
+        let src = "fn double(value: int -> int) { value * 2 }\n\
+                   fn triple(value: int -> int) { value * 3 }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+                   fn grow<T>(x: T, n: int -> int) { if n == 0: 0 else: grow([x], n - 1) }\n\
+                   fn main(-> int) { apply(double, 1) + apply(triple, 1) + grow(1, 3) }\n";
+        assert_eq!(
+            only(src),
+            "grow: `grow` の具体化が `<int>` から `<[int]>` へ再帰しています。型引数の変わる再帰(polymorphic recursion)はこの版では具体化できません"
+        );
+    }
+
     /// 呼ばれない generic 宣言は具体化を1つも作らない
     #[test]
     fn 呼ばれないgeneric宣言は具体化を作らない() {
@@ -9602,6 +9723,69 @@ fn shout(value: str -> str) { value }
                      fn grow<U>(&self, seed: T, value: U, n: int -> int) { if n == 0: 0 else: self.grow(seed, [value], n - 1) }\n\
                    }\n\
                    fn main(-> int) { let c = Container { tag = 1 }\n c.grow(0, 1, 3) }\n";
+        assert!(
+            errors(src)
+                .iter()
+                .any(|e| e.contains("polymorphic recursion")),
+            "{:?}",
+            errors(src)
+        );
+    }
+
+    // ---- callback を含む特殊化の鍵(MAP-040 tasks 4.5) ----
+
+    /// `impl` メソッドの索引は free 関数と同じ1本なので、callback を鍵へ足した
+    /// のもそのまま効く。型引数も callback も同じなら共有する
+    #[test]
+    fn 同じ型引数と同じcallbackのgeneric_impl呼び出しは具体化を共有する() {
+        let program = lowered(&format!(
+            "{IMPL_SRC}fn main(-> int) {{ let c = Container {{ tag = 1 }}\n c.wrap(1, double) + c.wrap(2, double) }}\n"
+        ));
+        assert_eq!(instances(&program, "wrap").len(), 1, "{}", program.dump());
+    }
+
+    /// 型引数が同じでも渡す関数が違えば別の具体化になる
+    #[test]
+    fn 違うcallbackのgeneric_impl呼び出しは別の具体化になる() {
+        let program = lowered(&format!(
+            "{IMPL_SRC}fn negate(value: int -> int) {{ 0 - value }}\n\
+             fn main(-> int) {{ let c = Container {{ tag = 1 }}\n c.wrap(1, double) + c.wrap(1, negate) }}\n"
+        ));
+        let made = instances(&program, "wrap");
+        assert_eq!(made.len(), 2, "{}", program.dump());
+        assert_ne!(made[0], made[1]);
+        assert_eq!(method_calls(&program, "main"), made);
+        // `(struct, trait)` の組の `impl` は今までどおり1つだけ
+        assert_eq!(program.trait_impls.len(), 1, "{}", program.dump());
+    }
+
+    /// 自分の callback 引数を再帰へ渡し直す `impl` メソッドも1つで閉じる
+    #[test]
+    fn callbackを転送するgeneric_implの自己再帰は1つの具体化で閉じる() {
+        let program = lowered(
+            "trait Count<T> { fn count<U>(&self, seed: T, f: fn(U -> U), value: U, n: int -> int) }\n\
+             struct Container { tag: int }\n\
+             impl<T> Count<T> for Container {\n\
+               fn count<U>(&self, seed: T, f: fn(U -> U), value: U, n: int -> int) { if n == 0: 0 else: 1 + self.count(seed, f, f(value), n - 1) }\n\
+             }\n\
+             fn double(value: int -> int) { value * 2 }\n\
+             fn main(-> int) { let c = Container { tag = 1 }\n c.count(0, double, 1, 3) }\n",
+        );
+        assert_eq!(instances(&program, "count").len(), 1, "{}", program.dump());
+    }
+
+    /// callback の違う具体化が別に居ても、型引数の変わる再帰は今までどおり落ちる
+    #[test]
+    fn 違うcallbackが居てもgeneric_implの型引数の変わる再帰を報告する() {
+        let src = "trait Grow<T> { fn grow<U>(&self, seed: T, value: U, n: int -> int) }\n\
+                   struct Container { tag: int }\n\
+                   impl<T> Grow<T> for Container {\n\
+                     fn grow<U>(&self, seed: T, value: U, n: int -> int) { if n == 0: 0 else: self.grow(seed, [value], n - 1) }\n\
+                   }\n\
+                   fn double(value: int -> int) { value * 2 }\n\
+                   fn triple(value: int -> int) { value * 3 }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+                   fn main(-> int) { let c = Container { tag = 1 }\n apply(double, 1) + apply(triple, 1) + c.grow(0, 1, 3) }\n";
         assert!(
             errors(src)
                 .iter()

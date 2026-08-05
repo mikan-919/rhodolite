@@ -169,12 +169,17 @@ generic declarations calling each other is out of scope for this capability.
 - Type-checking or instantiating generic trait methods or generic impl
   methods, or any generic declaration reachable only through `trait`/`impl`
   (MAP-025).
-- Including callback identity or trait implementation choice in the
-  specialization key, sharing instantiations across the whole program beyond
-  a single check-and-lower run, or only generating reachable instantiations
-  as a deliberate reachability pass (MAP-040 widens the key; reachability
-  already falls out of the existing ambient production planning that walks
-  from `main` and exported roots).
+- Sharing instantiations across the whole program beyond a single
+  check-and-lower run, or only generating reachable instantiations as a
+  deliberate reachability pass (reachability already falls out of the
+  existing call-driven single pass, and of the ambient production planning
+  that walks from `main` and exported roots).
+- Diagnosing a recursive call whose callback binding differs from the
+  instantiation currently being built as polymorphic recursion. A callable
+  value in this language is always either a direct reference to a declared
+  function or an immutable local alias of one, so a static recursive call
+  site's callback binding is fixed for the whole cycle and cannot grow the
+  way type arguments can.
 - Inferring ambient/effect requirements through a generic function's
   callback parameters on a per-callback basis (MAP-050).
 - Diagnosing a polymorphic-recursion cycle that spans more than one distinct

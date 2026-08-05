@@ -2220,6 +2220,83 @@ fn generic_implを呼ぶプログラムのwasmは決定的() {
     assert_eq!(invoke(&first, "__rhodolite_main", &[]).unwrap(), [38]);
 }
 
+// ---- 型引数と callback を特殊化の鍵に含める (MAP-040) ----
+
+/// Wasm モジュールが定義している関数の個数。具体化が1つ増えたことを、CLI の
+/// 成果物の側から数えられる唯一の既存の出口
+fn wasm_function_count(bytes: &[u8]) -> usize {
+    wasmparser::Parser::new(0)
+        .parse_all(bytes)
+        .filter_map(|payload| match payload {
+            Ok(wasmparser::Payload::FunctionSection(section)) => Some(section.count() as usize),
+            _ => None,
+        })
+        .sum()
+}
+
+const 汎用CALLBACK: &str = "fn double(value: int -> int) { value * 2 }\n\
+     fn triple(value: int -> int) { value * 3 }\n\
+     fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+
+/// 同じ型引数でも渡す関数が違えば、具体化は別の物理的な関数になる。
+/// どの callback にも渡されない組み合わせの具体化は作らない
+#[test]
+fn 違うcallbackの汎用呼び出しは別の関数として出る() {
+    let project = Project::new();
+    // `triple` を直に呼ぶだけで `apply` へは渡さない側。渡されていない
+    // callback の具体化は作られないので、`apply` の具体化は1つで足りる
+    project.write(
+        "one.rd",
+        &format!(
+            "{汎用CALLBACK}fn main(-> int) {{ apply(double, 10) + apply(double, 11) + triple(0) }}\n"
+        ),
+    );
+    // 同じ宣言・同じ関数の集合のまま、片方の呼び出しだけ渡す関数を変えた側
+    project.write(
+        "two.rd",
+        &format!(
+            "{汎用CALLBACK}fn main(-> int) {{ apply(double, 10) + apply(triple, 11) + triple(0) }}\n"
+        ),
+    );
+
+    // interpreter 側。それぞれの呼び出しが自分に渡した関数を通る
+    let text = output_text(&project.run("one.rd"));
+    assert!(text.contains("main -> 42"), "{text}");
+    let text = output_text(&project.run("two.rd"));
+    assert!(text.contains("main -> 53"), "{text}");
+
+    // Wasm 側。増えるのは `apply` の具体化ちょうど1つ
+    assert!(
+        project
+            .build(&["one.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert!(
+        project
+            .build(&["two.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let one = project.read("target/wasm/one.wasm");
+    let two = project.read("target/wasm/two.wasm");
+    assert_eq!(
+        wasm_function_count(&two),
+        wasm_function_count(&one) + 1,
+        "callback の違う呼び出しが具体化を1つ足す"
+    );
+    // 同じソースからは byte 単位で同じ成果物。差分検証も両方で一致する
+    assert!(
+        project
+            .build(&["two.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/two.wasm"), two);
+    assert_eq!(invoke(&one, "__rhodolite_main", &[]).unwrap(), [42]);
+    assert_eq!(invoke(&two, "__rhodolite_main", &[]).unwrap(), [53]);
+}
+
 #[test]
 fn 知らないtraitを実装するgeneric_implは実行前に失敗する() {
     実行前に失敗する(

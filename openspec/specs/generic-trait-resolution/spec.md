@@ -221,8 +221,12 @@ that would otherwise result.
   declared struct (an array, callable, builtin, or blanket impl target).
 - Resolving a generic trait method through ambient/slot dispatch (`with` /
   a slot-typed receiver).
-- Including callback identity in the specialization key, or generating only
-  reachable instantiations as a deliberate whole-program pass (MAP-040).
+- Generating only reachable instantiations as a deliberate whole-program
+  pass; reachability falls out of the existing call-driven single pass.
+- Diagnosing a recursive call whose callback binding differs from the
+  instantiation currently being built as polymorphic recursion — see the
+  `generic-function-instantiation` capability's Non-Goals for why a callback
+  binding cannot diverge across recursion depth in this language.
 - Feeding a resolved instantiation's concrete types through any new
   ownership-specific rule or dedicated ownership test matrix (MAP-030).
 - Diagnosing a polymorphic-recursion cycle that spans more than one distinct
