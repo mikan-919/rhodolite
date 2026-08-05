@@ -245,6 +245,26 @@ const GENERIC_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+/// generic な `impl` のメソッド呼び出しが解決して具体化した本体も通常の
+/// callable。同じメソッドを2つの具体型で呼ぶ形を interpreter と Wasm の
+/// 両方で走らせて突き合わせる(MAP-025)
+const GENERIC_IMPL_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+             struct Container { tag: int }\n\
+             impl<T> Box<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+             fn double(value: int -> int) { value * 2 }\n\
+             fn negate(value: int -> int) { 0 - value }\n\
+             fn flip(value: bool -> bool) { value == false }\n\
+             fn main(-> int) {\n\
+               let c = Container { tag = 1 }\n\
+               let flag = c.wrap(false, flip)\n\
+               let doubled = c.wrap(20, double)\n\
+               let negated = c.wrap(2, negate)\n\
+               if flag: doubled + negated else: 0\n\
+             }\n",
+}];
+
 const CANONICAL_FILES: &[FixtureFile] = &[FixtureFile {
     path: "main.rd",
     source: include_str!("../examples/canonical.rd"),
@@ -326,6 +346,12 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "generic-instantiation",
         files: GENERIC_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "generic-impl-resolution",
+        files: GENERIC_IMPL_FILES,
         probes: &[],
         expected_failure: None,
     },

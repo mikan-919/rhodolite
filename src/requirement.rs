@@ -174,6 +174,13 @@ struct Facts {
     /// 提供されないまま漏れたスロットの使用
     escaping: BTreeMap<hir::SlotId, SlotUse>,
     calls: Vec<Call>,
+    /// 要求は運ばないが、意味の結果を持たせるためだけに歩く特殊化。
+    ///
+    /// 値レシーバのメソッド呼び出しは辺にしない(`scan_body`)が、後段の
+    /// 計画は `requirements(callee, bindings)` をその特殊化で引く。callback を
+    /// 取れるメソッドは generic な `impl` にしか無いので(MAP-025)、ここが
+    /// 空でなくなるのは generic を持つプログラムだけ
+    walks: Vec<BodyKey>,
 }
 
 /// 本体を1回歩いて `Facts` を作る。
@@ -277,8 +284,16 @@ fn scan(
                 }
                 // ponytail: 値レシーバのメソッド呼び出しは辺にしない。要求が
                 // そこを通り抜けるが、AST を歩いていた頃と同じ保守的な
-                // 過小近似。辺にするなら `Facts` の合流だけを直せばよい
-                hir::Call::Method { .. } => {}
+                // 過小近似。辺にするなら `Facts` の合流だけを直せばよい。
+                //
+                // 辺にはしないが、呼び先の**特殊化**は歩いておく。計画は
+                // その鍵で意味の結果を引くので、callback を取るメソッド
+                // (generic な `impl` にしか無い)でも表が欠けない
+                hir::Call::Method { callable, args, .. } => {
+                    let inner = hir::callee_bindings(program, body, *callable, args, bindings);
+                    out.walks
+                        .push(BodyKey::Body(hir::BodyId::Callable(*callable), inner));
+                }
                 hir::Call::Ctor { .. } => {}
             }
             if let hir::Call::Method { recv, .. } = call {
@@ -404,6 +419,7 @@ fn merge_facts(into: &mut Facts, from: Facts) {
         }
     }
     into.calls.extend(from.calls);
+    into.walks.extend(from.walks);
 }
 
 /// 所有権検査済みプログラムから要求を推論する。
@@ -439,6 +455,7 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
         let body_facts = scan_body(program, program.body(*id), bindings);
         // 呼び出し先の特殊化をまだ見ていなければ後で歩く
         queue.extend(body_facts.calls.iter().map(|call| call.callee.clone()));
+        queue.extend(body_facts.walks.iter().cloned());
         facts.insert(key, body_facts);
     }
     // 契約メソッドは、それを実装する全ての本体の要求が合流した仮想の本体。

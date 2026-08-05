@@ -1967,8 +1967,9 @@ fn generic宣言があってもmainはそのまま走る() {
     let project = Project::new();
     project.write(
         "main.rd",
-        "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
-         impl<T> Map<T> for [T] { fn map<U>(self, f: fn(T -> U) -> [U]) { self } }\n\
+        "trait Map<T> { fn map<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         struct Cell { at: int }\n\
+         impl<T> Map<T> for Cell { fn map<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
          fn identity<T>(x: T -> T) { x }\n\
          fn main(-> int) { 1 }\n",
     );
@@ -2147,5 +2148,221 @@ fn structとenumの型パラメータリストは実行前に失敗する() {
     実行前に失敗する(
         "enum Option<T> { Some(T) None }\nfn main(-> int) { 1 }\n",
         "enum には型パラメータを書けません",
+    );
+}
+
+// ---- generic な trait / impl の契約検査と method resolution (MAP-025) ----
+
+/// 旗艦。`Map<T>` と同じ契約の形を、決定1 のとおり struct を対象にした
+/// 身代わりの `impl` で組んである
+const 汎用IMPL: &str = "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+     struct Container { tag: int }\n\
+     impl<T> Box<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+     fn double(value: int -> int) { value * 2 }\n\
+     fn negate(value: int -> int) { 0 - value }\n";
+
+/// 解決した generic `impl` のメソッドは通常のメソッド呼び出しとして走る
+#[test]
+fn generic_implのメソッド呼び出しは走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        &format!(
+            "{汎用IMPL}fn main(-> int) {{\n\
+               let c = Container {{ tag = 1 }}\n\
+               c.wrap(20, double) + c.wrap(2, negate)\n\
+             }}\n"
+        ),
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 38"), "{text}");
+}
+
+/// 具体化した generic `impl` のメソッドも通常の callable なので、Wasm 生成は
+/// そのまま通り、同じソースからは byte 単位で同じ成果物が出る。
+/// interpreter の結果とも一致する
+#[test]
+fn generic_implを呼ぶプログラムのwasmは決定的() {
+    let project = Project::new();
+    let source = format!(
+        "{汎用IMPL}fn main(-> int) {{\n\
+           let c = Container {{ tag = 1 }}\n\
+           c.wrap(20, double) + c.wrap(2, negate)\n\
+         }}\n"
+    );
+    project.write("app.rd", &source);
+
+    // interpreter 側
+    let output = project.run("app.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 38"), "{text}");
+
+    // Wasm 側。2度続けて作っても byte 単位で同じ
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let first = project.read("target/wasm/app.wasm");
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/app.wasm"), first);
+    // 差分検証: 同じ入口が両方で同じ値を出す
+    assert_eq!(invoke(&first, "__rhodolite_main", &[]).unwrap(), [38]);
+}
+
+#[test]
+fn 知らないtraitを実装するgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "struct Container { tag: int }\n\
+         impl<T> Missing<T> for Container { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         fn main(-> int) { 1 }\n",
+        "`Missing` は trait ではありません",
+    );
+}
+
+#[test]
+fn trait型引数の個数が合わないgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Pair<T, U> { fn both<V>(&self, a: T, b: U -> V) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Pair<T> for Container { fn both<V>(&self, a: T, b: T -> V) { a } }\n\
+         fn main(-> int) { 1 }\n",
+        "は型引数を 2 個取りますが、1 個渡しています",
+    );
+}
+
+#[test]
+fn structでない対象のgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         impl<T> Box<T> for [T] { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         fn main(-> int) { 1 }\n",
+        "`[T]` は struct ではありません",
+    );
+}
+
+#[test]
+fn 同じtraitを二度実装するgeneric_implは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T -> int) { 2 } }\n\
+         fn main(-> int) { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("既に実装されています"), "{text}");
+    // 2つめの `impl` を指し、最初の `impl` の位置も添える
+    assert!(text.contains("main.rd:4:1"), "{text}");
+    assert!(text.contains("最初の実装はここです"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 契約に足りないgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int)\n fn tag(&self -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn tag(&self -> int) { self.tag } }\n\
+         fn main(-> int) { 1 }\n",
+        "のメソッド `wrap` を実装していません",
+    );
+}
+
+#[test]
+fn 同じメソッドを二度実装するgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container {\n\
+           fn wrap<U>(&self, value: T -> int) { 1 }\n\
+           fn wrap<U>(&self, value: T -> int) { 2 }\n\
+         }\n\
+         fn main(-> int) { 1 }\n",
+        "`wrap` を二度実装しています",
+    );
+}
+
+#[test]
+fn 契約と署名が違うgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: int, f: fn(int -> U) -> U) { f(value) } }\n\
+         fn main(-> int) { 1 }\n",
+        "`wrap` の引数は (`T`, `fn(T -> U)`) ですが、(`int`, `fn(int -> U)`) を宣言しています",
+    );
+}
+
+#[test]
+fn 候補が複数のgeneric_implのメソッド呼び出しは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         trait Sack<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+         impl<T> Sack<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+         fn double(value: int -> int) { value * 2 }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.wrap(1, double) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("がどの trait のものか決まりません"), "{text}");
+    assert!(text.contains("main::Box"), "{text}");
+    assert!(text.contains("main::Sack"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 推論できないgeneric_implの型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.wrap(1) }\n",
+        "の型引数 `U` を推論できません",
+    );
+}
+
+#[test]
+fn 食い違うgeneric_implの型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Both<T> { fn both<U>(&self, a: T, b: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Both<T> for Container { fn both<U>(&self, a: T, b: T -> int) { 1 } }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.both(1, \"x\") }\n",
+        "が `int` と `str` の両方に決まります",
+    );
+}
+
+#[test]
+fn 型引数の変わるgeneric_implの再帰は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Grow<T> { fn grow<U>(&self, seed: T, value: U, n: int -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Grow<T> for Container {\n\
+           fn grow<U>(&self, seed: T, value: U, n: int -> int) { if n == 0: 0 else: self.grow(seed, [value], n - 1) }\n\
+         }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.grow(0, 1, 3) }\n",
+        "polymorphic recursion",
     );
 }

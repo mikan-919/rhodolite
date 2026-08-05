@@ -348,6 +348,49 @@ pub fn substitute(ty: &GenericType, subst: &BTreeMap<TypeParamId, Type>) -> Type
     }
 }
 
+/// 具体化前の型に、具体化前の型を通す(MAP-025 決定2)。
+///
+/// `substitute` の相棒で、結果が `GenericType` のまま残るところだけが違う。
+/// `subst` に無い型パラメータ参照はそのまま置いておく — 契約検査は trait の
+/// 型パラメータだけを先に通し、メソッド自身の分は次の段で通すので、覆えて
+/// いない参照は誤りではない。
+///
+/// 型パラメータ参照に書かれた借用と後置 `?` は、代入する型のそれに重なる
+/// (`substitute` と同じ規則)。
+pub fn substitute_generic(
+    ty: &GenericType,
+    subst: &BTreeMap<TypeParamId, GenericType>,
+) -> GenericType {
+    let kind = match &ty.kind {
+        GenericTypeKind::Array(element) => {
+            GenericTypeKind::Array(Box::new(substitute_generic(element, subst)))
+        }
+        GenericTypeKind::Callable { params, result } => GenericTypeKind::Callable {
+            params: params
+                .iter()
+                .map(|p| substitute_generic(p, subst))
+                .collect(),
+            result: Box::new(substitute_generic(result, subst)),
+        },
+        GenericTypeKind::Param(id) => match subst.get(id) {
+            Some(bound) => {
+                return GenericType {
+                    reference: ty.reference.or(bound.reference),
+                    kind: bound.kind.clone(),
+                    optional: ty.optional || bound.optional,
+                };
+            }
+            None => GenericTypeKind::Param(*id),
+        },
+        other => other.clone(),
+    };
+    GenericType {
+        reference: ty.reference,
+        kind,
+        optional: ty.optional,
+    }
+}
+
 /// generic 宣言が導入した型パラメータ1つ。名前と span は診断のためだけに持つ。
 #[derive(Debug)]
 pub struct TypeParamDecl {
@@ -481,6 +524,10 @@ pub struct PayloadDecl {
 #[derive(Debug)]
 pub struct TraitDecl {
     pub name: String,
+    /// trait 自身が導入した型パラメータ(non-generic な trait では空)。
+    /// 契約検査は、メソッドの `GenericDecl::type_params` の頭からこの個数を
+    /// 「trait 由来」、残りを「メソッド自身の分」として切り分ける(MAP-025 決定2)
+    pub type_params: Vec<TypeParamId>,
     pub methods: Vec<TraitMethodId>,
     pub span: Span,
 }
@@ -1806,6 +1853,66 @@ mod tests {
         assert_eq!(
             substitute(&owned(GenericTypeKind::Param(other)), &subst).kind,
             TypeKind::Poison
+        );
+    }
+
+    /// 契約検査の代入。覆えている参照だけが置き換わり、覆えていない参照は
+    /// 誤りではなくそのまま残る(MAP-025 決定2)
+    #[test]
+    fn substitute_genericは覆えた型パラメータだけを置き換える() {
+        let bound = TypeParamId::from_index(0);
+        let free = TypeParamId::from_index(1);
+        let user = StructId::from_index(0);
+        let subst = BTreeMap::from([(bound, owned(GenericTypeKind::Struct(user)))]);
+
+        // 覆えている参照は置き換わる
+        assert_eq!(
+            substitute_generic(&owned(GenericTypeKind::Param(bound)), &subst),
+            owned(GenericTypeKind::Struct(user))
+        );
+        // 覆えていない参照はそのまま
+        assert_eq!(
+            substitute_generic(&owned(GenericTypeKind::Param(free)), &subst),
+            owned(GenericTypeKind::Param(free))
+        );
+        // `&T?` の借用と後置 `?` は代入する型のそれに重なる
+        assert_eq!(
+            substitute_generic(
+                &GenericType {
+                    reference: Some(RefKind::Shared),
+                    kind: GenericTypeKind::Param(bound),
+                    optional: true,
+                },
+                &subst
+            ),
+            GenericType {
+                reference: Some(RefKind::Shared),
+                kind: GenericTypeKind::Struct(user),
+                optional: true,
+            }
+        );
+        // 入れ子は両方の葉まで降りる
+        assert_eq!(
+            substitute_generic(
+                &owned(GenericTypeKind::Array(Box::new(owned(
+                    GenericTypeKind::Callable {
+                        params: vec![owned(GenericTypeKind::Param(bound))],
+                        result: Box::new(owned(GenericTypeKind::Param(free))),
+                    }
+                )))),
+                &subst
+            ),
+            owned(GenericTypeKind::Array(Box::new(owned(
+                GenericTypeKind::Callable {
+                    params: vec![owned(GenericTypeKind::Struct(user))],
+                    result: Box::new(owned(GenericTypeKind::Param(free))),
+                }
+            ))))
+        );
+        // 型パラメータを持たない木はそのまま写る
+        assert_eq!(
+            substitute_generic(&owned(GenericTypeKind::Builtin(Builtin::Int)), &subst),
+            owned(GenericTypeKind::Builtin(Builtin::Int))
         );
     }
 
