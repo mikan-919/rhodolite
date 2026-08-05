@@ -5227,18 +5227,35 @@ fn make(-> User) { User { id = 1, name = \"a\" } }
         format!("{DATA}fn main(-> int) {{\n{body}\n  0\n}}\n")
     }
 
-    /// 本体1つ分の計画から、効果の行だけを取り出す
-    fn effects(dumped: &str, body: &str) -> Vec<String> {
+    /// 本体1つ分の計画。同じ名前の本体が並ぶこともある(同じ generic 宣言を
+    /// 別々の型引数で具体化した形)ので、`nth` で出現順に選ぶ
+    fn plan_of(dumped: &str, body: &str, nth: usize) -> String {
         dumped
             .split(&format!("body {body}\n"))
-            .nth(1)
+            .nth(nth + 1)
             .expect("その本体の計画がある")
             .lines()
             .take_while(|line| line.starts_with("  "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    /// その名前の本体がいくつ出ているか
+    fn plan_count(dumped: &str, body: &str) -> usize {
+        dumped.matches(&format!("body {body}\n")).count()
+    }
+
+    /// 本体1つ分の計画から、効果の行だけを取り出す
+    fn effects_of(plan: &str) -> Vec<String> {
+        plan.lines()
             .filter(|line| line.trim_start().starts_with("point#"))
             .filter_map(|line| line.split_once(" scope#"))
             .map(|(_, rest)| rest.split_once(' ').expect("効果がある").1.to_string())
             .collect()
+    }
+
+    fn effects(dumped: &str, body: &str) -> Vec<String> {
+        effects_of(&plan_of(dumped, body, 0))
     }
 
     /// struct リテラルは所有を作り、その所有はスコープの終わりで落ちる
@@ -6197,5 +6214,288 @@ fn main(-> int) {
             .collect();
         assert!(modes.contains(&Mode::Shared), "{modes:?}");
         assert!(modes.contains(&Mode::Move), "{modes:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 具体化と所有権検査の境界(MAP-030、generic-ownership-boundary)
+    //
+    // `hir::TypeKind` に `Param` は無いので、具体化した `hir::Callable` が
+    // 型変数を持つ形は**構造として存在しない**。だから所有権検査は
+    // `CallableOwner` も具体化の由来も一切見ない。ここはその契約を、
+    // 「同じ宣言の別々の具体化が、それぞれ**自分の**具体型で分類・move・
+    // drop される」という観測できる形で押さえる
+    // -----------------------------------------------------------------------
+
+    /// 具体化まわりのテストが共有する道具立て。`int` が Copy な型引数、
+    /// `User` が非 Copy な型引数
+    const GENERIC: &str = "struct User { id: int }
+struct Container { tag: int }
+fn make(-> User) { User { id = 1 } }
+fn take(u: User -> int) { u.id }
+";
+
+    /// 型引数をそのまま返す generic impl メソッド
+    const KEEP: &str = "trait Keep<T> { fn keep(&self, value: T -> T) }
+impl<T> Keep<T> for Container { fn keep(&self, value: T -> T) { value } }
+";
+
+    /// 同じ宣言を `int`(Copy)と `User`(非 Copy)で具体化すると、引数の
+    /// 分類は具体化ごとに独立する。Copy の側は所有者にならず読むだけ、
+    /// 非 Copy の側は所有者になって move される
+    #[test]
+    fn 汎用free関数の具体化ごとにcopy分類が独立する() {
+        let checked = accepted(&format!(
+            "{GENERIC}fn identity<T>(x: T -> T) {{ x }}
+fn main(-> int) {{
+  let n = identity(1)
+  let u = identity(make())
+  n + u.id
+}}
+"
+        ));
+        let dumped = checked.plan.dump(&checked.hir);
+        assert_eq!(plan_count(&dumped, "identity"), 2, "{dumped}");
+        // 具体化は呼び出し順。先が `int`、後が `User`
+        let copy = plan_of(&dumped, "identity", 0);
+        let owned = plan_of(&dumped, "identity", 1);
+        assert!(copy.contains("scope#0 [local#0]\n"), "{dumped}");
+        assert_eq!(
+            effects_of(&copy).last().unwrap(),
+            "read local#0(x)",
+            "{dumped}"
+        );
+        assert!(owned.contains("scope#0 [local#0*]\n"), "{dumped}");
+        assert_eq!(
+            effects_of(&owned).last().unwrap(),
+            "move local#0(x)",
+            "{dumped}"
+        );
+    }
+
+    /// generic impl メソッドでも同じ。受け手 `&self` は借用なので所有者に
+    /// ならず、`T` の引数だけが具体化ごとに分かれる
+    #[test]
+    fn 汎用implメソッドの具体化ごとにcopy分類が独立する() {
+        let checked = accepted(&format!(
+            "{GENERIC}{KEEP}fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  let n = c.keep(1)
+  let u = c.keep(make())
+  n + u.id
+}}
+"
+        ));
+        let dumped = checked.plan.dump(&checked.hir);
+        let body = "impl Container::keep";
+        assert_eq!(plan_count(&dumped, body), 2, "{dumped}");
+        let copy = plan_of(&dumped, body, 0);
+        let owned = plan_of(&dumped, body, 1);
+        assert!(copy.contains("scope#0 [local#0 local#1]\n"), "{dumped}");
+        assert_eq!(
+            effects_of(&copy).last().unwrap(),
+            "read local#1(value)",
+            "{dumped}"
+        );
+        assert!(owned.contains("scope#0 [local#0 local#1*]\n"), "{dumped}");
+        assert_eq!(
+            effects_of(&owned).last().unwrap(),
+            "move local#1(value)",
+            "{dumped}"
+        );
+    }
+
+    /// 診断の形が generic 版と非 generic 版で1ビットも変わらないこと
+    fn 同じ診断(generic: &str, plain: &str) {
+        let left = only(generic);
+        let right = only(plain);
+        assert_eq!(left.msg, right.msg);
+        assert_eq!(left.label, right.label);
+        assert_eq!(at(generic, &left), at(plain, &right));
+        assert_eq!(related(generic, &left), related(plain, &right));
+    }
+
+    /// 非 Copy で具体化した汎用関数を、move 済みの束縛でもう一度呼ぶのは
+    /// 拒否される。診断は非 generic な呼び出しとまったく同じ
+    #[test]
+    fn 非copyで具体化した汎用free関数はmove後の再利用を拒む() {
+        同じ診断(
+            &format!(
+                "{GENERIC}fn identity<T>(x: T -> T) {{ x }}
+fn main(-> int) {{
+  let u = make()
+  identity(move u).id + identity(move u).id
+}}
+"
+            ),
+            &format!(
+                "{GENERIC}fn identity(x: User -> User) {{ x }}
+fn main(-> int) {{
+  let u = make()
+  identity(move u).id + identity(move u).id
+}}
+"
+            ),
+        );
+    }
+
+    /// generic impl メソッドでも同じ。非 Copy な `T` の引数と、消費する
+    /// `self` の両方で move 後の再利用が落ちる
+    #[test]
+    fn 非copyで具体化した汎用implメソッドはmove後の再利用を拒む() {
+        同じ診断(
+            &format!(
+                "{GENERIC}{KEEP}fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  let u = make()
+  c.keep(move u).id + c.keep(move u).id
+}}
+"
+            ),
+            &format!(
+                "{GENERIC}trait Keep {{ fn keep(&self, value: User -> User) }}
+impl Keep for Container {{ fn keep(&self, value: User -> User) {{ value }} }}
+fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  let u = make()
+  c.keep(move u).id + c.keep(move u).id
+}}
+"
+            ),
+        );
+        // 消費する `self` を持つ generic impl メソッドは受け手を1度だけ動かす。
+        // 同じ束縛で2度呼ぶのは落ちる
+        let src = format!(
+            "{GENERIC}trait Eat<T> {{ fn eat(self, value: T -> int) }}
+impl<T> Eat<T> for Container {{ fn eat(self, value: T -> int) {{ self.tag }} }}
+fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  move c.eat(1) + move c.eat(2)
+}}
+"
+        );
+        assert_eq!(
+            only(&src).msg,
+            "main: `c` は既に move されているので使えません"
+        );
+    }
+
+    /// 具体化した本体の中の所有も、同じ具体型を書いた非 generic な本体と
+    /// 一字一句同じ計画になる。drop の位置も対象も
+    #[test]
+    fn 非copyで具体化した汎用free関数の計画は非genericと一致する() {
+        let checked = accepted(&format!(
+            "{GENERIC}fn hold<T>(x: T, n: int -> int) {{ let kept = move x
+  n }}
+fn plain(x: User, n: int -> int) {{ let kept = move x
+  n }}
+fn main(-> int) {{
+  hold(make(), 1) + plain(make(), 2)
+}}
+"
+        ));
+        let dumped = checked.plan.dump(&checked.hir);
+        let made = plan_of(&dumped, "hold", 0);
+        // 消費もせず返しもしない束縛は、スコープの終わりで落ちる
+        assert!(made.contains("drops [local#2]"), "{dumped}");
+        assert_eq!(made, plan_of(&dumped, "plain", 0), "{dumped}");
+    }
+
+    /// generic impl メソッドの本体でも同じ
+    #[test]
+    fn 非copyで具体化した汎用implメソッドの計画は非genericと一致する() {
+        let checked = accepted(&format!(
+            "{GENERIC}trait Hold<T> {{ fn hold(&self, value: T, n: int -> int) }}
+impl<T> Hold<T> for Container {{ fn hold(&self, value: T, n: int -> int) {{ let kept = move value
+  n }} }}
+trait Plain {{ fn plain(&self, value: User, n: int -> int) }}
+impl Plain for Container {{ fn plain(&self, value: User, n: int -> int) {{ let kept = move value
+  n }} }}
+fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  c.hold(make(), 1) + c.plain(make(), 2)
+}}
+"
+        ));
+        let dumped = checked.plan.dump(&checked.hir);
+        let made = plan_of(&dumped, "impl Container::hold", 0);
+        assert!(made.contains("drops [local#3]"), "{dumped}");
+        assert_eq!(
+            made,
+            plan_of(&dumped, "impl Container::plain", 0),
+            "{dumped}"
+        );
+    }
+
+    /// free 関数版(`汎用関数越しの非copy引数はちょうど1度moveされる`)の
+    /// generic impl メソッド版。consuming な callback へ渡す非 Copy な値は、
+    /// 呼び出し側でも具体化した本体でも**ちょうど1度**だけ動く
+    #[test]
+    fn 汎用implメソッド越しの非copy引数はちょうど1度moveされる() {
+        let checked = accepted(&format!(
+            "{GENERIC}trait Apply<T> {{ fn apply<U>(&self, f: fn(T -> U), x: T -> U) }}
+impl<T> Apply<T> for Container {{ fn apply<U>(&self, f: fn(T -> U), x: T -> U) {{ f(move x) }} }}
+fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  let u = make()
+  c.apply(take, move u)
+}}
+"
+        ));
+        let dumped = checked.plan.dump(&checked.hir);
+        let moves = |plan: &str| -> Vec<String> {
+            effects_of(plan)
+                .into_iter()
+                .filter(|effect| effect.starts_with("move "))
+                .collect()
+        };
+        assert_eq!(
+            moves(&plan_of(&dumped, "main", 0)),
+            vec!["move local#1(u)"],
+            "{dumped}"
+        );
+        assert_eq!(
+            moves(&plan_of(&dumped, "impl Container::apply", 0)),
+            vec!["move local#2(x)"],
+            "{dumped}"
+        );
+    }
+
+    /// 剛体検査の合成名(`rigid_name` の `#T0`)の綴り。dump の `#` は必ず
+    /// 番号が続くので、`#` の次が数字でなければ型変数が漏れている
+    fn placeholders(dumped: &str) -> Vec<&str> {
+        dumped
+            .match_indices('#')
+            .map(|(at, _)| &dumped[at..])
+            .filter(|rest| !rest[1..].starts_with(|c: char| c.is_ascii_digit()))
+            .map(|rest| rest.split_whitespace().next().unwrap_or("#"))
+            .collect()
+    }
+
+    /// 型変数が所有権検査へ漏れていないことの回帰テスト。同じ宣言を別々の
+    /// 型引数で具体化し、しかも宣言ごとに違う名前の型パラメータ(`T` と
+    /// `U`)を使っても、検査済み HIR にも所有権計画にも剛体検査の合成名は
+    /// 1つも残らない
+    #[test]
+    fn 具体化した本体に剛体検査の合成名は残らない() {
+        let checked = accepted(&format!(
+            "{GENERIC}trait Wrap<U> {{ fn wrap(&self, x: U -> U) }}
+impl<U> Wrap<U> for Container {{ fn wrap(&self, x: U -> U) {{ x }} }}
+fn identity<T>(x: T -> T) {{ x }}
+fn main(-> int) {{
+  let c = Container {{ tag = 1 }}
+  let n = identity(1)
+  let u = identity(make())
+  let m = c.wrap(2)
+  let v = c.wrap(make())
+  n + u.id + m + v.id
+}}
+"
+        ));
+        let hir = checked.hir.dump();
+        assert!(placeholders(&hir).is_empty(), "{hir}");
+        let dumped = checked.plan.dump(&checked.hir);
+        assert!(placeholders(&dumped).is_empty(), "{dumped}");
+        // 型変数の綴りを見張れているか、この検査自身を確かめる
+        assert_eq!(placeholders("body #T0 local#1 #U12"), vec!["#T0", "#U12"]);
     }
 }
