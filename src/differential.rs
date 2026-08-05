@@ -226,6 +226,25 @@ const AMBIENT_CALLBACK_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+/// 具体化した汎用関数は通常の callable。同じ宣言を2つの具体型で呼ぶ形と、
+/// callback を取る汎用関数を、interpreter と Wasm の両方で走らせて突き合わせる
+/// (MAP-020)
+const GENERIC_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "fn identity<T>(x: T -> T) { x }\n\
+             fn double(value: int -> int) { value * 2 }\n\
+             fn negate(value: int -> int) { 0 - value }\n\
+             fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+             fn count<T>(x: T, n: int -> int) { if n == 0: 0 else: 1 + count(x, n - 1) }\n\
+             fn main(-> int) {\n\
+               let flag = identity(true)\n\
+               let base = identity(20)\n\
+               let doubled = apply(double, base)\n\
+               let negated = apply(negate, count(base, 3))\n\
+               if flag: doubled + negated else: 0\n\
+             }\n",
+}];
+
 const CANONICAL_FILES: &[FixtureFile] = &[FixtureFile {
     path: "main.rd",
     source: include_str!("../examples/canonical.rd"),
@@ -301,6 +320,12 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "provider-substitution",
         files: PROVIDER_SUBSTITUTION_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "generic-instantiation",
+        files: GENERIC_FILES,
         probes: &[],
         expected_failure: None,
     },

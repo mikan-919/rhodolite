@@ -2010,6 +2010,134 @@ fn 宣言の外の型パラメータ名は実行前に失敗する() {
     );
 }
 
+// ---- 汎用関数の具体化 (MAP-020) ----
+
+/// `identity` を2つの具体型で呼ぶプログラムは、通常の呼び出しと同じように走る
+#[test]
+fn 汎用関数は複数の具体型で呼んでも走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn identity<T>(x: T -> T) { x }\n\
+         fn main(-> int) {\n\
+           let word = identity(\"ok\")\n\
+           assert word == \"ok\"\n\
+           identity(41) + 1\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 42"), "{text}");
+}
+
+/// callback を取る汎用関数も、名前付き関数を渡してそのまま走る
+#[test]
+fn callbackを取る汎用関数は名前付き関数で走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn double(value: int -> int) { value * 2 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) { apply(double, 21) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 42"), "{text}");
+}
+
+#[test]
+fn 推論できない型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "fn make<T>(-> T?) { nil }\n\
+         fn main(-> int) { let x = make()\n 1 }\n",
+        "の型引数 `T` を推論できません",
+    );
+}
+
+#[test]
+fn 食い違う型引数は実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn pair<T>(a: T, b: T -> T) { a }\n\
+         fn main(-> int) { pair(1, \"x\")\n 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("型引数 `T` が `int` と `str` の両方に決まります"),
+        "{text}"
+    );
+    // 呼び出し式そのものを指す
+    assert!(text.contains("main.rd:2:19"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 型引数の変わる再帰は実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn grow<T>(x: T, n: int -> int) { if n == 0: 0 else: grow([x], n - 1) }\n\
+         fn main(-> int) { grow(1, 3) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("polymorphic recursion"), "{text}");
+    assert!(text.contains("`<int>` から `<[int]>`"), "{text}");
+    // 再帰呼び出しの位置を指す
+    assert!(text.contains("main.rd:1:54"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+/// 呼び出し地点に型引数を書く構文は無い。型引数の推論より前に構文で落ちる
+#[test]
+fn 明示した型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "fn identity<T>(x: T -> T) { x }\n\
+         fn main(-> int) { identity<int>(5) }\n",
+        "1行に2つの式は書けません",
+    );
+}
+
+/// 具体化した汎用関数も通常の callable なので、Wasm 生成はそのまま通り、
+/// 同じソースからは byte 単位で同じ成果物が出る
+#[test]
+fn 汎用関数を呼ぶプログラムのwasmは決定的() {
+    let project = Project::new();
+    project.write(
+        "app.rd",
+        "fn identity<T>(x: T -> T) { x }\n\
+         fn double(value: int -> int) { value * 2 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) { identity(2) + apply(double, 20) }\n",
+    );
+
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let first = project.read("target/wasm/app.wasm");
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/app.wasm"), first);
+    assert_eq!(invoke(&first, "__rhodolite_main", &[]).unwrap(), [42]);
+}
+
 #[test]
 fn structとenumの型パラメータリストは実行前に失敗する() {
     実行前に失敗する(

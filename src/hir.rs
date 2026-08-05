@@ -311,6 +311,43 @@ impl GenericType {
     }
 }
 
+/// 具体化前の型に型引数を通して具体型にする(MAP-020 決定3)。
+///
+/// `subst` が宣言の型パラメータを全部覆っているときだけ呼ぶ。覆っていれば結果は
+/// 必ず `is_concrete` — 型変数の残る `Type` は構造として作れないので、覆えて
+/// いない参照だけが `Poison` になる(そこは必ず診断を伴う)。
+///
+/// 型パラメータ参照に書かれた借用と後置 `?` は、型引数の側のそれに重なる
+/// (`&T` は `T` に決まった型の共有借用)。
+pub fn substitute(ty: &GenericType, subst: &BTreeMap<TypeParamId, Type>) -> Type {
+    let kind = match &ty.kind {
+        GenericTypeKind::Builtin(builtin) => TypeKind::Builtin(*builtin),
+        GenericTypeKind::Struct(id) => TypeKind::Struct(*id),
+        GenericTypeKind::Enum(id) => TypeKind::Enum(*id),
+        GenericTypeKind::Array(element) => TypeKind::Array(Box::new(substitute(element, subst))),
+        GenericTypeKind::Callable { params, result } => TypeKind::Callable {
+            params: params.iter().map(|p| substitute(p, subst)).collect(),
+            result: Box::new(substitute(result, subst)),
+        },
+        GenericTypeKind::Param(id) => match subst.get(id) {
+            Some(bound) => {
+                return Type {
+                    reference: ty.reference.or(bound.reference),
+                    kind: bound.kind.clone(),
+                    optional: ty.optional || bound.optional,
+                };
+            }
+            None => TypeKind::Poison,
+        },
+        GenericTypeKind::Poison => TypeKind::Poison,
+    };
+    Type {
+        reference: ty.reference,
+        kind,
+        optional: ty.optional,
+    }
+}
+
 /// generic 宣言が導入した型パラメータ1つ。名前と span は診断のためだけに持つ。
 #[derive(Debug)]
 pub struct TypeParamDecl {
@@ -1712,6 +1749,63 @@ mod tests {
                 optional: false,
             }
             .is_concrete()
+        );
+    }
+
+    /// 型引数を通した結果は、木のどこにも型パラメータ参照を残さない。
+    /// 借用と後置 `?` は宣言側と型引数側が重なる(MAP-020 決定3)
+    #[test]
+    fn substituteは型パラメータを型引数へ置き換える() {
+        let param = TypeParamId::from_index(0);
+        let user = StructId::from_index(0);
+        let subst = BTreeMap::from([(
+            param,
+            Type {
+                reference: None,
+                kind: TypeKind::Struct(user),
+                optional: false,
+            },
+        )]);
+        let referenced = |kind| GenericType {
+            reference: Some(RefKind::Shared),
+            kind,
+            optional: false,
+        };
+
+        // `[T]` は `[User]`
+        let array = owned(GenericTypeKind::Array(Box::new(owned(
+            GenericTypeKind::Param(param),
+        ))));
+        assert_eq!(
+            substitute(&array, &subst),
+            Type {
+                reference: None,
+                kind: TypeKind::Array(Box::new(Type {
+                    reference: None,
+                    kind: TypeKind::Struct(user),
+                    optional: false,
+                })),
+                optional: false,
+            }
+        );
+
+        // `&T` は決まった型の共有借用
+        assert_eq!(
+            substitute(&referenced(GenericTypeKind::Param(param)), &subst).reference,
+            Some(RefKind::Shared)
+        );
+
+        // 型パラメータを持たない木はそのまま写る
+        assert_eq!(
+            substitute(&owned(GenericTypeKind::Builtin(Builtin::Int)), &subst),
+            Type::builtin(Builtin::Int)
+        );
+
+        // 覆えていない参照だけが `Poison`。ここは必ず診断を伴う
+        let other = TypeParamId::from_index(1);
+        assert_eq!(
+            substitute(&owned(GenericTypeKind::Param(other)), &subst).kind,
+            TypeKind::Poison
         );
     }
 

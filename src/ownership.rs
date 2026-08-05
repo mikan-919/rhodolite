@@ -2770,6 +2770,35 @@ mod tests {
 fn apply(f: fn(int -> int), value: int -> int) { f(value) }
 ";
 
+    /// 具体化した汎用関数も通常の callable。非 Copy な値を consuming な
+    /// callback へ渡す形は、非 generic な呼び出しとまったく同じ規則で
+    /// **1度だけ** move される(MAP-020)
+    #[test]
+    fn 汎用関数越しの非copy引数はちょうど1度moveされる() {
+        let src = format!(
+            "{DATA}fn apply<T, U>(f: fn(T -> U), x: T -> U) {{ f(move x) }}
+fn main(-> int) {{
+  let u = make()
+  apply(take, move u)
+}}
+"
+        );
+        let checked = accepted(&src);
+        let dumped = checked.plan.dump(&checked.hir);
+        // 呼び出し側は `u` を1度だけ動かす
+        let moves: Vec<String> = effects(&dumped, "main")
+            .into_iter()
+            .filter(|effect| effect.starts_with("move "))
+            .collect();
+        assert_eq!(moves, vec!["move local#0(u)"], "{dumped}");
+        // 具体化した本体の側も、受け取った所有を callback へ1度だけ動かす
+        let inner: Vec<String> = effects(&dumped, "apply")
+            .into_iter()
+            .filter(|effect| effect.starts_with("move "))
+            .collect();
+        assert_eq!(inner, vec!["move local#1(x)"], "{dumped}");
+    }
+
     /// callable 値は複製できる。同じ名前を何度渡しても move にならない
     #[test]
     fn callable値は複数回使える() {

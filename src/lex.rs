@@ -448,6 +448,17 @@ mod tests {
         toks(src).iter().filter(|t| **t == Tok::Newline).count()
     }
 
+    /// `#` は識別子の文字ではない。剛体検査が型パラメータに使う合成名
+    /// `#T<index>` がユーザーの書ける名前ともモジュール修飾名とも衝突しないのは
+    /// この1点に乗っている(MAP-020 決定1)
+    #[test]
+    fn 番号記号は識別子にならない() {
+        for src in ["#T0\n", "a#b\n", "#\n"] {
+            let error = lex(src).expect_err(src);
+            assert!(error.msg.contains("読めない文字です"), "{src}: {error:?}");
+        }
+    }
+
     #[test]
     fn 行末が式を終えられないなら継続する() {
         assert_eq!(newlines("let a = 1 +\n2\n"), 1);
