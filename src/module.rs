@@ -759,22 +759,31 @@ fn resolve_item(
             }
         }
         Item::Impl {
-            trait_name,
-            type_name,
+            trait_ref,
+            target,
             methods,
             ..
         } => {
-            if let Some(name) = trait_name {
-                *name = resolve_name(
-                    name,
+            if let Some(trait_ref) = trait_ref {
+                trait_ref.name = resolve_name(
+                    &trait_ref.name,
                     local,
                     imported_declarations,
                     imported_modules,
                     declarations,
                 );
+                for arg in &mut trait_ref.args {
+                    resolve_type(
+                        arg,
+                        local,
+                        imported_declarations,
+                        imported_modules,
+                        declarations,
+                    );
+                }
             }
-            *type_name = resolve_name(
-                type_name,
+            resolve_type(
+                target,
                 local,
                 imported_declarations,
                 imported_modules,
@@ -1437,15 +1446,18 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
                 }
             }
             Item::Impl {
-                trait_name,
-                type_name,
+                trait_ref,
+                target,
                 methods,
                 ..
             } => {
-                if let Some(trait_name) = trait_name {
-                    collect_name_path(trait_name, &mut paths);
+                if let Some(trait_ref) = trait_ref {
+                    collect_name_path(&trait_ref.name, &mut paths);
+                    for arg in &trait_ref.args {
+                        collect_type_paths(arg, &mut paths);
+                    }
                 }
-                collect_name_path(type_name, &mut paths);
+                collect_type_paths(target, &mut paths);
                 for (sig, _) in methods {
                     collect_sig_paths(sig, &mut paths);
                 }
@@ -2384,6 +2396,37 @@ mod tests {
         ])
         .expect("読み込めるはず");
         assert!(exported(&loaded).is_empty(), "{:?}", exported(&loaded));
+    }
+
+    /// 型パラメータ名は宣言の中でだけ意味を持つので、モジュール解決は
+    /// それを知らない。どのモジュールの宣言にも当たらない名前は素通しなので、
+    /// `T` は綴りのまま型検査のスコープ検査へ届く(MAP-010 決定3)
+    #[test]
+    fn モジュール解決は型パラメータ名を書き換えない() {
+        let loaded = load_files(&[(
+            "main.rd",
+            "fn identity<T>(x: T -> T) { x }\n\
+             impl<T> Holder for [T] { fn get<U>(self, f: fn(T -> U) -> [U]) { self } }\n\
+             fn main(-> int) { 1 }\n",
+        )])
+        .expect("読み込めるはず");
+        let Item::Fn { sig, .. } = &loaded.program.items[0] else {
+            panic!("fn ではない")
+        };
+        // 宣言名は正準化されるが、型パラメータの参照は裸のまま
+        assert_eq!(sig.name, "main::identity");
+        assert_eq!(sig.params[0].ty.to_string(), "T");
+        assert_eq!(sig.ret.as_ref().unwrap().to_string(), "T");
+
+        let Item::Impl {
+            target, methods, ..
+        } = &loaded.program.items[1]
+        else {
+            panic!("impl ではない")
+        };
+        assert_eq!(target.to_string(), "[T]");
+        assert_eq!(methods[0].0.params[0].ty.to_string(), "fn(T -> U)");
+        assert_eq!(methods[0].0.ret.as_ref().unwrap().to_string(), "[U]");
     }
 
     /// 公開名は型検査後の HIR の宣言へそのまま引ける。ここが ABI 層の入口になる

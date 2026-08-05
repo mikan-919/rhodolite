@@ -508,6 +508,44 @@ trait の中の `fn` が同じ見た目で違う意味になる。宣言に出�
 レシーバの型が決まらない呼び出し、候補の無い呼び出し、複数残って曖昧な呼び出しは
 どれも実行前に落ちる(→ `src/typecheck.rs`)。
 
+## 型パラメータ
+
+`fn`・`trait`・`impl` は型パラメータを宣言できる。綴りは宣言名の後ろの
+`<T, U>`(`impl` だけはキーワードの直後)。`struct` と `enum` には書けない。
+
+```
+type_params ::= '<' ident (',' ident)* '>'
+fn_head     ::= 'fn' ident type_params? '(' ... ')'
+trait_decl  ::= 'trait' ident type_params? '{' ... '}'
+impl_decl   ::= 'impl' type_params? (trait_ref 'for')? type '{' ... '}'
+trait_ref   ::= ident ('<' type (',' type)* '>')?
+```
+
+```rhodolite
+fn identity<T>(x: T -> T) { x }
+
+trait Map<T> {
+    fn map<U>(self, f: fn(T -> U) -> [U])
+}
+
+impl<T> Map<T> for [T] {
+    fn map<U>(self, f: fn(T -> U) -> [U]) { ... }
+}
+```
+
+`impl` の対象型は型注釈の文法そのものなので、`[T]` のような配列も書ける。
+trait 参照は `Map<T>` のように型引数を取れる。
+
+型パラメータ名が有効なのは、それを導入した宣言の署名・trait 参照・対象型の
+中だけ。`impl` の型パラメータはその `impl` のメソッド署名からも見え、メソッド
+自身の型パラメータがその上に重なる。同じ名前を二度導入することはできない
+(1つのリストの中でも、メソッドが囲む `impl` の名前を名乗り直す形でも)。
+宣言の外で同じ綴りを型位置に書けば、それはただの未宣言の型名として落ちる。
+
+この版では宣言構文と型表現までを扱う。型パラメータを持つ宣言の本体検査・
+呼び出し地点の型引数推論・具体化はまだ行わないので、generic 宣言は実行経路に
+繋がらない。
+
 ## まだ決めていない
 
 - variant 全体を覆う catch-all pattern と guard — どちらも「variant ごとに

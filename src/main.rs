@@ -391,13 +391,17 @@ fn summary(item: &ast::Item) -> String {
             format!("enum   {name} ({} variant)", variants.len())
         }
         Impl {
-            trait_name,
-            type_name,
+            trait_ref,
+            target,
             methods,
             ..
-        } => match trait_name {
-            Some(t) => format!("impl   {t} for {type_name} ({} メソッド)", methods.len()),
-            None => format!("impl   {type_name} ({} メソッド)", methods.len()),
+        } => match trait_ref {
+            Some(t) => format!(
+                "impl   {} for {target} ({} メソッド)",
+                t.name,
+                methods.len()
+            ),
+            None => format!("impl   {target} ({} メソッド)", methods.len()),
         },
         Effect {
             slot, trait_name, ..

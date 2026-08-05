@@ -231,6 +231,7 @@ impl<'a> Parser<'a> {
             Tok::Trait => {
                 self.bump();
                 let name = self.expect_ident("trait 名")?;
+                let type_params = self.type_params()?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut methods = Vec::new();
                 loop {
@@ -243,6 +244,7 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Item::Trait {
                     name,
+                    type_params,
                     methods,
                     span: self.to(start),
                 })
@@ -252,6 +254,7 @@ impl<'a> Parser<'a> {
             Tok::Struct => {
                 self.bump();
                 let name = self.expect_ident("struct 名")?;
+                self.reject_type_params("struct")?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut fields = Vec::new();
                 loop {
@@ -281,6 +284,7 @@ impl<'a> Parser<'a> {
             Tok::Enum => {
                 self.bump();
                 let name = self.expect_ident("enum 名")?;
+                self.reject_type_params("enum")?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut variants = Vec::new();
                 loop {
@@ -320,12 +324,8 @@ impl<'a> Parser<'a> {
             // ハンドラに専用構文は無い(CONTEXT.md「ハンドラ」)。ただの impl。
             Tok::Impl => {
                 self.bump();
-                let first = self.name_path("trait 名または型名")?;
-                let (trait_name, type_name) = if self.eat(&Tok::For) {
-                    (Some(first), self.name_path("型名")?)
-                } else {
-                    (None, first)
-                };
+                let type_params = self.type_params()?;
+                let (trait_ref, target) = self.impl_head()?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut methods = Vec::new();
                 loop {
@@ -339,8 +339,9 @@ impl<'a> Parser<'a> {
                     methods.push((sig, body));
                 }
                 Ok(Item::Impl {
-                    trait_name,
-                    type_name,
+                    type_params,
+                    trait_ref,
+                    target,
                     methods,
                     span: self.to(start),
                 })
@@ -408,11 +409,87 @@ impl<'a> Parser<'a> {
         Ok(parts.join("::"))
     }
 
+    /// `<T, U>` — 宣言が導入する型パラメータ。無ければ空(MAP-Q1)。
+    ///
+    /// `<` `>` は `with slot<Type>` でしか使われず、比較演算子でもないので、
+    /// キーワードで位置が固定されたここでは曖昧にならない
+    fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
+        if !self.eat(&Tok::Less) {
+            return Ok(Vec::new());
+        }
+        let mut params = Vec::new();
+        loop {
+            let start = self.span();
+            let name = self.expect_ident("型パラメータ名")?;
+            params.push(TypeParam {
+                name,
+                span: self.to(start),
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::Greater, "`>`")?;
+        Ok(params)
+    }
+
+    /// 型パラメータを取れない宣言で `<` を見たら、そこで止める(MAP-Q1)。
+    fn reject_type_params(&mut self, kind: &str) -> PResult<()> {
+        if self.at(&Tok::Less) {
+            return Err(self.err(&format!("{kind} には型パラメータを書けません")));
+        }
+        Ok(())
+    }
+
+    /// `Map<T> for [T]` / `Database for Postgres` / `Postgres` — `impl` の頭。
+    ///
+    /// trait 参照は識別子で始まり `for` で閉じる。trait を持たない `impl` の
+    /// 対象型は型注釈の文法そのままなので、`impl [T]` も同じ道を通る
+    fn impl_head(&mut self) -> PResult<(Option<TraitRef>, Type)> {
+        if !matches!(self.peek(), Tok::Ident(_)) {
+            return Ok((None, self.ty()?));
+        }
+        let name = self.name_path("trait 名または型名")?;
+        let args = self.type_args()?;
+        if self.eat(&Tok::For) {
+            return Ok((Some(TraitRef { name, args }), self.ty()?));
+        }
+        if !args.is_empty() {
+            return Err(self.err(
+                "`impl` の対象型に型引数は書けません。trait を実装するなら `for` が必要です",
+            ));
+        }
+        Ok((
+            None,
+            Type {
+                mode: TypeMode::Owned,
+                kind: TypeKind::Named(name),
+                optional: false,
+            },
+        ))
+    }
+
+    /// `<T, [U]>` — trait 参照に渡す型引数。無ければ空
+    fn type_args(&mut self) -> PResult<Vec<Type>> {
+        if !self.eat(&Tok::Less) {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![self.ty()?];
+        while self.eat(&Tok::Comma) {
+            args.push(self.ty()?);
+        }
+        self.expect(&Tok::Greater, "`>`")?;
+        Ok(args)
+    }
+
     /// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある。
     /// `fn now(-> int)` のように引数ゼロで戻り値だけ、も書ける。
     fn sig(&mut self) -> PResult<Sig> {
         let start = self.span();
         let name = self.expect_ident("関数名")?;
+        // 自由関数・trait メソッド・impl メソッドはこの1本を共有するので、
+        // `fn map<U>(...)` の構文は3箇所ぶん同時に入る
+        let type_params = self.type_params()?;
         self.expect(&Tok::LParen, "`(`")?;
 
         let mut params = Vec::new();
@@ -457,6 +534,7 @@ impl<'a> Parser<'a> {
         }
         Ok(Sig {
             name,
+            type_params,
             receiver,
             params,
             ret,
@@ -1924,16 +2002,19 @@ mod tests {
                     \x20 }\n\
                     }\n");
         let Item::Impl {
-            trait_name,
-            type_name,
+            trait_ref,
+            target,
             methods,
             ..
         } = &p.items[0]
         else {
             panic!()
         };
-        assert_eq!(trait_name.as_deref(), Some("Database"));
-        assert_eq!(type_name, "Postgres");
+        assert_eq!(
+            trait_ref.as_ref().map(|r| r.name.as_str()),
+            Some("Database")
+        );
+        assert_eq!(target.to_string(), "Postgres");
         // self は params には入らない。has_self に出る
         assert!(methods[0].0.has_self());
         assert_eq!(methods[0].0.params.len(), 1);
@@ -2614,5 +2695,148 @@ mod tests {
         assert_eq!(first("fn f() { move (u.name) }\n"), "move(u.name)");
         assert_eq!(first("fn f() { &(u.name) }\n"), "(&u.name)");
         assert_eq!(first("fn f() { (move u.name) }\n"), "(move u.name)");
+    }
+
+    // -----------------------------------------------------------------------
+    // 型パラメータ(MAP-010)
+    // -----------------------------------------------------------------------
+
+    /// 型パラメータ名とその綴りの範囲。span は重複診断がそのまま指す位置
+    fn param_spellings(src: &str, params: &[TypeParam]) -> Vec<String> {
+        params
+            .iter()
+            .map(|p| {
+                assert_eq!(
+                    &src[p.span.start as usize..p.span.end as usize],
+                    p.name,
+                    "span が名前を指していない: {p:?}"
+                );
+                p.name.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fnは名前の後ろに型パラメータを取る() {
+        let src = "fn identity<T>(x: T -> T) { x }\n";
+        let p = ok(src);
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        assert_eq!(param_spellings(src, &sig.type_params), ["T"]);
+        assert_eq!(sig.params[0].ty.to_string(), "T");
+        assert_eq!(sig.ret.as_ref().unwrap().to_string(), "T");
+    }
+
+    #[test]
+    fn 型パラメータは複数書ける() {
+        let src = "fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+        let p = ok(src);
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        assert_eq!(param_spellings(src, &sig.type_params), ["T", "U"]);
+    }
+
+    /// trait とその method、`impl` とその method の4箇所すべてに乗る
+    #[test]
+    fn traitとimplは型パラメータと型引数付き参照を取る() {
+        let src = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+                   impl<T> Map<T> for [T] {\n\
+                   \x20 fn map<U>(self, f: fn(T -> U) -> [U]) { self }\n\
+                   }\n";
+        let p = ok(src);
+        let Item::Trait {
+            type_params,
+            methods,
+            ..
+        } = &p.items[0]
+        else {
+            panic!("trait ではない")
+        };
+        assert_eq!(param_spellings(src, type_params), ["T"]);
+        assert_eq!(param_spellings(src, &methods[0].type_params), ["U"]);
+
+        let Item::Impl {
+            type_params,
+            trait_ref,
+            target,
+            methods,
+            ..
+        } = &p.items[1]
+        else {
+            panic!("impl ではない")
+        };
+        assert_eq!(param_spellings(src, type_params), ["T"]);
+        let trait_ref = trait_ref.as_ref().unwrap();
+        assert_eq!(trait_ref.name, "Map");
+        // 型引数も対象型も、型注釈の文法そのままで往復する
+        assert_eq!(
+            trait_ref
+                .args
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["T"]
+        );
+        assert_eq!(target.to_string(), "[T]");
+        assert_eq!(param_spellings(src, &methods[0].0.type_params), ["U"]);
+    }
+
+    /// 型パラメータの無い `impl` は今までどおり。対象型は `Named` の葉のまま
+    #[test]
+    fn 型パラメータの無いimplは従来の形で読める() {
+        for (src, trait_, target_spelling) in [
+            ("impl Postgres { fn f() { 1 } }\n", None, "Postgres"),
+            (
+                "impl data::Database for data::Postgres { fn f() { 1 } }\n",
+                Some("data::Database"),
+                "data::Postgres",
+            ),
+        ] {
+            let p = ok(src);
+            let Item::Impl {
+                type_params,
+                trait_ref,
+                target,
+                ..
+            } = &p.items[0]
+            else {
+                panic!("impl ではない")
+            };
+            assert!(type_params.is_empty(), "{src}");
+            assert_eq!(trait_ref.as_ref().map(|r| r.name.as_str()), trait_, "{src}");
+            assert!(trait_ref.iter().all(|r| r.args.is_empty()), "{src}");
+            assert_eq!(target.to_string(), target_spelling, "{src}");
+            assert_eq!(target.name(), Some(target_spelling), "{src}");
+        }
+    }
+
+    #[test]
+    fn structとenumには型パラメータを書けない() {
+        assert_eq!(
+            error("struct Box<T> { value: T }\n"),
+            "struct には型パラメータを書けません"
+        );
+        assert_eq!(
+            error("enum Option<T> { Some(T) None }\n"),
+            "enum には型パラメータを書けません"
+        );
+    }
+
+    /// `for` の無い `impl` の対象は型注釈なので、型引数の置き場所が無い
+    #[test]
+    fn 型引数付きの対象型だけのimplは断る() {
+        assert!(
+            error("impl Map<T> { fn f() { 1 } }\n").contains("型引数は書けません"),
+            "{}",
+            error("impl Map<T> { fn f() { 1 } }\n")
+        );
+    }
+
+    #[test]
+    fn 閉じない型パラメータリストは断る() {
+        assert!(error("fn f<T(x: T) { x }\n").contains("`>`"));
+        assert!(error("fn f<>(x: int) { x }\n").contains("型パラメータ名"));
     }
 }

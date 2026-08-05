@@ -1958,3 +1958,66 @@ fn 予約名の公開再エクスポートを拒否する() {
     assert!(text.contains("app.rd:1:1"), "{text}");
     assert!(!project.exists("target/wasm/app.wasm"), "{text}");
 }
+
+// ---- 型パラメータ (MAP-010) ----
+
+/// 型パラメータを持つ宣言は実行経路に繋がらないので、`main` は今までどおり走る
+#[test]
+fn generic宣言があってもmainはそのまま走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+         impl<T> Map<T> for [T] { fn map<U>(self, f: fn(T -> U) -> [U]) { self } }\n\
+         fn identity<T>(x: T -> T) { x }\n\
+         fn main(-> int) { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 1"), "{text}");
+}
+
+#[test]
+fn 重複する型パラメータは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn pair<T, T>(a: T, b: T -> T) { a }\n\
+         fn main(-> int) { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("型パラメータ `T` が重複して宣言されています"),
+        "{text}"
+    );
+    // 2度目に書かれた `T` の位置を指す
+    assert!(text.contains("main.rd:1:12"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 宣言の外の型パラメータ名は実行前に失敗する() {
+    実行前に失敗する(
+        "fn identity<T>(x: T -> T) { x }\n\
+         struct Box { value: T }\n\
+         fn main(-> int) { 1 }\n",
+        "型 `T` は宣言されていません",
+    );
+}
+
+#[test]
+fn structとenumの型パラメータリストは実行前に失敗する() {
+    実行前に失敗する(
+        "struct Box<T> { value: T }\nfn main(-> int) { 1 }\n",
+        "struct には型パラメータを書けません",
+    );
+    実行前に失敗する(
+        "enum Option<T> { Some(T) None }\nfn main(-> int) { 1 }\n",
+        "enum には型パラメータを書けません",
+    );
+}

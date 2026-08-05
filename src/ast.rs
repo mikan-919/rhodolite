@@ -31,9 +31,11 @@ pub struct UseMember {
 
 #[derive(Debug)]
 pub enum Item {
-    /// `trait Database { fn find(...) fn save(...) }` — 契約
+    /// `trait Database { fn find(...) fn save(...) }` — 契約。
+    /// `trait Map<T> { ... }` のように型パラメータを取れる(MAP-Q1)
     Trait {
         name: String,
+        type_params: Vec<TypeParam>,
         methods: Vec<Sig>,
         span: Span,
     },
@@ -51,10 +53,14 @@ pub enum Item {
         span: Span,
     },
     /// `impl Database for Postgres { ... }` — ハンドラの正体。専用構文は持たない。
-    /// `impl Postgres { ... }`(trait 無し)も書ける。`Postgres::new` はそこに置く
+    /// `impl Postgres { ... }`(trait 無し)も書ける。`Postgres::new` はそこに置く。
+    ///
+    /// `impl<T> Map<T> for [T] { ... }` のように型パラメータを取れる(MAP-Q1)。
+    /// trait 参照は型引数を持てて、対象型は型注釈の文法そのものなので `[T]` も書ける
     Impl {
-        trait_name: Option<String>,
-        type_name: String,
+        type_params: Vec<TypeParam>,
+        trait_ref: Option<TraitRef>,
+        target: Type,
         methods: Vec<(Sig, Vec<Expr>)>,
         span: Span,
     },
@@ -120,10 +126,29 @@ impl Item {
     }
 }
 
+/// `<T, U>` の1要素。名前は宣言の中でだけ意味を持つので、重複と
+/// スコープ外の診断が指せるよう span を持つ(MAP-Q1)
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub span: Span,
+}
+
+/// `impl` が実装する trait の参照。`Database` のように型引数を取らない形も、
+/// `Map<T>` のように取る形も同じ1つの表現に載せる
+#[derive(Debug, Clone)]
+pub struct TraitRef {
+    pub name: String,
+    /// `Map<T>` の `T`。型引数を取らない参照では空
+    pub args: Vec<Type>,
+}
+
 /// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある
 #[derive(Debug)]
 pub struct Sig {
     pub name: String,
+    /// `fn map<U>(...)` の `U`。自由関数・trait メソッド・impl メソッドで同じ
+    pub type_params: Vec<TypeParam>,
     /// 第一引数のレシーバ。トレイトのメソッドと関連関数の区別はこれ一つ。
     /// 暗黙にしないのは、`Postgres::new` のようにレシーバを取らないものと
     /// 見た目で区別できなくなるため
@@ -197,6 +222,30 @@ impl Type {
             TypeKind::Named(name) => Some(name),
             TypeKind::Array(_) | TypeKind::Callable { .. } => None,
         }
+    }
+}
+
+/// 書かれたままの綴り。`impl` の対象型のように、名前の葉に収まらない型を
+/// 診断へ出すのに要る
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.mode {
+            TypeMode::Owned => {}
+            TypeMode::Shared => write!(f, "&")?,
+            TypeMode::Mutable => write!(f, "&mut ")?,
+        }
+        match &self.kind {
+            TypeKind::Named(name) => write!(f, "{name}")?,
+            TypeKind::Array(element) => write!(f, "[{element}]")?,
+            TypeKind::Callable { params, result } => {
+                let params: Vec<String> = params.iter().map(ToString::to_string).collect();
+                write!(f, "fn({}-> {result})", crate::hir::spelled_params(&params))?;
+            }
+        }
+        if self.optional {
+            write!(f, "?")?;
+        }
+        Ok(())
     }
 }
 

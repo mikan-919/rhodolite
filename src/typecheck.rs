@@ -425,7 +425,9 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
     for item in &program.items {
         out.span = Some(item.span());
         match item {
-            Item::Fn { sig, body, .. } => {
+            // generic 宣言の本体は具体化(MAP-020)まで検査しない。宣言パスも
+            // 置き場所を積んでいないので、ここも同じ条件で飛ばす
+            Item::Fn { sig, body, .. } if !is_generic(&[], sig) => {
                 let target = next_target(&mut targets);
                 check_body(
                     body,
@@ -458,16 +460,23 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                 );
             }
             Item::Impl {
-                type_name, methods, ..
+                type_params,
+                target: impl_target,
+                methods,
+                ..
             } => {
+                let type_name = impl_target_name(impl_target);
                 for (sig, body) in methods {
+                    if is_generic(type_params, sig) {
+                        continue;
+                    }
                     let target = next_target(&mut targets);
                     let ctx = format!("impl {type_name}::{}", sig.name);
                     out.span = Some(sig.span);
                     check_body(
                         body,
                         Some(sig),
-                        sig.receiver.map(|mode| receiver_type(mode, type_name)),
+                        sig.receiver.map(|mode| receiver_type(mode, &type_name)),
                         &decls,
                         &ctx,
                         &effective_ret(sig),
@@ -647,11 +656,34 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
             }
             // trait のメンバー名の重複は宣言の誤りだが、契約としては一意に保つ。
             // 実装側の過不足は `check_impl` が契約と突き合わせて報告する
-            Item::Trait { name, methods, .. } => {
+            Item::Trait {
+                name,
+                type_params,
+                methods,
+                ..
+            } => {
                 others.insert(name.clone());
                 let owner = nominal.traits[name];
                 ids.traits.insert(name.clone(), owner);
+                // trait の型パラメータは全メソッドの署名から見える。
+                // 1度だけ導入して、各メソッド自身の分をその上に重ねる
+                let mut trait_scope = TypeParamScope::new();
+                let trait_params =
+                    declare_type_params(type_params, &mut trait_scope, &mut lowered, out);
                 for sig in methods {
+                    // generic な契約は具体化まで表に載せない(MAP-010 決定5)
+                    if is_generic(type_params, sig) {
+                        record_generic(
+                            sig,
+                            &trait_scope,
+                            &trait_params,
+                            hir::GenericOwner::Trait(owner),
+                            &nominal,
+                            &mut lowered,
+                            out,
+                        );
+                        continue;
+                    }
                     check_signature_shape(sig, &format!("trait {name}::{}", sig.name), false, out);
                     let id = lowered.trait_methods.alloc(hir::TraitMethodDecl {
                         name: sig.name.clone(),
@@ -673,6 +705,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                     name.clone(),
                     methods
                         .iter()
+                        .filter(|sig| !is_generic(type_params, sig))
                         .map(|sig| (sig.name.clone(), signature(sig)))
                         .collect(),
                 );
@@ -701,6 +734,20 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
             }
             Item::Fn { sig, span, .. } => {
                 others.insert(sig.name.clone());
+                // generic 関数は署名だけ記録して、callable にも本体の走査にも
+                // 載せない(MAP-010 決定5)
+                if is_generic(&[], sig) {
+                    record_generic(
+                        sig,
+                        &TypeParamScope::new(),
+                        &[],
+                        hir::GenericOwner::Free,
+                        &nominal,
+                        &mut lowered,
+                        out,
+                    );
+                    continue;
+                }
                 fns.insert(sig.name.clone(), signature(sig));
                 check_signature_shape(sig, &sig.name, true, out);
                 let id = lowered.callables.alloc(callable_shell(
@@ -715,28 +762,72 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                 lowered.bodies.push(hir::BodyId::Callable(id));
             }
             Item::Impl {
-                trait_name,
-                type_name,
+                type_params,
+                trait_ref,
+                target,
                 methods,
                 span,
             } => {
-                let entry = impls.entry(type_name.clone()).or_default();
-                for (sig, _) in methods {
-                    entry.push((sig.name.clone(), signature(sig)));
+                // generic メソッドは `impl` の型パラメータの上に自分の分を重ねた
+                // スコープで署名だけ記録する(MAP-010 決定3・5)
+                let mut impl_scope = TypeParamScope::new();
+                let impl_params =
+                    declare_type_params(type_params, &mut impl_scope, &mut lowered, out);
+                let type_name = impl_target_name(target);
+                let concrete: Vec<&Sig> = methods
+                    .iter()
+                    .map(|(sig, _)| sig)
+                    .filter(|sig| !is_generic(type_params, sig))
+                    .collect();
+                if !concrete.is_empty() {
+                    let entry = impls.entry(type_name.clone()).or_default();
+                    for sig in &concrete {
+                        entry.push((sig.name.clone(), signature(sig)));
+                    }
                 }
-                lower_impl(
-                    item,
-                    trait_name,
-                    type_name,
-                    methods,
-                    *span,
-                    &nominal,
-                    &mut ids,
-                    &mut lowered,
-                    &mut targets,
-                    &mut pending,
-                    out,
-                );
+                for (sig, _) in methods {
+                    if !is_generic(type_params, sig) {
+                        continue;
+                    }
+                    let owner = hir::GenericOwner::Impl {
+                        // trait 参照そのものが宣言を指しているかの検査は
+                        // generic の契約検査(MAP-025)の範囲
+                        trait_: trait_ref
+                            .as_ref()
+                            .and_then(|r| nominal.traits.get(&r.name).copied()),
+                        trait_args: trait_ref
+                            .iter()
+                            .flat_map(|r| &r.args)
+                            .map(|arg| lower_generic_type(arg, &impl_scope, &nominal, out))
+                            .collect(),
+                        target: lower_generic_type(target, &impl_scope, &nominal, out),
+                    };
+                    record_generic(
+                        sig,
+                        &impl_scope,
+                        &impl_params,
+                        owner,
+                        &nominal,
+                        &mut lowered,
+                        out,
+                    );
+                }
+                // 型パラメータを持つ `impl` は具体化まで trait 実装表に載せない
+                if type_params.is_empty() {
+                    lower_impl(
+                        item,
+                        &trait_ref.as_ref().map(|r| r.name.clone()),
+                        &type_name,
+                        &concrete,
+                        *span,
+                        &nominal,
+                        &mut ids,
+                        &mut lowered,
+                        &mut targets,
+                        &mut pending,
+                        out,
+                    );
+                }
             }
             Item::Test {
                 name,
@@ -771,21 +862,46 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
         nominal,
     };
 
-    // 契約の検査は索引が揃ってから。前方参照の trait も引ける(design.md 決定2)
+    // 契約の検査は索引が揃ってから。前方参照の trait も引ける(design.md 決定2)。
+    // generic な `impl` とそのメソッドは具体化(MAP-025)まで契約と照合しない
     for item in &program.items {
         if let Item::Impl {
-            trait_name: Some(trait_name),
-            type_name,
+            type_params,
+            trait_ref: Some(trait_ref),
+            target,
             methods,
             ..
         } = item
+            && type_params.is_empty()
         {
+            let concrete: Vec<&Sig> = methods
+                .iter()
+                .map(|(sig, _)| sig)
+                .filter(|sig| !is_generic(type_params, sig))
+                .collect();
             out.span = Some(item.span());
-            check_impl(trait_name, type_name, methods, &decls, out);
+            check_impl(
+                &trait_ref.name,
+                &impl_target_name(target),
+                &concrete,
+                &decls,
+                out,
+            );
         }
     }
 
     (decls, lowered, targets)
+}
+
+/// non-generic な `impl` の対象型を、これまでどおり1つの名前として綴る。
+///
+/// 対象型は型注釈になったが、型パラメータを持たない `impl` の対象は常に
+/// `Named` なので、綴りも既存の索引の引き方も変わらない。名前の葉を持たない
+/// 対象(`impl [int]`)は struct ではないので、書かれたままを診断に出す
+fn impl_target_name(target: &Type) -> String {
+    target
+        .name()
+        .map_or_else(|| target.to_string(), str::to_string)
 }
 
 impl Nominal {
@@ -1086,7 +1202,7 @@ fn lower_impl(
     item: &Item,
     trait_name: &Option<String>,
     type_name: &str,
-    methods: &[(Sig, Vec<Expr>)],
+    methods: &[&Sig],
     span: Span,
     nominal: &Nominal,
     ids: &mut Ids,
@@ -1122,7 +1238,7 @@ fn lower_impl(
         (Some(type_), None) => Some(hir::CallableOwner::Inherent(type_)),
         (None, _) => None,
     };
-    for (sig, _) in methods {
+    for sig in methods {
         check_signature_shape(sig, &format!("impl {type_name}::{}", sig.name), false, out);
         let Some(owner) = owner else {
             targets.push(Target::Discard);
@@ -1146,6 +1262,143 @@ fn lower_impl(
         targets.push(Target::Callable(id));
         lowered.bodies.push(hir::BodyId::Callable(id));
     }
+}
+
+// ---------------------------------------------------------------------------
+// generic 宣言(MAP-010 決定3・4・5)
+// ---------------------------------------------------------------------------
+
+/// 宣言1つの中でだけ有効な型パラメータ名の表。impl / trait の分を先に積み、
+/// メソッド自身の分を上に重ねる。
+type TypeParamScope = BTreeMap<String, hir::TypeParamId>;
+
+/// 宣言が導入した型パラメータをスコープへ積む。重複はその場で報告して、
+/// 先に宣言された ID を残す。
+///
+/// ここが「同じ名前を2度導入できない」唯一の門なので、1つのリストの中の重複も、
+/// impl の名前をメソッドが名乗り直した場合も同じ1本で捕まる(MAP-010 決定3)。
+fn declare_type_params(
+    params: &[crate::ast::TypeParam],
+    scope: &mut TypeParamScope,
+    lowered: &mut hir::Program,
+    out: &mut Out,
+) -> Vec<hir::TypeParamId> {
+    let mut declared = Vec::new();
+    for param in params {
+        if scope.contains_key(&param.name) {
+            out.push_at(
+                param.span,
+                format!("型パラメータ `{}` が重複して宣言されています", param.name),
+            );
+            continue;
+        }
+        let id = lowered.type_params.alloc(hir::TypeParamDecl {
+            name: param.name.clone(),
+            span: param.span,
+        });
+        scope.insert(param.name.clone(), id);
+        declared.push(id);
+    }
+    declared
+}
+
+/// 型注釈を具体化前の型へ。名前の葉はまずスコープの型パラメータを見て、
+/// 外れたら既存の組み込み / struct / enum の解決へ落ちる。
+///
+/// どちらでも当たらない名前は「型 `X` は宣言されていません」— 既存の
+/// `report_unknown` と同じ文言。宣言の外に出た型パラメータ名は、そこでは
+/// ただの未解決名なので、この1本でそのまま拒否される(MAP-010 決定3)。
+fn lower_generic_type(
+    ty: &Type,
+    scope: &TypeParamScope,
+    nominal: &Nominal,
+    out: &mut Out,
+) -> hir::GenericType {
+    let kind = match &ty.kind {
+        TypeKind::Array(element) => {
+            hir::GenericTypeKind::Array(Box::new(lower_generic_type(element, scope, nominal, out)))
+        }
+        TypeKind::Callable { params, result } => hir::GenericTypeKind::Callable {
+            params: params
+                .iter()
+                .map(|p| lower_generic_type(p, scope, nominal, out))
+                .collect(),
+            result: Box::new(lower_generic_type(result, scope, nominal, out)),
+        },
+        TypeKind::Named(name) => match scope.get(name) {
+            Some(id) => hir::GenericTypeKind::Param(*id),
+            None => match builtin(name) {
+                Some(builtin) => hir::GenericTypeKind::Builtin(builtin),
+                None => match nominal.types.get(name) {
+                    Some(hir::TypeKind::Struct(id)) => hir::GenericTypeKind::Struct(*id),
+                    Some(hir::TypeKind::Enum(id)) => hir::GenericTypeKind::Enum(*id),
+                    _ => {
+                        if out.unknown_types.insert(name.clone()) {
+                            out.push(format!("型 `{name}` は宣言されていません"));
+                        }
+                        hir::GenericTypeKind::Poison
+                    }
+                },
+            },
+        },
+    };
+    hir::GenericType {
+        reference: ref_kind(ty.mode),
+        kind,
+        optional: ty.optional,
+    }
+}
+
+/// generic 宣言1つを署名として記録する。本体は下ろさず、`Ids` のどの表にも
+/// 載せない(MAP-010 決定5)。
+///
+/// `enclosing` は impl / trait が導入した型パラメータ。メソッド自身の
+/// `sig.type_params` はその上に重なる。
+fn record_generic(
+    sig: &Sig,
+    enclosing: &TypeParamScope,
+    enclosing_params: &[hir::TypeParamId],
+    owner: hir::GenericOwner,
+    nominal: &Nominal,
+    lowered: &mut hir::Program,
+    out: &mut Out,
+) {
+    let mut scope = enclosing.clone();
+    let mut type_params = enclosing_params.to_vec();
+    type_params.extend(declare_type_params(
+        &sig.type_params,
+        &mut scope,
+        lowered,
+        out,
+    ));
+    let params = sig
+        .params
+        .iter()
+        .map(|p| lower_generic_type(&p.ty, &scope, nominal, out))
+        .collect();
+    let ret = match &sig.ret {
+        Some(ty) => lower_generic_type(ty, &scope, nominal, out),
+        None => hir::GenericType {
+            reference: None,
+            kind: hir::GenericTypeKind::Builtin(hir::Builtin::Unit),
+            optional: false,
+        },
+    };
+    lowered.generics.alloc(hir::GenericDecl {
+        name: sig.name.clone(),
+        owner,
+        type_params,
+        receiver: sig.receiver,
+        params,
+        ret,
+        span: sig.span,
+    });
+}
+
+/// この署名が具体化を待つ側か。宣言自身の型パラメータか、囲む `impl` / `trait`
+/// の型パラメータがあれば generic(MAP-010 決定5)。
+fn is_generic(enclosing: &[crate::ast::TypeParam], sig: &Sig) -> bool {
+    !enclosing.is_empty() || !sig.type_params.is_empty()
 }
 
 /// trait の契約が揃うのを待っている実装メソッド1つ。
@@ -1356,13 +1609,7 @@ fn report_cycle(lowered: &hir::Program, start: Node, cycle: &[&Edge], out: &mut 
 
 /// trait `impl` を契約と突き合わせる。呼び出しの到達性に依らせないため、
 /// 宣言の時点で見る(design.md 決定2)。
-fn check_impl(
-    trait_name: &str,
-    type_name: &str,
-    methods: &[(Sig, Vec<Expr>)],
-    decls: &Decls,
-    out: &mut Out,
-) {
+fn check_impl(trait_name: &str, type_name: &str, methods: &[&Sig], decls: &Decls, out: &mut Out) {
     let ctx = format!("impl {trait_name} for {type_name}");
     let Some(contract) = decls.traits.get(trait_name) else {
         out.push(format!("{ctx}: `{trait_name}` は trait ではありません"));
@@ -1374,7 +1621,7 @@ fn check_impl(
     }
 
     let mut given: BTreeSet<&str> = BTreeSet::new();
-    for (sig, _) in methods {
+    for sig in methods {
         if !given.insert(&sig.name) {
             out.push(format!("{ctx}: `{}` を二度実装しています", sig.name));
             continue;
@@ -7402,5 +7649,141 @@ rank: Rank }
             "&int",
             "戻り値の綴りも借用を出す"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 型パラメータ(MAP-010)
+    // -----------------------------------------------------------------------
+
+    /// 同じ名前を2度導入することはできない。1つのリストの中でも、メソッドが
+    /// 囲む `impl` の名前を名乗り直す形でも、同じ1本の診断で落ちる
+    #[test]
+    fn 重複する型パラメータ名は宣言のspanで落ちる() {
+        for src in [
+            "fn pair<T, T>(a: T, b: T -> T) { a }\n",
+            "trait Map<T, T> { fn map(self -> int) }\n",
+            "impl<T, T> Map<T> for [T] { fn map(self -> int) { 1 } }\n",
+            // メソッドが囲む `impl` の型パラメータを名乗り直す形も重複
+            "impl<T> Map<T> for [T] { fn map<T>(self -> int) { 1 } }\n",
+            "trait Map<T> { fn map<T>(self -> int) }\n",
+        ] {
+            let diagnostics = diagnostics(src);
+            assert_eq!(diagnostics.len(), 1, "{src}: {diagnostics:?}");
+            let diagnostic = &diagnostics[0];
+            assert_eq!(
+                diagnostic.msg, "型パラメータ `T` が重複して宣言されています",
+                "{src}"
+            );
+            // span は2度目に書かれた `T` そのものを指す
+            let span = diagnostic.span.expect("span を持つ");
+            assert_eq!(&src[span.start as usize..span.end as usize], "T", "{src}");
+            assert!(
+                span.start as usize > src.find('<').unwrap(),
+                "{src}: 2度目の綴りを指すはず"
+            );
+        }
+    }
+
+    /// 型パラメータ名が有効なのは導入した宣言の中だけ。外では未宣言の型名
+    #[test]
+    fn 宣言の外の型パラメータ名は未宣言の型として落ちる() {
+        assert_eq!(
+            only(
+                "fn identity<T>(x: T -> T) { x }\n\
+                 struct Box { value: T }\n"
+            ),
+            "型 `T` は宣言されていません"
+        );
+        // trait / impl が導入した名前も外へは漏れない
+        assert_eq!(
+            only(
+                "impl<T> Holder for [T] { fn get(self -> int) { 1 } }\n\
+                 struct Box { value: T }\n"
+            ),
+            "型 `T` は宣言されていません"
+        );
+    }
+
+    /// `impl<T> ... { fn map<U> }` は T と U の両方が署名から見える
+    #[test]
+    fn implの型パラメータはメソッド署名から見える() {
+        let program = lowered(
+            "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+             impl<T> Map<T> for [T] { fn map<U>(self, f: fn(T -> U) -> [U]) { self } }\n\
+             fn identity<T>(x: T -> T) { x }\n\
+             fn main(-> int) { 1 }\n",
+        );
+        assert_eq!(
+            program.dump(),
+            "trait#0 Map\n\
+             callable#0 fn main() -> int\n\
+             \x20 expr#0 : int = int 1\n\
+             \x20 root [#0]\n\
+             generic#0 trait Map map<T#0, U#1>(self, fn(T -> U)) -> [U]\n\
+             generic#1 impl Map<T> for [T] map<T#2, U#3>(self, fn(T -> U)) -> [U]\n\
+             generic#2 fn identity<T#4>(T) -> T\n"
+        );
+    }
+
+    /// generic 宣言は callable / trait 契約 / trait 実装のどの表にも載らない。
+    /// だから要求解析・ownership・interpreter・Wasm 生成はそれを観測しない
+    /// (MAP-010 決定5)
+    #[test]
+    fn generic宣言は実行経路のどの表にも載らない() {
+        let program = lowered(
+            "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+             impl<T> Map<T> for [T] { fn map<U>(self, f: fn(T -> U) -> [U]) { self } }\n\
+             fn identity<T>(x: T -> T) { x }\n\
+             fn main(-> int) { 1 }\n",
+        );
+        assert_eq!(program.generics.len(), 3);
+        // 本体を持つのは `main` だけ
+        assert_eq!(program.callables.len(), 1);
+        assert_eq!(
+            program.bodies,
+            vec![hir::BodyId::Callable(
+                program.free_callable("main").expect("`main` がある")
+            )]
+        );
+        assert!(program.trait_methods.is_empty(), "generic な契約は載らない");
+        assert!(program.trait_impls.is_empty(), "generic な実装は載らない");
+        assert!(program.free_callable("identity").is_none());
+    }
+
+    /// 記録した署名は自分の型パラメータを指している。具体化はまだなので
+    /// どれも具体型ではない
+    #[test]
+    fn generic署名は型パラメータ参照を保持する() {
+        let program = lowered("fn identity<T>(x: T -> T) { x }\nfn main(-> int) { 1 }\n");
+        let (_, decl) = program.generics.iter().next().expect("generic がある");
+        assert_eq!(decl.name, "identity");
+        assert_eq!(decl.owner, hir::GenericOwner::Free);
+        let param = decl.type_params[0];
+        assert_eq!(program.type_params[param].name, "T");
+        let expected = hir::GenericType {
+            reference: None,
+            kind: hir::GenericTypeKind::Param(param),
+            optional: false,
+        };
+        assert_eq!(decl.params, vec![expected.clone()]);
+        assert_eq!(decl.ret, expected);
+        assert!(!decl.is_concrete(), "型パラメータが残っている");
+    }
+
+    /// 型パラメータを持たない宣言は今までどおり。generic の arena は空のまま
+    #[test]
+    fn 型パラメータの無いプログラムは何も変わらない() {
+        let program = lowered(
+            "trait Clock { fn now(self -> int) }\n\
+             struct Frozen { at: int }\n\
+             impl Clock for Frozen { fn now(self -> int) { self.at } }\n\
+             impl Frozen { fn make(-> Frozen) { Frozen { at = 0 } } }\n\
+             fn main(-> int) { 1 }\n",
+        );
+        assert!(program.generics.is_empty());
+        assert!(program.type_params.is_empty());
+        assert_eq!(program.trait_impls.len(), 1);
+        assert_eq!(program.trait_methods.len(), 1);
+        assert_eq!(program.callables.len(), 3);
     }
 }
