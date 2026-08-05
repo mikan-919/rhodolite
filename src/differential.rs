@@ -226,6 +226,28 @@ const AMBIENT_CALLBACK_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+/// 型引数 × callback × provider の組み合わせ。同じ generic 宣言の具体化ごとに
+/// ambient の要求が別々に推論されること、slot を要らない具体化が兄弟の隠し欄を
+/// 持たないことを、interpreter と Wasm の両方で走らせて突き合わせる(MAP-050)
+const GENERIC_AMBIENT_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Clock { fn now(&self -> int) }\n\
+             struct Frozen { at: int }\n\
+             impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+             effect clock: Clock\n\
+             fn ticked(value: int -> int) { value + clock.now() }\n\
+             fn flagged(value: bool -> int) { if value: clock.now() else: 0 }\n\
+             fn plain(value: int -> int) { value + 1 }\n\
+             fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+             fn main(-> int) {\n\
+               let quiet = apply(plain, 1)\n\
+               with clock(Frozen { at = 1000 }) {\n\
+                 let inner = with clock(Frozen { at = 7 }) { apply(ticked, 0) }\n\
+                 apply(ticked, quiet) + inner + apply(flagged, true)\n\
+               }\n\
+             }\n",
+}];
+
 /// 具体化した汎用関数は通常の callable。同じ宣言を2つの具体型で呼ぶ形と、
 /// callback を取る汎用関数を、interpreter と Wasm の両方で走らせて突き合わせる
 /// (MAP-020)
@@ -352,6 +374,12 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "generic-impl-resolution",
         files: GENERIC_IMPL_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "generic-ambient-callbacks",
+        files: GENERIC_AMBIENT_FILES,
         probes: &[],
         expected_failure: None,
     },

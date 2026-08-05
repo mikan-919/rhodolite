@@ -932,6 +932,76 @@ mod tests {
         );
     }
 
+    // ---- generic な具体化の計画(MAP-050 tasks 2.x) ----
+
+    /// 上と同じ形の helper を generic にしたもの。具体化は宣言名をそのまま
+    /// 名乗るので、instance は表示名ではなく鍵で言い分かれる
+    const GENERIC_CALLBACK_SRC: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+
+    /// slot を要る callback と要らない callback で、generic な `apply` の
+    /// 具体化ごとに instance が割れる。no-slot 側は record も射影も持たない
+    #[test]
+    fn generic_の具体化ごとにinstanceが分かれる() {
+        let (program, plan) = plan_of(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(Frozen {{ t = 1000 }}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let mut ambient = callback_instances(&program, &plan, "apply");
+        ambient.sort_unstable();
+        assert_eq!(ambient, vec![false, true]);
+
+        let quiet: Vec<&Instance> = plan
+            .instances()
+            .map(|(_, instance)| instance)
+            .filter(|instance| {
+                program.show_body(instance.key.body) == "apply" && instance.layout.is_none()
+            })
+            .collect();
+        assert_eq!(quiet.len(), 1, "callback-free の具体化が1つ");
+        assert!(quiet[0].key.providers.is_empty(), "{:?}", quiet[0].key);
+        assert!(
+            quiet[0]
+                .calls
+                .values()
+                .all(|call| call.projection.is_empty()),
+            "{:?}",
+            quiet[0].calls
+        );
+    }
+
+    /// 同じ具体化・同じ provider への2つの呼び出しは1つの instance へ寄る
+    #[test]
+    fn 同じgeneric具体化への呼び出しは1つのinstanceに畳まれる() {
+        let (program, plan) = plan_of(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 with clock(Frozen {{ t = 1 }}) {{ apply(ticked, 1) + apply(ticked, 2) }}\n\
+             }}\n"
+        ));
+        assert_eq!(callback_instances(&program, &plan, "apply").len(), 1);
+    }
+
+    /// generic な具体化へ届く要求の提供忘れも、非 generic と同じ形で落ちる
+    #[test]
+    fn generic越しの提供忘れは計画で落ちる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
+        let entry = program.free_callable("main").expect("main がない");
+        let clock = slot(&program, "clock");
+        assert_eq!(
+            plan_hir_for_test(&program, &analysis, entry),
+            Err(PlanError::MissingProvider {
+                body: hir::BodyId::Callable(entry),
+                slot: clock
+            })
+        );
+    }
+
     pub(super) fn slot(program: &hir::Program, name: &str) -> hir::SlotId {
         program
             .slots

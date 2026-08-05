@@ -555,9 +555,15 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
         .collect();
 
     // 表示の境界で名前へ戻す。並びは宣言順の本体と、スロット名の順。
-    // 名前で引く一覧も提供忘れの診断も、この1つの意味の結果から作る
+    // 名前で引く一覧も提供忘れの診断も、この1つの意味の結果から作る。
+    //
+    // 表示名は同一性ではない。generic 宣言の具体化は宣言名をそのまま名乗る
+    // ので(`instantiate()` は `decl.name` を写すだけ)、物理的に別の本体が
+    // 同じ綴りになる。2つ目以降に ` #N` を足して、後の具体化が前の具体化の
+    // 要求を黙って上書きしないようにする(MAP-050 決定2)
     let mut order = Vec::new();
     let mut public: BTreeMap<String, Reqs> = BTreeMap::new();
+    let mut seen: HashMap<String, u32> = HashMap::new();
     for id in &program.bodies {
         // `impl` のメソッドは一覧に出さない(従来どおり fn と test だけ)
         if let hir::BodyId::Callable(callable) = id
@@ -565,7 +571,14 @@ fn analyze_hir(program: &hir::Program) -> Analysis {
         {
             continue;
         }
-        let name = program.show_body(*id);
+        let shown = program.show_body(*id);
+        let count = seen.entry(shown.clone()).or_insert(0);
+        *count += 1;
+        let name = if *count == 1 {
+            shown
+        } else {
+            format!("{shown} #{count}")
+        };
         public.insert(
             name.clone(),
             summary_of(&semantic, *id)
@@ -1010,6 +1023,239 @@ mod tests {
         );
         let analysis = analyze_hir_for_test(&program);
         assert!(analysis.unsatisfied().is_empty());
+    }
+
+    // ---- generic な helper の callback 特殊化(MAP-050 tasks 1.x) ----
+
+    /// generic な `apply` を使う前置き。`ticked` は clock を要り、`plain` は
+    /// 要らない。`stamped` は `apply<str, int>` を作るための別の型引数
+    const GENERIC_CALLBACK_PRELUDE: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn stamped(label: str -> int) { let ignored = label\n clock.now() }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+
+    /// その名前を持つ具体化の全て。generic 宣言は callable に載らないので、
+    /// 数えられるのは呼び出しが作った具体化だけ
+    fn instances(program: &hir::Program, name: &str) -> Vec<hir::CallableId> {
+        program
+            .callables
+            .iter()
+            .filter(|(_, callable)| {
+                callable.owner == hir::CallableOwner::Free && callable.name == name
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// 具体化は同じ表示名を持つので、束縛で言い分ける。返るのは
+    /// 「その callback を束縛した特殊化」の (本体, 要求スロット名) の全て
+    fn generic_specializations(
+        program: &hir::Program,
+        analysis: &Analysis,
+        helper: &str,
+        callback: &str,
+    ) -> Vec<(hir::BodyId, BTreeSet<String>)> {
+        let callback_id = program.free_callable(callback).expect("callback がある");
+        analysis
+            .semantic
+            .iter()
+            .filter(|((body, bindings), _)| match body {
+                hir::BodyId::Callable(id) => {
+                    program.callables[*id].owner == hir::CallableOwner::Free
+                        && program.callables[*id].name == helper
+                        && bindings.values().any(|bound| *bound == callback_id)
+                }
+                hir::BodyId::Test(_) => false,
+            })
+            .map(|((body, _), reqs)| {
+                (
+                    *body,
+                    reqs.keys()
+                        .map(|slot| program.slots[*slot].name.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// その callback を束縛した特殊化はちょうど1つ、という前提での要求
+    fn generic_specialized(
+        program: &hir::Program,
+        analysis: &Analysis,
+        helper: &str,
+        callback: &str,
+    ) -> BTreeSet<String> {
+        let found = generic_specializations(program, analysis, helper, callback);
+        assert_eq!(found.len(), 1, "{callback} の特殊化が1つでない: {found:?}");
+        found.into_iter().next().expect("1つある").1
+    }
+
+    fn req_names(reqs: &Reqs) -> BTreeSet<String> {
+        reqs.keys().cloned().collect()
+    }
+
+    /// generic な helper でも、選ばれた callback の要求が呼び出し元へ届く
+    /// (tasks 1.1)
+    #[test]
+    fn generic_helperのcallbackの要求が呼び出し元へ届く() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            generic_specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(req_names(&analysis.reqs["main"]), set(&["clock"]));
+    }
+
+    /// 同じ型引数でも callback が違えば別の具体化。slot を要らない側は
+    /// 相手の slot を拾わない(tasks 1.2)
+    #[test]
+    fn generic_の型引数が同じでもcallbackごとに要求が分かれる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(instances(&program, "apply").len(), 2, "{}", program.dump());
+
+        let ticked = generic_specializations(&program, &analysis, "apply", "ticked");
+        let plain = generic_specializations(&program, &analysis, "apply", "plain");
+        assert_eq!(ticked.len(), 1, "{ticked:?}");
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        assert_ne!(ticked[0].0, plain[0].0, "物理的に別の本体");
+        assert_eq!(ticked[0].1, set(&["clock"]));
+        assert_eq!(plain[0].1, BTreeSet::new(), "相手の slot を拾わない");
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    /// 型引数が違う具体化どうしも、それぞれ独立に slot を要求する(tasks 1.3)
+    #[test]
+    fn generic_の型引数ごとに要求が独立する() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, 1) + apply(stamped, \"a\") }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(instances(&program, "apply").len(), 2, "{}", program.dump());
+
+        let ticked = generic_specializations(&program, &analysis, "apply", "ticked");
+        let stamped = generic_specializations(&program, &analysis, "apply", "stamped");
+        assert_ne!(ticked[0].0, stamped[0].0, "型引数が違えば別の本体");
+        assert_eq!(ticked[0].1, set(&["clock"]));
+        assert_eq!(stamped[0].1, set(&["clock"]));
+    }
+
+    /// generic から generic へ callback を転送しても要求が運ばれる(tasks 1.4)
+    #[test]
+    fn 入れ子のgeneric呼び出しでもcallbackの要求が運ばれる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}\
+             fn relay<T, U>(f: fn(T -> U), x: T -> U) {{ apply(f, x) }}\n\
+             fn main(-> int) {{ relay(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            generic_specialized(&program, &analysis, "relay", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(
+            generic_specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+
+        let path: Vec<String> = analysis.reqs["main"]["clock"]
+            .path_names()
+            .iter()
+            .map(|hop| hop.to_string())
+            .collect();
+        for expected in ["relay", "apply", "ticked"] {
+            assert!(path.iter().any(|hop| hop == expected), "{path:?}");
+        }
+    }
+
+    /// 自分の callback を再帰へ転送する generic helper でも要求が出る
+    /// (tasks 1.5)
+    #[test]
+    fn callbackを転送する再帰generic_でも要求を推論する() {
+        let program = lowered_of(
+            "fn ticked(value: int -> int) { value + clock.now() }\n\
+             fn apply<T>(f: fn(T -> T), x: T, n: int -> T) {\n\
+             \x20 if n == 0: x else: apply(f, f(x), n - 1)\n\
+             }\n\
+             fn main(-> int) { apply(ticked, 1, 3) }\n",
+        );
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(instances(&program, "apply").len(), 1, "{}", program.dump());
+        assert_eq!(
+            generic_specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(req_names(&analysis.reqs["main"]), set(&["clock"]));
+    }
+
+    /// 提供忘れの経路は generic helper と選ばれた callback の両方を通る
+    /// (tasks 1.6)
+    #[test]
+    fn generic越しの提供忘れは経路にhelperとcallbackを出す() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let errors = analysis.unsatisfied();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let path: Vec<String> = analysis.reqs["main"]["clock"]
+            .path_names()
+            .iter()
+            .map(|hop| hop.to_string())
+            .collect();
+        assert!(path.iter().any(|hop| hop.ends_with("apply")), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("ticked")), "{path:?}");
+    }
+
+    /// 入れ子の `with` は generic な callback 越しでも要求を止める(tasks 1.7)
+    #[test]
+    fn 入れ子のwithはgeneric_なcallback越しでも要求を止める() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{\n\
+             \x20   with clock(SystemClock {{}}) {{ apply(ticked, 1) }}\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    /// 具体化が2つあっても、一覧はどちらの要求も落とさない(tasks 3.2)
+    #[test]
+    fn 具体化ごとに一覧の行が分かれる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let listed: Vec<&str> = analysis
+            .order
+            .iter()
+            .map(|name| name.as_str())
+            .filter(|name| name.starts_with("apply"))
+            .collect();
+        assert_eq!(listed, vec!["apply", "apply #2"], "{}", analysis.render());
+        // 片方は callback の slot を持ち、もう片方は持たない。同じ表示名でも
+        // 後の具体化が前の具体化を上書きしない
+        let mut shown: Vec<BTreeSet<String>> = listed
+            .iter()
+            .map(|name| req_names(&analysis.reqs[*name]))
+            .collect();
+        shown.sort();
+        assert_eq!(shown, vec![BTreeSet::new(), set(&["clock"])]);
     }
 
     /// provider の運び方は所有権検査が閉じる。要求はスロットが提供されたかと

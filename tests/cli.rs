@@ -2443,3 +2443,48 @@ fn 型引数の変わるgeneric_implの再帰は実行前に失敗する() {
         "polymorphic recursion",
     );
 }
+
+/// generic な helper の callback が要求するスロットの提供忘れは、実行前に
+/// helper と callback の両方を含む経路付きで報告される(MAP-050)
+#[test]
+fn generic_helper越しの提供忘れは実行前に経路付きで失敗する() {
+    実行前に失敗する(
+        "trait Clock { fn now(&self -> int) }\n\
+         struct Frozen { at: int }\n\
+         impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+         effect clock: Clock\n\
+         fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) { apply(ticked, 1) }\n",
+        "main::clock が要る ← main::ticked ← main::apply ← main::main",
+    );
+}
+
+/// slot を要らない具体化は、兄弟の具体化のスロットを一覧でも引き継がない
+/// (MAP-050)
+#[test]
+fn 不要なslotはgeneric_の別の具体化へ伝播しない() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Clock { fn now(&self -> int) }\n\
+         struct Frozen { at: int }\n\
+         impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+         effect clock: Clock\n\
+         fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) {\n\
+           let quiet = apply(plain, 1)\n\
+           with clock(Frozen { at = 1000 }) { apply(ticked, quiet) }\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 1002"), "{text}");
+    // 具体化は同じ宣言名を名乗るが、要求は片方だけに付く
+    assert!(text.contains("  main::apply / (要求なし)\n"), "{text}");
+    assert!(text.contains("  main::apply #2 / main::clock\n"), "{text}");
+}
