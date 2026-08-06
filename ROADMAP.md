@@ -115,7 +115,7 @@ fn main(-> [User?]) {
 | MAP-050 | `done` | 関数値と型引数ごとに ambient 要求を推論する | MAP-040 | L | 不要 |
 | MAP-060 | `done` | 汎用関数と trait method の具体化を HIR インタプリタで実行する | MAP-030, MAP-040, MAP-050 | M | 不要 |
 | MAP-070 | `done` | 汎用関数と trait method の具体化を Core Wasm へ生成する | MAP-030, MAP-040, MAP-050 | L | 不要 |
-| MAP-075 | `needs-design` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 必要 |
+| MAP-075 | `ready` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 不要 |
 | MAP-080 | `ready` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
 | MAP-090 | `ready` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
 | MAP-100 | `ready` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
@@ -252,9 +252,31 @@ fn main(-> [User?]) {
 
 ### MAP-075 — 配列構築手段
 
-実装前に、通常の Rhodolite コードが `[U]` を組み立てる最小 API と
-その ownership、評価順、OOM 時の振る舞いを決める。決定後に個別の完了条件と
-検証方法を追加し、`ready` / `不要` へ変更する。
+契約は MAP-Q6（Decisions）で確定済み。`trait Push<T> { fn push(&mut self, x: T) }`
+を新設し、`impl<T> Push<T> for [T]` はコンパイラ組み込み実装として提供する。
+
+完了条件:
+
+- `Push<T>` trait を宣言でき、`impl<T> Push<T> for [T]` が型検査・要求推論・
+  ownership 検査を通る（本体は `array_clone` / `array_drop` と同じ位置付けの
+  コンパイラ組み込みで、通常の Rhodolite ソースでは書けない）
+- `xs.push(y)` は `xs` を既存の暗黙 `&mut` 借用規約（`db.save(...)` と同じ）で
+  可変借用し、`y` は通常の関数呼び出し引数と同じ move-once セマンティクスで
+  評価される
+- capacity 超過時は倍々成長する。capacity が 0 の配列への初回 push は
+  capacity 1 を確保し、以降は現在の capacity の2倍を確保する
+- push 中の realloc が OOM した場合、既存 allocator 規約（ADR-0011）どおり
+  `unreachable` トラップする。push 固有の新しい失敗表現は追加しない
+- インタプリタと Core Wasm の両方で push を実行でき、結果配列の内容・長さ・
+  要素の所有権最終状態が一致する
+- `len()` や添字アクセス（`xs[i]`）は今回のスコープに含めない
+
+検証方法:
+
+- typecheck / ownership の `Push<T>` 契約と `&mut` 借用の焦点テスト
+- push の容量成長（0→1→2→4→...）と realloc 発生時のコピーを検証する
+  snapshot / unit test
+- push を使う小さなプログラムのインタプリタと Wasm の差分実行テスト
 
 ### MAP-080 — `Map<T>` trait と配列 impl
 
@@ -320,6 +342,8 @@ fn main(-> [User?]) {
 - callable 値の aggregate 格納と公開 ABI
 - 関数単位キャッシュと増分ビルド
 - LSP と IDE 連携
+- 配列の `len()`（長さ取得）と添字アクセス（`xs[i]`）。MAP-075 では
+  `push` のみを追加し、これらは意図的にスコープ外にした
 
 ## Non-goals
 
@@ -335,7 +359,7 @@ fn main(-> [User?]) {
 
 まだ設計判断が終わっていない問題。
 
-- **MAP-Q6:** 通常の Rhodolite コードが結果配列を組み立てる最小 API をどうするか
+なし
 
 ## Decisions
 
@@ -362,3 +386,13 @@ fn main(-> [User?]) {
   同じキーの再帰は具体化枠を先に確保して共有する。一つの再帰循環で同じ
   generic 宣言が異なる型引数を要求する polymorphic recursion は、
   無限具体化を避けるため実行前に診断する。
+- **MAP-Q6 — 配列構築手段:** `trait Push<T> { fn push(&mut self, x: T) }` を
+  新設し、`impl<T> Push<T> for [T]` はコンパイラ組み込み実装として提供する
+  （生バッファ操作を要するため通常の Rhodolite ソースでは書けない。
+  `array_clone` / `array_drop` と同じ位置付け）。`xs.push(y)` は既存の
+  暗黙 `&mut` 借用規約（`db.save(...)` と同じ）で `xs` を可変借用し、`y` は
+  通常の関数呼び出し引数と同じ move-once セマンティクスで評価される。
+  capacity 超過時は倍々成長し、capacity 0 からの初回 push は capacity 1 を
+  確保する。realloc が OOM した場合は既存 allocator 規約（ADR-0011）どおり
+  `unreachable` トラップし、push 固有の失敗表現は追加しない。`len()` と
+  添字アクセス（`xs[i]`）は今回のスコープに含めない（Future Directions）。
