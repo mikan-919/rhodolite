@@ -15,8 +15,10 @@ mutable borrows, inherent and trait methods, value and type slots, nested
 method instantiation (both scalar and owned-value cases, with and without
 callback-bound ambient requirements), array construction via `push`
 (including a capacity-growth boundary and a moved-in non-`Copy` element),
-and the canonical production program. Each corpus member SHALL identify
-the entry point and any observable final state required for comparison.
+generic array `map` (including an owned element and an ambient-requiring
+callback), and the canonical production program. Each corpus member SHALL
+identify the entry point and any observable final state required for
+comparison.
 
 #### Scenario: Every compiled-v1 feature family is represented
 - **WHEN** the maintained differential suite runs
@@ -46,6 +48,20 @@ the entry point and any observable final state required for comparison.
 - **THEN** it executes at least one corpus member that moves a non-`Copy`
   value into an array via `push` and compares the interpreter's and the
   generated module's final ownership state for that value
+
+#### Scenario: Generic array `map` with an owned element is represented
+- **WHEN** the maintained differential suite runs
+- **THEN** it executes at least one corpus member that calls `move
+  xs.map(f)` on an array of a non-`Copy` element type and compares the
+  interpreter's and the generated module's resulting array and final
+  ownership state
+
+#### Scenario: Generic array `map` with an ambient-requiring callback is represented
+- **WHEN** the maintained differential suite runs
+- **THEN** it executes at least one corpus member that calls `move
+  xs.map(f)` where `f` requires an ambient slot provided around the call,
+  and compares the interpreter's and the generated module's resulting
+  array
 
 ### Requirement: Observable execution outcomes are compared
 For every corpus member, the suite SHALL execute the same loaded program through

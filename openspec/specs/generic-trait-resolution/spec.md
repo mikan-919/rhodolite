@@ -3,8 +3,10 @@
 Checks a generic `impl`'s methods against its trait's declared contract with
 type parameters substituted and corresponded, and lets a method call on a
 concrete receiver resolve, uniquely, into a cached, concrete, directly
-executable generic `impl` method instance — without yet resolving an impl
-whose target is not a declared struct.
+executable generic `impl` method instance — for a target naming a declared
+struct or an array of the impl's own type parameter (the `impl<T> Trait<T>
+for [T]` shape), without yet resolving an impl whose target is any other
+non-struct shape.
 
 ## Requirements
 
@@ -28,13 +30,29 @@ for an arity mismatch, both the expected and given counts.
 - **THEN** compilation fails with a diagnostic reporting the expected and
   given type-argument counts
 
-### Requirement: A generic impl's target must name a declared struct
+### Requirement: A generic impl's target must name a declared struct or an array of the impl's own type parameter
 The system SHALL require a generic `impl`'s target type, after substituting
-the impl's own type parameters, to name a declared struct, using the same
-requirement and diagnostic a non-generic `impl`'s target already has.
+the impl's own type parameters, to either name a declared struct, or to be
+an array whose element type is exactly one of the impl's own type
+parameters (the `impl<T> Trait<T> for [T]` shape). Any other target shape
+— a concrete-element array, a callable type, a builtin, or any other
+non-struct, non-`[T]` shape — SHALL be rejected using the same requirement
+and diagnostic a non-generic `impl`'s target already has.
 
-#### Scenario: A generic impl targeting an array is rejected
-- **WHEN** the source declares `impl<T> Foo<T> for [T] { ... }`
+#### Scenario: A generic impl targeting `[T]` with the impl's own type parameter is accepted
+- **WHEN** the source declares a trait `Foo<T>` and `impl<T> Foo<T> for [T] { ... }`,
+  where `T` is the impl's own type parameter
+- **THEN** compilation accepts the impl's target and proceeds to
+  contract-check its methods
+
+#### Scenario: A generic impl targeting a concrete-element array is rejected
+- **WHEN** the source declares `impl<T> Foo<T> for [int] { ... }` (a
+  concrete element type, not the impl's own type parameter)
+- **THEN** compilation fails with a diagnostic reporting that the target is
+  not a struct
+
+#### Scenario: A generic impl targeting a callable type is rejected
+- **WHEN** the source declares `impl<T> Foo<T> for fn(T -> T) { ... }`
 - **THEN** compilation fails with a diagnostic reporting that the target is
   not a struct
 
@@ -230,7 +248,8 @@ differs while its type arguments stay the same is not polymorphic recursion.
 ## Non-Goals
 
 - Resolving or contract-checking an impl whose target does not name a
-  declared struct (an array, callable, builtin, or blanket impl target).
+  declared struct or an array of the impl's own type parameter (a
+  concrete-element array, callable, builtin, or blanket impl target).
 - Resolving a generic trait method through ambient/slot dispatch (`with` /
   a slot-typed receiver).
 - Generating only reachable instantiations as a deliberate whole-program
