@@ -96,6 +96,6 @@
       `every_fixture_is_byte_deterministic_and_independently_executable` で
       確認した。
 - [x] 6.5 安定状態を単独のスナップショットとしてコミットした。
-- [ ] 6.6 `array-push` / `method-call-type-checking` /
+- [x] 6.6 `array-push` / `method-call-type-checking` /
       `differential-execution` の delta spec を `openspec/specs/` へ sync し、
       ROADMAP.md の MAP-075 を `done` にする(後続ステップ)。
