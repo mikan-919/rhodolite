@@ -116,7 +116,7 @@ fn main(-> [User?]) {
 | MAP-060 | `done` | 汎用関数と trait method の具体化を HIR インタプリタで実行する | MAP-030, MAP-040, MAP-050 | M | 不要 |
 | MAP-070 | `done` | 汎用関数と trait method の具体化を Core Wasm へ生成する | MAP-030, MAP-040, MAP-050 | L | 不要 |
 | MAP-075 | `done` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 不要 |
-| MAP-080 | `ready` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
+| MAP-080 | `in-progress` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
 | MAP-090 | `ready` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
 | MAP-100 | `ready` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
 
