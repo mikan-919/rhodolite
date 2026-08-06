@@ -287,6 +287,29 @@ const GENERIC_IMPL_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+/// 非 `Copy` の値を `move` で汎用の消費 callback へ渡す形。struct と配列の
+/// どちらも通し、所有値の最終状態が interpreter と Wasm で一致することを
+/// 押さえる(MAP-070)
+const GENERIC_OWNED_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "struct Tag { name: str, weight: int }\n\
+             fn weigh(t: Tag -> int) { t.weight }\n\
+             fn labelled(t: Tag -> int) { if t.name == \"kept\": 100 else: 0 }\n\
+             fn total(xs: [int] -> int) {\n\
+               let mut sum = 0\n\
+               for x in move xs { sum = sum + x }\n\
+               sum\n\
+             }\n\
+             fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(move x) }\n\
+             fn hold<T>(x: T -> T) { x }\n\
+             fn main(-> int) {\n\
+               let first = Tag { name = \"kept\", weight = 5 }\n\
+               let second = hold(Tag { name = \"kept\", weight = 7 })\n\
+               let numbers = hold([1, 2, 3])\n\
+               apply(weigh, move first) + apply(labelled, move second) + apply(total, move numbers)\n\
+             }\n",
+}];
+
 const CANONICAL_FILES: &[FixtureFile] = &[FixtureFile {
     path: "main.rd",
     source: include_str!("../examples/canonical.rd"),
@@ -380,6 +403,12 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "generic-ambient-callbacks",
         files: GENERIC_AMBIENT_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "generic-owned-value",
+        files: GENERIC_OWNED_FILES,
         probes: &[],
         expected_failure: None,
     },
