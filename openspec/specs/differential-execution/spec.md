@@ -13,9 +13,10 @@ scalar control flow, owned-data construction and cleanup, explicit shared and
 mutable borrows, inherent and trait methods, value and type slots, nested
 `with` provisions, provider substitution, generic function and generic trait
 method instantiation (both scalar and owned-value cases, with and without
-callback-bound ambient requirements), and the canonical production program.
-Each corpus member SHALL identify the entry point and any observable final
-state required for comparison.
+callback-bound ambient requirements), array construction via `push`
+(including a capacity-growth boundary and a moved-in non-`Copy` element),
+and the canonical production program. Each corpus member SHALL identify
+the entry point and any observable final state required for comparison.
 
 #### Scenario: Every compiled-v1 feature family is represented
 - **WHEN** the maintained differential suite runs
@@ -32,6 +33,19 @@ state required for comparison.
 - **THEN** it executes at least one corpus member that moves a non-`Copy`
   value through a generic function or generic trait method instantiation and
   compares the interpreter's and the generated module's final result
+
+#### Scenario: `push` with a capacity-growth boundary is represented
+- **WHEN** the maintained differential suite runs
+- **THEN** it executes at least one corpus member that pushes past a
+  capacity-doubling boundary (for example, from a length that fills
+  capacity 1 into capacity 2) and compares the interpreter's and the
+  generated module's resulting array length and contents
+
+#### Scenario: `push` with an owned element is represented
+- **WHEN** the maintained differential suite runs
+- **THEN** it executes at least one corpus member that moves a non-`Copy`
+  value into an array via `push` and compares the interpreter's and the
+  generated module's final ownership state for that value
 
 ### Requirement: Observable execution outcomes are compared
 For every corpus member, the suite SHALL execute the same loaded program through
