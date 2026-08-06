@@ -251,6 +251,7 @@ fn check_expr(
         hir::ExprKind::Str(_) => {}
         hir::ExprKind::Access { place, .. } => children.push(*place),
         hir::ExprKind::Clone(inner) => children.push(*inner),
+        hir::ExprKind::Push { array, value } => children.extend([*array, *value]),
         hir::ExprKind::Nil => {}
         hir::ExprKind::UnitStruct(_) => {}
         hir::ExprKind::StructLit { fields, .. } => {
@@ -583,6 +584,16 @@ fn stash_sites(
                     }
                 }
             }
+            // 押し込む要素も宣言された要素型で受ける(配列リテラルと同じ)
+            hir::ExprKind::Push { array, value } => {
+                let element = body.expr(*array).result.ty().and_then(|ty| match &ty.kind {
+                    hir::TypeKind::Array(element) => Some((**element).clone()),
+                    _ => None,
+                });
+                if let Some(element) = element {
+                    sites.push((*value, values_of(layouts, program, &element)));
+                }
+            }
             hir::ExprKind::Coalesce { lhs, .. } => {
                 if let Some(ty) = body.expr(*lhs).result.ty().cloned() {
                     sites.push((*lhs, values_of(layouts, program, &ty)));
@@ -634,7 +645,9 @@ fn needs_scratch(
         | hir::ExprKind::Field { .. }
         | hir::ExprKind::Match { .. }
         // 対象・buffer・長さ・添字・要素・取り出した根を持ち回す
-        | hir::ExprKind::For { .. } => true,
+        | hir::ExprKind::For { .. }
+        // 帳簿・次の席・押し込む一時値を持ち回す(MAP-075)
+        | hir::ExprKind::Push { .. } => true,
         hir::ExprKind::AssignLocal { value, .. } => owned(layouts, *value),
         hir::ExprKind::Eq { lhs, rhs } => owned(layouts, *lhs) || owned(layouts, *rhs),
         // `??` は左辺の optional を受け直してから枝を選ぶ
@@ -674,6 +687,37 @@ fn plan_reachable(layouts: &mut Layouts, program: &hir::Program, plan: &Plan) {
             }
         }
     }
+}
+
+/// `push` が届いた配列の並び(MAP-075)。`reserve` を出す並びを決める。
+///
+/// 走査は instance の計画順、その中は式の番号順なので、同じ入力からは同じ集合
+fn pushed_layouts(
+    layouts: &mut Layouts,
+    program: &hir::Program,
+    plan: &Plan,
+) -> BTreeSet<LayoutId> {
+    let mut pushed = BTreeSet::new();
+    for (_, instance) in plan.instances() {
+        let hir::BodyId::Callable(id) = instance.key.body else {
+            continue;
+        };
+        let body = &program.callables[id].body;
+        for (_, expr) in body.exprs() {
+            let hir::ExprKind::Push { array, .. } = expr.kind else {
+                continue;
+            };
+            let Some(ty) = body.expr(array).result.ty() else {
+                continue;
+            };
+            if let Ok(ReprKind::Owned(layout) | ReprKind::Borrowed(layout)) =
+                layouts.repr(program, ty).map(|repr| repr.kind)
+            {
+                pushed.insert(layout);
+            }
+        }
+    }
+    pushed
 }
 
 /// 文字列リテラルを静的データへ決定的に並べる(tasks 4.1)。
@@ -1095,6 +1139,12 @@ impl Emitter<'_> {
                 {
                     wasm_data::mark_moved(&mut self.out, flag);
                 }
+            }
+
+            // 組み込みの `push`(MAP-075 決定3)
+            hir::ExprKind::Push { array, value } => {
+                let (array, value) = (*array, *value);
+                self.push_element(id, array, value);
             }
 
             // glue は割り当て済みの器へ写す。根はここで用意する
@@ -2108,6 +2158,55 @@ impl Emitter<'_> {
         self.out.get(root);
     }
 
+    /// 組み込みの `push`(MAP-075 決定3)。
+    ///
+    /// レシーバは検査器が挿した `&mut [T]` なので、評価すると帳簿のアドレスが
+    /// 1つ載る。容量は並びごとの `reserve` に任せ、ここは「次の席を求めて要素を
+    /// 収め、長さを1つ進める」だけ。席の求め方は `reserve` の後でなければ
+    /// ならない — 伸びると `data` が別のアドレスへ移る
+    fn push_element(&mut self, id: hir::ExprId, array: hir::ExprId, value: hir::ExprId) {
+        let layout = self
+            .compound_layout(array)
+            .expect("`push` のレシーバは配列を指す");
+        let (element, stride) = self.array_parts(layout);
+        let element_ty = self.element_type(array);
+        let scratch = self.scratch(id);
+        let (root, seat, temporary) = (scratch, scratch + 1, scratch + 2);
+
+        let want = self.produced(array);
+        self.expr(array, &want);
+        self.out.set(root);
+        self.push(Instruction::LocalGet(root));
+        self.push(Instruction::Call(self.indices.reserve_of(layout)));
+
+        self.out
+            .get(root)
+            .ins(Instruction::I32Load(wasm_data::buffer_data()));
+        self.out
+            .get(root)
+            .ins(Instruction::I32Load(wasm_data::buffer_len()));
+        if stride != 1 {
+            self.out.num(stride).ins(Instruction::I32Mul);
+        }
+        self.out.ins(Instruction::I32Add).set(seat);
+
+        let slot = wasm_layout::Slot {
+            offset: 0,
+            layout: element,
+            indirect: false,
+            nullable: false,
+        };
+        self.install_slot(&slot, value, &element_ty, seat, temporary);
+
+        self.out
+            .get(root)
+            .get(root)
+            .ins(Instruction::I32Load(wasm_data::buffer_len()))
+            .num(1)
+            .ins(Instruction::I32Add)
+            .ins(Instruction::I32Store(wasm_data::buffer_len()));
+    }
+
     /// 配列の並びから、要素の並びと刻み幅
     fn array_parts(&mut self, layout: LayoutId) -> (LayoutId, u32) {
         match self.layouts.get(layout).shape {
@@ -2676,6 +2775,12 @@ fn build(
     let mut indices = Indices::reserve(&layouts, glue_base);
     indices.alloc = runtime_base + wasm_runtime::ALLOC;
     indices.free = runtime_base + wasm_runtime::FREE;
+    // 配列の `reserve` は glue の後ろ。`push` が届いた並びにだけ出す
+    // (MAP-075 決定3)
+    let reserve_base = glue_base + indices.glue_count();
+    let pushed = pushed_layouts(&mut layouts, program, plan);
+    indices.reserve_arrays(&layouts, reserve_base, &pushed);
+    let helper_end = reserve_base + indices.reserve_count();
 
     // 公開署名に出た型だけが直列化関数を持つ。内部の型は境界に出ない
     let version = signatures.version();
@@ -2684,7 +2789,7 @@ fn build(
         .iter()
         .map(|ty| layouts.plan(program, ty).expect("公開型は 32bit に収まる"))
         .collect();
-    let wires = wasm_wire::Wires::reserve(&layouts, &roots, glue_base + indices.glue_count());
+    let wires = wasm_wire::Wires::reserve(&layouts, &roots, helper_end);
     let reserve_index = runtime_base + wasm_runtime::RESERVE;
 
     let mut types = Types::default();
@@ -2769,6 +2874,7 @@ fn build(
         for helper in Runtime::helpers(runtime_base)
             .into_iter()
             .chain(wasm_data::glue_functions(&layouts, &indices))
+            .chain(wasm_data::reserve_functions(&layouts, &indices))
             .chain(wasm_wire::wire_functions(
                 program, &layouts, &wires, &indices,
             ))
@@ -5061,6 +5167,122 @@ pub(crate) mod tests {
                 "{src}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 組み込みの `push`(MAP-075)
+    // -----------------------------------------------------------------------
+
+    /// 容量の境界(1→2→4)を越えても、要素の並びと長さは interpreter と一致する
+    #[test]
+    fn pushは容量の境界を越えても同じ配列を作る() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let mut xs = [1]\n\
+                 \x20 xs.push(2)\n\
+                 \x20 xs.push(3)\n\
+                 \x20 xs.push(4)\n\
+                 \x20 xs.push(5)\n\
+                 \x20 let mut total = 0\n\
+                 \x20 let mut count = 0\n\
+                 \x20 for x in &xs { total = total + x }\n\
+                 \x20 for x in &xs { count = count + 1 }\n\
+                 \x20 total * 10 + count\n\
+                 }\n"
+            ),
+            155
+        );
+    }
+
+    /// 容量 0 の配列への初回 push も通る
+    #[test]
+    fn 空の配列へのpushも通る() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let mut xs: [int] = []\n\
+                 \x20 xs.push(7)\n\
+                 \x20 let mut total = 0\n\
+                 \x20 for x in xs { total = total + x }\n\
+                 \x20 total\n\
+                 }\n"
+            ),
+            7
+        );
+    }
+
+    /// 所有する要素を push しても、伸ばした先で中身は生きたまま残る
+    #[test]
+    fn pushした所有要素は伸ばしても残る() {
+        assert_eq!(
+            same_as_interpreter(
+                "fn main(-> int) {\n\
+                 \x20 let mut xs = [\"a\"]\n\
+                 \x20 xs.push(\"b\")\n\
+                 \x20 xs.push(\"c\")\n\
+                 \x20 let mut hits = 0\n\
+                 \x20 for s in &xs { if s == \"a\" { hits = hits + 1 } }\n\
+                 \x20 for s in &xs { if s == \"c\" { hits = hits + 10 } }\n\
+                 \x20 hits\n\
+                 }\n"
+            ),
+            11
+        );
+    }
+
+    /// 有界なループの中で作っては捨てる配列は、伸ばして解放した buffer を
+    /// 使い回す。1ページに縛って走らせるので、漏れていれば trap する。
+    ///
+    /// 伸ばす側を関数に切り出してあるのは、同じ本体で `&mut` レシーバを二度
+    /// 借りるループが所有権検査に通らないため — `&mut c.bump(..)` を二度書く
+    /// ループと同じ既存の制限で、`push` に固有のものではない
+    #[test]
+    fn pushで伸ばした記憶は使い回される() {
+        let src = "fn built(-> int) {\n\
+                   \x20 let mut xs = [1]\n\
+                   \x20 xs.push(2)\n\
+                   \x20 xs.push(3)\n\
+                   \x20 xs.push(4)\n\
+                   \x20 xs.push(5)\n\
+                   \x20 let mut total = 0\n\
+                   \x20 for x in xs { total = total + x }\n\
+                   \x20 total\n\
+                   }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 2000) == false {\n\
+                   \x20   if built() == 15 { n = n + 1 } else { return 0 }\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![2000]));
+    }
+
+    /// 伸ばすための割り当てが取れなければ、既存の allocator 規約どおり
+    /// `unreachable` で落ちる(ADR-0011 §3)。push 固有の失敗値は無いので、
+    /// 呼び出し側からは trap としてしか観測できない。上限を広げれば同じ
+    /// プログラムが通ることも見る
+    #[test]
+    fn pushの割り当てが取れなければtrapする() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut xs = [0]\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 20000) == false {\n\
+                   \x20   xs.push(n)\n\
+                   \x20   n = n + 1\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert!(
+            invoke_capped(&bytes, ENTRY_EXPORT, 1).is_err(),
+            "1ページには収まらない"
+        );
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 16), Ok(vec![20000]));
     }
 
     // -----------------------------------------------------------------------

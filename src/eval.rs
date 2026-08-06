@@ -506,6 +506,23 @@ impl<'p> CheckedInterp<'p> {
                 self.replace_runtime_field(&place, *field, value)?;
                 Ok(CheckedValue::Owned(OwnedValue::Unit))
             }
+            // 組み込みの `push`(MAP-075 決定4)。`StoredValue::Array` は既に
+            // `Vec` なので、容量の帳簿は Rust に任せて要素を1つ足すだけ。
+            // 場所は右辺より先に解決する — 所有権計画がレシーバの排他アクセスを
+            // 値の評価より前に記録しているため
+            hir::ExprKind::Push { array, value } => {
+                let place = self.place_from_expr(body, *array)?;
+                let place = self.runtime_place(env, &place)?;
+                let evaluated = self.eval(body, *value, env)?;
+                let element = self.owned(evaluated)?;
+                let target = self.read_place(&place)?;
+                let id = self.location(target)?;
+                let StoredValue::Array(values) = self.store.get_mut(id) else {
+                    return fail("push の対象が配列ではありません");
+                };
+                values.push(element);
+                Ok(CheckedValue::Owned(OwnedValue::Unit))
+            }
             hir::ExprKind::Clone(inner) => {
                 let evaluated = self.eval(body, *inner, env)?;
                 let value = self.owned_ref(&evaluated)?;
@@ -3042,5 +3059,54 @@ fn main(-> int) {
             run(&generic_ambient_src(), "quiet"),
             Ok(Value::Int(2))
         ));
+    }
+
+    // ---- 組み込みの `push`(MAP-075 決定4) ----
+
+    /// 繰り返し押し込むと、書いた順にそのまま並ぶ
+    #[test]
+    fn pushは順序と長さを保つ() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut xs = [1]\n\
+                   \x20 xs.push(2)\n\
+                   \x20 xs.push(3)\n\
+                   \x20 xs.push(4)\n\
+                   \x20 let mut seen = 0\n\
+                   \x20 let mut count = 0\n\
+                   \x20 for x in &xs { seen = seen * 10 + x }\n\
+                   \x20 for x in &xs { count = count + 1 }\n\
+                   \x20 seen * 10 + count\n\
+                   }\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(12344))));
+    }
+
+    /// 容量 0 の配列へも押し込める
+    #[test]
+    fn 空の配列へもpushできる() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut xs: [int] = []\n\
+                   \x20 xs.push(9)\n\
+                   \x20 let mut total = 0\n\
+                   \x20 for x in xs { total = total + x }\n\
+                   \x20 total\n\
+                   }\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(9))));
+    }
+
+    /// 非 Copy の値は配列の中へ移る。移った先から読めることで、所有が
+    /// 配列側にあることを見る(元の束縛が使えないことは所有権検査が断る)
+    #[test]
+    fn pushした非copyの値は配列が持つ() {
+        let src = "struct Item { name: str, n: int }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut xs = [Item { name = \"a\", n = 1 }]\n\
+                   \x20 let it = Item { name = \"b\", n = 2 }\n\
+                   \x20 xs.push(move it)\n\
+                   \x20 let mut total = 0\n\
+                   \x20 for i in &xs { if i.name == \"b\" { total = total + i.n } }\n\
+                   \x20 for i in &xs { total = total + i.n }\n\
+                   \x20 total\n\
+                   }\n";
+        assert!(matches!(checked_run(src, "main"), Ok(Value::Int(5))));
     }
 }

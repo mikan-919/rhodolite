@@ -310,6 +310,60 @@ const GENERIC_OWNED_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+/// 組み込みの `push` で配列を伸ばす形。`[1]`(capacity 1)から始めて 1→2→4 と
+/// 二度容量境界を越え、要素の並びと長さが interpreter と Wasm で一致すること、
+/// 空の配列(capacity 0)への初回 push が通ることを押さえる(MAP-075)
+const PUSH_GROWTH_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Push<T> { fn push(&mut self, x: T) }\n\
+             fn sum(xs: &[int] -> int) {\n\
+               let mut total = 0\n\
+               for x in xs { total = total + x }\n\
+               total\n\
+             }\n\
+             fn count(xs: &[int] -> int) {\n\
+               let mut n = 0\n\
+               for x in xs { n = n + 1 }\n\
+               n\n\
+             }\n\
+             fn main(-> int) {\n\
+               let mut xs = [1]\n\
+               xs.push(2)\n\
+               xs.push(3)\n\
+               xs.push(4)\n\
+               xs.push(5)\n\
+               let mut empty: [int] = []\n\
+               empty.push(100)\n\
+               sum(&xs) * 100 + count(&xs) * 10 + sum(&empty) / 100\n\
+             }\n",
+}];
+
+/// 非 `Copy` の値を `push` で配列へ move する形。押し込んだ後の元の束縛は
+/// 使えないので、最終状態は配列の側にしか無い。所有が両実行系で同じところへ
+/// 落ち着くことを押さえる(MAP-075)
+const PUSH_OWNED_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Push<T> { fn push(&mut self, x: T) }\n\
+             struct Tag { name: str, weight: int }\n\
+             fn weigh(xs: &[Tag] -> int) {\n\
+               let mut total = 0\n\
+               for t in xs { total = total + t.weight }\n\
+               total\n\
+             }\n\
+             fn labelled(xs: &[Tag] -> int) {\n\
+               let mut hits = 0\n\
+               for t in xs { if t.name == \"kept\" { hits = hits + 1 } }\n\
+               hits\n\
+             }\n\
+             fn main(-> int) {\n\
+               let mut tags = [Tag { name = \"kept\", weight = 5 }]\n\
+               let second = Tag { name = \"kept\", weight = 7 }\n\
+               tags.push(move second)\n\
+               tags.push(Tag { name = \"dropped\", weight = 11 })\n\
+               weigh(&tags) * 10 + labelled(&tags)\n\
+             }\n",
+}];
+
 const CANONICAL_FILES: &[FixtureFile] = &[FixtureFile {
     path: "main.rd",
     source: include_str!("../examples/canonical.rd"),
@@ -409,6 +463,18 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "generic-owned-value",
         files: GENERIC_OWNED_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "push-capacity-growth",
+        files: PUSH_GROWTH_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "push-owned-element",
+        files: PUSH_OWNED_FILES,
         probes: &[],
         expected_failure: None,
     },

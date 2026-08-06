@@ -1193,6 +1193,21 @@ impl<'a> Build<'a> {
             // 違いで、`carry_from` を呼ばないことがそのまま所有の独立性になる
             // (design.md 決定4、tasks 6.5)
             hir::ExprKind::Clone(inner) => self.value(*inner, scope, Need::Read),
+
+            // 組み込みの `push`(MAP-075)。レシーバの排他借用は検査器が挿した
+            // `&mut` そのものなので、実引数の借用と同じく**呼び出しの点まで**
+            // 生かす。要素は通常の所有引数と同じ move-once
+            hir::ExprKind::Push { array, value } => {
+                let (array, value) = (*array, *value);
+                let mark = self.plan.loans.len();
+                self.callee = Some("push".to_string());
+                self.value(array, scope, Need::Mutate);
+                self.callee = Some("push".to_string());
+                self.value(value, scope, Need::Argument("引数", Some(0)));
+                self.callee = None;
+                let at = self.point(Some(id), scope, Effect::Nop);
+                self.hold_until(mark, at);
+            }
             hir::ExprKind::Arith { lhs, rhs, .. } | hir::ExprKind::Eq { lhs, rhs } => {
                 self.value(*lhs, scope, Need::Read);
                 self.value(*rhs, scope, Need::Read);
@@ -6497,5 +6512,87 @@ fn main(-> int) {{
         assert!(placeholders(&dumped).is_empty(), "{dumped}");
         // 型変数の綴りを見張れているか、この検査自身を確かめる
         assert_eq!(placeholders("body #T0 local#1 #U12"), vec!["#T0", "#U12"]);
+    }
+
+    // ---- 組み込みの `push`(MAP-075) ----
+
+    /// 可変な束縛への `push` は、呼び出し地点に `&mut` が無くても通る
+    #[test]
+    fn pushは修飾なしで排他借用を取る() {
+        accepted(
+            "fn main(-> int) {\n\
+             \x20 let mut xs = [1]\n\
+             \x20 xs.push(2)\n\
+             \x20 1\n\
+             }\n",
+        );
+    }
+
+    /// 不変な束縛は書き換えられない。他の排他アクセスと同じ文言で断る
+    #[test]
+    fn 不変な束縛へのpushを断る() {
+        assert_eq!(
+            only(
+                "fn main(-> int) {\n\
+                 \x20 let xs = [1]\n\
+                 \x20 xs.push(2)\n\
+                 \x20 1\n\
+                 }\n"
+            )
+            .msg,
+            "main: `xs` は可変な束縛ではないので変更できません"
+        );
+    }
+
+    /// 別の借用が生きている間は借りられない。衝突の報告は他の排他借用と同じ
+    #[test]
+    fn 借用が生きている間のpushを断る() {
+        let errors = rejected(
+            "fn take(xs: &[int] -> int) { 0 }\n\
+             fn main(-> int) {\n\
+             \x20 let mut xs = [1]\n\
+             \x20 let r = &xs\n\
+             \x20 xs.push(2)\n\
+             \x20 take(r)\n\
+             }\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.msg == "main: `xs` は共有借用されている間は排他的に触れません"),
+            "{errors:#?}"
+        );
+    }
+
+    /// 押し込む値は通常の所有引数と同じ move-once。`move` が要り、
+    /// 渡した後の使用は落ちる
+    #[test]
+    fn pushした値はmoveされる() {
+        assert_eq!(
+            only(
+                "struct Item { n: int }\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut xs = [Item { n = 1 }]\n\
+                 \x20 let it = Item { n = 2 }\n\
+                 \x20 xs.push(move it)\n\
+                 \x20 it.n\n\
+                 }\n"
+            )
+            .msg,
+            "main: `it.n` は既に move されているので使えません"
+        );
+        assert_eq!(
+            only(
+                "struct Item { n: int }\n\
+                 fn main(-> int) {\n\
+                 \x20 let mut xs = [Item { n = 1 }]\n\
+                 \x20 let it = Item { n = 2 }\n\
+                 \x20 xs.push(it)\n\
+                 \x20 1\n\
+                 }\n"
+            )
+            .msg,
+            "main: `push` の第 1 引数は所有を受け取りますが、束縛済みの `it` をそのまま渡しています"
+        );
     }
 }

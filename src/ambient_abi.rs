@@ -517,6 +517,13 @@ impl<'a> Planner<'a> {
             // record の欄に載せるのはデータ下ろしの段(design.md 決定11)
             hir::ExprKind::Access { place, .. } => walk!(place),
 
+            // 組み込みの `push` は葉。呼び出し先も提供も持たないので、計画に
+            // 足すのは部分式だけ(MAP-075 決定1)
+            hir::ExprKind::Push { array, value } => {
+                walk!(array);
+                walk!(value);
+            }
+
             hir::ExprKind::With {
                 provisions,
                 body: inner,

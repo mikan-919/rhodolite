@@ -3966,7 +3966,25 @@ fn resolve(
                     {
                         return Err(clone_of(receiver.id, ty, callee.span, cx, out));
                     }
-                    // optional の中身を取り出す規則はまだ無く、配列にメソッドも無い
+                    // 組み込みの `impl<T> Push<T> for [T]`(MAP-075 決定1・2)。
+                    // 配列には宣言できるメソッドが1つも無いので、名前で隠れる
+                    // ものは存在しない
+                    Outcome::Typed(ty)
+                        if name == "push" && !ty.optional && ty.element().is_some() =>
+                    {
+                        let ty = ty.clone();
+                        return Err(push_of(
+                            &receiver,
+                            &ty,
+                            args,
+                            recv.span,
+                            callee.span,
+                            cx,
+                            locals,
+                            out,
+                        ));
+                    }
+                    // optional の中身を取り出す規則はまだ無く、配列に他のメソッドは無い
                     Outcome::Typed(ty) => match ty.name().filter(|_| !ty.optional) {
                         // 既存の解決がその名前のメンバーを1つも知らないときだけ、
                         // generic な `impl` を探しに行く(MAP-025 決定4)。
@@ -4207,6 +4225,105 @@ fn clone_of(recv: hir::ExprId, ty: &KnownType, span: Span, cx: &Cx, out: &mut Ou
         },
         kind,
     )
+}
+
+/// 組み込みの `xs.push(y)`(MAP-075、design.md 決定1・2)。
+///
+/// `impl<T> Push<T> for [T]` は生バッファ操作を要するので通常の Rhodolite
+/// ソースでは書けない。`array_clone` / `array_drop` と同じくコンパイラが本体を
+/// 持ち、呼び出し地点はここで直接 `ExprKind::Push` へ解決する。
+///
+/// レシーバは既存の暗黙 `&mut` 借用規約(`db.save(...)` と同じ)で借りる —
+/// 呼び出し地点に `&mut` を書かせず、排他借用をここで1つ挿す。挿すのは場所の
+/// ときだけで、既に `&mut [T]` を持っているならそのまま通す。引数 `y` は通常の
+/// 所有引数と同じ move-once 規約で消費される。
+#[allow(clippy::too_many_arguments)]
+fn push_of(
+    receiver: &Checked,
+    ty: &KnownType,
+    args: &[Expr],
+    recv_span: Span,
+    span: Span,
+    cx: &Cx,
+    locals: &mut Locals,
+    out: &mut Out,
+) -> Lowered {
+    let element = ty.element().cloned().expect("配列レシーバだけがここへ来る");
+    if args.len() != 1 {
+        out.push_at(
+            span,
+            format!(
+                "{}: `push` は引数を 1 個取りますが、{} 個渡しています",
+                cx.ctx,
+                args.len()
+            ),
+        );
+        for arg in args {
+            synth(arg, cx, locals, out);
+        }
+        return poison();
+    }
+    let site = Site::Arg {
+        callee: "push",
+        index: 0,
+    };
+    let value = argument(&args[0], &element, &site, cx, locals, out);
+    let Some(array) = push_receiver(receiver, ty, recv_span, cx, out) else {
+        return poison();
+    };
+    produces_unit(hir::ExprKind::Push { array, value })
+}
+
+/// `push` のレシーバを `&mut [T]` の形へ揃える。
+///
+/// 既に排他借用で持っているならそのまま。所有の**場所**なら排他借用を1つ挿す。
+/// 共有借用と一時値は借りる先が無い(または借りても捨てるだけ)なので断る。
+fn push_receiver(
+    receiver: &Checked,
+    ty: &KnownType,
+    span: Span,
+    cx: &Cx,
+    out: &mut Out,
+) -> Option<hir::ExprId> {
+    match ty.reference {
+        Some(hir::RefKind::Mutable) => Some(receiver.id),
+        Some(hir::RefKind::Shared) => {
+            out.diagnostics.push(
+                Diag::at(
+                    span,
+                    format!("{}: 共有借用 `{ty}` には push できません", cx.ctx),
+                )
+                .label("排他借用にならないレシーバ")
+                .help("排他借用 `&mut [T]` か、可変な束縛から push してください"),
+            );
+            None
+        }
+        None if !out.body.is_place(receiver.id) => {
+            out.diagnostics.push(
+                Diag::at(
+                    span,
+                    format!("{}: 場所ではない配列には push できません", cx.ctx),
+                )
+                .label("借りる先の無いレシーバ")
+                .help("先に `let mut` で束縛してから push してください"),
+            );
+            None
+        }
+        None => {
+            let borrowed = KnownType {
+                reference: Some(hir::RefKind::Mutable),
+                ..ty.clone()
+            };
+            Some(out.body.alloc_expr(hir::Expr {
+                result: hir::ExprResult::Value(lower_known(&borrowed, &cx.decls.nominal)),
+                kind: hir::ExprKind::Access {
+                    mode: AccessMode::Mutable,
+                    place: receiver.id,
+                },
+                span,
+            }))
+        }
+    }
 }
 
 /// レシーバの所有モードを署名と突き合わせる(tasks 5.2)。
@@ -8152,6 +8269,7 @@ rank: Rank }
             AssignField { .. } => "assign-field",
             Access { .. } => "access",
             Clone(_) => "clone",
+            Push { .. } => "push",
             Neg(_) => "neg",
             Arith { .. } => "arith",
             Eq { .. } => "eq",
@@ -9808,5 +9926,174 @@ fn shout(value: str -> str) { value }
         assert_eq!(free.len(), 1, "{}", program.dump());
         assert_eq!(method.len(), 1, "{}", program.dump());
         assert_ne!(free[0], method[0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 組み込みの `push`(MAP-075)
+    // -----------------------------------------------------------------------
+
+    /// `Push<T>` は普通の generic trait として宣言できる。契約は `&mut self` と
+    /// trait の型パラメータ1つで、実装は書かない — `[T]` の分はコンパイラが持つ
+    #[test]
+    fn push契約のtraitを宣言できる() {
+        let src = "trait Push<T> { fn push(&mut self, x: T) }\n\
+                   fn main(-> int) { 1 }\n";
+        assert_eq!(errors(src), Vec::<String>::new());
+        let program = lowered(src);
+        let (id, trait_) = program.traits.iter().next().expect("trait がある");
+        assert_eq!(trait_.name, "Push");
+        assert_eq!(trait_.type_params.len(), 1);
+        // trait 自身の型パラメータを使う契約は、具体化まで generic の側に載る
+        // (MAP-010 決定5)
+        let (_, contract) = program
+            .generics
+            .iter()
+            .find(|(_, decl)| decl.owner == hir::GenericOwner::Trait(id))
+            .expect("契約がある");
+        assert_eq!(contract.name, "push");
+        assert_eq!(contract.receiver, Some(hir::ReceiverMode::Mutable));
+        assert_eq!(contract.params.len(), 1);
+        assert_eq!(
+            contract.params[0].kind,
+            hir::GenericTypeKind::Param(trait_.type_params[0])
+        );
+    }
+
+    /// `impl` を1つも書かなくても、どの要素型の配列でも `push` が解決する
+    #[test]
+    fn pushはimplを書かずに複数の要素型で解決する() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut ns = [1]\n\
+                   \x20 ns.push(2)\n\
+                   \x20 let mut ss = [\"a\"]\n\
+                   \x20 ss.push(\"b\")\n\
+                   \x20 1\n\
+                   }\n";
+        assert_eq!(errors(src), Vec::<String>::new());
+        let program = lowered(src);
+        let id = program.free_callable("main").expect("main がある");
+        let pushes = program.callables[id]
+            .body
+            .exprs()
+            .filter(|(_, e)| matches!(e.kind, hir::ExprKind::Push { .. }))
+            .count();
+        assert_eq!(pushes, 2, "{}", program.dump());
+    }
+
+    /// 呼び出し地点に `&mut` を書かなくても、排他借用が1つ挿さる
+    #[test]
+    fn pushはレシーバ修飾なしで排他借用を挿す() {
+        let program = lowered(
+            "fn main(-> int) {\n\
+             \x20 let mut xs = [1]\n\
+             \x20 xs.push(2)\n\
+             \x20 1\n\
+             }\n",
+        );
+        let id = program.free_callable("main").expect("main がある");
+        let body = &program.callables[id].body;
+        let (_, push) = body
+            .exprs()
+            .find(|(_, e)| matches!(e.kind, hir::ExprKind::Push { .. }))
+            .expect("push がある");
+        let hir::ExprKind::Push { array, .. } = push.kind else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                body.expr(array).kind,
+                hir::ExprKind::Access {
+                    mode: AccessMode::Mutable,
+                    ..
+                }
+            ),
+            "{}",
+            program.dump()
+        );
+        // 結果は `unit`。失敗を表す optional も enum も被せない
+        assert_eq!(push.result, hir::ExprResult::Value(hir::Type::unit()));
+    }
+
+    /// 例外は配列レシーバに閉じている。無関係な型の `push` という名前の
+    /// メソッドは、これまでどおり `&mut` を要求する
+    #[test]
+    fn 配列でないpushはこれまでどおり修飾が要る() {
+        let src = "struct Sink { n: int }\n\
+                   impl Sink { fn push(&mut self, x: int) { self.n = self.n + x } }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut s = Sink { n = 0 }\n\
+                   \x20 s.push(1)\n\
+                   \x20 s.n\n\
+                   }\n";
+        assert_eq!(
+            only(src),
+            "main: `Sink::push` のレシーバは `&mut Sink` ですが、`Sink` を渡しています"
+        );
+    }
+
+    /// 要素型に合わない値は、通常の実引数と同じ照合で落ちる
+    #[test]
+    fn pushの要素型は配列の要素型と照合される() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut xs = [1]\n\
+                   \x20 xs.push(\"a\")\n\
+                   \x20 1\n\
+                   }\n";
+        assert_eq!(
+            only(src),
+            "main: `push` の第 1 引数は `int` ですが、`str` を渡しています"
+        );
+    }
+
+    #[test]
+    fn pushの引数の個数違いを報告する() {
+        let src = "fn main(-> int) {\n\
+                   \x20 let mut xs = [1]\n\
+                   \x20 xs.push(1, 2)\n\
+                   \x20 1\n\
+                   }\n";
+        assert_eq!(
+            only(src),
+            "main: `push` は引数を 1 個取りますが、2 個渡しています"
+        );
+    }
+
+    /// 共有借用と一時値には借りる先が無い
+    #[test]
+    fn 共有借用と一時値へのpushを報告する() {
+        assert_eq!(
+            only(
+                "fn add(xs: &[int]) { xs.push(1) }\n\
+                 fn main(-> int) { 1 }\n"
+            ),
+            "add: 共有借用 `&[int]` には push できません"
+        );
+        assert_eq!(
+            only(
+                "fn main(-> int) {\n\
+                 \x20 [1].push(2)\n\
+                 \x20 1\n\
+                 }\n"
+            ),
+            "main: 場所ではない配列には push できません"
+        );
+    }
+
+    /// `push` は本体を持たない葉なので、呼んでも ambient の要求は増えない
+    #[test]
+    fn pushはambient要求を増やさない() {
+        let program = lowered(
+            "fn build(-> int) {\n\
+             \x20 let mut xs = [1]\n\
+             \x20 xs.push(2)\n\
+             \x20 1\n\
+             }\n\
+             fn main(-> int) { build() }\n",
+        );
+        let checked = crate::ownership::check(program).expect("所有権検査を通る");
+        let analysis = crate::requirement::analyze(&checked);
+        for (_, reqs) in analysis.bodies() {
+            assert!(reqs.is_empty(), "{:?}", reqs);
+        }
     }
 }
