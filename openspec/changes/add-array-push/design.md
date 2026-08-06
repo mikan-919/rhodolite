@@ -29,7 +29,11 @@ drive every decision below:
    [T]` participating in ordinary generic-impl method resolution
    (`Decls.traits`/`Decls.impls`, `struct Decls` typecheck.rs:70-91;
    `GenericOwner::Impl`, hir.rs:278), whose body is nonetheless not parsed
-   Rhodolite source.
+   Rhodolite source. (This turned out not to be reachable as planned — see
+   Decision 1's deviation note: `Decls`/`GenericOwner::Impl` are struct-only
+   throughout the current tree, so the implementation intercepts `.push` in
+   `resolve()` instead, the same way the `.clone()` bypass above already
+   does, rather than registering a real `impl<T> Push<T> for [T]`.)
 2. **`&mut` is never auto-inserted for a bound mutable receiver.**
    `conform()` (typecheck.rs:3684) only auto-inserts a *shared* borrow;
    `conform_receiver` (typecheck.rs:4218-4240) requires the receiver's
@@ -86,23 +90,41 @@ drive every decision below:
 
 ## Decisions
 
-### 1. `impl<T> Push<T> for [T]` is a `GenericOwner::Impl` with a sentinel/builtin body marker, not a parsed one
+### 1. `impl<T> Push<T> for [T]` is a dedicated HIR node (`ExprKind::Push`), not a `GenericOwner::Impl`
 
-The impl is registered during the same declaration-collection pass that
-registers parsed `impl` blocks (near `collect()`, typecheck.rs:692), with a
-signature (`fn push(&mut self, x: T)`) constructed directly rather than
-parsed, and a body represented as a new HIR marker (e.g. a
-`hir::CallableBody::Builtin(BuiltinFn::ArrayPush)` variant, or an
-equivalent enum case alongside however `hir::Callable` currently
-represents a body) instead of a `hir::ExprId` block. Every downstream
-consumer that already switches on a callable's body kind (generic
-instantiation/specialization keying, MAP-040's whole-program key; ambient
-requirement inference, MAP-050; ownership planning, MAP-030; ambient ABI
-planning) gets one new arm: "no requirements, receiver mode `&mut`,
-argument `x` moved once, no further body to walk." The interpreter and
-Wasm backend each get one new match arm at their "call a `Callable`" entry
-point that recognizes the builtin marker and runs/emits `push`'s behavior
-directly instead of evaluating/compiling a body.
+**Implementation deviation from the plan below, verified against the tree
+before implementing:** `check_generic_impls` rejects any impl target that
+is not a struct, and `instance_owner`/`TraitImplDecl::type_`/the
+generic-impl index are all struct-typed throughout `typecheck.rs`. Routing
+`impl<T> Push<T> for [T]` through `GenericOwner::Impl` as originally
+planned would first require building the general "generic impl targeting
+`[T]`" mechanism MAP-080 is scoped to add — a bigger, unrequested surface
+this change's Non-Goals already exclude. The implementation instead follows
+the `array_clone`/`array_drop`/`.clone()` precedent directly: `resolve()`
+(`src/typecheck.rs`) intercepts a `.push` call on an array-typed receiver
+before generic-impl lookup — the same interception point already used for
+the builtin `.clone()` (`fn declares_clone`/`fn clone_of`) — and lowers it
+straight to a new `hir::ExprKind::Push { array, value }` node (`push_of`,
+`push_receiver`, `src/typecheck.rs`) instead of resolving to any
+`CallTarget::Method`. `Push<T>` itself is still declarable as an ordinary
+generic trait (`GenericOwner::Trait`, reusing MAP-025's machinery) so the
+contract's trait-declarability requirement holds, but there is no `impl`
+block, parsed or synthesized, backing `[T]`'s conformance — the array
+receiver simply never reaches generic-impl resolution because the `.push`
+interception fires first, the same way `.clone()` never reaches trait-impl
+lookup either.
+
+Every pass that already switches on `hir::ExprKind` gets one new arm
+instead of one new callable-body-kind arm: `src/requirement.rs` and
+`src/ambient_abi.rs` walk only the `array`/`value` subexpressions and
+contribute no requirement or provision; `src/ownership.rs` treats the
+receiver as an exclusive place-borrow and the value as `Need::Argument`
+(move-once), the same shape a parsed `&mut self` call already produces;
+`src/eval.rs` and `src/wasm.rs`/`src/wasm_data.rs` each get one new arm at
+their expression-lowering entry point that runs/emits `push`'s behavior
+directly. Generic instantiation/specialization keying (MAP-040) is
+untouched — the builtin has no generic declaration of its own to
+instantiate.
 
 **Alternative considered:** synthesize a fake HIR body (e.g. hand-built
 `hir::ExprKind` nodes that "happen" to implement push using only
@@ -114,21 +136,33 @@ Rhodolite ソースでは書けない" for `array_clone`/`array_drop`); a fake b
 would just be dead HIR the backend still special-cases separately, adding a
 layer for no benefit.
 
-### 2. The receiver-modifier exception is keyed to the resolved callee, not to any syntactic pattern
+**Alternative considered (originally planned, superseded by the deviation
+above):** register the impl as a `GenericOwner::Impl` with a sentinel
+builtin-body marker on `hir::Callable`, so every already-generic-impl-aware
+pass (instantiation keying, ownership planning, ambient ABI planning) picks
+it up through its existing struct-impl machinery with one new body-kind
+arm each. Superseded — that path is blocked by the struct-only assumptions
+described above, and unblocking it means building MAP-080's array-generic-impl
+mechanism first, which is out of this change's scope.
 
-`conform_receiver` (typecheck.rs:4218) is the single place a resolved
-method call's receiver is checked against its declared mode. This decision
-adds one condition there: if the resolved callee is specifically
-`Push<T>::push`'s compiler-synthesized impl (checked by comparing the
-resolved `GenericFnId`/impl identity, not by string-matching the method
-name `"push"`), treat the receiver the way `conform()` already treats a
-`&self` receiver — auto-insert the exclusive borrow — instead of requiring
-the caller's `&mut`. Every other call, including a user-declared method
-named `push` on an unrelated type, and including any future non-array
-`impl Push<T> for SomeType` if one is ever allowed, still goes through the
-unmodified `&mut`-required path, because the check keys off "this
-particular resolved impl," not off the method name or the trait name in
-isolation.
+### 2. The receiver-modifier exception is keyed to the same builtin interception as Decision 1, not to any syntactic pattern
+
+Per Decision 1's actual mechanism, `push` never reaches `conform_receiver`
+(typecheck.rs:4218) at all — the array-receiver `.push` interception in
+`resolve()` fires first and calls a dedicated `push_receiver`
+(`src/typecheck.rs`) instead. `push_receiver` treats the receiver the way
+`conform()` already treats a `&self` receiver — auto-insert the exclusive
+borrow when the receiver is a place, pass an existing `&mut [T]` through
+unchanged, and reject a shared borrow or a temporary outright — instead of
+requiring the caller's `&mut`. Every other call, including a user-declared
+method named `push` on an unrelated type, and including any future
+non-array `impl Push<T> for SomeType` if one is ever allowed, still goes
+through the unmodified `conform_receiver`/`&mut`-required path, because the
+interception in `resolve()` keys off "this call resolved as the builtin
+array-receiver `.push`" (an array-typed, non-optional receiver — see
+Decision 1) — the same way it keys off "array receiver" rather than off the
+method name `"push"` or the trait name in isolation, so an unrelated
+struct's `push` method is never touched.
 
 **Alternative considered:** make the exception apply to *any* method whose
 trait is `Push`, or generalize "compiler-builtin `&mut self` methods skip
@@ -221,22 +255,23 @@ generic fixture separate.
 
 ## Risks / Trade-offs
 
-- [Widening `conform_receiver`'s single call-site check with an
-  impl-identity special case is exactly the kind of "no branch for this
-  came from a builtin" property earlier MAP-0xx designs deliberately
-  avoided (see MAP-070 design.md Decision 1's citation of MAP-060's
-  reasoning)] → Accepted narrowly: unlike those cases, MAP-Q6 explicitly
-  requires call-site behavior to differ for `Push<T>::push` specifically,
-  so *some* branch is unavoidable; Decision 2 keeps it to the smallest
-  possible surface (one exact resolved-impl check, one call site) rather
-  than a name- or trait-keyed rule that would leak to hypothetical future
-  impls.
-- [A compiler-builtin-bodied generic impl is new machinery every later
-  builtin-trait proposal will be tempted to reuse or diverge from] →
-  Accepted; Non-Goals explicitly declines to generalize it now. If a
-  second builtin-bodied trait is proposed later, that change can decide
-  whether to reuse this shape or not with a second real data point in
-  hand.
+- [Intercepting `.push` in `resolve()` ahead of ordinary method/generic-impl
+  lookup — the same shape as the existing `.clone()` builtin — is exactly
+  the kind of "no branch for this came from a builtin" property earlier
+  MAP-0xx designs deliberately avoided (see MAP-070 design.md Decision 1's
+  citation of MAP-060's reasoning)] → Accepted narrowly: unlike those
+  cases, MAP-Q6 explicitly requires call-site behavior to differ for
+  `xs.push(y)` specifically, so *some* branch is unavoidable; Decision 1/2
+  keep it to the smallest possible surface (one array-receiver-shaped
+  interception, mirroring the precedent `.clone()` already set) rather than
+  a name- or trait-keyed rule that would leak to hypothetical future impls.
+- [A dedicated builtin-call HIR node (`ExprKind::Push`) is new machinery
+  every later builtin-trait proposal will be tempted to reuse or diverge
+  from] → Accepted; Non-Goals explicitly declines to generalize it now. If
+  a second builtin-bodied trait is proposed later, that change can decide
+  whether to reuse this shape (or the originally-planned
+  generic-impl-with-builtin-body shape, once MAP-080 makes it reachable for
+  non-struct targets) with a second real data point in hand.
 - [Realloc-on-grow doubles peak memory during the copy (old + new buffer
   briefly live)] → Accepted; this is inherent to any copying grow strategy
   and matches what `array_clone` already does for an explicit `.clone()`;
@@ -244,15 +279,16 @@ generic fixture separate.
 
 ## Migration Plan
 
-1. Add `Push<T>` trait declaration support and the compiler-synthesized
-   `impl<T> Push<T> for [T]` registration (Decision 1); confirm it type-
-   checks, resolves through ordinary generic-impl method resolution, and
-   contributes no ambient requirement.
-2. Add the `conform_receiver` exception for the resolved `Push<T>::push`
-   impl (Decision 2) and the ownership-planning move-once treatment of
-   `push`'s second argument; add focused typecheck/ownership tests for
-   both, including a negative test that an unrelated `push`-named method
-   still requires its modifier.
+1. Add `Push<T>` trait declaration support (an ordinary `GenericOwner::Trait`)
+   and the `resolve()`-level interception that lowers an array-receiver
+   `.push` call straight to `hir::ExprKind::Push` (Decision 1); confirm it
+   type-checks, is reachable with no user-written `impl`, and contributes
+   no ambient requirement.
+2. Add the `push_receiver` exclusive-borrow auto-insertion (Decision 2) and
+   the ownership-planning move-once treatment of `push`'s second argument;
+   add focused typecheck/ownership tests for both, including a negative
+   test that an unrelated `push`-named method still requires its `&mut`
+   modifier through the unmodified `conform_receiver` path.
 3. Implement interpreter execution (Decision 4) and add eval-level
    scenario tests for content, length, and owned-element final state.
 4. Implement Core Wasm codegen: the `push`-per-layout generated function
