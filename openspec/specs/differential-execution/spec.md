@@ -92,9 +92,10 @@ SHALL fail the suite with the fixture identity and both normalized outcomes.
 Every Wasm artifact used by the differential corpus SHALL validate independently,
 instantiate without required imports or an automatic start action, and be
 executed only through its exported entry or public wrapper. The suite SHALL
-retain deterministic generated-module snapshots for representative programs,
-include small generated-program cases, and build every corpus member twice to
-assert byte-identical artifacts.
+retain deterministic generated-module snapshots for representative programs —
+including a scalar, an owned-data, an ambient, and a generic array `map`
+program — include small generated-program cases, and build every corpus
+member twice to assert byte-identical artifacts.
 
 #### Scenario: Generated artifact is run independently
 - **WHEN** a corpus member is compiled for Wasm
@@ -107,7 +108,7 @@ assert byte-identical artifacts.
 - **THEN** the two generated module byte sequences are identical
 
 #### Scenario: Representative module shape is pinned
-- **WHEN** a representative scalar, owned-data, or ambient corpus member is
-  intentionally changed
+- **WHEN** a representative scalar, owned-data, ambient, or generic array
+  `map` corpus member is intentionally changed
 - **THEN** its generated-module snapshot exposes the artifact-shape change for
   review

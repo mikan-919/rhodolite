@@ -649,6 +649,7 @@ const SNAPSHOTS: &[(&str, &str)] = &[
     ("scalar-control-flow", "290:7356f883ca8980d1"),
     ("owned-data", "6522:8ab1ea22a8f5b6b9"),
     ("nested-with", "1528:69aa1d0514a51c43"),
+    ("map-ambient-callback", "2299:ec7ea823a19cc934"),
 ];
 
 fn diagnostics(diags: &[crate::diag::Diag]) -> String {
