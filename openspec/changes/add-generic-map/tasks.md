@@ -103,9 +103,9 @@
 - [x] 7.4 Confirm two consecutive builds of each new fixture are
       byte-identical.
 - [x] 7.5 Commit the stable, passing state as a single snapshot.
-- [ ] 7.6 Sync the `generic-map` / `generic-trait-resolution` /
+- [x] 7.6 Sync the `generic-map` / `generic-trait-resolution` /
       `differential-execution` delta specs to `openspec/specs/`
       (including updating `generic-trait-resolution`'s main-spec `Purpose`
       text, which currently reads "without yet resolving an impl whose
       target is not a declared struct"), archive this change, and mark
-      MAP-080 `done` in `ROADMAP.md`.
+      MAP-080 `done` in `ROADMAP.md` (ROADMAP update is a follow-up step).
