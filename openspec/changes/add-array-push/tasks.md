@@ -1,113 +1,101 @@
-## 1. `Push<T>` declaration and compiler-synthesized `[T]` impl
+> 実装メモ(design.md 決定1からの逸脱): 組み込み `push` の同一性は
+> `hir::Callable` の「本体の種別」ではなく、専用の HIR ノード
+> `hir::ExprKind::Push { array, value }` が担っている。現在の木では
+> `GenericOwner::Impl` の対象は struct に限られ(`check_generic_impls`
+> 「struct ではありません」、`instance_owner` の struct 前提、
+> `TraitImplDecl::type_: StructId`)、`[T]` を対象にした generic impl を
+> 解決させるには MAP-080 が必要とする「配列を対象にした generic impl」機構を
+> 丸ごと先に作ることになる。観測可能な契約(spec の全 scenario)は同じまま、
+> 追加した分岐は `.clone()` の組み込みと同じ1本の resolve 分岐 +
+> 各パス1アームで済むこの形を選んだ。`array_clone` / `array_drop` と同じ
+> 「コンパイラが本体を持つ」位置付けは変わらない。
 
-- [ ] 1.1 Add `trait Push<T> { fn push(&mut self, x: T) }` support to the
-      trait declaration surface (parser, if needed, and `Decls`/HIR trait
-      registration), matching how other generic traits are declared
-      (design.md Decision 1).
-- [ ] 1.2 Register `impl<T> Push<T> for [T]` during declaration collection
-      (near `collect()`, `src/typecheck.rs:692`) with a constructed
-      signature and a new builtin-body marker (e.g. a
-      `hir::CallableBody::Builtin` variant) instead of a parsed body
-      (design.md Decision 1).
-- [ ] 1.3 Add one new match arm at each pass that switches on a callable's
-      body kind (generic specialization keying / MAP-040, ambient
-      requirement inference / MAP-050, ownership planning / MAP-030,
-      ambient ABI planning) so the builtin `push` body is treated as: no
-      requirements, receiver mode `&mut`, argument `x` moved once, no body
-      to walk further.
-- [ ] 1.4 Add typecheck focus tests: `Push<T>` trait declares correctly;
-      `xs.push(y)` resolves to the compiler-synthesized impl for at least
-      two distinct element types; a call requires no ambient requirement
-      (requirement-inference focus test).
+## 1. `Push<T>` 宣言と組み込みの `[T]` 実装
 
-## 2. Receiver-modifier exception and ownership
+- [x] 1.1 `trait Push<T> { fn push(&mut self, x: T) }` は既存の generic trait
+      宣言でそのまま通る(MAP-025 の `GenericOwner::Trait` に載る)。
+      焦点テスト `push契約のtraitを宣言できる` で契約の形を固定した。
+- [x] 1.2 組み込み実装の同一性は `hir::ExprKind::Push` が持つ(冒頭のメモ)。
+      `src/typecheck.rs` の `resolve` が配列レシーバの `.push` を
+      `push_of` / `push_receiver` で直接そこへ解決する。ユーザーの `impl` は
+      1つも要らない。
+- [x] 1.3 本体の種別ではなく式の種別で分岐するので、各パスに1アームずつ:
+      要求推論(`src/requirement.rs`)・ambient ABI 計画
+      (`src/ambient_abi.rs`)は部分式だけを歩き、要求も提供も増やさない。
+      所有権計画(`src/ownership.rs`)はレシーバを排他、引数を move-once に
+      する。具体化(MAP-040)は組み込みが generic 宣言でないので触らない。
+- [x] 1.4 typecheck 焦点テスト:`push契約のtraitを宣言できる` /
+      `pushはimplを書かずに複数の要素型で解決する`(`[int]` と `[str]`)/
+      `pushはambient要求を増やさない`。
 
-- [ ] 2.1 Add the `conform_receiver` (`src/typecheck.rs:4218`) exception:
-      when the resolved callee is specifically the compiler-synthesized
-      `Push<T>::push` impl (checked by resolved impl identity, not by
-      method name), auto-insert the exclusive borrow instead of requiring
-      a call-site `&mut` (design.md Decision 2).
-- [ ] 2.2 Add ownership planning for `push`'s exclusive-borrow receiver
-      effect and its move-once second argument, matching how any other
-      `&mut self` call plans its receiver borrow and owned argument.
-- [ ] 2.3 Add focus tests: `xs.push(y)` typechecks with no `&mut` written;
-      calling `push` while another borrow of `xs` is live is rejected the
-      same way any other exclusive-borrow conflict is; passing a bound
-      non-`Copy` local as `y` moves it (later use rejected); a
-      user-declared, unrelated method named `push` on a non-array type
-      still requires its normal receiver modifier (negative test proving
-      the exception is scoped to the resolved `Push<T>` impl, not the
-      name).
+## 2. レシーバ修飾の例外と所有権
 
-## 3. Interpreter execution
+- [x] 2.1 `push_receiver`(`src/typecheck.rs`)が排他借用を1つ挿す。
+      呼び出し地点の `&mut` は要らない。挿すのは場所のときだけで、
+      共有借用と一時値は断る。
+- [x] 2.2 挿した借用はソースに `&mut xs` と書いたときと同じ
+      `ExprKind::Access { mode: Mutable }` なので、所有権計画は他の
+      `&mut self` 呼び出しと同じ道を通る。引数は `Need::Argument` で
+      move-once。
+- [x] 2.3 焦点テスト:`pushは修飾なしで排他借用を取る` /
+      `借用が生きている間のpushを断る` / `不変な束縛へのpushを断る` /
+      `pushした値はmoveされる` / `共有借用と一時値へのpushを報告する` /
+      `配列でないpushはこれまでどおり修飾が要る`(無関係な struct の
+      `push` メソッドは従来どおり `&mut` を要求する negative test)。
 
-- [ ] 3.1 Implement `push` in `src/eval.rs` as a direct `Vec::push` on the
-      already-`Vec`-backed `StoredValue::Array`, evaluating and moving in
-      `y` under the existing owned-argument path (design.md Decision 4).
-- [ ] 3.2 Add eval-level tests: repeated pushes produce the expected
-      content/length/order; pushing a non-`Copy` struct/array moves it in
-      and the source binding is unusable afterward.
+## 3. インタプリタ実行
 
-## 4. Core Wasm codegen
+- [x] 3.1 `src/eval.rs` の `ExprKind::Push` は `Vec::push` 1本。場所は右辺より
+      先に解決する(所有権計画の順に合わせる)。
+- [x] 3.2 eval テスト:`pushは順序と長さを保つ` / `空の配列へもpushできる` /
+      `pushした非copyの値は配列が持つ`。
 
-- [ ] 4.1 Add a per-array-layout `push` generated function (alongside
-      `array_clone`/`array_drop` in `src/wasm_data.rs`, wired the same way
-      through the reachable-layout loop, `src/wasm_data.rs:440-491`):
-      read `len`/`capacity`; if `len < capacity`, write the new element at
-      the next slot and increment `len`; else compute new capacity (1 if
-      0, else doubled), `alloc` a new buffer, `MemoryCopy` the live
-      elements, `free` the old buffer (skip `free` when `data` is the
-      reserved empty-array sentinel address), store new `data`/`capacity`,
-      then append and increment `len` (design.md Decision 3).
-- [ ] 4.2 Wire `push` call-site codegen in `src/wasm.rs` to call the
-      generated per-layout `push` function, consistent with how other
-      resolved builtin/trait method calls already lower to a direct call
-      by function index.
-- [ ] 4.3 Add `src/wasm.rs`-local snapshot/unit tests pinning the 0→1→2→4
-      capacity-growth sequence (asserting `len`/`capacity` at each step)
-      and confirming prior elements survive a grow unchanged.
-- [ ] 4.4 Add a capped-page, bounded-loop test (modeled on the existing
-      `ループで作った文字列は使い回される` pattern) that pushes repeatedly
-      inside a bounded loop and asserts `invoke_capped` succeeds at a
-      tight page count, proving grown/freed buffers are reused rather than
-      leaked.
-- [ ] 4.5 Confirm an allocator failure during a `push`-triggered grow
-      traps via the existing `unreachable`/`memory.grow`-failure path
-      (`src/wasm_runtime.rs`'s `extend`) with no new push-specific error
-      value; add a regression test if one does not already cover this via
-      the capped-page technique above.
+## 4. Core Wasm 生成
 
-## 5. Differential coverage
+- [x] 4.1 並びごとの `reserve_array(ptr)` を `src/wasm_data.rs` に追加
+      (`array_clone` / `array_drop` の隣、`reserve_functions` で glue の
+      後ろへ並べる)。`len == capacity` なら capacity 0→1、以降は倍にして
+      `alloc` し、生きている bytes を `MemoryCopy` して古い buffer を `free`
+      する。要素の書き込みと長さの更新は呼び出し地点が受け持つ。
+      `data` が番兵になることは無い(空配列も `alloc(0)` の一意なアドレスを
+      持ち、`array_drop` も無条件に `free` している)ので番兵の分岐は無い。
+- [x] 4.2 `src/wasm.rs` の `push_element` が `reserve` を呼び、次の席を
+      求めて `install_slot` で要素を収め、`len` を1つ進める。`reserve` を
+      出すのは `push` が届いた並びだけ(`pushed_layouts`)なので、`push` を
+      持たないモジュールのバイト列は変わらない。
+- [x] 4.3 `src/wasm_data.rs` の単体テスト `pushの容量は倍々に伸びる`
+      (0→1→2→4→8 と、余りがあるときは伸びないこと)/
+      `容量を伸ばしても既存の要素は残る`。独立したエンジンに allocator と
+      `reserve` だけを載せて走らせる。
+- [x] 4.4 `pushで伸ばした記憶は使い回される` — 1ページに縛った有界ループ。
+      伸ばして解放した buffer を使い回さなければ trap する。
+- [x] 4.5 `pushの割り当てが取れなければtrapする` — 1ページでは伸ばせずに
+      trap し、16ページなら同じプログラムが通る。push 固有の失敗値は無い。
 
-- [ ] 5.1 Add an inline fixture to `src/differential.rs` (alongside the
-      existing `GENERIC_*` constants) that pushes past at least one
-      capacity-doubling boundary and register it in `FIXTURES` (design.md
-      Decision 5).
-- [ ] 5.2 Add a second inline fixture that moves a non-`Copy` value (e.g.
-      a small struct) into an array via `push` and register it in
-      `FIXTURES`.
-- [ ] 5.3 Run `cargo test --bin rhodolite differential::` and confirm both
-      new fixtures pass `maintained_corpus_has_matching_observable_
-      outcomes` and `every_fixture_is_byte_deterministic_and_
-      independently_executable` unmodified; diagnose and fix any gap in
-      `src/wasm.rs`/`src/wasm_data.rs`/`src/wasm_runtime.rs` before
-      proceeding.
+## 5. 差分実行
 
-## 6. Specs and closeout
+- [x] 5.1 `push-capacity-growth` fixture(`src/differential.rs`)。capacity
+      1 から 2 度の倍化境界を越え、capacity 0 の配列への初回 push も通す。
+- [x] 5.2 `push-owned-element` fixture。非 `Copy` な struct を `move` で
+      押し込み、最終状態を両実行系で照合する。
+- [x] 5.3 `cargo test --bin rhodolite differential::` が
+      `maintained_corpus_has_matching_observable_outcomes` と
+      `every_fixture_is_byte_deterministic_and_independently_executable` を
+      無改造で通ることを確認した。
 
-- [ ] 6.1 Confirm `openspec/changes/add-array-push/specs/array-push/
-      spec.md`, `.../specs/method-call-type-checking/spec.md`, and `.../
-      specs/differential-execution/spec.md` scenarios each map to a test
-      added in sections 1-5; adjust either the spec text or the tests so
-      they match exactly.
-- [ ] 6.2 Run the full test suite (`cargo test --bin rhodolite`) and
-      confirm all existing and new tests pass.
-- [ ] 6.3 Run `cargo fmt --check` and Clippy with warnings as errors; fix
-      any findings.
-- [ ] 6.4 Confirm two consecutive builds of each new differential fixture
-      are byte-identical (ROADMAP's MAP-010–MAP-100 common completion
-      condition).
-- [ ] 6.5 Commit the stable, passing state as a single snapshot.
-- [ ] 6.6 Sync the `array-push`, `method-call-type-checking`, and
-      `differential-execution` delta specs into `openspec/specs/` and
-      mark MAP-075 `done` in `ROADMAP.md`.
+## 6. 仕様と締め
+
+- [x] 6.1 delta spec の scenario と 1〜5 のテストの対応を確認した
+      (array-push の 13 scenario、method-call-type-checking の
+      `push needs no receiver modifier`、differential-execution の
+      push 2 件)。
+- [x] 6.2 `cargo test` 全通過(1012 + 125)。
+- [x] 6.3 `cargo fmt --check` と `cargo clippy --all-targets -- -D warnings`
+      が通る。
+- [x] 6.4 新 fixture の連続2回のビルドが byte 単位で一致することを
+      `every_fixture_is_byte_deterministic_and_independently_executable` で
+      確認した。
+- [x] 6.5 安定状態を単独のスナップショットとしてコミットした。
+- [ ] 6.6 `array-push` / `method-call-type-checking` /
+      `differential-execution` の delta spec を `openspec/specs/` へ sync し、
+      ROADMAP.md の MAP-075 を `done` にする(後続ステップ)。

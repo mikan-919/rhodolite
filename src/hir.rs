@@ -731,6 +731,14 @@ pub enum ExprKind {
     /// `value.clone()` — 検査器が知っている構造的な深い複製。所有を産むので
     /// レシーバは共有借用のまま残る(design.md 決定4)
     Clone(ExprId),
+    /// `xs.push(y)` — コンパイラ組み込みの `impl<T> Push<T> for [T]`(MAP-075)。
+    /// `array` は必ず `&mut [T]` を産む式で、呼び出し地点に `&mut` が書かれて
+    /// いなくても検査器が排他借用を1つ挿している。`value` は通常の所有引数と
+    /// 同じ move-once 規約で消費される。結果は `unit`
+    Push {
+        array: ExprId,
+        value: ExprId,
+    },
     Neg(ExprId),
     Arith {
         op: ArithOp,
@@ -1418,6 +1426,9 @@ impl Program {
                 place.index()
             ),
             ExprKind::Clone(inner) => format!("clone #{}", inner.index()),
+            ExprKind::Push { array, value } => {
+                format!("push #{} #{}", array.index(), value.index())
+            }
             ExprKind::Neg(inner) => format!("neg #{}", inner.index()),
             ExprKind::Arith { op, lhs, rhs } => {
                 format!("{} #{} #{}", op.spelling(), lhs.index(), rhs.index())

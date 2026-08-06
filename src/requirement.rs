@@ -352,6 +352,12 @@ fn scan(
         | hir::ExprKind::Access { place: inner, .. }
         | hir::ExprKind::Clone(inner)
         | hir::ExprKind::Return(Some(inner)) => walk!(inner),
+        // 組み込みの `push` は本体を持たない葉なので、要求は部分式の分だけ
+        // (MAP-075 決定1)
+        hir::ExprKind::Push { array, value } => {
+            walk!(array);
+            walk!(value);
+        }
         hir::ExprKind::Arith { lhs, rhs, .. }
         | hir::ExprKind::Eq { lhs, rhs }
         | hir::ExprKind::Coalesce { lhs, rhs } => {

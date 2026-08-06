@@ -16,7 +16,7 @@ use crate::wasm_layout::{
     Shape, Slot,
 };
 use crate::wasm_runtime::{Body, Helper};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::{BlockType, Function, Instruction, MemArg, ValType};
 
 /// 並び1つ分の生成関数。番号は本体を出す前に確定している(design.md 決定5)。
@@ -37,6 +37,8 @@ pub struct Indices {
     pub free: u32,
     /// 所有する並び → その glue。Copy の並びは持たない
     pub glue: BTreeMap<LayoutId, Glue>,
+    /// 配列の並び → その `reserve` 関数(MAP-075 決定3)。glue の後ろに並ぶ
+    pub reserves: BTreeMap<LayoutId, u32>,
 }
 
 impl Indices {
@@ -65,6 +67,26 @@ impl Indices {
             alloc: 0,
             free: 0,
             glue,
+            reserves: BTreeMap::new(),
+        }
+    }
+
+    /// `push` が届いた配列の並びごとに `reserve` を1つ、glue の後ろへ予約する
+    /// (MAP-075)。
+    ///
+    /// 並びは `Indices::reserve` と同じ計画順なので、同じ入力からは同じ番号。
+    /// `push` を1つも持たないモジュールのバイト列はこの change の前と変わらない
+    pub fn reserve_arrays(&mut self, layouts: &Layouts, base: u32, pushed: &BTreeSet<LayoutId>) {
+        let mut next = base;
+        for (id, layout) in layouts.planned() {
+            if layout.copy || !matches!(layout.shape, Shape::Array { .. }) {
+                continue;
+            }
+            if !pushed.contains(&id) {
+                continue;
+            }
+            self.reserves.insert(id, next);
+            next += 1;
         }
     }
 
@@ -73,8 +95,18 @@ impl Indices {
         self.glue.len() as u32 * 3
     }
 
+    /// 予約した配列 `reserve` の本数
+    pub fn reserve_count(&self) -> u32 {
+        self.reserves.len() as u32
+    }
+
     pub fn of(&self, layout: LayoutId) -> Glue {
         self.glue[&layout]
+    }
+
+    /// その配列の並びの `reserve` 関数
+    pub fn reserve_of(&self, layout: LayoutId) -> u32 {
+        self.reserves[&layout]
     }
 }
 
@@ -491,6 +523,25 @@ pub fn glue_functions(layouts: &Layouts, indices: &Indices) -> Vec<Helper> {
     helpers
 }
 
+/// 予約した配列の並びごとに `reserve` を1つ。並びは `reserve_arrays` と同じ順
+pub fn reserve_functions(layouts: &Layouts, indices: &Indices) -> Vec<Helper> {
+    let mut helpers = Vec::new();
+    for (id, layout) in layouts.planned() {
+        if !indices.reserves.contains_key(&id) {
+            continue;
+        }
+        let Shape::Array { stride, .. } = layout.shape else {
+            unreachable!("`reserve` を予約したのは配列の並びだけです");
+        };
+        helpers.push(one(
+            vec![ValType::I32],
+            vec![],
+            array_reserve(indices, stride),
+        ));
+    }
+    helpers
+}
+
 fn one(params: Vec<ValType>, results: Vec<ValType>, body: Function) -> Helper {
     Helper {
         params,
@@ -899,6 +950,60 @@ fn array_clone(indices: &Indices, layouts: &Layouts, element: LayoutId, stride: 
     b.finish()
 }
 
+/// `reserve_array(ptr)`。`len` が `capacity` に届いていたら容量を伸ばす
+/// (MAP-075 決定3)。
+///
+/// capacity 0 からの初回は 1、それ以外は現在の倍。新しい buffer は既存の
+/// `alloc` から取り、生きている要素の bytes をそのまま写して古い buffer を
+/// 返す — 器の中身は根のアドレスか Copy な値なので、bytes を移せば所有も
+/// そのまま移る(`array_clone` と違って要素を作り直さない)。
+///
+/// 割り当てが足りなければ `alloc` の中の `memory.grow` 失敗が `unreachable`
+/// で落ちる(ADR-0011 §3)。push 固有の失敗表現は増やさない。
+///
+/// ponytail: `new_capacity * stride` の桁あふれは見ていない。あふれる手前で
+/// `memory.grow` が先に落ちるので、追加の検査は 32bit では観測できない
+fn array_reserve(indices: &Indices, stride: u32) -> Function {
+    // 1: capacity, 2: 新しい capacity, 3: 新しい buffer, 4: 元の buffer
+    let mut b = Body::new(4);
+    b.get(0)
+        .ins(Instruction::I32Load(word(BUFFER_CAPACITY)))
+        .set(1);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_LEN)));
+    b.get(1).ins(Instruction::I32GeU);
+    b.ins(Instruction::If(BlockType::Empty));
+
+    b.get(1).ins(Instruction::I32Eqz);
+    b.ins(Instruction::If(BlockType::Empty));
+    b.num(1).set(2);
+    b.ins(Instruction::Else);
+    b.get(1).num(2).ins(Instruction::I32Mul).set(2);
+    b.ins(Instruction::End);
+
+    b.get(2).num(stride).ins(Instruction::I32Mul);
+    b.ins(Instruction::Call(indices.alloc)).set(3);
+    b.get(0).ins(Instruction::I32Load(word(BUFFER_DATA))).set(4);
+    b.get(3).get(4);
+    b.get(0)
+        .ins(Instruction::I32Load(word(BUFFER_LEN)))
+        .num(stride)
+        .ins(Instruction::I32Mul);
+    b.ins(Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+    b.get(4).ins(Instruction::Call(indices.free));
+    b.get(0)
+        .get(3)
+        .ins(Instruction::I32Store(word(BUFFER_DATA)));
+    b.get(0)
+        .get(2)
+        .ins(Instruction::I32Store(word(BUFFER_CAPACITY)));
+
+    b.ins(Instruction::End);
+    b.finish()
+}
+
 /// `eq_array(a, b) -> i32`。長さが違えばそこで、違う要素を見つけたらそこで打ち切る
 fn array_eq(indices: &Indices, layouts: &Layouts, element: LayoutId, stride: u32) -> Function {
     // 2: len, 3: index, 4: 左の要素, 5: 右の要素
@@ -936,4 +1041,196 @@ fn array_eq(indices: &Indices, layouts: &Layouts, element: LayoutId, stride: u32
     });
     b.num(1);
     b.finish()
+}
+
+// ---------------------------------------------------------------------------
+// テスト
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wasm_runtime::{ALLOC, COUNT, FREE, Runtime};
+    use wasm_encoder::{CodeSection, ExportKind, ExportSection, FunctionSection, Module};
+
+    /// allocator と1本の `reserve` だけを載せたモジュール。
+    ///
+    /// 生成器の知識を共有しないエンジンで走らせるので、容量の伸び方が
+    /// 「本当に Core Wasm としてそう動く」ことの証明になる
+    fn module(stride: u32) -> Vec<u8> {
+        let runtime = Runtime::new(&[]).expect("前置きは 32bit に収まる");
+        let indices = Indices {
+            alloc: ALLOC,
+            free: FREE,
+            glue: BTreeMap::new(),
+            reserves: BTreeMap::new(),
+        };
+        let helpers: Vec<Helper> = Runtime::helpers(0)
+            .into_iter()
+            .chain([Helper {
+                params: vec![ValType::I32],
+                results: Vec::new(),
+                body: array_reserve(&indices, stride),
+            }])
+            .collect();
+
+        let mut types = wasm_encoder::TypeSection::new();
+        let mut functions = FunctionSection::new();
+        let mut code = CodeSection::new();
+        for (index, helper) in helpers.iter().enumerate() {
+            types
+                .ty()
+                .function(helper.params.clone(), helper.results.clone());
+            functions.function(index as u32);
+            code.function(&helper.body);
+        }
+
+        let mut exports = ExportSection::new();
+        exports.export("alloc", ExportKind::Func, ALLOC);
+        exports.export("reserve", ExportKind::Func, COUNT);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&functions);
+        module.section(&runtime.memory_section());
+        module.section(&exports);
+        module.section(&code);
+        module.section(&runtime.data_section());
+        module.finish()
+    }
+
+    /// エンジンを1つ立てて、帳簿を1つ握った手
+    struct Buffer {
+        store: wasmi::Store<()>,
+        alloc: wasmi::Func,
+        reserve: wasmi::Func,
+        memory: wasmi::Memory,
+        root: u32,
+        stride: u32,
+    }
+
+    impl Buffer {
+        /// 長さ0・容量0の配列を1つ作る。`data` は `alloc(0)` の返す一意の
+        /// アドレスで、配列リテラルが空の配列に置くものと同じ形
+        fn empty(stride: u32) -> Buffer {
+            let bytes = module(stride);
+            crate::wasm::validate(&bytes).expect("検証を通るはず");
+            let engine = wasmi::Engine::default();
+            let compiled = wasmi::Module::new(&engine, &bytes).expect("読めるはず");
+            let mut store = wasmi::Store::new(&engine, ());
+            let instance = wasmi::Linker::new(&engine)
+                .instantiate_and_start(&mut store, &compiled)
+                .expect("立ち上がるはず");
+            let alloc = instance.get_func(&store, "alloc").unwrap();
+            let reserve = instance.get_func(&store, "reserve").unwrap();
+            let memory = instance.get_memory(&store, "memory").unwrap();
+            let mut buffer = Buffer {
+                store,
+                alloc,
+                reserve,
+                memory,
+                root: 0,
+                stride,
+            };
+            buffer.root = buffer.alloc(12);
+            let data = buffer.alloc(0);
+            buffer.write(buffer.root + BUFFER_DATA, data);
+            buffer.write(buffer.root + BUFFER_LEN, 0);
+            buffer.write(buffer.root + BUFFER_CAPACITY, 0);
+            buffer
+        }
+
+        fn alloc(&mut self, size: u32) -> u32 {
+            let mut out = [wasmi::Val::I32(0)];
+            self.alloc
+                .call(
+                    &mut self.store,
+                    &[wasmi::Val::I32(size as i32)],
+                    &mut out[..],
+                )
+                .expect("割り当てられるはず");
+            match out[0] {
+                wasmi::Val::I32(n) => n as u32,
+                ref other => panic!("アドレスではない: {other:?}"),
+            }
+        }
+
+        fn read(&self, at: u32) -> u32 {
+            let mut word = [0u8; 4];
+            self.memory
+                .read(&self.store, at as usize, &mut word)
+                .expect("読めるはず");
+            u32::from_le_bytes(word)
+        }
+
+        fn write(&mut self, at: u32, value: u32) {
+            self.memory
+                .write(&mut self.store, at as usize, &value.to_le_bytes())
+                .expect("書けるはず");
+        }
+
+        fn len(&self) -> u32 {
+            self.read(self.root + BUFFER_LEN)
+        }
+
+        fn capacity(&self) -> u32 {
+            self.read(self.root + BUFFER_CAPACITY)
+        }
+
+        fn element(&self, index: u32) -> u32 {
+            self.read(self.read(self.root + BUFFER_DATA) + index * self.stride)
+        }
+
+        /// 生成器が `push` の地点で出すのと同じ順:容量を確かめ、次の席へ
+        /// 要素を書き、長さを1つ進める
+        fn push(&mut self, value: u32) {
+            self.reserve
+                .call(
+                    &mut self.store,
+                    &[wasmi::Val::I32(self.root as i32)],
+                    &mut [],
+                )
+                .expect("伸ばせるはず");
+            let seat = self.read(self.root + BUFFER_DATA) + self.len() * self.stride;
+            self.write(seat, value);
+            let len = self.len();
+            self.write(self.root + BUFFER_LEN, len + 1);
+        }
+    }
+
+    /// 容量は 0 → 1 → 2 → 4 と倍々に伸び、余りがあるうちは伸びない
+    /// (MAP-075 決定3)
+    #[test]
+    fn pushの容量は倍々に伸びる() {
+        let mut buffer = Buffer::empty(4);
+        assert_eq!((buffer.len(), buffer.capacity()), (0, 0));
+
+        buffer.push(10);
+        assert_eq!((buffer.len(), buffer.capacity()), (1, 1));
+
+        buffer.push(20);
+        assert_eq!((buffer.len(), buffer.capacity()), (2, 2));
+
+        buffer.push(30);
+        assert_eq!((buffer.len(), buffer.capacity()), (3, 4));
+
+        // 余りがあるので、この1つは伸ばさない
+        buffer.push(40);
+        assert_eq!((buffer.len(), buffer.capacity()), (4, 4));
+
+        buffer.push(50);
+        assert_eq!((buffer.len(), buffer.capacity()), (5, 8));
+    }
+
+    /// 伸ばす前の要素は、並びも中身もそのまま新しい buffer へ移る
+    #[test]
+    fn 容量を伸ばしても既存の要素は残る() {
+        let mut buffer = Buffer::empty(4);
+        for n in 1..=5u32 {
+            buffer.push(n * 11);
+        }
+        let seen: Vec<u32> = (0..buffer.len()).map(|i| buffer.element(i)).collect();
+        assert_eq!(seen, vec![11, 22, 33, 44, 55]);
+    }
 }
