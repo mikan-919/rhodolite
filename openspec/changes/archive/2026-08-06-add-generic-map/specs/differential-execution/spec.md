@@ -1,10 +1,4 @@
-## Purpose
-
-Defines the maintained verification contract that keeps the checked-HIR
-interpreter and generated Core WebAssembly execution semantically aligned for
-the supported compiled-v1 Rhodolite surface.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Maintained supported-program differential corpus
 The repository SHALL maintain a named corpus of ownership-safe Rhodolite
@@ -62,52 +56,3 @@ comparison.
   xs.map(f)` where `f` requires an ambient slot provided around the call,
   and compares the interpreter's and the generated module's resulting
   array
-
-### Requirement: Observable execution outcomes are compared
-For every corpus member, the suite SHALL execute the same loaded program through
-the checked-HIR interpreter and through a freshly generated Core Wasm module in
-an independent Wasm engine. It SHALL compare successful return values, process
-completion, standard output, declared test results, runtime-error
-classification, and fixture-declared final owned or mutable state. A mismatch
-SHALL fail the suite with the fixture identity and both normalized outcomes.
-
-#### Scenario: Successful value and state agree
-- **WHEN** a corpus member completes successfully after owned mutation or an
-  explicit borrow
-- **THEN** the interpreter and Wasm engine report equal returned values and
-  equal fixture-declared final state
-
-#### Scenario: Runtime failure agrees
-- **WHEN** a corpus member reaches a supported runtime failure such as integer
-  division by zero
-- **THEN** both paths are recorded as the same runtime-error classification and
-  the differential suite succeeds for that expected failure case
-
-#### Scenario: Mismatch is actionable
-- **WHEN** either path produces a different normalized outcome
-- **THEN** the suite fails and reports the corpus member plus the interpreter
-  and Wasm observations without accepting either result as authoritative
-
-### Requirement: Differential artifacts are independently executable and deterministic
-Every Wasm artifact used by the differential corpus SHALL validate independently,
-instantiate without required imports or an automatic start action, and be
-executed only through its exported entry or public wrapper. The suite SHALL
-retain deterministic generated-module snapshots for representative programs,
-include small generated-program cases, and build every corpus member twice to
-assert byte-identical artifacts.
-
-#### Scenario: Generated artifact is run independently
-- **WHEN** a corpus member is compiled for Wasm
-- **THEN** an independent validator accepts the module and an independent Core
-  Wasm engine invokes its required exports
-
-#### Scenario: Repeated build preserves bytes
-- **WHEN** the suite builds the same corpus member twice with identical sources
-  and options
-- **THEN** the two generated module byte sequences are identical
-
-#### Scenario: Representative module shape is pinned
-- **WHEN** a representative scalar, owned-data, or ambient corpus member is
-  intentionally changed
-- **THEN** its generated-module snapshot exposes the artifact-shape change for
-  review

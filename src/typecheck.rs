@@ -242,13 +242,19 @@ fn signature(sig: &Sig) -> FnSig {
 /// レシーバの局所束縛の型。`&self` は `&T`、`&mut self` は `&mut T`、
 /// `self` は所有の `T`(design.md 決定2)。
 fn receiver_type(mode: ReceiverMode, type_name: &str) -> KnownType {
+    as_receiver(mode, &plain(type_name))
+}
+
+/// 対象型の所有の形にレシーバモードを重ねる。対象が struct でも `[T]` でも
+/// 同じ1本(MAP-080 決定3)。
+fn as_receiver(mode: ReceiverMode, owned: &KnownType) -> KnownType {
     KnownType {
         reference: match mode {
             ReceiverMode::Owned => None,
             ReceiverMode::Shared => Some(hir::RefKind::Shared),
             ReceiverMode::Mutable => Some(hir::RefKind::Mutable),
         },
-        ..plain(type_name)
+        ..owned.clone()
     }
 }
 
@@ -547,7 +553,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
             Item::Fn { sig, body, .. } if is_generic(&[], sig) => {
                 // 署名を記録できなかった宣言は診断済み。本体は見ない
                 if let Some(id) = decls.ids.generic_fns.get(&sig.name).copied() {
-                    check_rigid(id, sig, body, None, &sig.name, &decls, &generic_bodies, out);
+                    check_rigid(id, sig, body, &sig.name, &decls, &generic_bodies, out);
                 }
             }
             Item::Fn { sig, body, .. } => {
@@ -600,16 +606,7 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
                         let id = next_generic_method(&mut generic_methods);
                         let ctx = format!("impl {type_name}::{}", sig.name);
                         out.span = Some(sig.span);
-                        check_rigid(
-                            id,
-                            sig,
-                            body,
-                            sig.receiver.map(|mode| receiver_type(mode, &type_name)),
-                            &ctx,
-                            &decls,
-                            &generic_bodies,
-                            out,
-                        );
+                        check_rigid(id, sig, body, &ctx, &decls, &generic_bodies, out);
                         continue;
                     }
                     let target = next_target(&mut targets);
@@ -990,7 +987,7 @@ fn collect(program: &Program, out: &mut Out) -> (Decls, hir::Program, Vec<Target
                         trait_args,
                         type_name: type_name.clone(),
                         target: lowered_target,
-                        own_params: impl_params.len(),
+                        own: impl_params.clone(),
                         methods: recorded,
                     });
                 }
@@ -1619,9 +1616,9 @@ struct GenericImplBlock {
     /// 対象型の綴り。診断に出す
     type_name: String,
     target: hir::GenericType,
-    /// `impl` 自身が導入した型パラメータの個数。メソッドの `type_params` の
+    /// `impl` 自身が導入した型パラメータ。メソッドの `type_params` の
     /// 頭からこの個数が `impl` 由来で、残りがメソッド自身の分
-    own_params: usize,
+    own: Vec<hir::TypeParamId>,
     /// 提供されたメソッドを宣言順に
     methods: Vec<hir::GenericFnId>,
 }
@@ -1691,10 +1688,37 @@ fn contract_of(trait_: hir::TraitId, lowered: &hir::Program) -> Vec<ContractMeth
     table
 }
 
+/// 配列を対象にした generic な `impl` を `Ids::generic_impls` に載せるときの
+/// 正準鍵(MAP-080 決定1)。
+///
+/// `impl<T> Map<T> for [T]` の登録が型パラメータの綴りに左右されないように、
+/// 要素型を持たない固定の綴りにする。struct 名は宣言された識別子なので
+/// `[` / `]` を含みえず、この鍵は本物の型名と衝突しない
+const ARRAY_IMPL_KEY: &str = "[]";
+
+/// この `impl` の対象が `[T]`(要素が `impl` 自身の型パラメータそのもの)か
+/// (MAP-080 決定1)。
+///
+/// 借用や後置 `?` の付いた対象は受け付けない。`Map<T>` の実装が名乗れる形を
+/// MAP-Q1 の代表例そのものへ狭く留めるためで、それ以外の配列は今までどおり
+/// 「struct ではありません」で断る
+fn own_param_array(target: &hir::GenericType, own: &[hir::TypeParamId]) -> bool {
+    if target.reference.is_some() || target.optional {
+        return false;
+    }
+    let hir::GenericTypeKind::Array(element) = &target.kind else {
+        return false;
+    };
+    element.reference.is_none()
+        && !element.optional
+        && matches!(element.kind, hir::GenericTypeKind::Param(p) if own.contains(&p))
+}
+
 /// generic に触れている `impl` の trait 参照・対象型・契約を全部見る。
 ///
-/// 対象が struct であることを要求するのは非 generic な `impl` と同じで
-/// (MAP-025 決定1)、`Ids::generic_impls` に載るのはそれを満たしたものだけ。
+/// 対象は struct か、`impl` 自身の型パラメータを要素に持つ配列(MAP-080 決定1)。
+/// `Ids::generic_impls` に載るのはそれを満たしたものだけで、配列は
+/// `ARRAY_IMPL_KEY` に正規化して載せる。
 fn check_generic_impls(
     blocks: Vec<GenericImplBlock>,
     nominal: &Nominal,
@@ -1710,11 +1734,14 @@ fn check_generic_impls(
             Some(trait_name) => format!("impl {trait_name} for {}", block.type_name),
             None => format!("impl {}", block.type_name),
         };
-        // 対象の外側の形が struct になれないなら、置き場所が無い(決定1)。
-        // 宣言されていない名前は署名を記録したときに報告済み
+        // 対象の外側の形が struct にも `[T]` にもなれないなら、置き場所が無い
+        // (MAP-025 決定1・MAP-080 決定1)。宣言されていない名前は署名を記録した
+        // ときに報告済み
+        let array_target = own_param_array(&block.target, &block.own);
         let concrete_target = match block.target.kind {
             hir::GenericTypeKind::Struct(_) => true,
             hir::GenericTypeKind::Poison => false,
+            _ if array_target => true,
             _ => {
                 out.push(format!(
                     "{ctx}: `{}` は struct ではありません",
@@ -1723,10 +1750,16 @@ fn check_generic_impls(
                 false
             }
         };
+        // 索引の鍵だけを正規化する。診断は書かれたままの綴り(`[T]`)で出す
+        let key_name = if array_target {
+            ARRAY_IMPL_KEY.to_string()
+        } else {
+            block.type_name.clone()
+        };
         if concrete_target {
             for id in &block.methods {
                 ids.generic_impls
-                    .entry((block.type_name.clone(), lowered.generics[*id].name.clone()))
+                    .entry((key_name.clone(), lowered.generics[*id].name.clone()))
                     .or_default()
                     .push(*id);
             }
@@ -1747,7 +1780,7 @@ fn check_generic_impls(
             continue;
         }
         if concrete_target {
-            let key = (block.type_name.clone(), trait_name.clone());
+            let key = (key_name.clone(), trait_name.clone());
             let previous = pairs.get(&key).copied().or_else(|| {
                 ids.trait_impls
                     .get(&key)
@@ -1813,7 +1846,7 @@ fn check_generic_contract(
         };
         // 型パラメータの並びは「`impl` 由来 + メソッド自身」。頭を落とせば
         // 契約側の「メソッド自身」と位置で対応する
-        let own = &decl.type_params[block.own_params.min(decl.type_params.len())..];
+        let own = &decl.type_params[block.own.len().min(decl.type_params.len())..];
         if own.len() != declared.own.len() {
             out.push(format!(
                 "{ctx}: `{name}` は型パラメータを {} 個取りますが、{} 個宣言しています",
@@ -1947,9 +1980,9 @@ fn known_generic(ty: &hir::GenericType, bindings: &Bindings, lowered: &hir::Prog
 /// generic 宣言の本体を、型パラメータを不透明なまま**1度だけ**検査する
 /// (MAP-020 決定1)。free 関数と `impl` メソッドで同じ1本を通る。
 ///
-/// `impl` メソッドのレシーバだけは合成名ではなく**具体的な struct** の型
-/// (MAP-025 決定1 が対象を struct に限っている)。不透明なのは型パラメータ
-/// だけで、`self` は普通のレシーバとして扱える。
+/// `impl` メソッドのレシーバの型は宣言された対象型に剛体の綴りを代入したもの。
+/// struct 対象なら合成名は現れず(MAP-025 決定1)、`[T]` 対象なら要素だけが
+/// 合成名になる(`[#T0]`、MAP-080 決定3)。どちらも `self` は普通のレシーバ。
 ///
 /// 合成名はどの表にも載らないので、型パラメータを struct リテラル・フィールド
 /// 射影・メソッドのレシーバに使う本体は「宣言されていない名前」として落ちる。
@@ -1962,7 +1995,6 @@ fn check_rigid(
     id: hir::GenericFnId,
     sig: &Sig,
     body: &[Expr],
-    receiver: Option<KnownType>,
     ctx: &str,
     decls: &Decls,
     bodies: &GenericBodies,
@@ -1972,6 +2004,10 @@ fn check_rigid(
     let type_params = decl.type_params.clone();
     let declared = decl.params.clone();
     let declared_ret = decl.ret.clone();
+    let target = match &decl.owner {
+        hir::GenericOwner::Impl { target, .. } => Some(target.clone()),
+        hir::GenericOwner::Free | hir::GenericOwner::Trait(_) => None,
+    };
     let bindings: Bindings = type_params
         .iter()
         .map(|p| (*p, rigid_name(*p, &out.lowered)))
@@ -1987,6 +2023,10 @@ fn check_rigid(
         .collect();
     let params = instance_params(sig, &declared, &bindings, out);
     let ret = known_generic(&declared_ret, &bindings, &out.lowered);
+    let receiver = sig
+        .receiver
+        .zip(target.as_ref())
+        .map(|(mode, target)| as_receiver(mode, &known_generic(target, &bindings, &out.lowered)));
     check_body(
         body,
         &params,
@@ -2142,6 +2182,12 @@ fn generic_call(
     let declared = decl.params.clone();
     let declared_ret = decl.ret.clone();
     let declared_receiver = decl.receiver;
+    // `impl` の対象型。レシーバの期待型は、これに解けた型引数を代入したもの
+    // (MAP-080 決定3)。free 関数と trait 宣言にはレシーバが無い
+    let declared_target = match &decl.owner {
+        hir::GenericOwner::Impl { target, .. } => Some(target.clone()),
+        hir::GenericOwner::Free | hir::GenericOwner::Trait(_) => None,
+    };
 
     let before = out.count();
     let checked: Vec<Checked> = args.iter().map(|arg| synth(arg, cx, locals, out)).collect();
@@ -2237,18 +2283,25 @@ fn generic_call(
             // レシーバの所有モードの照合と `&self` への自動共有借用は
             // 非 generic なメソッド呼び出しと同じ1本を通る
             Some(callable) => match recv {
-                Some(recv) => CallTarget::Method {
-                    callable,
-                    recv: conform_receiver(
-                        &sig,
-                        recv.type_name,
-                        name,
-                        recv.checked,
-                        recv.span,
-                        cx,
-                        out,
-                    ),
-                },
+                Some(recv) => {
+                    let self_ty = declared_target.as_ref().map_or_else(
+                        || plain(recv.type_name),
+                        |target| known_generic(target, &bindings, &out.lowered),
+                    );
+                    CallTarget::Method {
+                        callable,
+                        recv: conform_receiver(
+                            &sig,
+                            &self_ty,
+                            recv.type_name,
+                            name,
+                            recv.checked,
+                            recv.span,
+                            cx,
+                            out,
+                        ),
+                    }
+                }
                 None => CallTarget::Direct(callable),
             },
             None => return unsolved(ids(&checked)),
@@ -2337,7 +2390,12 @@ fn instantiate(
     let span = decl.span;
     // 持ち主だけが free 関数と `impl` メソッドで違う。索引も再帰の検出も
     // `GenericFnId` だけを鍵にしているので、そこは1本のまま(MAP-025 決定5)
-    let (owner, receiver, ctx) = instance_owner(id, out);
+    let (owner, target, ctx) = instance_owner(id, out);
+    // `self` の型は対象型に解けた型引数を代入したもの。struct 対象では代入
+    // する場所が無いので今までどおりの名前1つに戻る(MAP-080 決定3)
+    let receiver = declared_receiver
+        .zip(target.as_ref())
+        .map(|(mode, target)| as_receiver(mode, &known_generic(target, bindings, &out.lowered)));
     let subst: BTreeMap<hir::TypeParamId, hir::Type> = type_params
         .iter()
         .copied()
@@ -2389,31 +2447,38 @@ fn instantiate(
     Some(shell)
 }
 
-/// 具体化する本体の持ち主・レシーバ束縛・診断の頭。
+/// 具体化する本体の持ち主・レシーバの対象型・診断の頭。
 ///
 /// `impl` メソッドの `TraitImplDecl` は `(struct, trait)` の組に1つだけ、
 /// 最初にその組のメソッドが解決したときに確保して以降は使い回す。契約メソッド
 /// への表は空のまま — 静的に解決した `Call::Method` はそこを引かない
 /// (MAP-025 決定5)。
+///
+/// 返す対象型はまだ具体化前の `GenericType`。`[T]` を対象にした `impl` は
+/// 具体化ごとに `self` の型が変わるので、型引数を代入するのは解けた束縛を
+/// 持っている呼び出し側(MAP-080 決定3)。
 fn instance_owner(
     id: hir::GenericFnId,
     out: &mut Out,
-) -> (hir::CallableOwner, Option<KnownType>, String) {
+) -> (hir::CallableOwner, Option<hir::GenericType>, String) {
     let decl = &out.lowered.generics[id];
     let name = decl.name.clone();
-    let receiver = decl.receiver;
     let hir::GenericOwner::Impl { trait_, target, .. } = &decl.owner else {
         return (hir::CallableOwner::Free, None, name);
     };
-    // 対象が struct でない `impl` は宣言の時点で診断済みで、呼び出しは
-    // そこへ解決しない(MAP-025 決定1)
+    let (trait_, target) = (*trait_, target.clone());
+    // 配列を対象にした `impl` には持ち主にできる `StructId` が無い。名指す
+    // 先の無い `TraitImplDecl` を作らず、generic な free 関数の具体化と同じ
+    // 扱いにする(MAP-080 決定3)。struct でも配列でもない対象は宣言の時点で
+    // 診断済みで、呼び出しはそこへ解決しない(MAP-025 決定1)
     let hir::GenericTypeKind::Struct(struct_) = target.kind else {
-        return (hir::CallableOwner::Free, None, name);
+        let ctx = format!("impl {}::{}", out.lowered.show_generic_type(&target), name);
+        return (hir::CallableOwner::Free, Some(target), ctx);
     };
     let type_name = out.lowered.structs[struct_].name.clone();
     let owner = match trait_ {
         Some(trait_) => {
-            let key = (struct_, *trait_);
+            let key = (struct_, trait_);
             let found = out
                 .trait_impls
                 .iter()
@@ -2421,7 +2486,7 @@ fn instance_owner(
                 .map(|(_, id)| *id);
             let impl_ = found.unwrap_or_else(|| {
                 let allocated = out.lowered.trait_impls.alloc(hir::TraitImplDecl {
-                    trait_: *trait_,
+                    trait_,
                     type_: struct_,
                     methods: BTreeMap::new(),
                     span: out.lowered.generics[id].span,
@@ -2434,11 +2499,7 @@ fn instance_owner(
         None => hir::CallableOwner::Inherent(struct_),
     };
     let ctx = format!("impl {type_name}::{name}");
-    (
-        owner,
-        receiver.map(|mode| receiver_type(mode, &type_name)),
-        ctx,
-    )
+    (owner, Some(target), ctx)
 }
 
 /// trait の契約が揃うのを待っている実装メソッド1つ。
@@ -3984,6 +4045,28 @@ fn resolve(
                             out,
                         ));
                     }
+                    // 配列を対象にした generic な `impl`(`impl<T> Map<T> for
+                    // [T]`、MAP-080 決定2)。組み込みの `clone` / `push` を
+                    // 先に通してあるので、その2つは宣言に隠されない
+                    Outcome::Typed(ty)
+                        if !ty.optional
+                            && ty.element().is_some()
+                            && let Some(candidates) = decls
+                                .ids
+                                .generic_impls
+                                .get(&(ARRAY_IMPL_KEY.to_string(), name.to_string())) =>
+                    {
+                        // 診断に出す綴りは借用を通した**所有の形**。struct の
+                        // 名前を `KnownType::name` が借用越しに引くのと同じ
+                        let shown = KnownType {
+                            reference: None,
+                            ..ty.clone()
+                        }
+                        .to_string();
+                        return Ok(generic_method(
+                            candidates, &shown, name, &receiver, recv.span, args, cx, locals, out,
+                        ));
+                    }
                     // optional の中身を取り出す規則はまだ無く、配列に他のメソッドは無い
                     Outcome::Typed(ty) => match ty.name().filter(|_| !ty.optional) {
                         // 既存の解決がその名前のメンバーを1つも知らないときだけ、
@@ -4007,7 +4090,14 @@ fn resolve(
                                 // レシーバの所有モードを署名と突き合わせる。
                                 // `&self` へは共有借用を1つ挿す(tasks 5.2)
                                 let recv = conform_receiver(
-                                    sig, type_name, name, &receiver, recv.span, cx, out,
+                                    sig,
+                                    &plain(type_name),
+                                    type_name,
+                                    name,
+                                    &receiver,
+                                    recv.span,
+                                    cx,
+                                    out,
                                 );
                                 (
                                     sig,
@@ -4332,8 +4422,13 @@ fn push_receiver(
 /// 状態と所有を動かすので、呼び出し側に `&mut` / `move` が書かれていなければ
 /// ここで断る(design.md 決定2)。消費レシーバに `move` が要ることは静的型では
 /// 言い分けられないので、その1件だけは所有権解析が見る。
+/// `self_ty` は対象型の**所有の形**。struct 対象なら型名そのものだが、
+/// `impl<T> Map<T> for [T]` は具体化ごとに変わるので呼び出し側が渡す
+/// (MAP-080 決定3)。
+#[allow(clippy::too_many_arguments)]
 fn conform_receiver(
     sig: &FnSig,
+    self_ty: &KnownType,
     type_name: &str,
     method: &str,
     receiver: &Checked,
@@ -4346,14 +4441,7 @@ fn conform_receiver(
     };
     let callee = format!("{type_name}::{method}");
     let site = Site::Receiver { callee: &callee };
-    conform(
-        receiver,
-        &receiver_type(mode, type_name),
-        &site,
-        span,
-        cx,
-        out,
-    )
+    conform(receiver, &as_receiver(mode, self_ty), &site, span, cx, out)
 }
 
 /// スロット経由の宛先。実行する本体はその場の提供が決めるので、ここでは
@@ -9512,15 +9600,22 @@ fn shout(value: str -> str) { value }
         );
     }
 
-    /// 対象の外側の形が struct になれない `impl` は、非 generic な `impl` と
-    /// 同じ文言で断る(MAP-025 決定1)
+    /// 対象の外側の形が struct にも `[T]` にもなれない `impl` は、非 generic な
+    /// `impl` と同じ文言で断る(MAP-025 決定1・MAP-080 決定1)
     #[test]
     fn struct以外を対象にしたgeneric_implを報告する() {
         for (src, shown) in [
+            // 要素が `impl` 自身の型パラメータでない配列は受け付けない
             (
                 "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
-                 impl<T> Box<T> for [T] { fn wrap<U>(&self, value: T -> int) { 1 } }\n",
-                "[T]",
+                 impl<T> Box<T> for [int] { fn wrap<U>(&self, value: T -> int) { 1 } }\n",
+                "[int]",
+            ),
+            // 対象が callable 型でも置き場所が無い
+            (
+                "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+                 impl<T> Box<T> for fn(T -> T) { fn wrap<U>(&self, value: T -> int) { 1 } }\n",
+                "fn(T -> T)",
             ),
             // blanket impl も、この版では置き場所が無い
             (
@@ -10095,5 +10190,215 @@ fn shout(value: str -> str) { value }
         for (_, reqs) in analysis.bodies() {
             assert!(reqs.is_empty(), "{:?}", reqs);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 汎用 `map`(MAP-080)
+    // -----------------------------------------------------------------------
+
+    /// `Map<T>` と `[T]` の実装。本体は通常の Rhodolite コードだけでできている
+    /// (MAP-080 決定4)
+    const MAP_SRC: &str = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+         impl<T> Map<T> for [T] {\n\
+         \x20 fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+         \x20   let mut result: [U] = []\n\
+         \x20   for x in move self { result.push(f(move x)) }\n\
+         \x20   move result\n\
+         \x20 }\n\
+         }\n";
+
+    /// 契約は消費レシーバとメソッド自身の型パラメータ `U` を持つ。宣言は
+    /// 既存の generic trait の仕組みだけで通る(tasks 1.1)
+    #[test]
+    fn map契約のtraitを宣言できる() {
+        let src = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+                   fn main(-> int) { 1 }\n";
+        assert_eq!(errors(src), Vec::<String>::new());
+        let program = lowered(src);
+        let (id, trait_) = program.traits.iter().next().expect("trait がある");
+        assert_eq!(trait_.name, "Map");
+        assert_eq!(trait_.type_params.len(), 1);
+        let (_, contract) = program
+            .generics
+            .iter()
+            .find(|(_, decl)| decl.owner == hir::GenericOwner::Trait(id))
+            .expect("契約がある");
+        assert_eq!(contract.name, "map");
+        assert_eq!(contract.receiver, Some(hir::ReceiverMode::Owned));
+        // trait の `T` の上にメソッド自身の `U` が重なる
+        assert_eq!(contract.type_params.len(), 2);
+        assert_eq!(
+            contract.ret.kind,
+            hir::GenericTypeKind::Array(Box::new(hir::GenericType {
+                reference: None,
+                kind: hir::GenericTypeKind::Param(contract.type_params[1]),
+                optional: false,
+            }))
+        );
+    }
+
+    /// 対象が `impl` 自身の型パラメータを要素に持つ配列なら受理して、本体を
+    /// 他の generic `impl` とまったく同じ1本で剛体検査する(tasks 1.3)
+    #[test]
+    fn 配列を対象にしたgeneric_implを受理する() {
+        assert_eq!(
+            errors(&format!("{MAP_SRC}fn main(-> int) {{ 1 }}\n")),
+            Vec::<String>::new()
+        );
+        let program = lowered(&format!("{MAP_SRC}fn main(-> int) {{ 1 }}\n"));
+        let (_, decl) = program
+            .generics
+            .iter()
+            .find(|(_, decl)| matches!(decl.owner, hir::GenericOwner::Impl { .. }))
+            .expect("impl のメソッドがある");
+        let hir::GenericOwner::Impl { target, .. } = &decl.owner else {
+            unreachable!()
+        };
+        // 対象は `[T]`。`T` は `impl` 自身の型パラメータ
+        assert_eq!(
+            target.kind,
+            hir::GenericTypeKind::Array(Box::new(hir::GenericType {
+                reference: None,
+                kind: hir::GenericTypeKind::Param(decl.type_params[0]),
+                optional: false,
+            }))
+        );
+    }
+
+    /// 同じ trait を配列へ二度実装することはできない。struct の組と同じ規則
+    /// (tasks 1.5)
+    #[test]
+    fn 配列への同じtraitの実装が2つあると報告する() {
+        let src = format!("{MAP_SRC}{MAP_SRC}fn main(-> int) {{ 1 }}\n");
+        assert!(
+            errors(&src)
+                .iter()
+                .any(|e| e.contains("`Map` は `[T]` に対して既に実装されています")),
+            "{:?}",
+            errors(&src)
+        );
+    }
+
+    /// 別々の trait が同じ名前のメソッドを配列へ提供したら、呼び出しが曖昧
+    /// (tasks 1.5)
+    #[test]
+    fn 配列の同名メソッドが2つあると呼び出しが曖昧になる() {
+        let other = MAP_SRC.replace("Map", "Other");
+        let src = format!(
+            "{MAP_SRC}{other}fn double(n: int -> int) {{ n * 2 }}\n\
+             fn main(-> int) {{ let xs = [1]\n let ys = move xs.map(double)\n 1 }}\n"
+        );
+        assert!(
+            errors(&src)
+                .iter()
+                .any(|e| e.contains("`[int]` の `map` がどの trait のものか決まりません")),
+            "{:?}",
+            errors(&src)
+        );
+    }
+
+    /// 型引数は実引数(callback)からだけ決まる。`U` は `f` の戻り値型
+    /// (tasks 2.2)
+    #[test]
+    fn mapの型引数はcallbackから推論する() {
+        let src = format!(
+            "{MAP_SRC}fn flag(n: int -> bool) {{ n == 0 }}\n\
+             fn count(xs: &[bool] -> int) {{ let mut n = 0\n for x in xs {{ n = n + 1 }}\n n }}\n\
+             fn main(-> int) {{ let xs = [1, 2]\n let ys = move xs.map(flag)\n count(&ys) }}\n"
+        );
+        assert_eq!(errors(&src), Vec::<String>::new());
+    }
+
+    /// 組み込みの `clone` / `push` は宣言された配列 impl より先に見る
+    /// (MAP-080 決定2、tasks 2.2)
+    #[test]
+    fn 配列の組み込みcloneとpushは宣言に隠されない() {
+        let shadow = "trait Shadow<T> { fn push(&mut self, x: T)\n fn clone(&self -> [T]) }\n\
+             impl<T> Shadow<T> for [T] {\n\
+             \x20 fn push(&mut self, x: T) { }\n\
+             \x20 fn clone(&self -> [T]) { [] }\n\
+             }\n";
+        let src = format!(
+            "{shadow}fn main(-> int) {{ let mut xs = [1]\n xs.push(2)\n let ys = xs.clone()\n 1 }}\n"
+        );
+        assert_eq!(errors(&src), Vec::<String>::new());
+        let program = lowered(&src);
+        let id = program.free_callable("main").expect("main がある");
+        let body = &program.callables[id].body;
+        // 組み込みの `push` ノードになっていて、宣言側の具体化は1つも起きない
+        assert_eq!(
+            body.exprs()
+                .filter(|(_, e)| matches!(e.kind, hir::ExprKind::Push { .. }))
+                .count(),
+            1,
+            "{}",
+            program.dump()
+        );
+        assert!(instances(&program, "push").is_empty(), "{}", program.dump());
+        assert!(
+            instances(&program, "clone").is_empty(),
+            "{}",
+            program.dump()
+        );
+    }
+
+    /// 宣言されていない名前は、配列 impl があってもこれまでどおり member 無し
+    /// (tasks 2.2)
+    #[test]
+    fn 配列の知らないメソッドはこれまでどおり落ちる() {
+        let src = format!("{MAP_SRC}fn main(-> int) {{ let xs = [1]\n xs.reverse()\n 1 }}\n");
+        assert!(
+            errors(&src).iter().any(|e| e.contains("reverse")),
+            "{:?}",
+            errors(&src)
+        );
+    }
+
+    /// 要素型の違う2つの呼び出しは、それぞれ別の具体化になり、`self` の型も
+    /// 別々に代入される(MAP-080 決定3、tasks 3.3)
+    #[test]
+    fn 要素型ごとにmapの具体化が分かれる() {
+        let program = lowered(&format!(
+            "{MAP_SRC}fn double(n: int -> int) {{ n * 2 }}\n\
+             fn flip(b: bool -> bool) {{ b == false }}\n\
+             fn main(-> int) {{ let ns = [1]\n let bs = [true]\n\
+             \x20 let a = move ns.map(double)\n let b = move bs.map(flip)\n 1 }}\n"
+        ));
+        let found = instances(&program, "map");
+        assert_eq!(found.len(), 2, "{}", program.dump());
+        let mut selves: Vec<String> = found
+            .iter()
+            .map(|id| {
+                let receiver = program.callables[*id]
+                    .body
+                    .receiver
+                    .expect("消費レシーバがある");
+                let ty = program.callables[*id].body.local(receiver).ty.clone();
+                program.show_type(&ty.expect("`self` は型を持つ"))
+            })
+            .collect();
+        selves.sort();
+        assert_eq!(selves, vec!["[bool]", "[int]"], "{}", program.dump());
+        // 配列を対象にした `impl` の具体化は generic free 関数と同じ扱い
+        for id in found {
+            assert_eq!(program.callables[id].owner, hir::CallableOwner::Free);
+        }
+    }
+
+    /// 借用レシーバの `map` は、他の受け取りモード違いと同じ文言で落ちる
+    #[test]
+    fn 借用レシーバのmap呼び出しを断る() {
+        let src = format!(
+            "{MAP_SRC}fn double(n: int -> int) {{ n * 2 }}\n\
+             fn main(-> int) {{ let xs = [1]\n let ys = &xs.map(double)\n 1 }}\n"
+        );
+        assert!(
+            errors(&src)
+                .iter()
+                .any(|e| e
+                    .contains("`[int]::map` のレシーバは `[int]` ですが、`&[int]` を渡しています")),
+            "{:?}",
+            errors(&src)
+        );
     }
 }

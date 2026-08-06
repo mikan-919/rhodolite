@@ -364,6 +364,141 @@ const PUSH_OWNED_FILES: &[FixtureFile] = &[FixtureFile {
              }\n",
 }];
 
+/// Copy な要素型を `move xs.map(f)` で写す形。結果の並びと長さが両実行系で
+/// 一致することを押さえる(MAP-080)
+const MAP_COPY_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+             impl<T> Map<T> for [T] {\n\
+               fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+                 let mut result: [U] = []\n\
+                 for x in move self { result.push(f(move x)) }\n\
+                 move result\n\
+               }\n\
+             }\n\
+fn double(n: int -> int) { n * 2 }\n\
+         fn fold(xs: &[int] -> int) {\n\
+           let mut t = 0\n\
+           for x in xs { t = t * 10 + x }\n\
+           t\n\
+         }\n\
+         fn count(xs: &[int] -> int) {\n\
+           let mut n = 0\n\
+           for x in xs { n = n + 1 }\n\
+           n\n\
+         }\n\
+         fn main(-> int) {\n\
+           let xs = [1, 2, 3]\n\
+           let ys = move xs.map(double)\n\
+           fold(&ys) * 10 + count(&ys)\n\
+         }\n",
+}];
+
+/// 非 `Copy` の要素を callback へ move する形。写した後の元の配列は
+/// レシーバごと move 済みなので、最終状態は結果の側にしか無い。
+/// `clone()` を挟んだ側は元の配列が残ることも一緒に押さえる(MAP-080)
+const MAP_OWNED_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+             impl<T> Map<T> for [T] {\n\
+               fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+                 let mut result: [U] = []\n\
+                 for x in move self { result.push(f(move x)) }\n\
+                 move result\n\
+               }\n\
+             }\n\
+struct Tag { name: str, weight: int }\n\
+         fn weigh(t: Tag -> int) { t.weight * 2 }\n\
+         fn heavier(t: Tag -> Tag) {\n\
+           let w = t.weight + 1\n\
+           Tag { name = t.name, weight = w }\n\
+         }\n\
+         fn fold(xs: &[int] -> int) {\n\
+           let mut t = 0\n\
+           for x in xs { t = t * 10 + x }\n\
+           t\n\
+         }\n\
+         fn total(xs: &[Tag] -> int) {\n\
+           let mut t = 0\n\
+           for x in xs { t = t + x.weight }\n\
+           t\n\
+         }\n\
+         fn kept(xs: &[Tag] -> int) {\n\
+           let mut hits = 0\n\
+           for x in xs { if x.name == \"kept\" { hits = hits + 1 } }\n\
+           hits\n\
+         }\n\
+         fn main(-> int) {\n\
+           let tags = [Tag { name = \"kept\", weight = 1 }, Tag { name = \"dropped\", weight = 2 }]\n\
+           let weights = move tags.map(weigh)\n\
+           let more = [Tag { name = \"kept\", weight = 5 }]\n\
+           let grown = more.clone().map(heavier)\n\
+           fold(&weights) * 10000 + total(&grown) * 100 + total(&more) * 10 + kept(&grown)\n\
+         }\n",
+}];
+
+/// 空の配列を写す形。callback は1度も呼ばれず、結果も空(MAP-080)
+const MAP_EMPTY_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+             impl<T> Map<T> for [T] {\n\
+               fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+                 let mut result: [U] = []\n\
+                 for x in move self { result.push(f(move x)) }\n\
+                 move result\n\
+               }\n\
+             }\n\
+fn double(n: int -> int) { n * 2 }\n\
+         fn count(xs: &[int] -> int) {\n\
+           let mut n = 0\n\
+           for x in xs { n = n + 1 }\n\
+           n\n\
+         }\n\
+         fn main(-> int) {\n\
+           let xs: [int] = []\n\
+           let ys = move xs.map(double)\n\
+           count(&ys) + 7\n\
+         }\n",
+}];
+
+/// callback が ambient スロットを要る形。要求は `map` を通って呼び出し元へ
+/// 伝わり、提供は呼び出しの周りの `with` が満たす。スロットの実装が
+/// `&mut self` で番号を進めるので、callback を呼ぶ**順序**まで観測できる
+/// (MAP-080)
+const MAP_AMBIENT_FILES: &[FixtureFile] = &[FixtureFile {
+    path: "main.rd",
+    source: "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+             impl<T> Map<T> for [T] {\n\
+               fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+                 let mut result: [U] = []\n\
+                 for x in move self { result.push(f(move x)) }\n\
+                 move result\n\
+               }\n\
+             }\n\
+trait Tick { fn next(&mut self -> int) }\n\
+         struct Counter { n: int }\n\
+         impl Tick for Counter {\n\
+           fn next(&mut self -> int) {\n\
+             self.n = self.n + 1\n\
+             self.n\n\
+           }\n\
+         }\n\
+         effect tick: Tick\n\
+         fn stamp(n: int -> int) { n * 10 + tick.next() }\n\
+         fn fold(xs: &[int] -> int) {\n\
+           let mut t = 0\n\
+           for x in xs { t = t * 1000 + x }\n\
+           t\n\
+         }\n\
+         fn mapped(xs: [int] -> int) {\n\
+           let ys = move xs.map(stamp)\n\
+           fold(&ys)\n\
+         }\n\
+         fn main(-> int) {\n\
+           with tick(Counter { n = 0 }) { mapped([7, 8, 9]) }\n\
+         }\n",
+}];
+
 const CANONICAL_FILES: &[FixtureFile] = &[FixtureFile {
     path: "main.rd",
     source: include_str!("../examples/canonical.rd"),
@@ -475,6 +610,30 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "push-owned-element",
         files: PUSH_OWNED_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "map-copy-element",
+        files: MAP_COPY_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "map-owned-element",
+        files: MAP_OWNED_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "map-empty-array",
+        files: MAP_EMPTY_FILES,
+        probes: &[],
+        expected_failure: None,
+    },
+    Fixture {
+        name: "map-ambient-callback",
+        files: MAP_AMBIENT_FILES,
         probes: &[],
         expected_failure: None,
     },

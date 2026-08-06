@@ -3109,4 +3109,116 @@ fn main(-> int) {
                    }\n";
         assert!(matches!(checked_run(src, "main"), Ok(Value::Int(5))));
     }
+
+    // ---- 汎用 `map`(MAP-080) ----
+
+    /// `Map<T>` と `[T]` の実装。本体は通常の Rhodolite コードだけ
+    const MAP_SRC: &str = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+         impl<T> Map<T> for [T] {\n\
+         \x20 fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+         \x20   let mut result: [U] = []\n\
+         \x20   for x in move self { result.push(f(move x)) }\n\
+         \x20   move result\n\
+         \x20 }\n\
+         }\n";
+
+    /// 呼び出しの**順序**を観測するための ambient なカウンタ。`f` が呼ばれる
+    /// たびに 1 から順に番号を返す
+    const TICK_SRC: &str = "trait Tick { fn next(&mut self -> int) }\n\
+         struct Counter { n: int }\n\
+         impl Tick for Counter { fn next(&mut self -> int) { self.n = self.n + 1\n self.n } }\n\
+         effect tick: Tick\n";
+
+    /// Copy な要素型。結果は入力と同じ並びで、`f` は要素ごとにちょうど1度
+    #[test]
+    fn mapはcopyな要素を順に写す() {
+        let src = format!(
+            "{MAP_SRC}fn double(n: int -> int) {{ n * 2 }}\n\
+             fn main(-> int) {{\n\
+             \x20 let xs = [1, 2, 3]\n\
+             \x20 let ys = move xs.map(double)\n\
+             \x20 let mut seen = 0\n\
+             \x20 let mut count = 0\n\
+             \x20 for y in &ys {{ seen = seen * 10 + y }}\n\
+             \x20 for y in &ys {{ count = count + 1 }}\n\
+             \x20 seen * 10 + count\n\
+             }}\n"
+        );
+        assert!(matches!(checked_run(&src, "main"), Ok(Value::Int(2463))));
+    }
+
+    /// `f` は左から順に1度ずつ呼ばれる。ambient なカウンタが返す番号が
+    /// 要素の並びと一致することで、結果の並びではなく**呼び出し順**を見る
+    #[test]
+    fn mapのcallbackは左から順に一度ずつ呼ばれる() {
+        let src = format!(
+            "{MAP_SRC}{TICK_SRC}fn stamp(n: int -> int) {{ n * 10 + tick.next() }}\n\
+             fn fold(xs: &[int] -> int) {{ let mut t = 0\n for x in xs {{ t = t * 1000 + x }}\n t }}\n\
+             fn main(-> int) {{\n\
+             \x20 with tick(Counter {{ n = 0 }}) {{\n\
+             \x20   let xs = [7, 8, 9]\n\
+             \x20   let ys = move xs.map(stamp)\n\
+             \x20   fold(&ys)\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        assert!(matches!(
+            checked_run(&src, "main"),
+            Ok(Value::Int(71_082_093))
+        ));
+    }
+
+    /// 空の配列では `f` を1度も呼ばず、結果も空
+    #[test]
+    fn 空の配列のmapはcallbackを呼ばない() {
+        let src = format!(
+            "{MAP_SRC}{TICK_SRC}fn stamp(n: int -> int) {{ n * 10 + tick.next() }}\n\
+             fn main(-> int) {{\n\
+             \x20 with tick(Counter {{ n = 0 }}) {{\n\
+             \x20   let xs: [int] = []\n\
+             \x20   let ys = move xs.map(stamp)\n\
+             \x20   let mut count = 0\n\
+             \x20   for y in &ys {{ count = count + 1 }}\n\
+             \x20   count * 10 + tick.next()\n\
+             \x20 }}\n\
+             }}\n"
+        );
+        // 長さ 0、かつ写像後の最初の `tick.next()` がまだ 1 = 1度も呼んでいない
+        assert!(matches!(checked_run(&src, "main"), Ok(Value::Int(1))));
+    }
+
+    /// 非 Copy の要素は `f` の中へ move される。結果の配列が新しい所有を持つ
+    #[test]
+    fn mapは非copyな要素をcallbackへmoveする() {
+        let src = format!(
+            "{MAP_SRC}struct Tag {{ name: str, weight: int }}\n\
+             fn weigh(t: Tag -> int) {{ t.weight * 2 }}\n\
+             fn main(-> int) {{\n\
+             \x20 let tags = [Tag {{ name = \"a\", weight = 1 }}, Tag {{ name = \"b\", weight = 2 }}]\n\
+             \x20 let ws = move tags.map(weigh)\n\
+             \x20 let mut total = 0\n\
+             \x20 for w in &ws {{ total = total * 10 + w }}\n\
+             \x20 total\n\
+             }}\n"
+        );
+        assert!(matches!(checked_run(&src, "main"), Ok(Value::Int(24))));
+    }
+
+    /// `clone()` してから写せば、元の配列はそのまま残る
+    #[test]
+    fn cloneしたmapは元の配列を残す() {
+        let src = format!(
+            "{MAP_SRC}fn double(n: int -> int) {{ n * 2 }}\n\
+             fn main(-> int) {{\n\
+             \x20 let xs = [1, 2, 3]\n\
+             \x20 let ys = xs.clone().map(double)\n\
+             \x20 let mut original = 0\n\
+             \x20 let mut mapped = 0\n\
+             \x20 for x in &xs {{ original = original * 10 + x }}\n\
+             \x20 for y in &ys {{ mapped = mapped * 10 + y }}\n\
+             \x20 mapped * 1000 + original\n\
+             }}\n"
+        );
+        assert!(matches!(checked_run(&src, "main"), Ok(Value::Int(246_123))));
+    }
 }
