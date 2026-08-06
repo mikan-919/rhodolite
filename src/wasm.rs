@@ -5996,4 +5996,202 @@ pub(crate) mod tests {
             []
         );
     }
+
+    // -----------------------------------------------------------------------
+    // 汎用具体化の生成(MAP-070)
+    // -----------------------------------------------------------------------
+
+    /// 定義順に、各関数が直に呼ぶ相手を集める。表越しの呼び出しに出会ったら
+    /// その場で落とす。汎用具体化も直呼びだけで届くことの根拠
+    fn direct_call_targets(bytes: &[u8]) -> Vec<Vec<u32>> {
+        let mut bodies = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+            match payload.unwrap() {
+                wasmparser::Payload::ImportSection(section) => {
+                    assert_eq!(section.count(), 0, "host import は増やさない");
+                }
+                wasmparser::Payload::TableSection(section) => {
+                    assert_eq!(section.count(), 0, "function table は持たない");
+                }
+                wasmparser::Payload::CodeSectionEntry(body) => {
+                    let mut targets = Vec::new();
+                    let mut reader = body.get_operators_reader().expect("命令を読めるはず");
+                    while !reader.eof() {
+                        match reader.read().expect("命令を読めるはず") {
+                            wasmparser::Operator::Call { function_index } => {
+                                targets.push(function_index);
+                            }
+                            wasmparser::Operator::CallIndirect { .. } => {
+                                panic!("表越しの呼び出しがある");
+                            }
+                            _ => {}
+                        }
+                    }
+                    bodies.push(targets);
+                }
+                _ => {}
+            }
+        }
+        bodies
+    }
+
+    /// 本体の名前で instance 番号を引く。番号はそのまま function index
+    fn instance_indices(
+        checked: &CheckedProgram,
+        production: &ProductionPlan,
+        name: &str,
+    ) -> Vec<u32> {
+        production
+            .plan
+            .instances()
+            .filter(|(_, instance)| checked.hir.show_body(instance.key.body) == name)
+            .map(|(id, _)| id.index() as u32)
+            .collect()
+    }
+
+    /// 同じ汎用宣言でも、型引数・callback・provider が違えば別々の instance に
+    /// なり、署名と隠し欄の並びが固定される。ambient を要らない具体化は兄弟の
+    /// 隠し欄を持たない
+    #[test]
+    fn 汎用具体化のinstance署名と隠し欄は固定される() {
+        let src = "trait Clock { fn now(&self -> int) }\n\
+                   struct Frozen { at: int }\n\
+                   impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+                   effect clock: Clock\n\
+                   fn ticked(value: int -> int) { value + clock.now() }\n\
+                   fn flagged(value: bool -> int) { if value: clock.now() else: 0 }\n\
+                   fn plain(value: int -> int) { value + 1 }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+                   fn main(-> int) {\n\
+                   \x20 let quiet = apply(plain, 1)\n\
+                   \x20 with clock(Frozen { at = 7 }) { apply(ticked, quiet) + apply(flagged, true) }\n\
+                   }\n";
+        let (checked, production) = plan_of(src, &[]);
+        let program = &checked.hir;
+        let mut snapshots = production
+            .plan
+            .instances()
+            .filter(|(_, instance)| program.show_body(instance.key.body) == "apply")
+            .map(|(id, _)| instance_signature_snapshot(&checked, &production, id))
+            .collect::<Vec<_>>();
+        snapshots.sort();
+        assert_eq!(
+            snapshots,
+            [
+                // bool 引数 + clock の隠し欄
+                "apply params=[I32, I32] ambient=[clock=1]",
+                // int 引数 + clock の隠し欄
+                "apply params=[I64, I32] ambient=[clock=1]",
+                // ambient を要らない兄弟は隠し欄を持たない
+                "apply params=[I64] ambient=[]",
+            ]
+        );
+    }
+
+    /// callback の束縛が違えば、呼び出し口はそれぞれ自分の具体化を直に呼ぶ。
+    /// 共有の分岐点は無く、表も funcref も import も増えない
+    #[test]
+    fn 汎用具体化の呼び出しは束縛ごとの直呼びになる() {
+        let src = "fn double(value: int -> int) { value * 2 }\n\
+                   fn negate(value: int -> int) { 0 - value }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+                   fn main(-> int) { apply(double, 21) + apply(double, 1) + apply(negate, 5) }\n";
+        let (checked, production) = plan_of(src, &[]);
+        let applies = instance_indices(&checked, &production, "apply");
+        let double = instance_indices(&checked, &production, "double");
+        let negate = instance_indices(&checked, &production, "negate");
+        assert_eq!(
+            applies.len(),
+            2,
+            "束縛ごとに具体化が分かれ、同じ束縛は畳まれる"
+        );
+        assert_eq!(double.len(), 1);
+        assert_eq!(negate.len(), 1);
+
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        let bodies = direct_call_targets(&bytes);
+        let mut bound: Vec<Vec<u32>> = applies
+            .iter()
+            .map(|index| bodies[*index as usize].clone())
+            .collect();
+        bound.sort();
+        let mut expected = vec![double.clone(), negate.clone()];
+        expected.sort();
+        assert_eq!(
+            bound, expected,
+            "具体化はそれぞれ自分の callback を直に呼ぶ"
+        );
+        let mut called = bodies[0].clone();
+        called.sort();
+        called.dedup();
+        assert_eq!(
+            called, applies,
+            "呼び出し口は計画した instance 番号をそのまま使う"
+        );
+        assert_eq!(scalars(&invoke(&bytes, ENTRY_EXPORT, &[]).unwrap()), [39]);
+    }
+
+    /// 到達しない汎用宣言は関数を1つも生まない。宣言を消したモジュールと
+    /// バイト単位で同じになることで見る
+    #[test]
+    fn 到達しない汎用宣言は関数を生まない() {
+        let reached = "fn identity<T>(x: T -> T) { x }\n\
+                       fn main(-> int) { identity(3) }\n";
+        let with_unreached = "fn identity<T>(x: T -> T) { x }\n\
+                              fn unreached<T>(x: T, n: int -> T) { if n == 0: x else: unreached(x, n - 1) }\n\
+                              fn main(-> int) { identity(3) }\n";
+        let (checked, production) = plan_of(with_unreached, &[]);
+        assert!(
+            instance_indices(&checked, &production, "unreached").is_empty(),
+            "到達しない宣言は instance にならない"
+        );
+        assert_eq!(
+            compile(with_unreached, &[]).expect("生成できるはず"),
+            compile(reached, &[]).expect("生成できるはず"),
+            "到達しない宣言はバイト列を変えない"
+        );
+    }
+
+    /// 所有値を汎用の消費 callback へ `move` する呼び出しを有界なループで
+    /// 繰り返しても、解放した記憶を使い回すのでメモリは伸びない
+    #[test]
+    fn 汎用の消費callbackを繰り返してもメモリは伸びない() {
+        let src = "struct Tag { name: str }\n\
+                   fn weigh(t: Tag -> int) { if t.name == \"kept\": 1 else: 0 }\n\
+                   fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(move x) }\n\
+                   fn main(-> int) {\n\
+                   \x20 let mut n = 0\n\
+                   \x20 while (n == 3000) == false {\n\
+                   \x20   n = n + apply(weigh, Tag { name = \"kept\" })\n\
+                   \x20 }\n\
+                   \x20 n\n\
+                   }\n";
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        validate(&bytes).expect("検証を通るはず");
+        assert_eq!(invoke_capped(&bytes, ENTRY_EXPORT, 1), Ok(vec![3000]));
+    }
+
+    /// 汎用 trait メソッドの具体化も、型引数ごとに1つの関数へ下りて走り切る
+    #[test]
+    fn 汎用trait_methodの具体化は普通のmethodと同じに走る() {
+        let src = "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+                   struct Container { tag: int }\n\
+                   impl<T> Box<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+                   fn double(value: int -> int) { value * 2 }\n\
+                   fn flip(value: bool -> bool) { value == false }\n\
+                   fn main(-> int) {\n\
+                   \x20 let c = Container { tag = 1 }\n\
+                   \x20 if c.wrap(false, flip): c.wrap(20, double) else: 0\n\
+                   }\n";
+        assert_eq!(same_as_interpreter(src), 40);
+        let bytes = compile(src, &[]).expect("生成できるはず");
+        let (checked, production) = plan_of(src, &[]);
+        assert_eq!(
+            instance_indices(&checked, &production, "impl Container::wrap").len(),
+            2,
+            "型引数ごとに具体化が1つずつ"
+        );
+        direct_call_targets(&bytes);
+    }
 }
