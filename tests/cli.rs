@@ -2322,9 +2322,9 @@ fn trait型引数の個数が合わないgeneric_implは実行前に失敗する
 fn structでない対象のgeneric_implは実行前に失敗する() {
     実行前に失敗する(
         "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
-         impl<T> Box<T> for [T] { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         impl<T> Box<T> for [int] { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
          fn main(-> int) { 1 }\n",
-        "`[T]` は struct ではありません",
+        "`[int]` は struct ではありません",
     );
 }
 

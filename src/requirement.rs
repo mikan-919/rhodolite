@@ -282,17 +282,18 @@ fn scan(
                         span: expr.span,
                     });
                 }
-                // ponytail: 値レシーバのメソッド呼び出しは辺にしない。要求が
-                // そこを通り抜けるが、AST を歩いていた頃と同じ保守的な
-                // 過小近似。辺にするなら `Facts` の合流だけを直せばよい。
-                //
-                // 辺にはしないが、呼び先の**特殊化**は歩いておく。計画は
-                // その鍵で意味の結果を引くので、callback を取るメソッド
-                // (generic な `impl` にしか無い)でも表が欠けない
+                // 値レシーバのメソッド呼び出しも直接呼び出しと同じ辺(MAP-080
+                // 決定5)。`calls` は到達だけでなく要求の伝播にも使われるので、
+                // callback の ambient 要求が `xs.map(f)` を通って呼び出し側へ
+                // 届く。ここまで `walks` だけに積んでいたのは AST を歩いて
+                // いた頃と同じ保守的な過小近似だった
                 hir::Call::Method { callable, args, .. } => {
                     let inner = hir::callee_bindings(program, body, *callable, args, bindings);
-                    out.walks
-                        .push(BodyKey::Body(hir::BodyId::Callable(*callable), inner));
+                    out.calls.push(Call {
+                        callee: BodyKey::Body(hir::BodyId::Callable(*callable), inner),
+                        provided: provided.clone(),
+                        span: expr.span,
+                    });
                 }
                 hir::Call::Ctor { .. } => {}
             }
@@ -1896,7 +1897,9 @@ mod tests {
         );
         // 隠した arm は要求を作らないが、隠していない arm の分は残る
         assert_eq!(facts.0, set(&["clock"]));
-        assert_eq!(facts.1, set(&["impl Clock::now"]));
+        // 隠した arm の `db.save(u)` は具体型のメソッド呼び出しで、値レシーバ
+        // でも辺になる(MAP-080 決定5)。スロットは隠れているので要求は作らない
+        assert_eq!(facts.1, set(&["impl Clock::now", "impl Postgres::save"]));
     }
 
     #[test]
@@ -2232,5 +2235,67 @@ mod tests {
              fn main(-> Store) {{ Store::new() }}\n"
         ));
         assert_eq!(a.reqs["main"]["clock"].level, SlotLevel::Value);
+    }
+
+    // ---- 汎用 `map`(MAP-080) ----
+
+    /// `Map<T>` と `[T]` の実装、要求のある callback と無い callback
+    const MAP_PRELUDE: &str = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+         impl<T> Map<T> for [T] {\n\
+         \x20 fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+         \x20   let mut result: [U] = []\n\
+         \x20   for x in move self { result.push(f(move x)) }\n\
+         \x20   move result\n\
+         \x20 }\n\
+         }\n\
+         fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn sum(xs: &[int] -> int) { let mut t = 0\n for x in xs { t = t + x }\n t }\n\
+         fn mapped(f: fn(int -> int), xs: [int] -> int) { let ys = move xs.map(f)\n sum(&ys) }\n";
+
+    /// callback の ambient 要求は `map` と trait dispatch を通って呼び出し元へ
+    /// 届く(MAP-080 決定5、tasks 5.2)
+    #[test]
+    fn mapのcallbackの要求が呼び出し元へ届く() {
+        let a = analysis_of(&format!(
+            "{PRELUDE}{MAP_PRELUDE}fn main(-> int) {{ mapped(ticked, [1, 2]) }}\n"
+        ));
+        assert_eq!(req_names(&a.reqs["mapped"]), set(&["clock"]));
+        assert_eq!(req_names(&a.reqs["main"]), set(&["clock"]));
+    }
+
+    /// 要求を持たない callback を渡した呼び出し地点は綺麗なまま(tasks 5.2)
+    #[test]
+    fn 要求の無いcallbackのmapは要求を作らない() {
+        let a = analysis_of(&format!(
+            "{PRELUDE}{MAP_PRELUDE}fn main(-> int) {{ mapped(plain, [1, 2]) }}\n"
+        ));
+        assert_eq!(req_names(&a.reqs["main"]), BTreeSet::new());
+    }
+
+    /// 提供が経路のどこにも無ければ実行前に落ち、経路は `map` を名指す
+    /// (tasks 5.2)
+    #[test]
+    fn mapを通る提供忘れの経路はmapを名指す() {
+        let program = lowered_of(&format!(
+            "{MAP_PRELUDE}fn main(-> int) {{ mapped(ticked, [1, 2]) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(analysis.unsatisfied().len(), 1);
+        let path: Vec<&str> = analysis.reqs["main"]["clock"].path_names();
+        assert!(path.contains(&"map"), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("mapped")), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("ticked")), "{path:?}");
+    }
+
+    /// `with` で覆えば要求は止まる。`map` の中の間接呼び出しでも同じ
+    #[test]
+    fn mapの周りのwithは要求を止める() {
+        let a = analysis_of(&format!(
+            "{PRELUDE}{MAP_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{ mapped(ticked, [1, 2]) }}\n\
+             }}\n"
+        ));
+        assert_eq!(req_names(&a.reqs["main"]), BTreeSet::new());
     }
 }

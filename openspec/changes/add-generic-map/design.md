@@ -159,6 +159,16 @@ untouched: they already only need a candidate list, a receiver, and a
 label, and do not care whether the underlying target is a struct or an
 array.
 
+**Implementation deviation (diagnostic label only):** the arm passes the
+*receiver's own owned spelling* (`[int]`, computed by stripping the
+receiver type's borrow the same way `KnownType::name()` looks through one
+for a struct) as the diagnostic `type_name`, instead of the literal
+sentinel `"[]"`. The sentinel stays confined to the index key, exactly as
+Decision 1 requires; using it in messages would print `` `[]` の `map` が
+どの trait のものか決まりません `` and `` `&[]::map` のレシーバは… ``,
+which name no type the user wrote. Nothing else changes: the lookup key,
+the candidate list, and `generic_method`/`generic_call` are as planned.
+
 **Alternative considered:** make `KnownType::name()` return `Some("[]")`
 for an array so the existing `Some(type_name) => ...` arm handles it with
 no new match arm. Rejected — `name()`'s callers outside this one match arm
@@ -192,6 +202,26 @@ already-in-scope `bindings` the same way it already builds `ret`
 (the target has no type-parameter-dependent part), so the struct path's
 resulting `KnownType` and `CallableOwner::TraitImpl`/`Inherent` choice are
 unchanged byte-for-byte.
+
+**Implementation note (two further sites the same substitution reaches,
+both found by the existing suite, neither a new decision):** the same
+"`self`'s type is the target substituted through this context's bindings"
+rule has to be applied at the two *other* places that spelled `self`'s type
+from a fixed name, or `impl<T> Map<T> for [T]` cannot type-check at all.
+(a) The rigid one-shot body check (`check_rigid`, `typecheck.rs`) built the
+receiver from `impl_target_name(target)` — the literal string `"[T]"` as a
+*nominal* name — so `for x in move self` reported "`for` の反復対象は配列
+である必要がありますが、`[T]` です". It now takes the target from the
+decl's `GenericOwner::Impl` and substitutes the rigid bindings, giving
+`[#T0]`; a struct target still yields exactly the struct's own name, so the
+existing rigid checks are unchanged. (b) The call site's receiver
+conformance (`conform_receiver`, reached from `generic_call`) built the
+expected type with `receiver_type(mode, type_name)`, i.e. a nominal name
+again. It now takes the owned self type as a parameter — `plain(type_name)`
+on the unchanged non-generic path, and the substituted target from
+`generic_call` — with `type_name` kept for the diagnostic label only. Both
+sites go through one new helper, `as_receiver(mode, owned)`, which is
+literally the body `receiver_type` already had.
 
 For the array case, `CallableOwner` is `Free` — mirroring today's dead
 fallback branch instance_owner already has for a non-struct target

@@ -6595,4 +6595,60 @@ fn main(-> int) {{
             "main: `push` の第 1 引数は所有を受け取りますが、束縛済みの `it` をそのまま渡しています"
         );
     }
+
+    // ---- 汎用 `map`(MAP-080) ----
+
+    /// `Map<T>` と `[T]` の実装。本体は通常の Rhodolite コードだけ
+    const MAP_SRC: &str = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+         impl<T> Map<T> for [T] {\n\
+         \x20 fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+         \x20   let mut result: [U] = []\n\
+         \x20   for x in move self { result.push(f(move x)) }\n\
+         \x20   move result\n\
+         \x20 }\n\
+         }\n\
+         fn double(n: int -> int) { n * 2 }\n";
+
+    /// `map` の本体(`for x in move self` + `push` + `move result`)は
+    /// 既存の規則だけで通る。所有権解析に `map` 専用の枝は無い(tasks 4.2)
+    #[test]
+    fn mapの本体は既存の規則で受理される() {
+        accepted(&format!(
+            "{MAP_SRC}fn main(-> int) {{ let xs = [1]\n let ys = move xs.map(double)\n 1 }}\n"
+        ));
+    }
+
+    /// 消費レシーバなので、呼び出し地点に `move` が要る
+    #[test]
+    fn moveのないmap呼び出しを断る() {
+        assert_eq!(
+            only(&format!(
+                "{MAP_SRC}fn main(-> int) {{ let xs = [1]\n let ys = xs.map(double)\n 1 }}\n"
+            ))
+            .msg,
+            "main: `map` のレシーバは所有を受け取りますが、束縛済みの `xs` をそのまま渡しています"
+        );
+    }
+
+    /// レシーバは move されるので、その後の元の配列は使えない
+    #[test]
+    fn mapしたあとの元の配列は使えない() {
+        assert_eq!(
+            only(&format!(
+                "{MAP_SRC}fn sum(xs: &[int] -> int) {{ let mut t = 0\n for x in xs {{ t = t + x }}\n t }}\n\
+                 fn main(-> int) {{ let xs = [1]\n let ys = move xs.map(double)\n sum(&xs) }}\n"
+            ))
+            .msg,
+            "main: `xs` は既に move されているので使えません"
+        );
+    }
+
+    /// `clone()` を挟めば元の配列は残る。借用版 `map` は要らない
+    #[test]
+    fn cloneしてからのmapは元の配列を残す() {
+        accepted(&format!(
+            "{MAP_SRC}fn sum(xs: &[int] -> int) {{ let mut t = 0\n for x in xs {{ t = t + x }}\n t }}\n\
+             fn main(-> int) {{ let xs = [1]\n let ys = xs.clone().map(double)\n sum(&xs) + sum(&ys) }}\n"
+        ));
+    }
 }
