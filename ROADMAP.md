@@ -139,7 +139,7 @@ fn main(-> [User?]) {
 | MAP-075 | `done` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 不要 |
 | MAP-080 | `done` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
 | MAP-090 | `done` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
-| MAP-100 | `in-progress` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
+| MAP-100 | `done` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
 
 ### MAP-000 — 汎用 `map` の契約
 
