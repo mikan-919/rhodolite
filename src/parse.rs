@@ -96,6 +96,19 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok("as".to_string())
             }
+            // 所有権の綴りも宣言位置の外では識別子に戻す。`use`/`pub`/`as` と同じ
+            Tok::Mut => {
+                self.bump();
+                Ok("mut".to_string())
+            }
+            Tok::Move => {
+                self.bump();
+                Ok("move".to_string())
+            }
+            Tok::Indirect => {
+                self.bump();
+                Ok("indirect".to_string())
+            }
             other => Err(self.err(&format!("{} が必要です (実際は {:?})", what, other))),
         }
     }
@@ -218,6 +231,7 @@ impl<'a> Parser<'a> {
             Tok::Trait => {
                 self.bump();
                 let name = self.expect_ident("trait 名")?;
+                let type_params = self.type_params()?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut methods = Vec::new();
                 loop {
@@ -230,6 +244,7 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Item::Trait {
                     name,
+                    type_params,
                     methods,
                     span: self.to(start),
                 })
@@ -239,6 +254,7 @@ impl<'a> Parser<'a> {
             Tok::Struct => {
                 self.bump();
                 let name = self.expect_ident("struct 名")?;
+                self.reject_type_params("struct")?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut fields = Vec::new();
                 loop {
@@ -246,9 +262,14 @@ impl<'a> Parser<'a> {
                     if self.eat(&Tok::RBrace) {
                         break;
                     }
+                    let indirect = self.indirect_modifier();
                     let fname = self.expect_ident("フィールド名")?;
                     self.expect(&Tok::Colon, "`:`")?;
-                    fields.push((fname, self.ty()?));
+                    fields.push(FieldDecl {
+                        name: fname,
+                        ty: self.ty()?,
+                        indirect,
+                    });
                     self.eat(&Tok::Comma);
                 }
                 Ok(Item::Struct {
@@ -263,6 +284,7 @@ impl<'a> Parser<'a> {
             Tok::Enum => {
                 self.bump();
                 let name = self.expect_ident("enum 名")?;
+                self.reject_type_params("enum")?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut variants = Vec::new();
                 loop {
@@ -274,7 +296,11 @@ impl<'a> Parser<'a> {
                     let mut payload = Vec::new();
                     if self.eat(&Tok::LParen) {
                         while !self.at(&Tok::RParen) {
-                            payload.push(self.ty()?);
+                            let indirect = self.indirect_modifier();
+                            payload.push(PayloadDecl {
+                                ty: self.ty()?,
+                                indirect,
+                            });
                             if !self.eat(&Tok::Comma) {
                                 break;
                             }
@@ -298,12 +324,8 @@ impl<'a> Parser<'a> {
             // ハンドラに専用構文は無い(CONTEXT.md「ハンドラ」)。ただの impl。
             Tok::Impl => {
                 self.bump();
-                let first = self.name_path("trait 名または型名")?;
-                let (trait_name, type_name) = if self.eat(&Tok::For) {
-                    (Some(first), self.name_path("型名")?)
-                } else {
-                    (None, first)
-                };
+                let type_params = self.type_params()?;
+                let (trait_ref, target) = self.impl_head()?;
                 self.expect(&Tok::LBrace, "`{`")?;
                 let mut methods = Vec::new();
                 loop {
@@ -317,8 +339,9 @@ impl<'a> Parser<'a> {
                     methods.push((sig, body));
                 }
                 Ok(Item::Impl {
-                    trait_name,
-                    type_name,
+                    type_params,
+                    trait_ref,
+                    target,
                     methods,
                     span: self.to(start),
                 })
@@ -369,6 +392,8 @@ impl<'a> Parser<'a> {
                 })
             }
 
+            Tok::Unsafe => Err(self.err("`unsafe` はありません")),
+
             other => Err(self.err(&format!(
                 "trait / struct / enum / impl / effect / fn / test のいずれかが必要です (実際は {:?})",
                 other
@@ -384,20 +409,97 @@ impl<'a> Parser<'a> {
         Ok(parts.join("::"))
     }
 
+    /// `<T, U>` — 宣言が導入する型パラメータ。無ければ空(MAP-Q1)。
+    ///
+    /// `<` `>` は `with slot<Type>` でしか使われず、比較演算子でもないので、
+    /// キーワードで位置が固定されたここでは曖昧にならない
+    fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
+        if !self.eat(&Tok::Less) {
+            return Ok(Vec::new());
+        }
+        let mut params = Vec::new();
+        loop {
+            let start = self.span();
+            let name = self.expect_ident("型パラメータ名")?;
+            params.push(TypeParam {
+                name,
+                span: self.to(start),
+            });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::Greater, "`>`")?;
+        Ok(params)
+    }
+
+    /// 型パラメータを取れない宣言で `<` を見たら、そこで止める(MAP-Q1)。
+    fn reject_type_params(&mut self, kind: &str) -> PResult<()> {
+        if self.at(&Tok::Less) {
+            return Err(self.err(&format!("{kind} には型パラメータを書けません")));
+        }
+        Ok(())
+    }
+
+    /// `Map<T> for [T]` / `Database for Postgres` / `Postgres` — `impl` の頭。
+    ///
+    /// trait 参照は識別子で始まり `for` で閉じる。trait を持たない `impl` の
+    /// 対象型は型注釈の文法そのままなので、`impl [T]` も同じ道を通る
+    fn impl_head(&mut self) -> PResult<(Option<TraitRef>, Type)> {
+        if !matches!(self.peek(), Tok::Ident(_)) {
+            return Ok((None, self.ty()?));
+        }
+        let name = self.name_path("trait 名または型名")?;
+        let args = self.type_args()?;
+        if self.eat(&Tok::For) {
+            return Ok((Some(TraitRef { name, args }), self.ty()?));
+        }
+        if !args.is_empty() {
+            return Err(self.err(
+                "`impl` の対象型に型引数は書けません。trait を実装するなら `for` が必要です",
+            ));
+        }
+        Ok((
+            None,
+            Type {
+                mode: TypeMode::Owned,
+                kind: TypeKind::Named(name),
+                optional: false,
+            },
+        ))
+    }
+
+    /// `<T, [U]>` — trait 参照に渡す型引数。無ければ空
+    fn type_args(&mut self) -> PResult<Vec<Type>> {
+        if !self.eat(&Tok::Less) {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![self.ty()?];
+        while self.eat(&Tok::Comma) {
+            args.push(self.ty()?);
+        }
+        self.expect(&Tok::Greater, "`>`")?;
+        Ok(args)
+    }
+
     /// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある。
     /// `fn now(-> int)` のように引数ゼロで戻り値だけ、も書ける。
     fn sig(&mut self) -> PResult<Sig> {
         let start = self.span();
         let name = self.expect_ident("関数名")?;
+        // 自由関数・trait メソッド・impl メソッドはこの1本を共有するので、
+        // `fn map<U>(...)` の構文は3箇所ぶん同時に入る
+        let type_params = self.type_params()?;
         self.expect(&Tok::LParen, "`(`")?;
 
         let mut params = Vec::new();
         let mut ret = None;
 
         // `fn save(self, u: User -> unit)` — self は型を書かない。
-        // これがある/ないだけがメソッドと関連関数の区別
-        let has_self = self.eat(&Tok::SelfKw);
-        if has_self {
+        // これがある/ないだけがメソッドと関連関数の区別。所有モードは
+        // `self` / `&self` / `&mut self` の3つ(design.md 決定2)
+        let receiver = self.receiver_mode()?;
+        if receiver.is_some() {
             self.eat(&Tok::Comma);
         }
 
@@ -419,27 +521,104 @@ impl<'a> Parser<'a> {
         }
 
         self.expect(&Tok::RParen, "`)`")?;
+        // 破棄はコンパイラが決めるので、利用者が書ける後始末フックは無い。
+        // 対象はレシーバを取るものだけ。レシーバの無い自由関数は後始末フックに
+        // なりようがないので従来どおり(deterministic-destruction)
+        if receiver.is_some() && matches!(name.as_str(), "drop" | "deinit" | "finalize") {
+            return Err(Diag::at(
+                start,
+                format!(
+                    "`{name}` はユーザー定義のデストラクタになるため宣言できません。破棄はコンパイラが決めます"
+                ),
+            ));
+        }
         Ok(Sig {
             name,
-            has_self,
+            type_params,
+            receiver,
             params,
             ret,
             span: self.to(start),
         })
     }
 
-    /// `User` / `[User]` / `[User?]?`。後置 `?` は直前の完成した型に付く
-    /// ので、`[T]?` と `[T?]` は別物(design.md 決定2)。
+    /// 引数リストの先頭のレシーバ。`&` は引数名にはなれないので曖昧にならない。
+    fn receiver_mode(&mut self) -> PResult<Option<ReceiverMode>> {
+        if self.eat(&Tok::SelfKw) {
+            return Ok(Some(ReceiverMode::Owned));
+        }
+        if !self.at(&Tok::Amp) {
+            return Ok(None);
+        }
+        self.bump();
+        let mode = if self.eat(&Tok::Mut) {
+            ReceiverMode::Mutable
+        } else {
+            ReceiverMode::Shared
+        };
+        self.expect(&Tok::SelfKw, "`self`")?;
+        Ok(Some(mode))
+    }
+
+    /// `indirect` は宣言位置の修飾。型が続かないなら普通の識別子に戻す。
+    fn indirect_modifier(&mut self) -> bool {
+        let next = self.toks.get(self.pos + 1).map(|t| &t.tok);
+        if !self.at(&Tok::Indirect) || !matches!(next, Some(Tok::Ident(_) | Tok::LBracket)) {
+            return false;
+        }
+        self.bump();
+        true
+    }
+
+    /// `User` / `[User]` / `[User?]?` / `&User` / `&mut User`。後置 `?` は
+    /// 直前の完成した型に付くので、`[T]?` と `[T?]` は別物(design.md 決定2)。
     fn ty(&mut self) -> PResult<Type> {
+        let mode = if self.eat(&Tok::Amp) {
+            if self.eat(&Tok::Mut) {
+                TypeMode::Mutable
+            } else {
+                TypeMode::Shared
+            }
+        } else {
+            TypeMode::Owned
+        };
+        match self.peek() {
+            Tok::Star => {
+                return Err(self.err("生ポインタ型はありません。`&T` か `&mut T` と書きます"));
+            }
+            Tok::Amp => return Err(self.err("参照の参照は書けません")),
+            _ => {}
+        }
         let kind = if self.eat(&Tok::LBracket) {
             let element = self.ty()?;
             self.expect(&Tok::RBracket, "`]`")?;
             TypeKind::Array(Box::new(element))
+        } else if self.eat(&Tok::Fn) {
+            // `fn(P1, P2 -> R)`。宣言の署名と違い、名前も本体も持たない
+            self.expect(&Tok::LParen, "`(`")?;
+            let mut params = Vec::new();
+            while !self.at(&Tok::Arrow) {
+                params.push(self.ty()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Tok::Arrow, "`->`")?;
+            let result = self.ty()?;
+            self.expect(&Tok::RParen, "`)`")?;
+            TypeKind::Callable {
+                params,
+                result: Box::new(result),
+            }
         } else {
             TypeKind::Named(self.name_path("型名")?)
         };
         let optional = self.eat(&Tok::Question);
-        Ok(Type { kind, optional })
+        Ok(Type {
+            mode,
+            kind,
+            optional,
+        })
     }
 }
 
@@ -704,6 +883,16 @@ impl<'a> Parser<'a> {
         let mut bindings = Vec::new();
         if self.eat(&Tok::LParen) {
             while !self.at(&Tok::RParen) {
+                // モードは対象全体に一つ。pattern ごとの部分的な move は無い
+                // (design.md 決定7)。`move` / `mut` は他の位置と同じく、
+                // 場所が続くときだけ修飾。続かなければただの束縛名
+                if self.at(&Tok::Amp)
+                    || (matches!(self.peek(), Tok::Move | Tok::Mut) && self.place_follows())
+                {
+                    return Err(self.err(
+                        "pattern に所有権修飾は書けません。`match` の対象に `&mut` か `move` を付けます",
+                    ));
+                }
                 let name = self.expect_ident("payload の束縛名または `_`")?;
                 bindings.push(if name == "_" {
                     PatternBinding::Discard
@@ -843,7 +1032,94 @@ impl<'a> Parser<'a> {
                 span: self.to(start),
             });
         }
+        if let Some(mode) = self.access_mode()? {
+            return self.qualified_place(mode, start);
+        }
         self.postfix()
+    }
+
+    /// `&` / `&mut` / `move` の接頭辞。所有権修飾は場所に付くので、単項演算子
+    /// ではなくここで場所ごと読む(design.md 決定2)。
+    ///
+    /// `move` / `mut` は場所が続くときだけ修飾。続かなければ従来どおり識別子。
+    fn access_mode(&mut self) -> PResult<Option<AccessMode>> {
+        if self.eat(&Tok::Amp) {
+            return Ok(Some(if self.eat(&Tok::Mut) {
+                AccessMode::Mutable
+            } else {
+                AccessMode::Shared
+            }));
+        }
+        if !matches!(self.peek(), Tok::Move | Tok::Mut) || !self.place_follows() {
+            return Ok(None);
+        }
+        if self.eat(&Tok::Move) {
+            return Ok(Some(AccessMode::Move));
+        }
+        Err(self.err("`mut` だけでは修飾になりません。`&mut place` か `let mut` と書きます"))
+    }
+
+    /// 次のトークンから場所(あるいは重ねた修飾)が始まるか。
+    /// これが偽なら `move` / `mut` は従来どおりただの名前。
+    ///
+    /// ponytail: `(` を場所の始まりに入れられないので `move (u.name)` は
+    /// `move` という名前の呼び出しに読める。`move` の識別子用法を捨てるか
+    /// 修飾を予約語にするまでこの天井は残る。`&(u.name)` と `(move u.name)`
+    /// は書けるので回避路はある
+    fn place_follows(&self) -> bool {
+        matches!(
+            self.toks.get(self.pos + 1).map(|t| &t.tok),
+            Some(Tok::Ident(_) | Tok::SelfKw | Tok::Amp | Tok::Move | Tok::Mut)
+        )
+    }
+
+    /// 修飾された場所。末尾がメソッド呼び出しならレシーバに、そうでなければ
+    /// 射影全体に付く。括弧は受けるが要らない(design.md 決定2)。
+    fn qualified_place(&mut self, mode: AccessMode, start: Span) -> PResult<Expr> {
+        if matches!(self.peek(), Tok::Amp | Tok::Move | Tok::Mut) {
+            return Err(self.err("所有権修飾は重ねて書けません"));
+        }
+        let Expr { kind, span: inner } = self.postfix()?;
+        let span = self.to(start);
+        let to_inner = |end: u32| Span {
+            src: start.src,
+            start: start.start,
+            end,
+        };
+
+        // `&mut account.user.rename(name)` — 修飾が付くのは `account.user`
+        match kind {
+            ExprKind::Call(callee, args) if matches!(callee.kind, ExprKind::Field(..)) => {
+                let callee_span = callee.span;
+                let ExprKind::Field(receiver, method) = callee.kind else {
+                    unreachable!("直前の照合で Field と分かっている")
+                };
+                let place = Expr {
+                    span: to_inner(receiver.span.end),
+                    kind: ExprKind::Access {
+                        mode,
+                        place: receiver,
+                    },
+                };
+                Ok(Expr {
+                    kind: ExprKind::Call(
+                        Box::new(Expr {
+                            kind: ExprKind::Field(Box::new(place), method),
+                            span: to_inner(callee_span.end),
+                        }),
+                        args,
+                    ),
+                    span,
+                })
+            }
+            kind => Ok(Expr {
+                kind: ExprKind::Access {
+                    mode,
+                    place: Box::new(Expr { kind, span: inner }),
+                },
+                span,
+            }),
+        }
     }
 
     /// 後置。`.field` / `.?field` / `(args)` / `::name` を左から積む
@@ -991,9 +1267,24 @@ impl<'a> Parser<'a> {
                 self.bump();
                 ExprKind::Ident("as".to_string())
             }
+            // 場所が続かなかった所有権の綴りは、従来どおりただの名前
+            Tok::Mut => {
+                self.bump();
+                ExprKind::Ident("mut".to_string())
+            }
+            Tok::Move => {
+                self.bump();
+                ExprKind::Ident("move".to_string())
+            }
+            Tok::Indirect => {
+                self.bump();
+                ExprKind::Ident("indirect".to_string())
+            }
 
             Tok::Let => {
                 self.bump();
+                // `let` は不変。可変にするのは `let mut` だけ
+                let mutable = self.eat(&Tok::Mut);
                 let name = self.expect_ident("変数名")?;
                 // 型注釈は引数・フィールド・戻り値と同じ型文法を使う
                 let annotation = if self.eat(&Tok::Colon) {
@@ -1009,6 +1300,7 @@ impl<'a> Parser<'a> {
                 let value = self.stmt()?;
                 ExprKind::Let {
                     name,
+                    mutable,
                     annotation,
                     value: Box::new(value),
                 }
@@ -1079,6 +1371,11 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // 安全性は実行前の検査で閉じるので、抜け道は用意しない
+            Tok::Unsafe => {
+                return Err(self.err("`unsafe` はありません"));
+            }
+
             other => {
                 return Err(self.err(&format!("式が必要です (実際は {:?})", other)));
             }
@@ -1143,7 +1440,18 @@ mod tests {
         variants
             .iter()
             .map(|v| {
-                let payload = v.payload.iter().map(show_type).collect();
+                let payload = v
+                    .payload
+                    .iter()
+                    .map(|p| {
+                        let ty = show_type(&p.ty);
+                        if p.indirect {
+                            format!("indirect {ty}")
+                        } else {
+                            ty
+                        }
+                    })
+                    .collect();
                 (v.name.clone(), payload)
             })
             .collect()
@@ -1153,11 +1461,66 @@ mod tests {
         let base = match &ty.kind {
             TypeKind::Named(name) => name.clone(),
             TypeKind::Array(element) => format!("[{}]", show_type(element)),
+            TypeKind::Callable { params, result } => {
+                let params: Vec<String> = params.iter().map(show_type).collect();
+                format!(
+                    "fn({}-> {})",
+                    crate::hir::spelled_params(&params),
+                    show_type(result)
+                )
+            }
         };
-        if ty.optional {
+        let base = if ty.optional {
             format!("{base}?")
         } else {
             base
+        };
+        match ty.mode {
+            TypeMode::Owned => base,
+            TypeMode::Shared => format!("&{base}"),
+            TypeMode::Mutable => format!("&mut {base}"),
+        }
+    }
+
+    /// 所有権修飾の付き先が見えるところまで式を綴る。他の形は種別名だけ
+    fn show_expr(e: &Expr) -> String {
+        match &e.kind {
+            ExprKind::Ident(name) => name.clone(),
+            ExprKind::Path(parts) => parts.join("::"),
+            ExprKind::Field(recv, name) => format!("{}.{name}", show_expr(recv)),
+            ExprKind::OptionalField(recv, name) => format!("{}.?{name}", show_expr(recv)),
+            ExprKind::Call(callee, args) => {
+                let args: Vec<String> = args.iter().map(show_expr).collect();
+                format!("{}({})", show_expr(callee), args.join(", "))
+            }
+            ExprKind::Access { mode, place } => {
+                let mode = match mode {
+                    AccessMode::Shared => "&",
+                    AccessMode::Mutable => "&mut ",
+                    AccessMode::Move => "move ",
+                };
+                format!("({mode}{})", show_expr(place))
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                format!("({} {op:?} {})", show_expr(lhs), show_expr(rhs))
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// 関数本体の最初の式
+    fn first(src: &str) -> String {
+        let p = ok(src);
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!("fn ではない: {:?}", p.items[0])
+        };
+        show_expr(&body[0])
+    }
+
+    fn error(src: &str) -> String {
+        match parse_src(src) {
+            Ok(_) => panic!("通ってしまった:\n{src}"),
+            Err(e) => e.msg,
         }
     }
 
@@ -1196,6 +1559,64 @@ mod tests {
                 ),
                 ("Skipped".to_string(), Vec::new()),
             ]
+        );
+    }
+
+    /// 引数の型の綴りを取り出す(tasks 1.3)
+    fn param_types(src: &str) -> Vec<String> {
+        let p = ok(src);
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない: {:?}", p.items[0])
+        };
+        sig.params.iter().map(|p| show_type(&p.ty)).collect()
+    }
+
+    #[test]
+    fn callable型は引数位置に書ける() {
+        assert_eq!(
+            param_types("fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n"),
+            vec!["fn(int -> int)".to_string(), "int".to_string()]
+        );
+    }
+
+    #[test]
+    fn callable型は引数を0個でも複数でも取れる() {
+        assert_eq!(
+            param_types("fn run(a: fn(-> int), b: fn(&User, int -> bool) -> int) { 0 }\n"),
+            vec![
+                "fn(-> int)".to_string(),
+                "fn(&User, int -> bool)".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn callable型の結果は省略できない() {
+        let e = parse_src("fn apply(f: fn(int) -> int) { 0 }\n").unwrap_err();
+        assert!(e.msg.contains("`->`"), "{}", e.msg);
+    }
+
+    #[test]
+    fn 局所束縛にもcallable注釈を書ける() {
+        let p = ok("fn main(-> int) { let f: fn(int -> int) = double\n f(1) }\n");
+        let Item::Fn { body, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        let ExprKind::Let { annotation, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        assert_eq!(
+            show_type(annotation.as_ref().expect("注釈がある")),
+            "fn(int -> int)"
+        );
+    }
+
+    /// 既存の直接呼び出しの綴りは何も変わらない(tasks 1.3)
+    #[test]
+    fn 直接呼び出しの綴りは変わらない() {
+        assert_eq!(
+            param_types("fn stamp(u: &mut User, at: int) { u.at = at }\n"),
+            vec!["&mut User".to_string(), "int".to_string()]
         );
     }
 
@@ -1581,20 +2002,23 @@ mod tests {
                     \x20 }\n\
                     }\n");
         let Item::Impl {
-            trait_name,
-            type_name,
+            trait_ref,
+            target,
             methods,
             ..
         } = &p.items[0]
         else {
             panic!()
         };
-        assert_eq!(trait_name.as_deref(), Some("Database"));
-        assert_eq!(type_name, "Postgres");
+        assert_eq!(
+            trait_ref.as_ref().map(|r| r.name.as_str()),
+            Some("Database")
+        );
+        assert_eq!(target.to_string(), "Postgres");
         // self は params には入らない。has_self に出る
-        assert!(methods[0].0.has_self);
+        assert!(methods[0].0.has_self());
         assert_eq!(methods[0].0.params.len(), 1);
-        assert!(!methods[1].0.has_self);
+        assert!(!methods[1].0.has_self());
         assert_eq!(methods[1].0.params.len(), 1);
     }
 
@@ -1613,12 +2037,14 @@ mod tests {
     fn 配列型を全ての型位置で読む() {
         fn named(name: &str, optional: bool) -> Type {
             Type {
+                mode: TypeMode::Owned,
                 kind: TypeKind::Named(name.to_string()),
                 optional,
             }
         }
         fn array(element: Type, optional: bool) -> Type {
             Type {
+                mode: TypeMode::Owned,
                 kind: TypeKind::Array(Box::new(element)),
                 optional,
             }
@@ -1630,9 +2056,9 @@ mod tests {
         let Item::Struct { fields, .. } = &p.items[0] else {
             panic!()
         };
-        assert_eq!(fields[0].1, array(named("User", false), false));
+        assert_eq!(fields[0].ty, array(named("User", false), false));
         assert_eq!(
-            fields[1].1,
+            fields[1].ty,
             array(array(named("str", false), true), false),
             "入れ子の要素にも後置 `?` が付く"
         );
@@ -1819,5 +2245,598 @@ mod tests {
     fn useに相対モジュールパスは書けない() {
         let error = parse_src("use super::services\nfn main() { 0 }\n").unwrap_err();
         assert!(error.msg.contains("絶対"), "{}", error.msg);
+    }
+
+    // -----------------------------------------------------------------------
+    // 所有権と借用の構文 (introduce-ownership-and-borrowing フェーズ1)
+    // -----------------------------------------------------------------------
+
+    /// `&T` / `&mut T` は名前が書ける型位置ならどこでも読める
+    #[test]
+    fn 参照型を全ての型位置で読む() {
+        let p = ok("struct Session { user: &User\nedit: &mut [User]? }\n\
+                    fn touch(u: &User, e: &mut User -> &[User]?) {\n\
+                    \x20 let v: &mut User = e\n\
+                    \x20 1\n\
+                    }\n\
+                    enum Ref { One(&User, &mut [str]) }\n");
+
+        let Item::Struct { fields, .. } = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(show_type(&fields[0].ty), "&User");
+        assert_eq!(
+            show_type(&fields[1].ty),
+            "&mut [User]?",
+            "後置 `?` は参照の内側の完成した型に付く"
+        );
+
+        let Item::Fn { sig, body, .. } = &p.items[1] else {
+            panic!()
+        };
+        assert_eq!(show_type(&sig.params[0].ty), "&User");
+        assert_eq!(show_type(&sig.params[1].ty), "&mut User");
+        assert_eq!(show_type(sig.ret.as_ref().unwrap()), "&[User]?");
+        let ExprKind::Let { annotation, .. } = &body[0].kind else {
+            panic!("let ではない: {:?}", body[0].kind)
+        };
+        assert_eq!(show_type(annotation.as_ref().unwrap()), "&mut User");
+
+        assert_eq!(
+            variants("enum Ref { One(&User, &mut [str]) }\n"),
+            vec![(
+                "One".to_string(),
+                vec!["&User".to_string(), "&mut [str]".to_string()]
+            )]
+        );
+    }
+
+    /// 所有型・共有借用・排他借用は別の型として綴られる
+    #[test]
+    fn 所有と借用は別の型になる() {
+        let p = ok("fn f(a: User, b: &User, c: &mut User) {\n 1\n}\n");
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!()
+        };
+        let modes: Vec<TypeMode> = sig.params.iter().map(|p| p.ty.mode).collect();
+        assert_eq!(
+            modes,
+            vec![TypeMode::Owned, TypeMode::Shared, TypeMode::Mutable]
+        );
+        assert_ne!(sig.params[0].ty, sig.params[1].ty);
+        assert_ne!(sig.params[1].ty, sig.params[2].ty);
+    }
+
+    /// `self` / `&self` / `&mut self` とレシーバ無しの4通り
+    #[test]
+    fn レシーバの所有モードを読み分ける() {
+        let p = ok("impl Database for Postgres {\n\
+                    \x20 fn finish(self -> unit) { 1 }\n\
+                    \x20 fn find(&self, id: int -> User?) { nil }\n\
+                    \x20 fn save(&mut self, u: User -> unit) { 1 }\n\
+                    \x20 fn new(url: str -> Postgres) { 2 }\n\
+                    }\n");
+        let Item::Impl { methods, .. } = &p.items[0] else {
+            panic!()
+        };
+        let receivers: Vec<Option<ReceiverMode>> = methods.iter().map(|m| m.0.receiver).collect();
+        assert_eq!(
+            receivers,
+            vec![
+                Some(ReceiverMode::Owned),
+                Some(ReceiverMode::Shared),
+                Some(ReceiverMode::Mutable),
+                None,
+            ]
+        );
+        // self は params に入らない。`&self` でも同じ
+        assert_eq!(methods[1].0.params.len(), 1);
+        assert!(methods[1].0.has_self());
+        assert!(!methods[3].0.has_self());
+
+        // trait 側も同じ形を宣言できる
+        let p = ok(
+            "trait Database {\n fn find(&self, id: int -> User?)\n fn save(&mut self, u: User -> unit)\n}\n",
+        );
+        let Item::Trait { methods, .. } = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(methods[0].receiver, Some(ReceiverMode::Shared));
+        assert_eq!(methods[1].receiver, Some(ReceiverMode::Mutable));
+    }
+
+    #[test]
+    fn 参照だけのレシーバはselfを要求する() {
+        assert!(error("impl P {\n fn f(&mut x: int) { 1 }\n}\n").contains("`self`"));
+    }
+
+    /// `let` は不変、`let mut` だけが可変。注釈はどちらにも付く
+    #[test]
+    fn letとlet_mutを読み分ける() {
+        fn mutability(src: &str) -> (bool, Option<String>) {
+            let p = ok(src);
+            let Item::Fn { body, .. } = &p.items[0] else {
+                panic!()
+            };
+            let ExprKind::Let {
+                mutable,
+                annotation,
+                ..
+            } = &body[0].kind
+            else {
+                panic!("let ではない: {:?}", body[0].kind)
+            };
+            (*mutable, annotation.as_ref().map(show_type))
+        }
+
+        assert_eq!(mutability("fn f() {\n let n = 1\n}\n"), (false, None));
+        assert_eq!(mutability("fn f() {\n let mut n = 1\n}\n"), (true, None));
+        assert_eq!(
+            mutability("fn f() {\n let mut u: User = value\n}\n"),
+            (true, Some("User".to_string()))
+        );
+        assert_eq!(
+            mutability("fn f() {\n let v: &User = other\n}\n"),
+            (false, Some("&User".to_string()))
+        );
+
+        // 初期化子の所有権修飾も普通の式として読む
+        for (src, want) in [
+            ("fn f() {\n let v = &user\n}\n", "(&user)"),
+            ("fn f() {\n let e = &mut user\n}\n", "(&mut user)"),
+            ("fn f() {\n let o = move user\n}\n", "(move user)"),
+        ] {
+            let p = ok(src);
+            let Item::Fn { body, .. } = &p.items[0] else {
+                panic!()
+            };
+            let ExprKind::Let { value, .. } = &body[0].kind else {
+                panic!("let ではない: {:?}", body[0].kind)
+            };
+            assert_eq!(show_expr(value), want, "{src}");
+        }
+    }
+
+    /// `indirect` は struct フィールドと enum payload の宣言位置に付く
+    #[test]
+    fn indirectは宣言の所有エッジに付く() {
+        let p = ok("struct Node { value: int\nindirect next: Node? }\n");
+        let Item::Struct { fields, .. } = &p.items[0] else {
+            panic!()
+        };
+        assert!(!fields[0].indirect);
+        assert!(fields[1].indirect);
+        assert_eq!(show_type(&fields[1].ty), "Node?");
+
+        assert_eq!(
+            variants("enum List { Cons(int, indirect List)\nEmpty }\n"),
+            vec![
+                (
+                    "Cons".to_string(),
+                    vec!["int".to_string(), "indirect List".to_string()]
+                ),
+                ("Empty".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    /// 宣言位置の外の `indirect` は従来どおりただの名前
+    #[test]
+    fn indirectは修飾でなければ識別子に戻る() {
+        let p = ok("struct S { indirect: int }\nfn indirect() { 1 }\nfn f() { indirect() }\n");
+        let Item::Struct { fields, .. } = &p.items[0] else {
+            panic!()
+        };
+        assert_eq!(fields[0].name, "indirect");
+        assert!(!fields[0].indirect);
+    }
+
+    /// 修飾が付くのは場所。末尾のメソッド呼び出しがあればそのレシーバ
+    /// (design.md 決定2)
+    #[test]
+    fn 所有権修飾は場所に付く() {
+        // メソッド呼び出しが無ければ射影全体
+        assert_eq!(first("fn f() { &user }\n"), "(&user)");
+        assert_eq!(first("fn f() { &mut user.name }\n"), "(&mut user.name)");
+        assert_eq!(first("fn f() { move user.name }\n"), "(move user.name)");
+        assert_eq!(first("fn f() { &self.rank }\n"), "(&self.rank)");
+
+        // 末尾がメソッド呼び出しならレシーバだけ
+        assert_eq!(
+            first("fn f() { &mut account.user.rename(name) }\n"),
+            "(&mut account.user).rename(name)"
+        );
+        assert_eq!(
+            first("fn f() { move value.finish() }\n"),
+            "(move value).finish()"
+        );
+        assert_eq!(
+            first("fn f() { &mut a.b().c() }\n"),
+            "(&mut a.b()).c()",
+            "レシーバは末尾呼び出しの直前まで"
+        );
+
+        // 呼び出しがメソッドでなければ射影全体に付く
+        assert_eq!(first("fn f() { move make(x) }\n"), "(move make(x))");
+    }
+
+    /// 括弧は受けるが要らない。同じ構文木になる(design.md 決定2)
+    #[test]
+    fn 所有権修飾に括弧は要らない() {
+        for (bare, parenthesized) in [
+            (
+                "fn f() { &mut account.user.rename(name) }\n",
+                "fn f() { (&mut account.user).rename(name) }\n",
+            ),
+            (
+                "fn f() { move value.finish() }\n",
+                "fn f() { (move value).finish() }\n",
+            ),
+            (
+                "fn f() { &mut user.name }\n",
+                "fn f() { &mut (user.name) }\n",
+            ),
+        ] {
+            assert_eq!(first(bare), first(parenthesized), "{bare}");
+        }
+    }
+
+    /// 行継続規則は修飾された場所の後置連鎖にもそのまま効く
+    #[test]
+    fn 所有権修飾は複数行の後置連鎖に跨がる() {
+        assert_eq!(
+            first("fn f() {\n &mut account\n .user\n .rename(name)\n}\n"),
+            "(&mut account.user).rename(name)"
+        );
+        assert_eq!(
+            first("fn f() {\n save(\n move user\n )\n}\n"),
+            "save((move user))"
+        );
+    }
+
+    /// 修飾は二項演算子の被演算子にもそのまま置ける
+    #[test]
+    fn 所有権修飾は式の中に置ける() {
+        assert_eq!(
+            first("fn f() { &a.name == &b.name }\n"),
+            "((&a.name) Eq (&b.name))"
+        );
+        assert_eq!(
+            first("fn f() { found ?? move fallback }\n"),
+            "(found Coalesce (move fallback))"
+        );
+        assert_eq!(
+            first("fn f() { move found ?? fallback }\n"),
+            "((move found) Coalesce fallback)"
+        );
+    }
+
+    /// `match` / `for` / `with` の対象にも同じ修飾が付く(design.md 決定7)
+    #[test]
+    fn 制御構造の対象に所有権修飾を付けられる() {
+        fn subject(src: &str) -> String {
+            let p = ok(src);
+            let Item::Fn { body, .. } = &p.items[0] else {
+                panic!()
+            };
+            match &body[0].kind {
+                ExprKind::Match { subject, .. } => show_expr(subject),
+                ExprKind::Head {
+                    head: Head::For { iter, .. },
+                    ..
+                } => show_expr(iter),
+                ExprKind::Head {
+                    head: Head::Ambient(provisions),
+                    ..
+                } => match &provisions[0] {
+                    Provision::Value { value, .. } => show_expr(value),
+                    Provision::Type { type_name, .. } => type_name.clone(),
+                },
+                other => panic!("対象を持たない: {other:?}"),
+            }
+        }
+
+        assert_eq!(subject("fn f() {\n match &mut l { _: 1 }\n}\n"), "(&mut l)");
+        assert_eq!(subject("fn f() {\n match move l { _: 1 }\n}\n"), "(move l)");
+        assert_eq!(
+            subject("fn f() {\n for u in &mut users { go() }\n}\n"),
+            "(&mut users)"
+        );
+        assert_eq!(
+            subject("fn f() {\n for u in move users { go() }\n}\n"),
+            "(move users)"
+        );
+        assert_eq!(
+            subject("fn f() {\n with db(&mut store) { go() }\n}\n"),
+            "(&mut store)"
+        );
+        assert_eq!(
+            subject("fn f() {\n with db(move store) { go() }\n}\n"),
+            "(move store)"
+        );
+        // 型だけの提供は値を持たないので従来どおり
+        assert_eq!(
+            subject("fn f() {\n with db<Postgres> { go() }\n}\n"),
+            "Postgres"
+        );
+    }
+
+    // ---- 拒否する形 ----
+
+    #[test]
+    fn ライフタイム注釈は書けない() {
+        let e = lex("fn f(u: &'a User) { 1 }\n").unwrap_err();
+        assert!(e.msg.contains("ライフタイム"), "{}", e.msg);
+        assert!(e.span.is_some(), "位置を持たない診断");
+    }
+
+    #[test]
+    fn patternに所有権修飾は書けない() {
+        for src in [
+            "fn f(l: Lookup) {\n match l { Lookup::Found(move user): 1 }\n}\n",
+            "fn f(l: Lookup) {\n match l { Lookup::Found(&user): 1 }\n}\n",
+            "fn f(l: Lookup) {\n match l { Lookup::Found(&mut user): 1 }\n}\n",
+        ] {
+            assert!(error(src).contains("pattern に所有権修飾"), "{src}");
+        }
+    }
+
+    #[test]
+    fn 壊れた所有権修飾を報告する() {
+        assert!(
+            error("fn f() {\n mut user.rename(x)\n}\n").contains("`mut` だけでは"),
+            "`mut` 単独は修飾にならない"
+        );
+        for src in [
+            "fn f() {\n &&user\n}\n",
+            "fn f() {\n move &user\n}\n",
+            "fn f() {\n move move user\n}\n",
+            "fn f() {\n &mut mut user\n}\n",
+        ] {
+            assert!(error(src).contains("重ねて書けません"), "{src}");
+        }
+        assert!(error("fn f(u: &&User) { 1 }\n").contains("参照の参照"));
+        // 場所の続かない `&mut` に専用の文言は無く、式が無いところで落ちる
+        assert!(
+            error("fn f() {\n let x = &mut\n}\n").contains("式が必要です"),
+            "{}",
+            error("fn f() {\n let x = &mut\n}\n")
+        );
+    }
+
+    #[test]
+    fn 生ポインタ型はない() {
+        for src in [
+            "fn f(p: *User) { 1 }\n",
+            "fn f(p: &*User) { 1 }\n",
+            "struct S { p: *int }\n",
+        ] {
+            assert!(error(src).contains("生ポインタ"), "{src}");
+        }
+    }
+
+    #[test]
+    fn unsafeはない() {
+        assert!(error("fn f() {\n unsafe { go() }\n}\n").contains("`unsafe`"));
+        assert!(error("unsafe fn f() { 1 }\n").contains("`unsafe`"));
+    }
+
+    #[test]
+    fn ユーザー定義のデストラクタは書けない() {
+        for name in ["drop", "deinit", "finalize"] {
+            let src = format!("impl Node {{\n fn {name}(self) {{ 1 }}\n}}\n");
+            let e = error(&src);
+            assert!(e.contains("デストラクタ"), "{src}: {e}");
+        }
+        // trait 宣言側も同じ
+        assert!(error("trait Resource {\n fn drop(&mut self)\n}\n").contains("デストラクタ"));
+        // 禁じるのは後始末フックになりうるレシーバ付きだけ。自由関数は従来どおり
+        ok("fn drop(x: int -> int) {\n x\n}\n");
+        ok("impl Node {\n fn drop(x: int -> int) { x }\n}\n");
+    }
+
+    /// `unsafe` は識別子に戻さない。戻すと 1.4 の診断を出す先が無くなる
+    #[test]
+    fn unsafeは識別子にも戻らない() {
+        assert!(error("fn unsafe() { 1 }\n").contains("Unsafe"));
+        assert!(error("fn f() {\n let unsafe = 1\n}\n").contains("変数名"));
+        assert!(error("struct S { unsafe: int }\n").contains("フィールド名"));
+    }
+
+    /// 所有権の綴りは、修飾にならない位置では従来どおり識別子
+    #[test]
+    fn 所有権の綴りは修飾でなければ識別子に戻る() {
+        ok("fn mut() { 1 }\nfn main() { mut() }\n");
+        ok("fn move() { 1 }\nfn main() { move() }\n");
+        ok("fn f(u: User) { u.mut }\n");
+        assert_eq!(first("fn f() { move + 1 }\n"), "(move Add Int(1))");
+        // pattern の束縛名にも使える(修飾は対象全体に付くのでここには来ない)
+        assert_eq!(
+            arm_patterns("fn f(l: Lookup) {\n let x = match l { Lookup::Found(move): 1 }\n}\n"),
+            vec![("Lookup::Found".to_string(), vec!["move".to_string()])]
+        );
+    }
+
+    /// 行末の所有権の綴りは識別子。落とすと次の行が繋がって別の木になる
+    #[test]
+    fn 行末の所有権の綴りは次の行を巻き込まない() {
+        for (src, initializer) in [
+            (
+                "fn main( -> int) {\n let move = 1\n let x = move\n x\n}\n",
+                "move",
+            ),
+            ("fn main(mut: int -> int) {\n let x = mut\n g()\n}\n", "mut"),
+            (
+                "fn main( -> int) {\n let indirect = 1\n let x = indirect\n x\n}\n",
+                "indirect",
+            ),
+        ] {
+            let p = ok(src);
+            let Item::Fn { body, .. } = &p.items[0] else {
+                panic!()
+            };
+            let last = body.len() - 1;
+            let ExprKind::Let { value, .. } = &body[last - 1].kind else {
+                panic!("let ではない: {:?}", body[last - 1].kind)
+            };
+            assert_eq!(show_expr(value), initializer, "{src}");
+            // 続く行は巻き込まれず、独立した式のまま残っている
+            assert!(matches!(
+                &body[last].kind,
+                ExprKind::Ident(_) | ExprKind::Call(..)
+            ));
+        }
+    }
+
+    /// ponytail: `move (place)` は `move` という名前の呼び出しに読める。
+    /// `&(place)` と `(move place)` は書けるので回避路はある
+    #[test]
+    fn moveと括弧の組み合わせは呼び出しに読める() {
+        assert_eq!(first("fn f() { move (u.name) }\n"), "move(u.name)");
+        assert_eq!(first("fn f() { &(u.name) }\n"), "(&u.name)");
+        assert_eq!(first("fn f() { (move u.name) }\n"), "(move u.name)");
+    }
+
+    // -----------------------------------------------------------------------
+    // 型パラメータ(MAP-010)
+    // -----------------------------------------------------------------------
+
+    /// 型パラメータ名とその綴りの範囲。span は重複診断がそのまま指す位置
+    fn param_spellings(src: &str, params: &[TypeParam]) -> Vec<String> {
+        params
+            .iter()
+            .map(|p| {
+                assert_eq!(
+                    &src[p.span.start as usize..p.span.end as usize],
+                    p.name,
+                    "span が名前を指していない: {p:?}"
+                );
+                p.name.clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fnは名前の後ろに型パラメータを取る() {
+        let src = "fn identity<T>(x: T -> T) { x }\n";
+        let p = ok(src);
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        assert_eq!(param_spellings(src, &sig.type_params), ["T"]);
+        assert_eq!(sig.params[0].ty.to_string(), "T");
+        assert_eq!(sig.ret.as_ref().unwrap().to_string(), "T");
+    }
+
+    #[test]
+    fn 型パラメータは複数書ける() {
+        let src = "fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+        let p = ok(src);
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        assert_eq!(param_spellings(src, &sig.type_params), ["T", "U"]);
+    }
+
+    /// trait とその method、`impl` とその method の4箇所すべてに乗る
+    #[test]
+    fn traitとimplは型パラメータと型引数付き参照を取る() {
+        let src = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+                   impl<T> Map<T> for [T] {\n\
+                   \x20 fn map<U>(self, f: fn(T -> U) -> [U]) { self }\n\
+                   }\n";
+        let p = ok(src);
+        let Item::Trait {
+            type_params,
+            methods,
+            ..
+        } = &p.items[0]
+        else {
+            panic!("trait ではない")
+        };
+        assert_eq!(param_spellings(src, type_params), ["T"]);
+        assert_eq!(param_spellings(src, &methods[0].type_params), ["U"]);
+
+        let Item::Impl {
+            type_params,
+            trait_ref,
+            target,
+            methods,
+            ..
+        } = &p.items[1]
+        else {
+            panic!("impl ではない")
+        };
+        assert_eq!(param_spellings(src, type_params), ["T"]);
+        let trait_ref = trait_ref.as_ref().unwrap();
+        assert_eq!(trait_ref.name, "Map");
+        // 型引数も対象型も、型注釈の文法そのままで往復する
+        assert_eq!(
+            trait_ref
+                .args
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["T"]
+        );
+        assert_eq!(target.to_string(), "[T]");
+        assert_eq!(param_spellings(src, &methods[0].0.type_params), ["U"]);
+    }
+
+    /// 型パラメータの無い `impl` は今までどおり。対象型は `Named` の葉のまま
+    #[test]
+    fn 型パラメータの無いimplは従来の形で読める() {
+        for (src, trait_, target_spelling) in [
+            ("impl Postgres { fn f() { 1 } }\n", None, "Postgres"),
+            (
+                "impl data::Database for data::Postgres { fn f() { 1 } }\n",
+                Some("data::Database"),
+                "data::Postgres",
+            ),
+        ] {
+            let p = ok(src);
+            let Item::Impl {
+                type_params,
+                trait_ref,
+                target,
+                ..
+            } = &p.items[0]
+            else {
+                panic!("impl ではない")
+            };
+            assert!(type_params.is_empty(), "{src}");
+            assert_eq!(trait_ref.as_ref().map(|r| r.name.as_str()), trait_, "{src}");
+            assert!(trait_ref.iter().all(|r| r.args.is_empty()), "{src}");
+            assert_eq!(target.to_string(), target_spelling, "{src}");
+            assert_eq!(target.name(), Some(target_spelling), "{src}");
+        }
+    }
+
+    #[test]
+    fn structとenumには型パラメータを書けない() {
+        assert_eq!(
+            error("struct Box<T> { value: T }\n"),
+            "struct には型パラメータを書けません"
+        );
+        assert_eq!(
+            error("enum Option<T> { Some(T) None }\n"),
+            "enum には型パラメータを書けません"
+        );
+    }
+
+    /// `for` の無い `impl` の対象は型注釈なので、型引数の置き場所が無い
+    #[test]
+    fn 型引数付きの対象型だけのimplは断る() {
+        assert!(
+            error("impl Map<T> { fn f() { 1 } }\n").contains("型引数は書けません"),
+            "{}",
+            error("impl Map<T> { fn f() { 1 } }\n")
+        );
+    }
+
+    #[test]
+    fn 閉じない型パラメータリストは断る() {
+        assert!(error("fn f<T(x: T) { x }\n").contains("`>`"));
+        assert!(error("fn f<>(x: int) { x }\n").contains("型パラメータ名"));
     }
 }

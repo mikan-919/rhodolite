@@ -10,3 +10,6 @@ wasmparser = { version = "0.255.0", default-features = false, features = ["std",
 
 [dev-dependencies]
 wasmi = { version = "1.1.0", default-features = false, features = ["std"] }
+# `ResourceLimiter` の誤り型だけが wasmi から公開されていない。wasmi が既に
+# 使っている同じ crate なので、依存は増えない
+wasmi_core = { version = "1.1.0", default-features = false }

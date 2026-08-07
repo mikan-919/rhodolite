@@ -52,6 +52,15 @@ pub enum Tok {
     /// キーワードとして働き、それ以外の位置では識別子に戻る
     Pub,
     As,
+    /// `&mut T` / `let mut x` の可変修飾。単独では識別子に戻る
+    Mut,
+    /// `move place` の所有権移動修飾。場所が続くときだけ修飾として働く
+    Move,
+    /// `indirect next: Node?` — 再帰型の層を切る所有エッジ。
+    /// 宣言位置の外では識別子に戻る
+    Indirect,
+    /// 予約語。この版に unsafe は無いので、識別子には戻さず拒否する
+    Unsafe,
     Return,
     Assert,
     True,
@@ -80,6 +89,7 @@ pub enum Tok {
     Minus,
     Star,
     Slash,
+    Amp, // & 参照
 
     Newline,
     Eof,
@@ -221,6 +231,15 @@ pub fn lex_source(src: &str, source: SourceId) -> Result<Vec<Token>, Diag> {
             b'-' => Tok::Minus,
             b'*' => Tok::Star,
             b'/' => Tok::Slash,
+            b'&' => Tok::Amp,
+            // ライフタイム引数はソース言語に無い。`'` が出る位置は他に無いので
+            // ここで名指しで断る(ownership-and-borrowing)
+            b'\'' => {
+                return Err(Diag::at(
+                    span(start, i + 1),
+                    "ライフタイム注釈は書けません。参照は `&T` / `&mut T` と書きます",
+                ));
+            }
             _ => {
                 return Err(Diag::at(
                     span(start, i + 1),
@@ -273,6 +292,10 @@ fn keyword_or_ident(w: &str) -> Tok {
         "use" => Tok::Use,
         "pub" => Tok::Pub,
         "as" => Tok::As,
+        "mut" => Tok::Mut,
+        "move" => Tok::Move,
+        "indirect" => Tok::Indirect,
+        "unsafe" => Tok::Unsafe,
         "return" => Tok::Return,
         "assert" => Tok::Assert,
         "true" => Tok::True,
@@ -338,6 +361,11 @@ pub fn join(tokens: Vec<Token>) -> Vec<Token> {
 }
 
 /// このトークンで式を終えられるか(＝行末に来たとき文が完結しうるか)。
+///
+/// `mut` / `move` / `indirect` は識別子にも戻るので、識別子と同じ扱いを保つ。
+/// 修飾として使うときは同じ行に場所が続くため、行末に立つのは識別子用法だけ。
+/// ponytail: この選択で `move` 改行 `place` は継続しなくなる。修飾を複数行に
+/// 跨げるようにするなら、行継続ではなくパーサ側で改行を跨ぐ規則が要る
 fn can_end_expr(t: &Tok) -> bool {
     matches!(
         t,
@@ -353,6 +381,9 @@ fn can_end_expr(t: &Tok) -> bool {
             | Tok::RBracket
             | Tok::Question // `User?` の後置
             | Tok::Return // 値なし return
+            | Tok::Mut
+            | Tok::Move
+            | Tok::Indirect
     )
 }
 
@@ -391,6 +422,13 @@ fn can_start_expr(t: &Tok) -> bool {
             | Tok::Use
             | Tok::Pub
             | Tok::As
+            // 所有権修飾は場所の手前に立つので、行頭に来たら式の始まり。
+            // `mut` / `indirect` は識別子にも戻るので、識別子と同じ扱いを保つ
+            | Tok::Amp
+            | Tok::Move
+            | Tok::Mut
+            | Tok::Indirect
+            | Tok::Unsafe
             | Tok::Return
             | Tok::Assert
             | Tok::RBrace // ブロックの終わりは「次の文」ではないが改行は残したい
@@ -408,6 +446,17 @@ mod tests {
 
     fn newlines(src: &str) -> usize {
         toks(src).iter().filter(|t| **t == Tok::Newline).count()
+    }
+
+    /// `#` は識別子の文字ではない。剛体検査が型パラメータに使う合成名
+    /// `#T<index>` がユーザーの書ける名前ともモジュール修飾名とも衝突しないのは
+    /// この1点に乗っている(MAP-020 決定1)
+    #[test]
+    fn 番号記号は識別子にならない() {
+        for src in ["#T0\n", "a#b\n", "#\n"] {
+            let error = lex(src).expect_err(src);
+            assert!(error.msg.contains("読めない文字です"), "{src}: {error:?}");
+        }
     }
 
     #[test]
@@ -478,6 +527,51 @@ mod tests {
             newlines("match r {\nRank::Bronze: 1\nRank::Gold: 2\n}\n"),
             3
         );
+    }
+
+    /// 所有権の綴りはトークンになり、`&` は読める文字になる
+    #[test]
+    fn 所有権の綴りをトークンにする() {
+        assert_eq!(
+            toks("&mut move indirect"),
+            vec![Tok::Amp, Tok::Mut, Tok::Move, Tok::Indirect, Tok::Eof]
+        );
+        // 位置は1文字ずつ正確に刻む
+        let t = lex("a & b").unwrap();
+        assert_eq!(t[1].tok, Tok::Amp);
+        assert_eq!((t[1].span.start, t[1].span.end), (2, 3));
+    }
+
+    /// `mut` / `indirect` は識別子にも戻るので、行の始まりの扱いを変えない
+    #[test]
+    fn 所有権の綴りは行頭に立てる() {
+        for src in [
+            "a()\nmut()\n",
+            "a()\nmove x\n",
+            "a()\nindirect y\n",
+            "a()\n&x\n",
+        ] {
+            assert_eq!(newlines(src), 2, "{src}");
+        }
+    }
+
+    /// 識別子として行末にも立てる。ここを落とすと次の行が繋がってしまう
+    #[test]
+    fn 所有権の綴りは行末に立てる() {
+        for src in [
+            "let x = mut\nx\n",
+            "let x = move\nx\n",
+            "let x = indirect\nx\n",
+        ] {
+            assert_eq!(newlines(src), 2, "{src}");
+        }
+    }
+
+    #[test]
+    fn ライフタイムの引用符を名指しで断る() {
+        let e = lex("&'a User").unwrap_err();
+        assert!(e.msg.contains("ライフタイム"), "{}", e.msg);
+        assert_eq!(e.span.map(|s| (s.start, s.end)), Some((1, 2)));
     }
 
     #[test]

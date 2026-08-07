@@ -752,7 +752,7 @@ fn catch_all_armは残りのvariantを受けて実行される() {
          \x20 Skipped\n\
          }\n\
          fn describe(l: Lookup -> str) {\n\
-         \x20 match l {\n\
+         \x20 match move l {\n\
          \x20   Lookup::Found(n) {\n\
          \x20     assert n == 7\n\
          \x20     \"found\"\n\
@@ -836,7 +836,7 @@ fn guard付きのarmは条件どおりに選ばれて実行される() {
          \x20 Skipped\n\
          }\n\
          fn describe(l: Lookup -> str) {\n\
-         \x20 match l {\n\
+         \x20 match move l {\n\
          \x20   Lookup::Found(n) if n == threshold(): \"exact\"\n\
          \x20   Lookup::Missing(reason) if reason == \"gone\" {\n\
          \x20     \"gone\"\n\
@@ -922,7 +922,7 @@ fn payloadの構築と分解が往復して実行される() {
          \x20 Skipped\n\
          }\n\
          fn describe(l: Lookup -> str) {\n\
-         \x20 match l {\n\
+         \x20 match move l {\n\
          \x20   Lookup::Found(found, _) {\n\
          \x20     assert found.id == 7\n\
          \x20     \"found\"\n\
@@ -940,7 +940,7 @@ fn payloadの構築と分解が往復して実行される() {
          }\n\
          fn main(-> str) {\n\
          \x20 let u = make()\n\
-         \x20 assert rank(Lookup::Found(u, 5)) == 5\n\
+         \x20 assert rank(Lookup::Found(u.clone(), 5)) == 5\n\
          \x20 assert describe(Lookup::Missing(\"gone\")) == \"gone\"\n\
          \x20 assert describe(Skipped) == \"skipped\"\n\
          \x20 assert Lookup::Missing(\"a\") == Lookup::Missing(\"a\")\n\
@@ -1039,9 +1039,9 @@ fn payload束縛に隠されたスロットは要求にならない() {
     let project = Project::new();
     project.write(
         "main.rd",
-        "trait Clock { fn now(self -> int) }\n\
+        "trait Clock { fn now(&self -> int) }\n\
          struct SystemClock {}\n\
-         impl Clock for SystemClock { fn now(self -> int) { 42 } }\n\
+         impl Clock for SystemClock { fn now(&self -> int) { 42 } }\n\
          effect clock: Clock\n\
          enum Lookup { Found(SystemClock) Skipped }\n\
          fn read(l: Lookup -> int) {\n\
@@ -1071,7 +1071,7 @@ fn enum型フィールドに同じenumのvariantを入れたプログラムは�
         "enum Rank { Bronze Gold }\n\
          struct User { rank: Rank }\n\
          fn main(-> bool) {\n\
-           let u = User { rank = Bronze }\n\
+           let mut u = User { rank = Bronze }\n\
            u.rank = Gold\n\
            u.rank == Gold\n\
          }\n",
@@ -1381,6 +1381,23 @@ fn 型の決まらない式は呼ばれない宣言でも実行前に失敗す�
     );
 }
 
+/// 所有権検査も到達性に依らず全本体を走る。未呼び出しの関数にある
+/// use-after-move を、実行時の経路へ持ち越さない。
+#[test]
+fn move後使用は呼ばれない宣言でも実行前に失敗する() {
+    実行前に失敗する(
+        "struct User { id: int }\n\
+         fn broken(-> int) {\n\
+         \x20 let user = User { id = 1 }\n\
+         \x20 let moved = move user\n\
+         \x20 moved.id\n\
+         \x20 user.id\n\
+         }\n\
+         fn main(-> int) { 1 }\n",
+        "既に move されているので使えません",
+    );
+}
+
 /// 呼び出し先が一意に決まらない呼び出しも、実行に到達する前に落ちる。
 /// 評価器の同じ防御(`find_method` など)には頼らない
 #[test]
@@ -1452,19 +1469,19 @@ fn 全ての式の形を含むプログラムが検査を通って走る() {
          profile: Profile? }\n\
          fn make(-> User) { User { id = 1, rank = Gold, profile = nil } }\n\
          fn every(u: User, us: [User], o: Rank?, l: Lookup -> int) {\n\
-         \x20 let n = 1\n\
+         \x20 let mut n = 1\n\
          \x20 let s = \"x\"\n\
          \x20 let b = true\n\
          \x20 let nothing: User? = nil\n\
          \x20 let empty: [User] = []\n\
          \x20 let id = u.id\n\
-         \x20 let alias = u.profile.?name\n\
+         \x20 let alias: str? = nil\n\
          \x20 let made = make()\n\
-         \x20 let xs = [u, made]\n\
+         \x20 let xs = [u.clone(), made]\n\
          \x20 let lit = User { id = 2, rank = Bronze, profile = nil }\n\
          \x20 let qualified = Rank::Gold\n\
          \x20 let bare = Bronze\n\
-         \x20 let ctor = Lookup::Found(u, n)\n\
+         \x20 let ctor = Lookup::Found(move u, n)\n\
          \x20 let neg = -n\n\
          \x20 let unwrapped = o ?? Gold\n\
          \x20 n = n + 1 - 1 * 1 / 1\n\
@@ -1483,10 +1500,11 @@ fn 全ての式の形を含むプログラムが検査を通って走る() {
          \x20   _: 0\n\
          \x20 }\n\
          \x20 if m == 0 { return 0 }\n\
-         \x20 m + id + neg + nothing_id(nothing)\n\
+         \x20 m + id + neg + nothing_id(move nothing)\n\
          }\n\
          fn nothing_id(u: User? -> int) { u.?id ?? 0 }\n\
-         fn unused(u: User, l: Lookup -> int) { every(u, [u], nil, l) }\n";
+         fn unused(u: User, l: Lookup -> int) { let copied = u.clone()\n\
+         \x20 every(move copied, [move u], nil, move l) }\n";
 
     let project = Project::new();
     project.write(
@@ -1655,7 +1673,7 @@ fn 到達経路のホップは宣言元のファイルで描かれる() {
 
 /// int の境界は実行経路でも保たれる。ラップは失敗ではないので成功のまま出る
 #[test]
-fn 整数の回り込みはCLIでも成功する() {
+fn 整数の回り込みは_cliでも成功する() {
     let project = Project::new();
     project.write("main.rd", "fn main(-> int) { 9223372036854775807 + 1 }\n");
 
@@ -1845,8 +1863,12 @@ fn 各段の失敗で成果物を出さない() {
             "提供されていません",
         ),
         (
-            "struct User { name: str }\n\
-             fn main(-> int) {\n let u = User { name = \"a\" }\n 1\n}\n",
+            "struct Node { value: int, indirect next: Node? }\n\
+             fn main(-> int) {\n\
+             \x20 let n: Node? = Node { value = 1, next = nil }\n\
+             \x20 let tail = n.?next.clone() ?? Node { value = 2, next = nil }\n\
+             \x20 tail.value\n\
+             }\n",
             "Wasm ターゲットでは扱えません",
         ),
     ] {
@@ -1935,4 +1957,534 @@ fn 予約名の公開再エクスポートを拒否する() {
     assert!(text.contains("予約名"), "{text}");
     assert!(text.contains("app.rd:1:1"), "{text}");
     assert!(!project.exists("target/wasm/app.wasm"), "{text}");
+}
+
+// ---- 型パラメータ (MAP-010) ----
+
+/// 型パラメータを持つ宣言は実行経路に繋がらないので、`main` は今までどおり走る
+#[test]
+fn generic宣言があってもmainはそのまま走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Map<T> { fn map<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         struct Cell { at: int }\n\
+         impl<T> Map<T> for Cell { fn map<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+         fn identity<T>(x: T -> T) { x }\n\
+         fn main(-> int) { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 1"), "{text}");
+}
+
+#[test]
+fn 重複する型パラメータは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn pair<T, T>(a: T, b: T -> T) { a }\n\
+         fn main(-> int) { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("型パラメータ `T` が重複して宣言されています"),
+        "{text}"
+    );
+    // 2度目に書かれた `T` の位置を指す
+    assert!(text.contains("main.rd:1:12"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 宣言の外の型パラメータ名は実行前に失敗する() {
+    実行前に失敗する(
+        "fn identity<T>(x: T -> T) { x }\n\
+         struct Box { value: T }\n\
+         fn main(-> int) { 1 }\n",
+        "型 `T` は宣言されていません",
+    );
+}
+
+// ---- 汎用関数の具体化 (MAP-020) ----
+
+/// `identity` を2つの具体型で呼ぶプログラムは、通常の呼び出しと同じように走る
+#[test]
+fn 汎用関数は複数の具体型で呼んでも走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn identity<T>(x: T -> T) { x }\n\
+         fn main(-> int) {\n\
+           let word = identity(\"ok\")\n\
+           assert word == \"ok\"\n\
+           identity(41) + 1\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 42"), "{text}");
+}
+
+/// callback を取る汎用関数も、名前付き関数を渡してそのまま走る
+#[test]
+fn callbackを取る汎用関数は名前付き関数で走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn double(value: int -> int) { value * 2 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) { apply(double, 21) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 42"), "{text}");
+}
+
+#[test]
+fn 推論できない型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "fn make<T>(-> T?) { nil }\n\
+         fn main(-> int) { let x = make()\n 1 }\n",
+        "の型引数 `T` を推論できません",
+    );
+}
+
+#[test]
+fn 食い違う型引数は実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn pair<T>(a: T, b: T -> T) { a }\n\
+         fn main(-> int) { pair(1, \"x\")\n 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        text.contains("型引数 `T` が `int` と `str` の両方に決まります"),
+        "{text}"
+    );
+    // 呼び出し式そのものを指す
+    assert!(text.contains("main.rd:2:19"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 型引数の変わる再帰は実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn grow<T>(x: T, n: int -> int) { if n == 0: 0 else: grow([x], n - 1) }\n\
+         fn main(-> int) { grow(1, 3) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("polymorphic recursion"), "{text}");
+    assert!(text.contains("`<int>` から `<[int]>`"), "{text}");
+    // 再帰呼び出しの位置を指す
+    assert!(text.contains("main.rd:1:54"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+/// 呼び出し地点に型引数を書く構文は無い。型引数の推論より前に構文で落ちる
+#[test]
+fn 明示した型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "fn identity<T>(x: T -> T) { x }\n\
+         fn main(-> int) { identity<int>(5) }\n",
+        "1行に2つの式は書けません",
+    );
+}
+
+/// 具体化した汎用関数も通常の callable なので、Wasm 生成はそのまま通り、
+/// 同じソースからは byte 単位で同じ成果物が出る
+#[test]
+fn 汎用関数を呼ぶプログラムのwasmは決定的() {
+    let project = Project::new();
+    project.write(
+        "app.rd",
+        "fn identity<T>(x: T -> T) { x }\n\
+         fn double(value: int -> int) { value * 2 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) { identity(2) + apply(double, 20) }\n",
+    );
+
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let first = project.read("target/wasm/app.wasm");
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/app.wasm"), first);
+    assert_eq!(invoke(&first, "__rhodolite_main", &[]).unwrap(), [42]);
+}
+
+#[test]
+fn structとenumの型パラメータリストは実行前に失敗する() {
+    実行前に失敗する(
+        "struct Box<T> { value: T }\nfn main(-> int) { 1 }\n",
+        "struct には型パラメータを書けません",
+    );
+    実行前に失敗する(
+        "enum Option<T> { Some(T) None }\nfn main(-> int) { 1 }\n",
+        "enum には型パラメータを書けません",
+    );
+}
+
+// ---- generic な trait / impl の契約検査と method resolution (MAP-025) ----
+
+/// 旗艦。`Map<T>` と同じ契約の形を、決定1 のとおり struct を対象にした
+/// 身代わりの `impl` で組んである
+const 汎用IMPL: &str = "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+     struct Container { tag: int }\n\
+     impl<T> Box<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+     fn double(value: int -> int) { value * 2 }\n\
+     fn negate(value: int -> int) { 0 - value }\n";
+
+/// 解決した generic `impl` のメソッドは通常のメソッド呼び出しとして走る
+#[test]
+fn generic_implのメソッド呼び出しは走る() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        &format!(
+            "{汎用IMPL}fn main(-> int) {{\n\
+               let c = Container {{ tag = 1 }}\n\
+               c.wrap(20, double) + c.wrap(2, negate)\n\
+             }}\n"
+        ),
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 38"), "{text}");
+}
+
+/// 具体化した generic `impl` のメソッドも通常の callable なので、Wasm 生成は
+/// そのまま通り、同じソースからは byte 単位で同じ成果物が出る。
+/// interpreter の結果とも一致する
+#[test]
+fn generic_implを呼ぶプログラムのwasmは決定的() {
+    let project = Project::new();
+    let source = format!(
+        "{汎用IMPL}fn main(-> int) {{\n\
+           let c = Container {{ tag = 1 }}\n\
+           c.wrap(20, double) + c.wrap(2, negate)\n\
+         }}\n"
+    );
+    project.write("app.rd", &source);
+
+    // interpreter 側
+    let output = project.run("app.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 38"), "{text}");
+
+    // Wasm 側。2度続けて作っても byte 単位で同じ
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let first = project.read("target/wasm/app.wasm");
+    assert!(
+        project
+            .build(&["app.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/app.wasm"), first);
+    // 差分検証: 同じ入口が両方で同じ値を出す
+    assert_eq!(invoke(&first, "__rhodolite_main", &[]).unwrap(), [38]);
+}
+
+// ---- 型引数と callback を特殊化の鍵に含める (MAP-040) ----
+
+/// Wasm モジュールが定義している関数の個数。具体化が1つ増えたことを、CLI の
+/// 成果物の側から数えられる唯一の既存の出口
+fn wasm_function_count(bytes: &[u8]) -> usize {
+    wasmparser::Parser::new(0)
+        .parse_all(bytes)
+        .filter_map(|payload| match payload {
+            Ok(wasmparser::Payload::FunctionSection(section)) => Some(section.count() as usize),
+            _ => None,
+        })
+        .sum()
+}
+
+const 汎用CALLBACK: &str = "fn double(value: int -> int) { value * 2 }\n\
+     fn triple(value: int -> int) { value * 3 }\n\
+     fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+
+/// 同じ型引数でも渡す関数が違えば、具体化は別の物理的な関数になる。
+/// どの callback にも渡されない組み合わせの具体化は作らない
+#[test]
+fn 違うcallbackの汎用呼び出しは別の関数として出る() {
+    let project = Project::new();
+    // `triple` を直に呼ぶだけで `apply` へは渡さない側。渡されていない
+    // callback の具体化は作られないので、`apply` の具体化は1つで足りる
+    project.write(
+        "one.rd",
+        &format!(
+            "{汎用CALLBACK}fn main(-> int) {{ apply(double, 10) + apply(double, 11) + triple(0) }}\n"
+        ),
+    );
+    // 同じ宣言・同じ関数の集合のまま、片方の呼び出しだけ渡す関数を変えた側
+    project.write(
+        "two.rd",
+        &format!(
+            "{汎用CALLBACK}fn main(-> int) {{ apply(double, 10) + apply(triple, 11) + triple(0) }}\n"
+        ),
+    );
+
+    // interpreter 側。それぞれの呼び出しが自分に渡した関数を通る
+    let text = output_text(&project.run("one.rd"));
+    assert!(text.contains("main -> 42"), "{text}");
+    let text = output_text(&project.run("two.rd"));
+    assert!(text.contains("main -> 53"), "{text}");
+
+    // Wasm 側。増えるのは `apply` の具体化ちょうど1つ
+    assert!(
+        project
+            .build(&["one.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert!(
+        project
+            .build(&["two.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    let one = project.read("target/wasm/one.wasm");
+    let two = project.read("target/wasm/two.wasm");
+    assert_eq!(
+        wasm_function_count(&two),
+        wasm_function_count(&one) + 1,
+        "callback の違う呼び出しが具体化を1つ足す"
+    );
+    // 同じソースからは byte 単位で同じ成果物。差分検証も両方で一致する
+    assert!(
+        project
+            .build(&["two.rd", "--target", "wasm"])
+            .status
+            .success()
+    );
+    assert_eq!(project.read("target/wasm/two.wasm"), two);
+    assert_eq!(invoke(&one, "__rhodolite_main", &[]).unwrap(), [42]);
+    assert_eq!(invoke(&two, "__rhodolite_main", &[]).unwrap(), [53]);
+}
+
+#[test]
+fn 知らないtraitを実装するgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "struct Container { tag: int }\n\
+         impl<T> Missing<T> for Container { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         fn main(-> int) { 1 }\n",
+        "`Missing` は trait ではありません",
+    );
+}
+
+#[test]
+fn trait型引数の個数が合わないgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Pair<T, U> { fn both<V>(&self, a: T, b: U -> V) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Pair<T> for Container { fn both<V>(&self, a: T, b: T -> V) { a } }\n\
+         fn main(-> int) { 1 }\n",
+        "は型引数を 2 個取りますが、1 個渡しています",
+    );
+}
+
+#[test]
+fn structでない対象のgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         impl<T> Box<T> for [int] { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         fn main(-> int) { 1 }\n",
+        "`[int]` は struct ではありません",
+    );
+}
+
+#[test]
+fn 同じtraitを二度実装するgeneric_implは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T -> int) { 2 } }\n\
+         fn main(-> int) { 1 }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("既に実装されています"), "{text}");
+    // 2つめの `impl` を指し、最初の `impl` の位置も添える
+    assert!(text.contains("main.rd:4:1"), "{text}");
+    assert!(text.contains("最初の実装はここです"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 契約に足りないgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int)\n fn tag(&self -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn tag(&self -> int) { self.tag } }\n\
+         fn main(-> int) { 1 }\n",
+        "のメソッド `wrap` を実装していません",
+    );
+}
+
+#[test]
+fn 同じメソッドを二度実装するgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container {\n\
+           fn wrap<U>(&self, value: T -> int) { 1 }\n\
+           fn wrap<U>(&self, value: T -> int) { 2 }\n\
+         }\n\
+         fn main(-> int) { 1 }\n",
+        "`wrap` を二度実装しています",
+    );
+}
+
+#[test]
+fn 契約と署名が違うgeneric_implは実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: int, f: fn(int -> U) -> U) { f(value) } }\n\
+         fn main(-> int) { 1 }\n",
+        "`wrap` の引数は (`T`, `fn(T -> U)`) ですが、(`int`, `fn(int -> U)`) を宣言しています",
+    );
+}
+
+#[test]
+fn 候補が複数のgeneric_implのメソッド呼び出しは実行前に失敗する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Box<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         trait Sack<T> { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+         impl<T> Sack<T> for Container { fn wrap<U>(&self, value: T, f: fn(T -> U) -> U) { f(value) } }\n\
+         fn double(value: int -> int) { value * 2 }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.wrap(1, double) }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("がどの trait のものか決まりません"), "{text}");
+    assert!(text.contains("main::Box"), "{text}");
+    assert!(text.contains("main::Sack"), "{text}");
+    assert!(!text.contains("main ->"), "{text}");
+}
+
+#[test]
+fn 推論できないgeneric_implの型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Box<T> { fn wrap<U>(&self, value: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Box<T> for Container { fn wrap<U>(&self, value: T -> int) { 1 } }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.wrap(1) }\n",
+        "の型引数 `U` を推論できません",
+    );
+}
+
+#[test]
+fn 食い違うgeneric_implの型引数は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Both<T> { fn both<U>(&self, a: T, b: T -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Both<T> for Container { fn both<U>(&self, a: T, b: T -> int) { 1 } }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.both(1, \"x\") }\n",
+        "が `int` と `str` の両方に決まります",
+    );
+}
+
+#[test]
+fn 型引数の変わるgeneric_implの再帰は実行前に失敗する() {
+    実行前に失敗する(
+        "trait Grow<T> { fn grow<U>(&self, seed: T, value: U, n: int -> int) }\n\
+         struct Container { tag: int }\n\
+         impl<T> Grow<T> for Container {\n\
+           fn grow<U>(&self, seed: T, value: U, n: int -> int) { if n == 0: 0 else: self.grow(seed, [value], n - 1) }\n\
+         }\n\
+         fn main(-> int) { let c = Container { tag = 1 }\n c.grow(0, 1, 3) }\n",
+        "polymorphic recursion",
+    );
+}
+
+/// generic な helper の callback が要求するスロットの提供忘れは、実行前に
+/// helper と callback の両方を含む経路付きで報告される(MAP-050)
+#[test]
+fn generic_helper越しの提供忘れは実行前に経路付きで失敗する() {
+    実行前に失敗する(
+        "trait Clock { fn now(&self -> int) }\n\
+         struct Frozen { at: int }\n\
+         impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+         effect clock: Clock\n\
+         fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) { apply(ticked, 1) }\n",
+        "main::clock が要る ← main::ticked ← main::apply ← main::main",
+    );
+}
+
+/// slot を要らない具体化は、兄弟の具体化のスロットを一覧でも引き継がない
+/// (MAP-050)
+#[test]
+fn 不要なslotはgeneric_の別の具体化へ伝播しない() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "trait Clock { fn now(&self -> int) }\n\
+         struct Frozen { at: int }\n\
+         impl Clock for Frozen { fn now(&self -> int) { self.at } }\n\
+         effect clock: Clock\n\
+         fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n\
+         fn main(-> int) {\n\
+           let quiet = apply(plain, 1)\n\
+           with clock(Frozen { at = 1000 }) { apply(ticked, quiet) }\n\
+         }\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("main -> 1002"), "{text}");
+    // 具体化は同じ宣言名を名乗るが、要求は片方だけに付く
+    assert!(text.contains("  main::apply / (要求なし)\n"), "{text}");
+    assert!(text.contains("  main::apply #2 / main::clock\n"), "{text}");
 }

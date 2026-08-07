@@ -22,6 +22,9 @@
 //! そこから名前を引くだけで、意味の照合には使わない。**意味を持つ型参照に
 //! 文字列は入らない**(`Type` を見れば分かる)。
 
+/// 所有モードは構文と意味で同じ3択なので、構文木の定義をそのまま使う。
+/// HIR が捨てるのは「どう書かれたか」であって「何を要求したか」ではない
+pub use crate::ast::{AccessMode, ReceiverMode};
 use crate::lex::Span;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -84,6 +87,11 @@ ids! {
     TraitImplId,
     SlotId,
     TestId,
+    /// generic 宣言が導入した型パラメータ1つ。宣言のスコープの中でだけ意味を
+    /// 持ち、`Type` からは決して参照されない(MAP-010 決定4)
+    TypeParamId,
+    /// 型パラメータを持つ宣言1つ分の署名。具体化するまで callable にならない
+    GenericFnId,
     /// callable / test の中で一意な局所束縛。引数・`self`・`let`・ループ変数・
     /// match payload のすべてがこれになる(design.md 決定5)
     LocalId,
@@ -178,15 +186,42 @@ impl Builtin {
     }
 }
 
-/// 値の型。同一性は形と後置 `?` の一致だけ(nominal, design.md 決定2)。
+/// 借用の強さ。所有値は `None` で表すので、ここには借用の2つしか無い
+/// (design.md 決定3)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefKind {
+    /// `&T` — 共有借用。Copy な能力
+    Shared,
+    /// `&mut T` — 排他借用。Copy ではない
+    Mutable,
+}
+
+impl RefKind {
+    pub fn spelling(self) -> &'static str {
+        match self {
+            RefKind::Shared => "&",
+            RefKind::Mutable => "&mut ",
+        }
+    }
+}
+
+/// 値の型。同一性は形と後置 `?` と借用の強さの一致だけ(nominal, design.md 決定2)。
+/// 所有 `T`・共有 `&T`・排他 `&mut T` は別の静的型(design.md 決定3)。
 ///
 /// trait とスロットは値の型ではないのでここに現れない。制御が続かないことは
 /// 型ではなく `ExprResult::Diverges` で言う。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Type {
+    /// `&T` / `&mut T`。所有値は `None`。参照は借用の nominal な形なので
+    /// `TypeKind` の変種ではなく、完成した所有形の外側に1つだけ付く
+    /// (design.md 決定3)
+    pub reference: Option<RefKind>,
     pub kind: TypeKind,
     /// `User?` / `[User]?` の後置 `?`。完成した型に1 bit 付くだけなので
-    /// `[T]?` と `[T?]` を言い分けられる
+    /// `[T]?` と `[T?]` を言い分けられる。
+    ///
+    /// optional が付くのは**所有の形**だけ。検査を通った型では
+    /// `reference.is_some()` と `optional` は両立しない(design.md 決定3)
     pub optional: bool,
 }
 
@@ -196,6 +231,11 @@ pub enum TypeKind {
     Struct(StructId),
     Enum(EnumId),
     Array(Box<Type>),
+    /// `fn(P -> R)` — 名前付きトップレベル関数の値型。Copy で、捕捉を持たない
+    Callable {
+        params: Vec<Type>,
+        result: Box<Type>,
+    },
     /// 型注釈が宣言されていない名前を指していた型。`ExprKind::Poison` と同じで
     /// **診断を伴うときだけ**存在する(`Program::poisoned` が検査する)
     Poison,
@@ -204,6 +244,7 @@ pub enum TypeKind {
 impl Type {
     pub fn builtin(builtin: Builtin) -> Self {
         Type {
+            reference: None,
             kind: TypeKind::Builtin(builtin),
             optional: false,
         }
@@ -211,6 +252,202 @@ impl Type {
 
     pub fn unit() -> Self {
         Type::builtin(Builtin::Unit)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 具体化前の型(MAP-010 決定4)
+// ---------------------------------------------------------------------------
+
+/// 具体化前の署名にだけ現れる型。`Type` の形をそのまま写して、型パラメータ
+/// 参照 `Param` を1つだけ足してある。
+///
+/// `TypeKind` 側には `Param` を足さない。だから ownership・要求解析・
+/// interpreter・Wasm 生成が読む具体 HIR に型変数が入る形は**構造として存在
+/// しない**。「具体化後の HIR に型変数が残らない」は実行時の表明ではなく、
+/// この2つの型を分けたこと自体で保証される。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GenericType {
+    pub reference: Option<RefKind>,
+    pub kind: GenericTypeKind,
+    pub optional: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GenericTypeKind {
+    Builtin(Builtin),
+    Struct(StructId),
+    Enum(EnumId),
+    Array(Box<GenericType>),
+    Callable {
+        params: Vec<GenericType>,
+        result: Box<GenericType>,
+    },
+    /// スコープの中で解決できた型パラメータ参照。具体化はここを置き換える
+    Param(TypeParamId),
+    /// 宣言されていない名前を指していた型。`TypeKind::Poison` と同じで
+    /// 診断を伴うときだけ存在する
+    Poison,
+}
+
+impl GenericType {
+    /// 型パラメータ参照を含まないか。木のどこかに `Param` があるときだけ偽。
+    ///
+    /// MAP-020 の具体化はこれが真になったものだけを `Type` へ移せる。偽のまま
+    /// 移そうとしたら不変条件違反
+    pub fn is_concrete(&self) -> bool {
+        match &self.kind {
+            GenericTypeKind::Param(_) => false,
+            GenericTypeKind::Array(element) => element.is_concrete(),
+            GenericTypeKind::Callable { params, result } => params
+                .iter()
+                .chain(std::iter::once(&**result))
+                .all(GenericType::is_concrete),
+            GenericTypeKind::Builtin(_)
+            | GenericTypeKind::Struct(_)
+            | GenericTypeKind::Enum(_)
+            | GenericTypeKind::Poison => true,
+        }
+    }
+}
+
+/// 具体化前の型に型引数を通して具体型にする(MAP-020 決定3)。
+///
+/// `subst` が宣言の型パラメータを全部覆っているときだけ呼ぶ。覆っていれば結果は
+/// 必ず `is_concrete` — 型変数の残る `Type` は構造として作れないので、覆えて
+/// いない参照だけが `Poison` になる(そこは必ず診断を伴う)。
+///
+/// 型パラメータ参照に書かれた借用と後置 `?` は、型引数の側のそれに重なる
+/// (`&T` は `T` に決まった型の共有借用)。
+pub fn substitute(ty: &GenericType, subst: &BTreeMap<TypeParamId, Type>) -> Type {
+    let kind = match &ty.kind {
+        GenericTypeKind::Builtin(builtin) => TypeKind::Builtin(*builtin),
+        GenericTypeKind::Struct(id) => TypeKind::Struct(*id),
+        GenericTypeKind::Enum(id) => TypeKind::Enum(*id),
+        GenericTypeKind::Array(element) => TypeKind::Array(Box::new(substitute(element, subst))),
+        GenericTypeKind::Callable { params, result } => TypeKind::Callable {
+            params: params.iter().map(|p| substitute(p, subst)).collect(),
+            result: Box::new(substitute(result, subst)),
+        },
+        GenericTypeKind::Param(id) => match subst.get(id) {
+            Some(bound) => {
+                return Type {
+                    reference: ty.reference.or(bound.reference),
+                    kind: bound.kind.clone(),
+                    optional: ty.optional || bound.optional,
+                };
+            }
+            None => TypeKind::Poison,
+        },
+        GenericTypeKind::Poison => TypeKind::Poison,
+    };
+    Type {
+        reference: ty.reference,
+        kind,
+        optional: ty.optional,
+    }
+}
+
+/// 具体化前の型に、具体化前の型を通す(MAP-025 決定2)。
+///
+/// `substitute` の相棒で、結果が `GenericType` のまま残るところだけが違う。
+/// `subst` に無い型パラメータ参照はそのまま置いておく — 契約検査は trait の
+/// 型パラメータだけを先に通し、メソッド自身の分は次の段で通すので、覆えて
+/// いない参照は誤りではない。
+///
+/// 型パラメータ参照に書かれた借用と後置 `?` は、代入する型のそれに重なる
+/// (`substitute` と同じ規則)。
+pub fn substitute_generic(
+    ty: &GenericType,
+    subst: &BTreeMap<TypeParamId, GenericType>,
+) -> GenericType {
+    let kind = match &ty.kind {
+        GenericTypeKind::Array(element) => {
+            GenericTypeKind::Array(Box::new(substitute_generic(element, subst)))
+        }
+        GenericTypeKind::Callable { params, result } => GenericTypeKind::Callable {
+            params: params
+                .iter()
+                .map(|p| substitute_generic(p, subst))
+                .collect(),
+            result: Box::new(substitute_generic(result, subst)),
+        },
+        GenericTypeKind::Param(id) => match subst.get(id) {
+            Some(bound) => {
+                return GenericType {
+                    reference: ty.reference.or(bound.reference),
+                    kind: bound.kind.clone(),
+                    optional: ty.optional || bound.optional,
+                };
+            }
+            None => GenericTypeKind::Param(*id),
+        },
+        other => other.clone(),
+    };
+    GenericType {
+        reference: ty.reference,
+        kind,
+        optional: ty.optional,
+    }
+}
+
+/// generic 宣言が導入した型パラメータ1つ。名前と span は診断のためだけに持つ。
+#[derive(Debug)]
+pub struct TypeParamDecl {
+    pub name: String,
+    pub span: Span,
+}
+
+/// どの宣言の署名か。表示名と、具体化が復元すべき文脈を持つ。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GenericOwner {
+    /// トップレベル `fn map<T, U>(...)`
+    Free,
+    /// generic な `trait` のメソッド、または generic な署名を持つ trait メソッド
+    Trait(TraitId),
+    /// `impl<T> Map<T> for [T]` のメソッド。trait 参照と対象型はここに持つ
+    Impl {
+        trait_: Option<TraitId>,
+        /// `Map<T>` の `T`。trait 参照が無い、または型引数を取らないなら空
+        trait_args: Vec<GenericType>,
+        /// `for [T]` の `[T]`
+        target: GenericType,
+    },
+}
+
+/// 型パラメータを持つ宣言1つ分の署名(MAP-010 決定5)。
+///
+/// `Ids::fns` / `Ids::trait_methods` / `Ids::methods` / `Ids::trait_impls` の
+/// どれにも載らない。だから要求解析・ownership・interpreter・Wasm 生成は
+/// generic 宣言を1つも観測しない
+#[derive(Debug)]
+pub struct GenericDecl {
+    pub name: String,
+    pub owner: GenericOwner,
+    /// 宣言順の型パラメータ。impl メソッドなら `impl` の分が先に並ぶ
+    pub type_params: Vec<TypeParamId>,
+    pub receiver: Option<ReceiverMode>,
+    pub params: Vec<GenericType>,
+    /// 実効戻り値型。注釈が無ければ `unit`
+    pub ret: GenericType,
+    pub span: Span,
+}
+
+impl GenericDecl {
+    /// 署名のどこにも型パラメータ参照が無いか。`GenericType::is_concrete` の
+    /// 署名全体版で、具体化の出口の不変条件を1手で見るためにある
+    pub fn is_concrete(&self) -> bool {
+        let trait_and_target: Vec<&GenericType> = match &self.owner {
+            GenericOwner::Impl {
+                trait_args, target, ..
+            } => trait_args.iter().chain(std::iter::once(target)).collect(),
+            GenericOwner::Free | GenericOwner::Trait(_) => Vec::new(),
+        };
+        self.params
+            .iter()
+            .chain(std::iter::once(&self.ret))
+            .chain(trait_and_target)
+            .all(GenericType::is_concrete)
     }
 }
 
@@ -253,6 +490,9 @@ pub struct FieldDecl {
     pub name: String,
     pub owner: StructId,
     pub ty: Type,
+    /// `indirect next: Node?` — 所有エッジを間接化する。値の見た目の型は `ty` の
+    /// ままで、型の中身の並びからは外れるので再帰の層が切れる(design.md 決定10)
+    pub indirect: bool,
     pub span: Span,
 }
 
@@ -268,14 +508,26 @@ pub struct EnumDecl {
 pub struct VariantDecl {
     pub name: String,
     pub owner: EnumId,
-    /// 宣言順の payload 型。fieldless は空
-    pub payload: Vec<Type>,
+    /// 宣言順の payload。fieldless は空
+    pub payload: Vec<PayloadDecl>,
     pub span: Span,
+}
+
+/// `Cons(int, indirect List)` — variant の payload 1位置。
+#[derive(Debug)]
+pub struct PayloadDecl {
+    pub ty: Type,
+    /// `indirect`。`FieldDecl::indirect` と同じ意味(design.md 決定10)
+    pub indirect: bool,
 }
 
 #[derive(Debug)]
 pub struct TraitDecl {
     pub name: String,
+    /// trait 自身が導入した型パラメータ(non-generic な trait では空)。
+    /// 契約検査は、メソッドの `GenericDecl::type_params` の頭からこの個数を
+    /// 「trait 由来」、残りを「メソッド自身の分」として切り分ける(MAP-025 決定2)
+    pub type_params: Vec<TypeParamId>,
     pub methods: Vec<TraitMethodId>,
     pub span: Span,
 }
@@ -285,7 +537,8 @@ pub struct TraitDecl {
 pub struct TraitMethodDecl {
     pub name: String,
     pub owner: TraitId,
-    pub has_self: bool,
+    /// 解決済みのレシーバ。取らないなら `None`(design.md 決定2)
+    pub receiver: Option<ReceiverMode>,
     pub params: Vec<Type>,
     /// 実効戻り値型。注釈が無ければ `unit`
     pub ret: Type,
@@ -331,7 +584,9 @@ pub struct Callable {
     /// 正準表示名。トップレベルは関数名、メソッドは短いメソッド名
     pub name: String,
     pub owner: CallableOwner,
-    pub has_self: bool,
+    /// 解決済みのレシーバ。`self` / `&self` / `&mut self` を言い分ける。
+    /// レシーバの局所束縛の型はこのモードから決まる(design.md 決定2)
+    pub receiver: Option<ReceiverMode>,
     /// `self` を含まない宣言順の引数。`self` は `Body::receiver`
     pub params: Vec<LocalId>,
     pub ret: Type,
@@ -369,6 +624,9 @@ pub struct LocalDecl {
     /// 初期化子が値を産まない `let`(`let x = return 1`)だけ `None`。
     /// そのローカルは読めない(読めば検査が落ちる)
     pub ty: Option<Type>,
+    /// `let mut` で宣言されたか。引数・`self`・ループ変数・match payload は
+    /// 構文上 `mut` を持てないので偽(design.md 決定2)
+    pub mutable: bool,
     pub span: Span,
 }
 
@@ -396,6 +654,25 @@ impl Body {
     pub fn locals(&self) -> impl Iterator<Item = (LocalId, &LocalDecl)> {
         self.locals.iter()
     }
+
+    /// 場所として書けている式か。局所束縛とその非 optional なフィールド射影だけ
+    /// が場所で、呼び出しや構築の結果は一時値(design.md 決定5)。
+    ///
+    /// 所有権解析の `place_of` は同じ形から射影の列まで組み立てる。あちらは
+    /// `.?` も optional 射影の場所として畳むが、ここは「共有借用を挿してよいか」
+    /// だけを決める。`.?` の結果は必ず optional で、optional な参照は作れない
+    /// ので、挿せる位置がそもそも無い(design.md 決定3)
+    pub fn is_place(&self, id: ExprId) -> bool {
+        match &self.expr(id).kind {
+            ExprKind::Local(_) => true,
+            ExprKind::Field {
+                recv,
+                optional: false,
+                ..
+            } => self.is_place(*recv),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -415,6 +692,8 @@ pub enum ExprKind {
     Local(LocalId),
     /// フィールド0個の struct は名前だけで値になる
     UnitStruct(StructId),
+    /// 値位置に書かれたトップレベル関数の名前。callable 値そのもの
+    Function(CallableId),
     /// payload 0個の variant は名前だけで値になる
     Variant(VariantId),
     /// `u.rank` / `u.?rank`。所属は `FieldId` が持つ
@@ -441,6 +720,23 @@ pub enum ExprKind {
     AssignField {
         recv: ExprId,
         field: FieldId,
+        value: ExprId,
+    },
+    /// `&place` / `&mut place` / `move place` — 解決済みの所有権修飾。
+    /// 結果型は `place` の型にモードを掛けたもの(design.md 決定3)
+    Access {
+        mode: AccessMode,
+        place: ExprId,
+    },
+    /// `value.clone()` — 検査器が知っている構造的な深い複製。所有を産むので
+    /// レシーバは共有借用のまま残る(design.md 決定4)
+    Clone(ExprId),
+    /// `xs.push(y)` — コンパイラ組み込みの `impl<T> Push<T> for [T]`(MAP-075)。
+    /// `array` は必ず `&mut [T]` を産む式で、呼び出し地点に `&mut` が書かれて
+    /// いなくても検査器が排他借用を1つ挿している。`value` は通常の所有引数と
+    /// 同じ move-once 規約で消費される。結果は `unit`
+    Push {
+        array: ExprId,
         value: ExprId,
     },
     Neg(ExprId),
@@ -567,6 +863,9 @@ pub enum Call {
         slot_span: Span,
         args: Vec<ExprId>,
     },
+    /// `f(value)` — callable 値を持つ不変 local / 引数を通した呼び出し。
+    /// 呼び出し先はその呼び出し特殊化の callback 束縛から静的に決まる
+    Indirect { callee: ExprId, args: Vec<ExprId> },
     /// `Lookup::Found(user)` — enum の構築
     Ctor {
         variant: VariantId,
@@ -598,6 +897,11 @@ pub struct Program {
     pub slots: Arena<SlotId, SlotDecl>,
     pub callables: Arena<CallableId, Callable>,
     pub tests: Arena<TestId, TestDecl>,
+    /// generic 宣言が導入した型パラメータ。`Type` からは参照されない
+    pub type_params: Arena<TypeParamId, TypeParamDecl>,
+    /// 具体化を待っている generic 宣言の署名。本体は持たず、実行経路の
+    /// どの表にも載らない(MAP-010 決定5)
+    pub generics: Arena<GenericFnId, GenericDecl>,
     /// 宣言順の本体。要求の一覧の並びは宣言順なので、arena が種類ごとに
     /// 分かれていても元の順を復元できるようここに持つ
     pub bodies: Vec<BodyId>,
@@ -619,12 +923,80 @@ impl Program {
             TypeKind::Struct(id) => self.structs[*id].name.clone(),
             TypeKind::Enum(id) => self.enums[*id].name.clone(),
             TypeKind::Array(element) => format!("[{}]", self.show_type(element)),
+            TypeKind::Callable { params, result } => {
+                let params: Vec<String> = params.iter().map(|p| self.show_type(p)).collect();
+                format!(
+                    "fn({}-> {})",
+                    spelled_params(&params),
+                    self.show_type(result)
+                )
+            }
             TypeKind::Poison => "?".to_string(),
         };
         if ty.optional {
             out.push('?');
         }
-        out
+        match ty.reference {
+            Some(kind) => format!("{}{out}", kind.spelling()),
+            None => out,
+        }
+    }
+
+    /// 具体化前の型の綴り。型パラメータは宣言された名前で出す
+    pub fn show_generic_type(&self, ty: &GenericType) -> String {
+        let mut out = match &ty.kind {
+            GenericTypeKind::Builtin(builtin) => builtin.spelling().to_string(),
+            GenericTypeKind::Struct(id) => self.structs[*id].name.clone(),
+            GenericTypeKind::Enum(id) => self.enums[*id].name.clone(),
+            GenericTypeKind::Array(element) => format!("[{}]", self.show_generic_type(element)),
+            GenericTypeKind::Callable { params, result } => {
+                let params: Vec<String> =
+                    params.iter().map(|p| self.show_generic_type(p)).collect();
+                format!(
+                    "fn({}-> {})",
+                    spelled_params(&params),
+                    self.show_generic_type(result)
+                )
+            }
+            GenericTypeKind::Param(id) => self.type_params[*id].name.clone(),
+            GenericTypeKind::Poison => "?".to_string(),
+        };
+        if ty.optional {
+            out.push('?');
+        }
+        match ty.reference {
+            Some(kind) => format!("{}{out}", kind.spelling()),
+            None => out,
+        }
+    }
+
+    /// 暗黙に複製してよい型か(design.md 決定4)。
+    ///
+    /// Copy はこの版では意図的に小さい。スカラー・payload を持たない enum・
+    /// 共有借用だけで、`&mut T` と所有の複合値(struct・payload enum・`str`・
+    /// 配列・非 Copy を包む optional)は入らない。`copy struct` の opt-in は
+    /// 後の capability に残してある
+    pub fn is_copy(&self, ty: &Type) -> bool {
+        match ty.reference {
+            // `&T` は複製できる能力、`&mut T` は排他なので複製できない
+            Some(RefKind::Shared) => return true,
+            Some(RefKind::Mutable) => return false,
+            None => {}
+        }
+        match &ty.kind {
+            TypeKind::Builtin(Builtin::Int | Builtin::Bool | Builtin::Unit) => true,
+            TypeKind::Builtin(Builtin::Str) => false,
+            TypeKind::Struct(_) => false,
+            // payload を1つでも持つ enum は所有の複合値
+            TypeKind::Enum(id) => self.enums[*id]
+                .variants
+                .iter()
+                .all(|v| self.variants[*v].payload.is_empty()),
+            TypeKind::Array(_) => false,
+            // 名前付き関数の同一性だけを持つので、借用も後始末も要らない
+            TypeKind::Callable { .. } => true,
+            TypeKind::Poison => false,
+        }
     }
 
     pub fn body(&self, id: BodyId) -> &Body {
@@ -684,7 +1056,7 @@ impl Program {
             }
         }
         for (_, variant) in self.variants.iter() {
-            if variant.payload.iter().any(poisoned_type) {
+            if variant.payload.iter().any(|p| poisoned_type(&p.ty)) {
                 return Some(variant.span);
             }
         }
@@ -727,6 +1099,10 @@ fn poisoned_type(ty: &Type) -> bool {
     match &ty.kind {
         TypeKind::Poison => true,
         TypeKind::Array(element) => poisoned_type(element),
+        TypeKind::Callable { params, result } => params
+            .iter()
+            .chain(std::iter::once(&**result))
+            .any(poisoned_type),
         TypeKind::Builtin(_) | TypeKind::Struct(_) | TypeKind::Enum(_) => false,
     }
 }
@@ -749,7 +1125,8 @@ impl Program {
                 .map(|f| {
                     let field = &self.fields[*f];
                     format!(
-                        "{}#{}: {}",
+                        "{}{}#{}: {}",
+                        if field.indirect { "indirect " } else { "" },
                         field.name,
                         f.index(),
                         self.show_type(&field.ty)
@@ -770,8 +1147,17 @@ impl Program {
                 .iter()
                 .map(|v| {
                     let variant = &self.variants[*v];
-                    let payload: Vec<String> =
-                        variant.payload.iter().map(|t| self.show_type(t)).collect();
+                    let payload: Vec<String> = variant
+                        .payload
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{}{}",
+                                if p.indirect { "indirect " } else { "" },
+                                self.show_type(&p.ty)
+                            )
+                        })
+                        .collect();
                     if payload.is_empty() {
                         format!("{}#{}", variant.name, v.index())
                     } else {
@@ -796,7 +1182,7 @@ impl Program {
                     "  method#{} {}{}",
                     method.index(),
                     sig.name,
-                    self.show_signature(sig.has_self, &sig.params, &sig.ret)
+                    self.show_signature(sig.receiver, &sig.params, &sig.ret)
                 );
             }
         }
@@ -845,7 +1231,7 @@ impl Program {
                 id.index(),
                 owner,
                 decl.name,
-                self.show_signature(decl.has_self, &params, &decl.ret)
+                self.show_signature(decl.receiver, &params, &decl.ret)
             );
             self.dump_body(&decl.body, &mut out);
         }
@@ -853,13 +1239,91 @@ impl Program {
             let _ = writeln!(out, "test#{} {:?}", id.index(), decl.name);
             self.dump_body(&decl.body, &mut out);
         }
+        // generic 宣言は本体を持たないので署名だけ。generic を1つも持たない
+        // プログラムでは1行も増えない
+        for (id, decl) in self.generics.iter() {
+            let params: Vec<String> = decl
+                .type_params
+                .iter()
+                .map(|p| format!("{}#{}", self.type_params[*p].name, p.index()))
+                .collect();
+            let owner = match &decl.owner {
+                GenericOwner::Free => "fn".to_string(),
+                GenericOwner::Trait(trait_) => format!("trait {}", self.traits[*trait_].name),
+                GenericOwner::Impl {
+                    trait_,
+                    trait_args,
+                    target,
+                } => {
+                    let args: Vec<String> = trait_args
+                        .iter()
+                        .map(|a| self.show_generic_type(a))
+                        .collect();
+                    match trait_ {
+                        Some(trait_) if args.is_empty() => format!(
+                            "impl {} for {}",
+                            self.traits[*trait_].name,
+                            self.show_generic_type(target)
+                        ),
+                        Some(trait_) => format!(
+                            "impl {}<{}> for {}",
+                            self.traits[*trait_].name,
+                            args.join(", "),
+                            self.show_generic_type(target)
+                        ),
+                        None => format!("impl {}", self.show_generic_type(target)),
+                    }
+                }
+            };
+            let _ = writeln!(
+                out,
+                "generic#{} {} {}<{}>{}",
+                id.index(),
+                owner,
+                decl.name,
+                params.join(", "),
+                self.show_generic_signature(decl)
+            );
+        }
         out
     }
 
-    fn show_signature(&self, has_self: bool, params: &[Type], ret: &Type) -> String {
+    fn show_generic_signature(&self, decl: &GenericDecl) -> String {
         let mut shown: Vec<String> = Vec::new();
-        if has_self {
-            shown.push("self".to_string());
+        if let Some(mode) = decl.receiver {
+            shown.push(
+                match mode {
+                    ReceiverMode::Owned => "self",
+                    ReceiverMode::Shared => "&self",
+                    ReceiverMode::Mutable => "&mut self",
+                }
+                .to_string(),
+            );
+        }
+        shown.extend(decl.params.iter().map(|t| self.show_generic_type(t)));
+        format!(
+            "({}) -> {}",
+            shown.join(", "),
+            self.show_generic_type(&decl.ret)
+        )
+    }
+
+    fn show_signature(
+        &self,
+        receiver: Option<ReceiverMode>,
+        params: &[Type],
+        ret: &Type,
+    ) -> String {
+        let mut shown: Vec<String> = Vec::new();
+        if let Some(mode) = receiver {
+            shown.push(
+                match mode {
+                    ReceiverMode::Owned => "self",
+                    ReceiverMode::Shared => "&self",
+                    ReceiverMode::Mutable => "&mut self",
+                }
+                .to_string(),
+            );
         }
         shown.extend(params.iter().map(|t| self.show_type(t)));
         format!("({}) -> {}", shown.join(", "), self.show_type(ret))
@@ -871,7 +1335,14 @@ impl Program {
                 Some(ty) => self.show_type(ty),
                 None => "?".to_string(),
             };
-            let _ = writeln!(out, "  local#{} {}: {}", id.index(), local.name, ty);
+            let _ = writeln!(
+                out,
+                "  local#{} {}{}: {}",
+                id.index(),
+                if local.mutable { "mut " } else { "" },
+                local.name,
+                ty
+            );
         }
         for (id, expr) in body.exprs() {
             let result = match &expr.result {
@@ -909,6 +1380,7 @@ impl Program {
             ExprKind::Nil => "nil".to_string(),
             ExprKind::Local(local) => format!("local#{}", local.index()),
             ExprKind::UnitStruct(id) => format!("unit-struct {}", self.structs[*id].name),
+            ExprKind::Function(id) => format!("function callable#{}", id.index()),
             ExprKind::Variant(id) => format!("variant {}", self.variants[*id].name),
             ExprKind::Field {
                 recv,
@@ -944,6 +1416,19 @@ impl Program {
                 self.fields[*field].name,
                 value.index()
             ),
+            ExprKind::Access { mode, place } => format!(
+                "{}#{}",
+                match mode {
+                    AccessMode::Shared => "&",
+                    AccessMode::Mutable => "&mut ",
+                    AccessMode::Move => "move ",
+                },
+                place.index()
+            ),
+            ExprKind::Clone(inner) => format!("clone #{}", inner.index()),
+            ExprKind::Push { array, value } => {
+                format!("push #{} #{}", array.index(), value.index())
+            }
             ExprKind::Neg(inner) => format!("neg #{}", inner.index()),
             ExprKind::Arith { op, lhs, rhs } => {
                 format!("{} #{} #{}", op.spelling(), lhs.index(), rhs.index())
@@ -1041,6 +1526,9 @@ impl Program {
                 Call::Associated { callable, args: a } => {
                     format!("call ::callable#{}({})", callable.index(), args(a))
                 }
+                Call::Indirect { callee, args: a } => {
+                    format!("call indirect #{}({})", callee.index(), args(a))
+                }
                 Call::Slot {
                     slot,
                     method,
@@ -1064,6 +1552,67 @@ impl Program {
             ExprKind::Poison => "poison".to_string(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// callback 束縛(named function values)
+// ---------------------------------------------------------------------------
+
+/// `fn(P -> R)` の引数の並びの綴り。引数が無ければ `fn(-> R)` になる
+pub fn spelled_params(params: &[String]) -> String {
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", params.join(", "))
+    }
+}
+
+/// callable な場所 → その場所が指す名前付き関数。
+///
+/// この版の callable 値は不変 local か引数にしか置けないので、1つの本体の
+/// 中では場所と関数が1対1に決まる。呼び出し特殊化の鍵はこの表そのもの
+/// (design.md 決定3)。
+pub type Bindings = std::collections::BTreeMap<LocalId, CallableId>;
+
+/// 式が指す名前付き関数。callable 値でなければ `None`。
+pub fn callable_of(body: &Body, id: ExprId, bindings: &Bindings) -> Option<CallableId> {
+    match &body.expr(id).kind {
+        ExprKind::Function(callable) => Some(*callable),
+        ExprKind::Local(local) => bindings.get(local).copied(),
+        _ => None,
+    }
+}
+
+/// 引数の束縛から、この本体で見える callable な場所を全部求める。
+///
+/// 不変 local の別名 `let g = f` を辿る。`Let` の式 ID は初期化子より後に
+/// 確保されるので、arena 順の1パスで別名の連なりも閉じる。
+pub fn resolve_bindings(body: &Body, params: &Bindings) -> Bindings {
+    let mut bindings = params.clone();
+    for (_, expr) in body.exprs() {
+        if let ExprKind::Let { local, value } = &expr.kind
+            && let Some(callable) = callable_of(body, *value, &bindings)
+        {
+            bindings.insert(*local, callable);
+        }
+    }
+    bindings
+}
+
+/// 呼び出し先の引数の束縛。実引数が callable 値のものだけが入る。
+pub fn callee_bindings(
+    program: &Program,
+    body: &Body,
+    callee: CallableId,
+    args: &[ExprId],
+    bindings: &Bindings,
+) -> Bindings {
+    program.callables[callee]
+        .params
+        .iter()
+        .zip(args)
+        .filter_map(|(param, arg)| Some((*param, callable_of(body, *arg, bindings)?)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1117,6 +1666,7 @@ mod tests {
         let local = body.alloc_local(LocalDecl {
             name: "n".to_string(),
             ty: Some(Type::builtin(Builtin::Int)),
+            mutable: false,
             span: span(),
         });
         let value = body.alloc_expr(Expr {
@@ -1128,7 +1678,7 @@ mod tests {
         program.callables.alloc(Callable {
             name: "main".to_string(),
             owner: CallableOwner::Free,
-            has_self: false,
+            receiver: None,
             params: vec![local],
             ret: Type::builtin(Builtin::Int),
             body,
@@ -1165,6 +1715,7 @@ mod tests {
             name: "x".to_string(),
             owner: point,
             ty: Type::builtin(Builtin::Int),
+            indirect: false,
             span: span(),
         });
         program.structs.get_mut(point).fields.push(x);
@@ -1179,7 +1730,7 @@ mod tests {
         program.callables.alloc(Callable {
             name: "main".to_string(),
             owner: CallableOwner::Free,
-            has_self: false,
+            receiver: None,
             params: Vec::new(),
             ret: Type::builtin(Builtin::Int),
             body,
@@ -1191,5 +1742,282 @@ mod tests {
         assert!(dumped.contains("struct#0 Point"), "{dumped}");
         assert!(dumped.contains("callable#0 fn main() -> int"), "{dumped}");
         assert!(dumped.contains("expr#0 : int = int 1"), "{dumped}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 具体化前の型(MAP-010)
+    // -----------------------------------------------------------------------
+
+    fn owned(kind: GenericTypeKind) -> GenericType {
+        GenericType {
+            reference: None,
+            kind,
+            optional: false,
+        }
+    }
+
+    /// 木のどこに `Param` があっても具体型ではない。裏返しに、`Param` が
+    /// 1つも無ければ具体型。MAP-020 の具体化はこの判定を出口の不変条件に使う
+    #[test]
+    fn is_concreteは型パラメータ参照がある木だけを落とす() {
+        let param = TypeParamId::from_index(0);
+        let int = || owned(GenericTypeKind::Builtin(Builtin::Int));
+
+        assert!(int().is_concrete());
+        assert!(owned(GenericTypeKind::Struct(StructId::from_index(0))).is_concrete());
+        assert!(owned(GenericTypeKind::Enum(EnumId::from_index(0))).is_concrete());
+        assert!(owned(GenericTypeKind::Array(Box::new(int()))).is_concrete());
+        assert!(
+            owned(GenericTypeKind::Callable {
+                params: vec![int()],
+                result: Box::new(int()),
+            })
+            .is_concrete()
+        );
+        // 解決できなかった名前は診断済み。型変数ではないので具体側に数える
+        assert!(owned(GenericTypeKind::Poison).is_concrete());
+
+        assert!(!owned(GenericTypeKind::Param(param)).is_concrete());
+        // 配列の要素と callable の引数・結果まで辿る
+        assert!(
+            !owned(GenericTypeKind::Array(Box::new(owned(
+                GenericTypeKind::Param(param)
+            ))))
+            .is_concrete()
+        );
+        assert!(
+            !owned(GenericTypeKind::Callable {
+                params: vec![owned(GenericTypeKind::Param(param))],
+                result: Box::new(int()),
+            })
+            .is_concrete()
+        );
+        assert!(
+            !owned(GenericTypeKind::Callable {
+                params: vec![int()],
+                result: Box::new(owned(GenericTypeKind::Param(param))),
+            })
+            .is_concrete()
+        );
+        // 参照と後置 `?` は判定に効かない。中身だけを見る
+        assert!(
+            !GenericType {
+                reference: Some(RefKind::Shared),
+                kind: GenericTypeKind::Param(param),
+                optional: false,
+            }
+            .is_concrete()
+        );
+    }
+
+    /// 型引数を通した結果は、木のどこにも型パラメータ参照を残さない。
+    /// 借用と後置 `?` は宣言側と型引数側が重なる(MAP-020 決定3)
+    #[test]
+    fn substituteは型パラメータを型引数へ置き換える() {
+        let param = TypeParamId::from_index(0);
+        let user = StructId::from_index(0);
+        let subst = BTreeMap::from([(
+            param,
+            Type {
+                reference: None,
+                kind: TypeKind::Struct(user),
+                optional: false,
+            },
+        )]);
+        let referenced = |kind| GenericType {
+            reference: Some(RefKind::Shared),
+            kind,
+            optional: false,
+        };
+
+        // `[T]` は `[User]`
+        let array = owned(GenericTypeKind::Array(Box::new(owned(
+            GenericTypeKind::Param(param),
+        ))));
+        assert_eq!(
+            substitute(&array, &subst),
+            Type {
+                reference: None,
+                kind: TypeKind::Array(Box::new(Type {
+                    reference: None,
+                    kind: TypeKind::Struct(user),
+                    optional: false,
+                })),
+                optional: false,
+            }
+        );
+
+        // `&T` は決まった型の共有借用
+        assert_eq!(
+            substitute(&referenced(GenericTypeKind::Param(param)), &subst).reference,
+            Some(RefKind::Shared)
+        );
+
+        // 型パラメータを持たない木はそのまま写る
+        assert_eq!(
+            substitute(&owned(GenericTypeKind::Builtin(Builtin::Int)), &subst),
+            Type::builtin(Builtin::Int)
+        );
+
+        // 覆えていない参照だけが `Poison`。ここは必ず診断を伴う
+        let other = TypeParamId::from_index(1);
+        assert_eq!(
+            substitute(&owned(GenericTypeKind::Param(other)), &subst).kind,
+            TypeKind::Poison
+        );
+    }
+
+    /// 契約検査の代入。覆えている参照だけが置き換わり、覆えていない参照は
+    /// 誤りではなくそのまま残る(MAP-025 決定2)
+    #[test]
+    fn substitute_genericは覆えた型パラメータだけを置き換える() {
+        let bound = TypeParamId::from_index(0);
+        let free = TypeParamId::from_index(1);
+        let user = StructId::from_index(0);
+        let subst = BTreeMap::from([(bound, owned(GenericTypeKind::Struct(user)))]);
+
+        // 覆えている参照は置き換わる
+        assert_eq!(
+            substitute_generic(&owned(GenericTypeKind::Param(bound)), &subst),
+            owned(GenericTypeKind::Struct(user))
+        );
+        // 覆えていない参照はそのまま
+        assert_eq!(
+            substitute_generic(&owned(GenericTypeKind::Param(free)), &subst),
+            owned(GenericTypeKind::Param(free))
+        );
+        // `&T?` の借用と後置 `?` は代入する型のそれに重なる
+        assert_eq!(
+            substitute_generic(
+                &GenericType {
+                    reference: Some(RefKind::Shared),
+                    kind: GenericTypeKind::Param(bound),
+                    optional: true,
+                },
+                &subst
+            ),
+            GenericType {
+                reference: Some(RefKind::Shared),
+                kind: GenericTypeKind::Struct(user),
+                optional: true,
+            }
+        );
+        // 入れ子は両方の葉まで降りる
+        assert_eq!(
+            substitute_generic(
+                &owned(GenericTypeKind::Array(Box::new(owned(
+                    GenericTypeKind::Callable {
+                        params: vec![owned(GenericTypeKind::Param(bound))],
+                        result: Box::new(owned(GenericTypeKind::Param(free))),
+                    }
+                )))),
+                &subst
+            ),
+            owned(GenericTypeKind::Array(Box::new(owned(
+                GenericTypeKind::Callable {
+                    params: vec![owned(GenericTypeKind::Struct(user))],
+                    result: Box::new(owned(GenericTypeKind::Param(free))),
+                }
+            ))))
+        );
+        // 型パラメータを持たない木はそのまま写る
+        assert_eq!(
+            substitute_generic(&owned(GenericTypeKind::Builtin(Builtin::Int)), &subst),
+            owned(GenericTypeKind::Builtin(Builtin::Int))
+        );
+    }
+
+    /// 署名全体版。引数・戻り値・trait 参照の型引数・対象型のどこか1つでも
+    /// 型パラメータ参照を持てば、その宣言はまだ具体化されていない
+    #[test]
+    fn 署名全体のis_concreteは全ての位置を見る() {
+        let param = TypeParamId::from_index(0);
+        let int = || owned(GenericTypeKind::Builtin(Builtin::Int));
+        let decl = |owner, params, ret| GenericDecl {
+            name: "f".to_string(),
+            owner,
+            type_params: vec![param],
+            receiver: None,
+            params,
+            ret,
+            span: span(),
+        };
+
+        assert!(decl(GenericOwner::Free, vec![int()], int()).is_concrete());
+        assert!(
+            !decl(
+                GenericOwner::Free,
+                vec![owned(GenericTypeKind::Param(param))],
+                int()
+            )
+            .is_concrete()
+        );
+        assert!(
+            !decl(
+                GenericOwner::Free,
+                vec![int()],
+                owned(GenericTypeKind::Param(param))
+            )
+            .is_concrete()
+        );
+        // trait 参照の型引数
+        assert!(
+            !decl(
+                GenericOwner::Impl {
+                    trait_: None,
+                    trait_args: vec![owned(GenericTypeKind::Param(param))],
+                    target: int(),
+                },
+                vec![int()],
+                int()
+            )
+            .is_concrete()
+        );
+        // 対象型
+        assert!(
+            !decl(
+                GenericOwner::Impl {
+                    trait_: None,
+                    trait_args: Vec::new(),
+                    target: owned(GenericTypeKind::Array(Box::new(owned(
+                        GenericTypeKind::Param(param)
+                    )))),
+                },
+                vec![int()],
+                int()
+            )
+            .is_concrete()
+        );
+    }
+
+    /// 具体 HIR の型は型パラメータを表せない。`TypeKind` に変種が増えたら
+    /// この `match` がコンパイルエラーになるので、型変数を表せる変種が
+    /// 紛れ込む編集はここで止まる(MAP-010 決定4)
+    #[test]
+    fn 具体hirの型は型変数を表せない() {
+        fn concrete_only(kind: &TypeKind) -> bool {
+            match kind {
+                TypeKind::Builtin(_)
+                | TypeKind::Struct(_)
+                | TypeKind::Enum(_)
+                | TypeKind::Array(_)
+                | TypeKind::Callable { .. }
+                | TypeKind::Poison => true,
+            }
+        }
+        let int = Type::builtin(Builtin::Int);
+        for kind in [
+            TypeKind::Builtin(Builtin::Int),
+            TypeKind::Struct(StructId::from_index(0)),
+            TypeKind::Enum(EnumId::from_index(0)),
+            TypeKind::Array(Box::new(int.clone())),
+            TypeKind::Callable {
+                params: vec![int.clone()],
+                result: Box::new(int.clone()),
+            },
+            TypeKind::Poison,
+        ] {
+            assert!(concrete_only(&kind), "{kind:?}");
+        }
     }
 }

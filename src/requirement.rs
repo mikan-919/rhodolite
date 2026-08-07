@@ -23,6 +23,7 @@
 use crate::diag::Diag;
 use crate::hir;
 use crate::lex::Span;
+use crate::ownership::CheckedProgram;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -119,21 +120,25 @@ pub struct Analysis {
     pub order: Vec<String>,
     /// 具体的な本体 → その本体が外へ要求するもの。契約メソッドの仮想本体は
     /// 不動点の内部鍵なのでここには出さない
-    semantic: BTreeMap<hir::BodyId, BodyReqs>,
+    semantic: BTreeMap<(hir::BodyId, hir::Bindings), BodyReqs>,
     diagnostics: Vec<Diag>,
 }
 
 impl Analysis {
-    /// 本体1つ分の意味の結果。全ての本体が表を持つ(要求が無ければ空)。
-    pub fn requirements(&self, body: hir::BodyId) -> &BodyReqs {
+    /// 呼び出し特殊化1つ分の意味の結果。計画と提供検査はこの厳密な結果だけを
+    /// 使う(design.md 決定3)。
+    pub fn requirements(&self, body: hir::BodyId, bindings: &hir::Bindings) -> &BodyReqs {
         self.semantic
-            .get(&body)
-            .expect("全ての本体に要求の表がある")
+            .get(&(body, bindings.clone()))
+            .expect("歩いた特殊化には要求の表がある")
     }
 
     /// 全本体を決定的な順で。並びは `BodyId` の順(callable が先、各々宣言順)
-    pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, &BodyReqs)> {
-        self.semantic.iter().map(|(id, reqs)| (*id, reqs))
+    #[cfg(test)]
+    pub fn bodies(&self) -> impl Iterator<Item = (hir::BodyId, BodyReqs)> {
+        let ids: BTreeSet<hir::BodyId> = self.semantic.keys().map(|(id, _)| *id).collect();
+        ids.into_iter()
+            .map(|id| (id, summary_of(&self.semantic, id)))
     }
 }
 
@@ -146,9 +151,11 @@ impl Analysis {
 /// スロット経由の呼び出しは、実行時にどの実装が走るかを提供が決めるので、
 /// 契約メソッドという**仮想の本体**へ向かう。その契約を実装する全ての本体の
 /// 要求がそこで合流する(design.md 決定8)。
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum BodyKey {
-    Body(hir::BodyId),
+    /// 本体と、その呼び出しに選ばれた callback の束縛。同じ本体でも別の
+    /// callback で呼ばれれば別の要求集合になる(design.md 決定3)
+    Body(hir::BodyId, hir::Bindings),
     TraitMethod(hir::TraitMethodId),
 }
 
@@ -167,6 +174,13 @@ struct Facts {
     /// 提供されないまま漏れたスロットの使用
     escaping: BTreeMap<hir::SlotId, SlotUse>,
     calls: Vec<Call>,
+    /// 要求は運ばないが、意味の結果を持たせるためだけに歩く特殊化。
+    ///
+    /// 値レシーバのメソッド呼び出しは辺にしない(`scan_body`)が、後段の
+    /// 計画は `requirements(callee, bindings)` をその特殊化で引く。callback を
+    /// 取れるメソッドは generic な `impl` にしか無いので(MAP-025)、ここが
+    /// 空でなくなるのは generic を持つプログラムだけ
+    walks: Vec<BodyKey>,
 }
 
 /// 本体を1回歩いて `Facts` を作る。
@@ -174,11 +188,12 @@ struct Facts {
 /// AST を歩いていた頃はスロット名とローカル名を字句スコープで言い分ける必要が
 /// あったが、HIR ではスロットの使用が `Call::Slot` と `With` の提供にしか
 /// 現れない(名前は既に解決済み)。字句スコープの手当てはここには要らない。
-fn scan_body(body: &hir::Body) -> Facts {
+fn scan_body(program: &hir::Program, body: &hir::Body, params: &hir::Bindings) -> Facts {
     let mut facts = Facts::default();
     let nothing = BTreeMap::new();
+    let bindings = hir::resolve_bindings(body, params);
     for id in &body.root {
-        scan(body, *id, &nothing, &mut facts);
+        scan(program, body, *id, &nothing, &bindings, &mut facts);
     }
     facts
 }
@@ -187,16 +202,18 @@ fn scan_body(body: &hir::Body) -> Facts {
 /// 戻った時点で `inner` は消えていて、呼び出し元は元の `provided` を持ったまま。
 /// 字句スコープを呼び出しスタックがそのまま表現している。
 fn scan(
+    program: &hir::Program,
     body: &hir::Body,
     id: hir::ExprId,
     provided: &BTreeMap<hir::SlotId, SlotLevel>,
+    bindings: &hir::Bindings,
     out: &mut Facts,
 ) {
     let expr = body.expr(id);
     // 部分式をたどる。`provided` は枝ごとに差し替えて下へ運ぶ
     macro_rules! walk {
         ($child:expr) => {
-            scan(body, *$child, provided, out)
+            scan(program, body, *$child, provided, bindings, out)
         };
     }
     match &expr.kind {
@@ -219,17 +236,31 @@ fn scan(
                 };
                 inner_provided.insert(provision.slot, level);
             }
-            scan(body, *inner, &inner_provided, out);
+            scan(program, body, *inner, &inner_provided, bindings, out);
         }
 
         hir::ExprKind::Call(call) => {
             match call {
-                hir::Call::Direct { callable, .. } | hir::Call::Associated { callable, .. } => {
+                hir::Call::Direct { callable, args } | hir::Call::Associated { callable, args } => {
+                    let inner = hir::callee_bindings(program, body, *callable, args, bindings);
                     out.calls.push(Call {
-                        callee: BodyKey::Body(hir::BodyId::Callable(*callable)),
+                        callee: BodyKey::Body(hir::BodyId::Callable(*callable), inner),
                         provided: provided.clone(),
                         span: expr.span,
                     });
+                }
+                // 間接呼び出しは、この特殊化で選ばれている名前付き関数への辺。
+                // 解決できないのは束縛の無い body 単体の走査だけで、その結果は
+                // 一覧の要約にしか使わない
+                hir::Call::Indirect { callee, args } => {
+                    if let Some(callable) = hir::callable_of(body, *callee, bindings) {
+                        let inner = hir::callee_bindings(program, body, callable, args, bindings);
+                        out.calls.push(Call {
+                            callee: BodyKey::Body(hir::BodyId::Callable(callable), inner),
+                            provided: provided.clone(),
+                            span: expr.span,
+                        });
+                    }
                 }
                 // スロット経由は契約へ向かう。実行時に選ばれる実装は提供が決める
                 hir::Call::Slot {
@@ -251,10 +282,19 @@ fn scan(
                         span: expr.span,
                     });
                 }
-                // ponytail: 値レシーバのメソッド呼び出しは辺にしない。要求が
-                // そこを通り抜けるが、AST を歩いていた頃と同じ保守的な
-                // 過小近似。辺にするなら `Facts` の合流だけを直せばよい
-                hir::Call::Method { .. } => {}
+                // 値レシーバのメソッド呼び出しも直接呼び出しと同じ辺(MAP-080
+                // 決定5)。`calls` は到達だけでなく要求の伝播にも使われるので、
+                // callback の ambient 要求が `xs.map(f)` を通って呼び出し側へ
+                // 届く。ここまで `walks` だけに積んでいたのは AST を歩いて
+                // いた頃と同じ保守的な過小近似だった
+                hir::Call::Method { callable, args, .. } => {
+                    let inner = hir::callee_bindings(program, body, *callable, args, bindings);
+                    out.calls.push(Call {
+                        callee: BodyKey::Body(hir::BodyId::Callable(*callable), inner),
+                        provided: provided.clone(),
+                        span: expr.span,
+                    });
+                }
                 hir::Call::Ctor { .. } => {}
             }
             if let hir::Call::Method { recv, .. } = call {
@@ -283,6 +323,7 @@ fn scan(
         | hir::ExprKind::Local(_)
         | hir::ExprKind::UnitStruct(_)
         | hir::ExprKind::Variant(_)
+        | hir::ExprKind::Function(_)
         | hir::ExprKind::Return(None)
         | hir::ExprKind::Poison => {}
 
@@ -302,9 +343,22 @@ fn scan(
             walk!(recv);
             walk!(value);
         }
+        // 所有権修飾は要求を変えない。修飾が包めるのは場所(局所束縛とその
+        // フィールド射影)だけで、場所の中に呼び出しも提供も現れないため
+        // (tasks 5.5)。提供の所有モードも同じ理由で要求に効かない —
+        // スロットが立っているかどうかだけが要求で、実体をどう運ぶかは
+        // 所有権解析が閉じる(design.md 決定11)
         hir::ExprKind::Neg(inner)
         | hir::ExprKind::Assert(inner)
+        | hir::ExprKind::Access { place: inner, .. }
+        | hir::ExprKind::Clone(inner)
         | hir::ExprKind::Return(Some(inner)) => walk!(inner),
+        // 組み込みの `push` は本体を持たない葉なので、要求は部分式の分だけ
+        // (MAP-075 決定1)
+        hir::ExprKind::Push { array, value } => {
+            walk!(array);
+            walk!(value);
+        }
         hir::ExprKind::Arith { lhs, rhs, .. }
         | hir::ExprKind::Eq { lhs, rhs }
         | hir::ExprKind::Coalesce { lhs, rhs } => {
@@ -337,6 +391,7 @@ fn call_args(call: &hir::Call) -> &[hir::ExprId] {
         | hir::Call::Associated { args, .. }
         | hir::Call::Method { args, .. }
         | hir::Call::Slot { args, .. }
+        | hir::Call::Indirect { args, .. }
         | hir::Call::Ctor { args, .. } => args,
     }
 }
@@ -371,19 +426,44 @@ fn merge_facts(into: &mut Facts, from: Facts) {
         }
     }
     into.calls.extend(from.calls);
+    into.walks.extend(from.walks);
 }
 
-/// 型検査を通った HIR から要求を推論する。
-pub fn analyze(program: &hir::Program) -> Analysis {
+/// 所有権検査済みプログラムから要求を推論する。
+///
+/// 通常のパイプラインが未検査 HIR を後段へ渡せないよう、公開入口は
+/// `CheckedProgram` だけを受け取る。
+pub fn analyze(checked: &CheckedProgram) -> Analysis {
+    analyze_hir(&checked.hir)
+}
+
+/// HIR 単体の走査本体。公開しないので通常の後段入口にはならない。
+fn analyze_hir(program: &hir::Program) -> Analysis {
     let mut diagnostics = duplicate_slot_diagnostics(program);
     diagnostics.sort();
     diagnostics.dedup();
 
-    // 各本体を1回だけ歩く。ここから先は式を見ない
+    // 特殊化を1つずつ歩く。束縛の無い形は全ての本体にあり、callback を取る
+    // 本体はそこから呼び出しごとの特殊化が生えて、有限個で閉じる
+    // (callable 値は宣言済み関数の参照しか作れないため)
     let mut facts: BTreeMap<BodyKey, Facts> = BTreeMap::new();
-    for id in &program.bodies {
-        let body_facts = scan_body(program.body(*id));
-        merge_facts(facts.entry(BodyKey::Body(*id)).or_default(), body_facts);
+    let mut queue: Vec<BodyKey> = program
+        .bodies
+        .iter()
+        .map(|id| BodyKey::Body(*id, hir::Bindings::new()))
+        .collect();
+    while let Some(key) = queue.pop() {
+        let BodyKey::Body(id, bindings) = &key else {
+            continue;
+        };
+        if facts.contains_key(&key) {
+            continue;
+        }
+        let body_facts = scan_body(program, program.body(*id), bindings);
+        // 呼び出し先の特殊化をまだ見ていなければ後で歩く
+        queue.extend(body_facts.calls.iter().map(|call| call.callee.clone()));
+        queue.extend(body_facts.walks.iter().cloned());
+        facts.insert(key, body_facts);
     }
     // 契約メソッドは、それを実装する全ての本体の要求が合流した仮想の本体。
     // 文字列の鍵を作らずに `impl Trait::method` と `impl Type::method` の
@@ -392,7 +472,10 @@ pub fn analyze(program: &hir::Program) -> Analysis {
         let _ = impl_;
         for (method, callable) in &decl.methods {
             let concrete = facts
-                .get(&BodyKey::Body(hir::BodyId::Callable(*callable)))
+                .get(&BodyKey::Body(
+                    hir::BodyId::Callable(*callable),
+                    hir::Bindings::new(),
+                ))
                 .cloned()
                 .unwrap_or_default();
             merge_facts(
@@ -412,8 +495,10 @@ pub fn analyze(program: &hir::Program) -> Analysis {
     // ponytail: 素朴な不動点反復。呼び出しグラフを Tarjan で SCC 縮約して
     // 逆位相順に舐めれば反復を減らせる(docs/adr/0003)。プログラムが
     // 大きくなって遅くなったら、そのときに入れ替える。
-    let mut reqs: BTreeMap<BodyKey, BodyReqs> =
-        facts.keys().map(|key| (*key, BTreeMap::new())).collect();
+    let mut reqs: BTreeMap<BodyKey, BodyReqs> = facts
+        .keys()
+        .map(|key| (key.clone(), BTreeMap::new()))
+        .collect();
 
     loop {
         let mut changed = false;
@@ -444,7 +529,7 @@ pub fn analyze(program: &hir::Program) -> Analysis {
                     // このホップは「呼び出し元のどの呼び出しが要求を運んだか」
                     // なので、名前は呼び先、位置は呼び出し地点になる
                     let mut path = vec![Hop {
-                        name: show_key(program, site.callee),
+                        name: show_key(program, &site.callee),
                         span: site.span,
                     }];
                     path.extend(requirement.path.iter().cloned());
@@ -458,7 +543,7 @@ pub fn analyze(program: &hir::Program) -> Analysis {
                 }
             }
 
-            updated.insert(*key, next);
+            updated.insert(key.clone(), next);
         }
 
         reqs = updated;
@@ -468,21 +553,24 @@ pub fn analyze(program: &hir::Program) -> Analysis {
     }
 
     // 意味の結果。契約メソッドの仮想本体は不動点の内部鍵なので落とす
-    let semantic: BTreeMap<hir::BodyId, BodyReqs> = program
-        .bodies
-        .iter()
-        .map(|id| {
-            let found = reqs
-                .remove(&BodyKey::Body(*id))
-                .expect("全ての本体に要求の表がある");
-            (*id, found)
+    let semantic: BTreeMap<(hir::BodyId, hir::Bindings), BodyReqs> = reqs
+        .into_iter()
+        .filter_map(|(key, found)| match key {
+            BodyKey::Body(id, bindings) => Some(((id, bindings), found)),
+            BodyKey::TraitMethod(_) => None,
         })
         .collect();
 
     // 表示の境界で名前へ戻す。並びは宣言順の本体と、スロット名の順。
-    // 名前で引く一覧も提供忘れの診断も、この1つの意味の結果から作る
+    // 名前で引く一覧も提供忘れの診断も、この1つの意味の結果から作る。
+    //
+    // 表示名は同一性ではない。generic 宣言の具体化は宣言名をそのまま名乗る
+    // ので(`instantiate()` は `decl.name` を写すだけ)、物理的に別の本体が
+    // 同じ綴りになる。2つ目以降に ` #N` を足して、後の具体化が前の具体化の
+    // 要求を黙って上書きしないようにする(MAP-050 決定2)
     let mut order = Vec::new();
     let mut public: BTreeMap<String, Reqs> = BTreeMap::new();
+    let mut seen: HashMap<String, u32> = HashMap::new();
     for id in &program.bodies {
         // `impl` のメソッドは一覧に出さない(従来どおり fn と test だけ)
         if let hir::BodyId::Callable(callable) = id
@@ -490,10 +578,17 @@ pub fn analyze(program: &hir::Program) -> Analysis {
         {
             continue;
         }
-        let name = program.show_body(*id);
+        let shown = program.show_body(*id);
+        let count = seen.entry(shown.clone()).or_insert(0);
+        *count += 1;
+        let name = if *count == 1 {
+            shown
+        } else {
+            format!("{shown} #{count}")
+        };
         public.insert(
             name.clone(),
-            semantic[id]
+            summary_of(&semantic, *id)
                 .iter()
                 .map(|(slot, req)| (program.slots[*slot].name.clone(), req.clone()))
                 .collect(),
@@ -510,11 +605,34 @@ pub fn analyze(program: &hir::Program) -> Analysis {
     }
 }
 
+/// 本体1つ分の人向けの要約。全特殊化の決定的な合併。
+fn summary_of(
+    semantic: &BTreeMap<(hir::BodyId, hir::Bindings), BodyReqs>,
+    body: hir::BodyId,
+) -> BodyReqs {
+    let mut merged = BodyReqs::new();
+    for ((id, _), reqs) in semantic {
+        if *id != body {
+            continue;
+        }
+        for (slot, req) in reqs {
+            merge_requirement(&mut merged, *slot, req.level, req.span, req.path.clone());
+        }
+    }
+    merged
+}
+
+/// HIR 走査そのものを対象にする単体テストだけの明示的な抜け道。
+#[cfg(test)]
+pub(crate) fn analyze_hir_for_test(program: &hir::Program) -> Analysis {
+    analyze_hir(program)
+}
+
 /// 本体の表示名。到達経路のホップに載る綴り。
-fn show_key(program: &hir::Program, key: BodyKey) -> String {
+fn show_key(program: &hir::Program, key: &BodyKey) -> String {
     match key {
-        BodyKey::Body(id) => program.show_body(id),
-        BodyKey::TraitMethod(id) => program.show_trait_method(id),
+        BodyKey::Body(id, _) => program.show_body(*id),
+        BodyKey::TraitMethod(id) => program.show_trait_method(*id),
     }
 }
 
@@ -695,7 +813,7 @@ mod tests {
 
     fn analysis_of_program(p: &ast::Program) -> Analysis {
         let lowered = crate::typecheck::check_and_lower(p).expect("型検査を通るはず");
-        analyze(&lowered)
+        analyze_hir_for_test(&lowered)
     }
 
     /// 文言だけを見る検査のための取り出し。
@@ -743,9 +861,18 @@ mod tests {
         crate::typecheck::check_and_lower(&p).expect("型検査を通るはず")
     }
 
+    /// 所有権検査まで通した HIR。要求解析の API は task 8.1 まで従来どおり
+    /// `hir::Program` を受けるが、ここでは provider mode が確定した入力でも
+    /// 要求の事実が変わらないことを検証する。
+    fn ownership_checked_of(src: &str) -> hir::Program {
+        crate::ownership::check(lowered_of(src))
+            .expect("所有権検査を通るはず")
+            .hir
+    }
+
     fn scan_of(program: &hir::Program, f: &str) -> Facts {
         let id = program.free_callable(f).expect("その名前の関数がない");
-        scan_body(&program.callables[id].body)
+        scan_body(program, &program.callables[id].body, &hir::Bindings::new())
     }
 
     fn slot_id(program: &hir::Program, name: &str) -> hir::SlotId {
@@ -771,9 +898,410 @@ mod tests {
             facts
                 .calls
                 .iter()
-                .map(|call| show_key(&lowered, call.callee))
+                .map(|call| show_key(&lowered, &call.callee))
                 .collect(),
         )
+    }
+
+    // ---- callback 特殊化(tasks 3.1 / 3.4) ----
+
+    const CALLBACK_PRELUDE: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n";
+
+    /// 特殊化ごとの要求を、束縛を名前で与えて読む
+    fn specialized(
+        program: &hir::Program,
+        analysis: &Analysis,
+        helper: &str,
+        callback: &str,
+    ) -> BTreeSet<String> {
+        let helper_id = program.free_callable(helper).expect("helper がある");
+        let callback_id = program.free_callable(callback).expect("callback がある");
+        let param = program.callables[helper_id].params[0];
+        let bindings: hir::Bindings = [(param, callback_id)].into_iter().collect();
+        analysis
+            .requirements(hir::BodyId::Callable(helper_id), &bindings)
+            .keys()
+            .map(|slot| program.slots[*slot].name.clone())
+            .collect()
+    }
+
+    /// 同じ helper でも、選ばれた callback ごとに要求が別々に出る
+    #[test]
+    fn callback特殊化ごとに要求が分かれる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "plain"),
+            BTreeSet::new()
+        );
+    }
+
+    /// 束縛が同じなら同じ特殊化。呼び出しの回数だけ増えたりしない
+    #[test]
+    fn 同じcallbackの特殊化は1つに畳まれる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, 1) + apply(ticked, 2) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let apply = program.free_callable("apply").expect("apply がある");
+        let count = analysis
+            .bodies()
+            .filter(|(id, _)| *id == hir::BodyId::Callable(apply))
+            .count();
+        // 一覧は本体ごとに1行。特殊化は要約に畳まれる
+        assert_eq!(count, 1);
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+    }
+
+    /// 不変 local の別名を通しても同じ名前付き関数を指す
+    #[test]
+    fn callableの別名も同じ特殊化になる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let f = ticked\n\
+             \x20 let g = f\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(g, 1) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+    }
+
+    /// 提供忘れの経路は helper と選ばれた callback の両方を通る
+    #[test]
+    fn 間接呼び出しの提供忘れは経路にhelperとcallbackを出す() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let errors = analysis.unsatisfied();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let path: Vec<String> = analysis.reqs["main"]["clock"]
+            .path_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(path.iter().any(|hop| hop.ends_with("apply")), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("ticked")), "{path:?}");
+    }
+
+    /// 入れ子の `with` は内側が外側を隠す。callback 越しでも同じ
+    #[test]
+    fn 入れ子のwithはcallback越しでも要求を止める() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{\n\
+             \x20   with clock(SystemClock {{}}) {{ apply(ticked, 1) }}\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    /// 再帰する helper でも特殊化は有限個で止まる
+    #[test]
+    fn callback特殊化は再帰でも止まる() {
+        let program = lowered_of(
+            "fn step(value: int -> int) { value - 1 }\n\
+             fn loop_(f: fn(int -> int), value: int -> int) {\n\
+             \x20 if value == 0: 0 else: loop_(f, f(value))\n\
+             }\n\
+             fn main(-> int) { loop_(step, 3) }\n",
+        );
+        let analysis = analyze_hir_for_test(&program);
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    // ---- generic な helper の callback 特殊化(MAP-050 tasks 1.x) ----
+
+    /// generic な `apply` を使う前置き。`ticked` は clock を要り、`plain` は
+    /// 要らない。`stamped` は `apply<str, int>` を作るための別の型引数
+    const GENERIC_CALLBACK_PRELUDE: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn stamped(label: str -> int) { let ignored = label\n clock.now() }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+
+    /// その名前を持つ具体化の全て。generic 宣言は callable に載らないので、
+    /// 数えられるのは呼び出しが作った具体化だけ
+    fn instances(program: &hir::Program, name: &str) -> Vec<hir::CallableId> {
+        program
+            .callables
+            .iter()
+            .filter(|(_, callable)| {
+                callable.owner == hir::CallableOwner::Free && callable.name == name
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// 具体化は同じ表示名を持つので、束縛で言い分ける。返るのは
+    /// 「その callback を束縛した特殊化」の (本体, 要求スロット名) の全て
+    fn generic_specializations(
+        program: &hir::Program,
+        analysis: &Analysis,
+        helper: &str,
+        callback: &str,
+    ) -> Vec<(hir::BodyId, BTreeSet<String>)> {
+        let callback_id = program.free_callable(callback).expect("callback がある");
+        analysis
+            .semantic
+            .iter()
+            .filter(|((body, bindings), _)| match body {
+                hir::BodyId::Callable(id) => {
+                    program.callables[*id].owner == hir::CallableOwner::Free
+                        && program.callables[*id].name == helper
+                        && bindings.values().any(|bound| *bound == callback_id)
+                }
+                hir::BodyId::Test(_) => false,
+            })
+            .map(|((body, _), reqs)| {
+                (
+                    *body,
+                    reqs.keys()
+                        .map(|slot| program.slots[*slot].name.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// その callback を束縛した特殊化はちょうど1つ、という前提での要求
+    fn generic_specialized(
+        program: &hir::Program,
+        analysis: &Analysis,
+        helper: &str,
+        callback: &str,
+    ) -> BTreeSet<String> {
+        let found = generic_specializations(program, analysis, helper, callback);
+        assert_eq!(found.len(), 1, "{callback} の特殊化が1つでない: {found:?}");
+        found.into_iter().next().expect("1つある").1
+    }
+
+    fn req_names(reqs: &Reqs) -> BTreeSet<String> {
+        reqs.keys().cloned().collect()
+    }
+
+    /// generic な helper でも、選ばれた callback の要求が呼び出し元へ届く
+    /// (tasks 1.1)
+    #[test]
+    fn generic_helperのcallbackの要求が呼び出し元へ届く() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            generic_specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(req_names(&analysis.reqs["main"]), set(&["clock"]));
+    }
+
+    /// 同じ型引数でも callback が違えば別の具体化。slot を要らない側は
+    /// 相手の slot を拾わない(tasks 1.2)
+    #[test]
+    fn generic_の型引数が同じでもcallbackごとに要求が分かれる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(instances(&program, "apply").len(), 2, "{}", program.dump());
+
+        let ticked = generic_specializations(&program, &analysis, "apply", "ticked");
+        let plain = generic_specializations(&program, &analysis, "apply", "plain");
+        assert_eq!(ticked.len(), 1, "{ticked:?}");
+        assert_eq!(plain.len(), 1, "{plain:?}");
+        assert_ne!(ticked[0].0, plain[0].0, "物理的に別の本体");
+        assert_eq!(ticked[0].1, set(&["clock"]));
+        assert_eq!(plain[0].1, BTreeSet::new(), "相手の slot を拾わない");
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    /// 型引数が違う具体化どうしも、それぞれ独立に slot を要求する(tasks 1.3)
+    #[test]
+    fn generic_の型引数ごとに要求が独立する() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, 1) + apply(stamped, \"a\") }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(instances(&program, "apply").len(), 2, "{}", program.dump());
+
+        let ticked = generic_specializations(&program, &analysis, "apply", "ticked");
+        let stamped = generic_specializations(&program, &analysis, "apply", "stamped");
+        assert_ne!(ticked[0].0, stamped[0].0, "型引数が違えば別の本体");
+        assert_eq!(ticked[0].1, set(&["clock"]));
+        assert_eq!(stamped[0].1, set(&["clock"]));
+    }
+
+    /// generic から generic へ callback を転送しても要求が運ばれる(tasks 1.4)
+    #[test]
+    fn 入れ子のgeneric呼び出しでもcallbackの要求が運ばれる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}\
+             fn relay<T, U>(f: fn(T -> U), x: T -> U) {{ apply(f, x) }}\n\
+             fn main(-> int) {{ relay(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(
+            generic_specialized(&program, &analysis, "relay", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(
+            generic_specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+
+        let path: Vec<String> = analysis.reqs["main"]["clock"]
+            .path_names()
+            .iter()
+            .map(|hop| hop.to_string())
+            .collect();
+        for expected in ["relay", "apply", "ticked"] {
+            assert!(path.iter().any(|hop| hop == expected), "{path:?}");
+        }
+    }
+
+    /// 自分の callback を再帰へ転送する generic helper でも要求が出る
+    /// (tasks 1.5)
+    #[test]
+    fn callbackを転送する再帰generic_でも要求を推論する() {
+        let program = lowered_of(
+            "fn ticked(value: int -> int) { value + clock.now() }\n\
+             fn apply<T>(f: fn(T -> T), x: T, n: int -> T) {\n\
+             \x20 if n == 0: x else: apply(f, f(x), n - 1)\n\
+             }\n\
+             fn main(-> int) { apply(ticked, 1, 3) }\n",
+        );
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(instances(&program, "apply").len(), 1, "{}", program.dump());
+        assert_eq!(
+            generic_specialized(&program, &analysis, "apply", "ticked"),
+            set(&["clock"])
+        );
+        assert_eq!(req_names(&analysis.reqs["main"]), set(&["clock"]));
+    }
+
+    /// 提供忘れの経路は generic helper と選ばれた callback の両方を通る
+    /// (tasks 1.6)
+    #[test]
+    fn generic越しの提供忘れは経路にhelperとcallbackを出す() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let errors = analysis.unsatisfied();
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        let path: Vec<String> = analysis.reqs["main"]["clock"]
+            .path_names()
+            .iter()
+            .map(|hop| hop.to_string())
+            .collect();
+        assert!(path.iter().any(|hop| hop.ends_with("apply")), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("ticked")), "{path:?}");
+    }
+
+    /// 入れ子の `with` は generic な callback 越しでも要求を止める(tasks 1.7)
+    #[test]
+    fn 入れ子のwithはgeneric_なcallback越しでも要求を止める() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{\n\
+             \x20   with clock(SystemClock {{}}) {{ apply(ticked, 1) }}\n\
+             \x20 }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert!(analysis.unsatisfied().is_empty());
+    }
+
+    /// 具体化が2つあっても、一覧はどちらの要求も落とさない(tasks 3.2)
+    #[test]
+    fn 具体化ごとに一覧の行が分かれる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_PRELUDE}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(SystemClock {{}}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        let listed: Vec<&str> = analysis
+            .order
+            .iter()
+            .map(|name| name.as_str())
+            .filter(|name| name.starts_with("apply"))
+            .collect();
+        assert_eq!(listed, vec!["apply", "apply #2"], "{}", analysis.render());
+        // 片方は callback の slot を持ち、もう片方は持たない。同じ表示名でも
+        // 後の具体化が前の具体化を上書きしない
+        let mut shown: Vec<BTreeSet<String>> = listed
+            .iter()
+            .map(|name| req_names(&analysis.reqs[*name]))
+            .collect();
+        shown.sort();
+        assert_eq!(shown, vec![BTreeSet::new(), set(&["clock"])]);
+    }
+
+    /// provider の運び方は所有権検査が閉じる。要求はスロットが提供されたかと
+    /// 実体が要るかだけを扱うため、shared / mutable / moved / temporary の別で
+    /// 要求表や callable / slot の ID を動かしてはならない(tasks 5.5)。
+    #[test]
+    fn provider_modeは要求の事実とidを変えない() {
+        let variants = [
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(store) { stamp() }",
+            "let mut store = SharedFrozen { t = 1 }\n with shared_clock(&mut store) { stamp() }",
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(move store) { stamp() }",
+            "with shared_clock(SharedFrozen { t = 1 }) { stamp() }",
+        ];
+        let mut expected = None;
+        for provision in variants {
+            let program = ownership_checked_of(&format!(
+                "trait SharedClock {{ fn now(&self -> int) }}\n\
+                 struct SharedFrozen {{ t: int }}\n\
+                 impl SharedClock for SharedFrozen {{ fn now(&self -> int) {{ self.t }} }}\n\
+                 effect shared_clock: SharedClock\n\
+                 fn stamp(-> int) {{ shared_clock.now() }}\n\
+                 fn main(-> int) {{ {provision} }}\n"
+            ));
+            let analysis = analyze_hir_for_test(&program);
+            let facts = (
+                analysis.render(),
+                program.free_callable("stamp"),
+                program.free_callable("main"),
+                slot_id(&program, "shared_clock"),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &facts, expected,
+                    "provider mode must not alter requirements"
+                );
+            } else {
+                expected = Some(facts);
+            }
+        }
     }
 
     // ---- 移行前後で同じ結果になることを固定する corpus ----
@@ -868,7 +1396,7 @@ mod tests {
     /// あるので、入力が HIR へ変わって結果が動いたらここが落ちる
     const EXPECTED: [&str; 5] = [
         // 正典
-        "  stamp / clock, db\n\
+        "  stamp / clock\n\
          \x20 promote / clock, db\n\
          \x20 handle / clock, db\n\
          \x20 main / (要求なし)\n\
@@ -998,11 +1526,11 @@ mod tests {
     fn 意味の結果は全ての本体をidで引ける() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let lowered = crate::typecheck::check_and_lower(&program(&src)).expect("型検査を通る");
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
 
         assert_eq!(
             semantic_report(&lowered, &analysis),
-            "callable#0 stamp / slot#0 db (値), slot#1 clock (値)\n\
+            "callable#0 stamp / slot#1 clock (値)\n\
              callable#1 promote / slot#0 db (値), slot#1 clock (値)\n\
              callable#2 handle / slot#0 db (値), slot#1 clock (値)\n\
              callable#3 impl Postgres::new / -\n\
@@ -1027,13 +1555,19 @@ mod tests {
             "fn make(-> int) { clock::zero() }\n\
              fn used(-> int) { clock.now() }\n",
         );
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
         let clock = slot_id(&lowered, "clock");
 
         let make = hir::BodyId::Callable(lowered.free_callable("make").unwrap());
         let used = hir::BodyId::Callable(lowered.free_callable("used").unwrap());
-        assert_eq!(analysis.requirements(make)[&clock].level, SlotLevel::Type);
-        assert_eq!(analysis.requirements(used)[&clock].level, SlotLevel::Value);
+        assert_eq!(
+            analysis.requirements(make, &hir::Bindings::new())[&clock].level,
+            SlotLevel::Type
+        );
+        assert_eq!(
+            analysis.requirements(used, &hir::Bindings::new())[&clock].level,
+            SlotLevel::Value
+        );
     }
 
     /// 同名スロットを持つ別モジュールでも、ID なら取り違えない
@@ -1065,10 +1599,10 @@ mod tests {
         ])
         .expect("ロードできる");
         let lowered = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
 
         let both = hir::BodyId::Callable(lowered.free_callable("main::both").unwrap());
-        let reqs = analysis.requirements(both);
+        let reqs = analysis.requirements(both, &hir::Bindings::new());
         assert_eq!(reqs.len(), 2, "同名でも別のスロット");
         let names: Vec<&str> = reqs
             .keys()
@@ -1081,7 +1615,7 @@ mod tests {
     #[test]
     fn 意味の結果に契約メソッドの仮想本体は出ない() {
         let lowered = lowered_of("fn main(u: User) { db.save(u) }\n");
-        let analysis = analyze(&lowered);
+        let analysis = analyze_hir_for_test(&lowered);
         assert_eq!(
             analysis.bodies().count(),
             lowered.bodies.len(),
@@ -1095,7 +1629,7 @@ mod tests {
     #[test]
     fn 手順1_スロット表を作る() {
         let lowered = lowered_of("fn main() { assert true }\n");
-        let slots = analyze(&lowered).slots;
+        let slots = analyze_hir_for_test(&lowered).slots;
 
         assert_eq!(slots.trait_of("db"), Some("Database"));
         assert_eq!(slots.trait_of("clock"), Some("Clock"));
@@ -1118,7 +1652,7 @@ mod tests {
     #[test]
     fn 重複したスロットを報告する() {
         let lowered = lowered_of("effect db: Database\nfn main() { assert true }\n");
-        let errors = analyze(&lowered).errors();
+        let errors = analyze_hir_for_test(&lowered).errors();
 
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(
@@ -1143,7 +1677,7 @@ mod tests {
     #[test]
     fn 後で定義された関数は呼び出せる() {
         let lowered = lowered_of("fn main() { stamp() }\nfn stamp() { let n = 1 }\n");
-        assert!(analyze(&lowered).errors().is_empty());
+        assert!(analyze_hir_for_test(&lowered).errors().is_empty());
     }
 
     // ---- 手順2 ----
@@ -1363,7 +1897,9 @@ mod tests {
         );
         // 隠した arm は要求を作らないが、隠していない arm の分は残る
         assert_eq!(facts.0, set(&["clock"]));
-        assert_eq!(facts.1, set(&["impl Clock::now"]));
+        // 隠した arm の `db.save(u)` は具体型のメソッド呼び出しで、値レシーバ
+        // でも辺になる(MAP-080 決定5)。スロットは隠れているので要求は作らない
+        assert_eq!(facts.1, set(&["impl Clock::now", "impl Postgres::save"]));
     }
 
     #[test]
@@ -1494,8 +2030,8 @@ mod tests {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let a = analysis_of(&src);
 
-        // stamp が clock と db を使い、promote / handle は1文字も書いていないのに届く
-        assert_eq!(a.reqs["stamp"].keys().count(), 2);
+        // stamp が clock を使い、promote / handle は1文字も書いていない db と clock が届く
+        assert_eq!(a.reqs["stamp"].keys().count(), 1);
         assert_eq!(a.reqs["promote"].keys().count(), 2);
         assert_eq!(a.reqs["handle"].keys().count(), 2);
 
@@ -1699,5 +2235,67 @@ mod tests {
              fn main(-> Store) {{ Store::new() }}\n"
         ));
         assert_eq!(a.reqs["main"]["clock"].level, SlotLevel::Value);
+    }
+
+    // ---- 汎用 `map`(MAP-080) ----
+
+    /// `Map<T>` と `[T]` の実装、要求のある callback と無い callback
+    const MAP_PRELUDE: &str = "trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }\n\
+         impl<T> Map<T> for [T] {\n\
+         \x20 fn map<U>(self, f: fn(T -> U) -> [U]) {\n\
+         \x20   let mut result: [U] = []\n\
+         \x20   for x in move self { result.push(f(move x)) }\n\
+         \x20   move result\n\
+         \x20 }\n\
+         }\n\
+         fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn sum(xs: &[int] -> int) { let mut t = 0\n for x in xs { t = t + x }\n t }\n\
+         fn mapped(f: fn(int -> int), xs: [int] -> int) { let ys = move xs.map(f)\n sum(&ys) }\n";
+
+    /// callback の ambient 要求は `map` と trait dispatch を通って呼び出し元へ
+    /// 届く(MAP-080 決定5、tasks 5.2)
+    #[test]
+    fn mapのcallbackの要求が呼び出し元へ届く() {
+        let a = analysis_of(&format!(
+            "{PRELUDE}{MAP_PRELUDE}fn main(-> int) {{ mapped(ticked, [1, 2]) }}\n"
+        ));
+        assert_eq!(req_names(&a.reqs["mapped"]), set(&["clock"]));
+        assert_eq!(req_names(&a.reqs["main"]), set(&["clock"]));
+    }
+
+    /// 要求を持たない callback を渡した呼び出し地点は綺麗なまま(tasks 5.2)
+    #[test]
+    fn 要求の無いcallbackのmapは要求を作らない() {
+        let a = analysis_of(&format!(
+            "{PRELUDE}{MAP_PRELUDE}fn main(-> int) {{ mapped(plain, [1, 2]) }}\n"
+        ));
+        assert_eq!(req_names(&a.reqs["main"]), BTreeSet::new());
+    }
+
+    /// 提供が経路のどこにも無ければ実行前に落ち、経路は `map` を名指す
+    /// (tasks 5.2)
+    #[test]
+    fn mapを通る提供忘れの経路はmapを名指す() {
+        let program = lowered_of(&format!(
+            "{MAP_PRELUDE}fn main(-> int) {{ mapped(ticked, [1, 2]) }}\n"
+        ));
+        let analysis = analyze_hir_for_test(&program);
+        assert_eq!(analysis.unsatisfied().len(), 1);
+        let path: Vec<&str> = analysis.reqs["main"]["clock"].path_names();
+        assert!(path.contains(&"map"), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("mapped")), "{path:?}");
+        assert!(path.iter().any(|hop| hop.ends_with("ticked")), "{path:?}");
+    }
+
+    /// `with` で覆えば要求は止まる。`map` の中の間接呼び出しでも同じ
+    #[test]
+    fn mapの周りのwithは要求を止める() {
+        let a = analysis_of(&format!(
+            "{PRELUDE}{MAP_PRELUDE}fn main(-> int) {{\n\
+             \x20 with clock(SystemClock {{}}) {{ mapped(ticked, [1, 2]) }}\n\
+             }}\n"
+        ));
+        assert_eq!(req_names(&a.reqs["main"]), BTreeSet::new());
     }
 }

@@ -7,6 +7,8 @@ mod ast;
 #[allow(dead_code)]
 mod ambient_abi;
 mod diag;
+#[cfg(test)]
+mod differential;
 mod eval;
 // HIR は宣言 span と所属を語彙として全部持つ。診断と Wasm 下ろしが読むもの、
 // そして `dump` のように下ろしのテストだけが使うものがあるので、いまの3つの
@@ -15,12 +17,21 @@ mod eval;
 mod hir;
 mod lex;
 mod module;
+mod ownership;
 mod parse;
 mod render;
 mod requirement;
 mod typecheck;
 mod wasm;
 mod wasm_abi;
+// ambient record の物理表現は段階的に wasm emitter へ接続する。土台の local
+// allocator は先に単体テストで固定するので、接続前の unused 警告を抑える。
+#[allow(dead_code)]
+mod wasm_ambient;
+mod wasm_data;
+mod wasm_layout;
+mod wasm_runtime;
+mod wasm_wire;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -110,7 +121,14 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
     };
     let sources = loaded.sources;
 
-    let checked = match typecheck::check_and_lower(&loaded.program) {
+    let lowered = match typecheck::check_and_lower(&loaded.program) {
+        Ok(lowered) => lowered,
+        Err(errors) => {
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
+    let checked = match ownership::check(lowered) {
         Ok(checked) => checked,
         Err(errors) => {
             render::report(&errors, &sources);
@@ -118,7 +136,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
         }
     };
 
-    let Some(entry_callable) = checked.free_callable(&loaded.entry) else {
+    let Some(entry_callable) = checked.hir.free_callable(&loaded.entry) else {
         eprintln!("エントリー `{}` がありません", loaded.entry);
         return ExitCode::FAILURE;
     };
@@ -150,7 +168,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
         .filter_map(|export| {
             Some((
                 export.name.clone(),
-                checked.free_callable(&export.canonical)?,
+                checked.hir.free_callable(&export.canonical)?,
             ))
         })
         .collect();
@@ -161,7 +179,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
     roots.extend(
         exports
             .iter()
-            .map(|(_, id)| checked.callables[*id].name.clone()),
+            .map(|(_, id)| checked.hir.callables[*id].name.clone()),
     );
     let errors = analysis.errors_for_roots(&roots);
     if !errors.is_empty() {
@@ -173,7 +191,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
         match ambient_abi::plan_production(&checked, &analysis, entry_callable, &exports) {
             Ok(production) => production,
             Err(error) => {
-                eprintln!("{}", error.show(&checked));
+                eprintln!("{}", error.show(&checked.hir));
                 return ExitCode::FAILURE;
             }
         };
@@ -260,7 +278,15 @@ fn main() -> ExitCode {
 
     // 検査と下ろしはひとつ。ここを通れば、後段が受け取るのは型の付いた
     // 参照解決済みの HIR で、名前を引き直す必要がない(src/hir.rs)
-    let checked = match typecheck::check_and_lower(&program) {
+    let lowered = match typecheck::check_and_lower(&program) {
+        Ok(lowered) => lowered,
+        Err(errors) => {
+            eprintln!();
+            render::report(&errors, &sources);
+            return ExitCode::FAILURE;
+        }
+    };
+    let checked = match ownership::check(lowered) {
         Ok(checked) => checked,
         Err(errors) => {
             eprintln!();
@@ -293,10 +319,14 @@ fn main() -> ExitCode {
 }
 
 /// `test` があれば全部走らせる。無ければ `main` を走らせる。
-fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> ExitCode {
-    let interp = eval::Interp::new(checked);
+fn run(
+    checked: &ownership::CheckedProgram,
+    entry: &str,
+    sources: &[module::SourceFile],
+) -> ExitCode {
+    let interp = eval::Interp::new_checked(checked);
 
-    if checked.tests.is_empty() {
+    if checked.hir.tests.is_empty() {
         println!("\n実行:");
         return match interp.run(entry) {
             Ok(v) => {
@@ -313,7 +343,7 @@ fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> E
 
     println!("\nテスト:");
     let mut failed = 0;
-    for (id, declared) in checked.tests.iter() {
+    for (id, declared) in checked.hir.tests.iter() {
         let name = &declared.name;
         match interp.run_test(id) {
             Ok(_) => println!("  ok   {name}"),
@@ -325,7 +355,7 @@ fn run(checked: &hir::Program, entry: &str, sources: &[module::SourceFile]) -> E
         }
     }
 
-    let total = checked.tests.len();
+    let total = checked.hir.tests.len();
     println!("\n{total} 件中 {} 件成功", total - failed);
     if failed == 0 {
         ExitCode::SUCCESS
@@ -361,13 +391,17 @@ fn summary(item: &ast::Item) -> String {
             format!("enum   {name} ({} variant)", variants.len())
         }
         Impl {
-            trait_name,
-            type_name,
+            trait_ref,
+            target,
             methods,
             ..
-        } => match trait_name {
-            Some(t) => format!("impl   {t} for {type_name} ({} メソッド)", methods.len()),
-            None => format!("impl   {type_name} ({} メソッド)", methods.len()),
+        } => match trait_ref {
+            Some(t) => format!(
+                "impl   {} for {target} ({} メソッド)",
+                t.name,
+                methods.len()
+            ),
+            None => format!("impl   {target} ({} メソッド)", methods.len()),
         },
         Effect {
             slot, trait_name, ..

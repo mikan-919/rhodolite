@@ -494,8 +494,8 @@ fn resolve(
         let mut changed = false;
         for (owner, name, member) in additions {
             let table = publics.entry(owner).or_default();
-            if !table.contains_key(&name) {
-                table.insert(name, member);
+            if let std::collections::btree_map::Entry::Vacant(entry) = table.entry(name) {
+                entry.insert(member);
                 changed = true;
             }
         }
@@ -731,9 +731,9 @@ fn resolve_item(
         }
         Item::Struct { name, fields, .. } => {
             *name = local[name].clone();
-            for (_, ty) in fields {
+            for field in fields {
                 resolve_type(
-                    ty,
+                    &mut field.ty,
                     local,
                     imported_declarations,
                     imported_modules,
@@ -747,9 +747,9 @@ fn resolve_item(
             *name = local[name].clone();
             for variant in variants {
                 variant.name = local[&variant.name].clone();
-                for ty in &mut variant.payload {
+                for payload in &mut variant.payload {
                     resolve_type(
-                        ty,
+                        &mut payload.ty,
                         local,
                         imported_declarations,
                         imported_modules,
@@ -759,22 +759,31 @@ fn resolve_item(
             }
         }
         Item::Impl {
-            trait_name,
-            type_name,
+            trait_ref,
+            target,
             methods,
             ..
         } => {
-            if let Some(name) = trait_name {
-                *name = resolve_name(
-                    name,
+            if let Some(trait_ref) = trait_ref {
+                trait_ref.name = resolve_name(
+                    &trait_ref.name,
                     local,
                     imported_declarations,
                     imported_modules,
                     declarations,
                 );
+                for arg in &mut trait_ref.args {
+                    resolve_type(
+                        arg,
+                        local,
+                        imported_declarations,
+                        imported_modules,
+                        declarations,
+                    );
+                }
             }
-            *type_name = resolve_name(
-                type_name,
+            resolve_type(
+                target,
                 local,
                 imported_declarations,
                 imported_modules,
@@ -790,7 +799,7 @@ fn resolve_item(
                 );
                 let mut locals: BTreeSet<String> =
                     sig.params.iter().map(|p| p.name.clone()).collect();
-                if sig.has_self {
+                if sig.has_self() {
                     locals.insert("self".to_string());
                 }
                 resolve_exprs(
@@ -904,6 +913,17 @@ fn resolve_type(
             imported_modules,
             declarations,
         ),
+        TypeKind::Callable { params, result } => {
+            for param in params.iter_mut().chain(std::iter::once(&mut **result)) {
+                resolve_type(
+                    param,
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                );
+            }
+        }
     }
 }
 
@@ -1048,6 +1068,7 @@ fn resolve_expr(
             name,
             annotation,
             value,
+            ..
         } => {
             // 注釈の名前の葉は引数・フィールド・戻り値と同じ規則で正準化する
             if let Some(annotation) = annotation {
@@ -1095,7 +1116,9 @@ fn resolve_expr(
                 diagnostics,
             );
         }
-        ExprKind::Unary(_, inner) | ExprKind::Assert(inner) => resolve_expr(
+        ExprKind::Unary(_, inner)
+        | ExprKind::Assert(inner)
+        | ExprKind::Access { place: inner, .. } => resolve_expr(
             inner,
             locals,
             local,
@@ -1389,7 +1412,7 @@ fn module_references(items: &[Item]) -> Vec<Vec<String>> {
                 for (sig, body) in methods {
                     let mut locals: BTreeSet<String> =
                         sig.params.iter().map(|param| param.name.clone()).collect();
-                    if sig.has_self {
+                    if sig.has_self() {
                         locals.insert("self".to_string());
                     }
                     collect_expr_paths(body, &mut locals, &mut paths);
@@ -1418,20 +1441,23 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
                 }
             }
             Item::Struct { fields, .. } => {
-                for (_, ty) in fields {
-                    collect_type_paths(ty, &mut paths);
+                for field in fields {
+                    collect_type_paths(&field.ty, &mut paths);
                 }
             }
             Item::Impl {
-                trait_name,
-                type_name,
+                trait_ref,
+                target,
                 methods,
                 ..
             } => {
-                if let Some(trait_name) = trait_name {
-                    collect_name_path(trait_name, &mut paths);
+                if let Some(trait_ref) = trait_ref {
+                    collect_name_path(&trait_ref.name, &mut paths);
+                    for arg in &trait_ref.args {
+                        collect_type_paths(arg, &mut paths);
+                    }
                 }
-                collect_name_path(type_name, &mut paths);
+                collect_type_paths(target, &mut paths);
                 for (sig, _) in methods {
                     collect_sig_paths(sig, &mut paths);
                 }
@@ -1441,8 +1467,8 @@ fn declaration_references(items: &[Item]) -> Vec<Vec<String>> {
             // enum が参照するのは variant payload の型だけ
             Item::Enum { variants, .. } => {
                 for variant in variants {
-                    for ty in &variant.payload {
-                        collect_type_paths(ty, &mut paths);
+                    for payload in &variant.payload {
+                        collect_type_paths(&payload.ty, &mut paths);
                     }
                 }
             }
@@ -1466,6 +1492,12 @@ fn collect_type_paths(ty: &Type, paths: &mut Vec<Vec<String>>) {
     match &ty.kind {
         TypeKind::Named(name) => collect_name_path(name, paths),
         TypeKind::Array(element) => collect_type_paths(element, paths),
+        TypeKind::Callable { params, result } => {
+            for param in params {
+                collect_type_paths(param, paths);
+            }
+            collect_type_paths(result, paths);
+        }
     }
 }
 
@@ -1485,7 +1517,8 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             ExprKind::Field(recv, _)
             | ExprKind::OptionalField(recv, _)
             | ExprKind::Unary(_, recv)
-            | ExprKind::Assert(recv) => {
+            | ExprKind::Assert(recv)
+            | ExprKind::Access { place: recv, .. } => {
                 collect_expr_paths(std::slice::from_ref(recv), locals, paths);
             }
             ExprKind::Call(callee, args) => {
@@ -1511,6 +1544,7 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
                 name,
                 annotation,
                 value,
+                ..
             } => {
                 // 注釈が他モジュールの型を名乗るなら、その参照も収集する
                 if let Some(annotation) = annotation {
@@ -1748,9 +1782,10 @@ mod tests {
         ])
         .expect("ロードできる");
 
-        let checked = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let hir = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let checked = crate::ownership::check(hir).expect("所有権検査を通る");
         let Err(crate::eval::Flow::Error(diagnostic)) =
-            crate::eval::Interp::new(&checked).run(&loaded.entry)
+            crate::eval::Interp::new_checked(&checked).run(&loaded.entry)
         else {
             panic!("`assert false` は失敗するはず");
         };
@@ -2083,11 +2118,11 @@ mod tests {
         assert_eq!(name, "main::Lookup");
         assert_eq!(variants[0].name, "main::Found");
         // ローカル宣言・import 経由・角括弧と後置 `?` の内側まで同じ規則で通る
-        assert_eq!(variants[0].payload[0].name(), Some("main::User"));
-        let TypeKind::Array(element) = &variants[0].payload[1].kind else {
+        assert_eq!(variants[0].payload[0].ty.name(), Some("main::User"));
+        let TypeKind::Array(element) = &variants[0].payload[1].ty.kind else {
             panic!("配列ではない: {:?}", variants[0].payload[1])
         };
-        assert!(variants[0].payload[1].optional);
+        assert!(variants[0].payload[1].ty.optional);
         assert_eq!(element.name(), Some("dep::Row"));
         assert!(element.optional);
         // fieldless は payload 無しのまま
@@ -2108,9 +2143,9 @@ mod tests {
         };
 
         let local = BTreeMap::from([("User".to_string(), "main::User".to_string())]);
-        for (_, ty) in fields.iter_mut() {
+        for field in fields.iter_mut() {
             resolve_type(
-                ty,
+                &mut field.ty,
                 &local,
                 &BTreeMap::new(),
                 &BTreeMap::new(),
@@ -2118,15 +2153,15 @@ mod tests {
             );
         }
 
-        let TypeKind::Array(outer) = &fields[0].1.kind else {
-            panic!("配列ではない: {:?}", fields[0].1)
+        let TypeKind::Array(outer) = &fields[0].ty.kind else {
+            panic!("配列ではない: {:?}", fields[0].ty)
         };
         let TypeKind::Array(inner) = &outer.kind else {
             panic!("入れ子の配列ではない: {outer:?}")
         };
         assert_eq!(inner.name(), Some("main::User"));
         assert!(outer.optional, "要素の後置 `?` は解決で失われない");
-        assert_eq!(fields[1].1.name(), Some("main::User"));
+        assert_eq!(fields[1].ty.name(), Some("main::User"));
     }
 
     // -----------------------------------------------------------------------
@@ -2144,8 +2179,7 @@ mod tests {
 
     fn load_err(files: &[(&str, &str)]) -> String {
         load_files(files)
-            .err()
-            .expect("読み込みは失敗するはず")
+            .expect_err("読み込みは失敗するはず")
             .diagnostics
             .into_iter()
             .map(|d| d.msg)
@@ -2362,6 +2396,37 @@ mod tests {
         ])
         .expect("読み込めるはず");
         assert!(exported(&loaded).is_empty(), "{:?}", exported(&loaded));
+    }
+
+    /// 型パラメータ名は宣言の中でだけ意味を持つので、モジュール解決は
+    /// それを知らない。どのモジュールの宣言にも当たらない名前は素通しなので、
+    /// `T` は綴りのまま型検査のスコープ検査へ届く(MAP-010 決定3)
+    #[test]
+    fn モジュール解決は型パラメータ名を書き換えない() {
+        let loaded = load_files(&[(
+            "main.rd",
+            "fn identity<T>(x: T -> T) { x }\n\
+             impl<T> Holder for [T] { fn get<U>(self, f: fn(T -> U) -> [U]) { self } }\n\
+             fn main(-> int) { 1 }\n",
+        )])
+        .expect("読み込めるはず");
+        let Item::Fn { sig, .. } = &loaded.program.items[0] else {
+            panic!("fn ではない")
+        };
+        // 宣言名は正準化されるが、型パラメータの参照は裸のまま
+        assert_eq!(sig.name, "main::identity");
+        assert_eq!(sig.params[0].ty.to_string(), "T");
+        assert_eq!(sig.ret.as_ref().unwrap().to_string(), "T");
+
+        let Item::Impl {
+            target, methods, ..
+        } = &loaded.program.items[1]
+        else {
+            panic!("impl ではない")
+        };
+        assert_eq!(target.to_string(), "[T]");
+        assert_eq!(methods[0].0.params[0].ty.to_string(), "fn(T -> U)");
+        assert_eq!(methods[0].0.ret.as_ref().unwrap().to_string(), "[U]");
     }
 
     /// 公開名は型検査後の HIR の宣言へそのまま引ける。ここが ABI 層の入口になる

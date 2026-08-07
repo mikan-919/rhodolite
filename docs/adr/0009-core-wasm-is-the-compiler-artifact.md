@@ -12,6 +12,11 @@ JavaScript・ホストフレームワークは、いずれもコンパイラの�
 [ADR-0008](./0008-ambient-abi-is-a-specialization-plan.md) が決めた特殊化計画の、
 **出力側**を固定する ADR にあたる。C 生成を次段としていた計画をここで差し替える。
 
+> [ADR-0011](./0011-owned-data-layout-and-abi-v1.md) が、下の決定6が引いた
+> 「v0 は scalar だけ」という線と、境界表現が scalar に閉じるという前提を
+> 差し替えた。成果物が import-free な Core Wasm + 埋め込み JSON であること、
+> 到達したところだけを対応検査すること、scalar の境界表現そのものは変わらない。
+
 ## Decision
 
 ### 1. 正規の成果物は Core Wasm

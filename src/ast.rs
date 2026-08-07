@@ -31,16 +31,18 @@ pub struct UseMember {
 
 #[derive(Debug)]
 pub enum Item {
-    /// `trait Database { fn find(...) fn save(...) }` — 契約
+    /// `trait Database { fn find(...) fn save(...) }` — 契約。
+    /// `trait Map<T> { ... }` のように型パラメータを取れる(MAP-Q1)
     Trait {
         name: String,
+        type_params: Vec<TypeParam>,
         methods: Vec<Sig>,
         span: Span,
     },
     /// `struct User { rank: Rank }` — フィールドの宣言
     Struct {
         name: String,
-        fields: Vec<(String, Type)>,
+        fields: Vec<FieldDecl>,
         span: Span,
     },
     /// `enum Lookup { Found(User) Skipped }` — variant ごとに0個以上の
@@ -51,10 +53,14 @@ pub enum Item {
         span: Span,
     },
     /// `impl Database for Postgres { ... }` — ハンドラの正体。専用構文は持たない。
-    /// `impl Postgres { ... }`(trait 無し)も書ける。`Postgres::new` はそこに置く
+    /// `impl Postgres { ... }`(trait 無し)も書ける。`Postgres::new` はそこに置く。
+    ///
+    /// `impl<T> Map<T> for [T] { ... }` のように型パラメータを取れる(MAP-Q1)。
+    /// trait 参照は型引数を持てて、対象型は型注釈の文法そのものなので `[T]` も書ける
     Impl {
-        trait_name: Option<String>,
-        type_name: String,
+        type_params: Vec<TypeParam>,
+        trait_ref: Option<TraitRef>,
+        target: Type,
         methods: Vec<(Sig, Vec<Expr>)>,
         span: Span,
     },
@@ -83,8 +89,26 @@ pub enum Item {
 #[derive(Debug)]
 pub struct EnumVariant {
     pub name: String,
-    /// 宣言順の payload 型
-    pub payload: Vec<Type>,
+    /// 宣言順の payload
+    pub payload: Vec<PayloadDecl>,
+}
+
+/// `indirect next: Node?` — struct の1フィールド。
+///
+/// `indirect` は所有エッジを間接化して再帰型の層を切る。値の見た目の型は
+/// `T` / `T?` のままで、`Box<T>` のような包みは表に出さない(design.md 決定10)
+#[derive(Debug, Clone)]
+pub struct FieldDecl {
+    pub name: String,
+    pub ty: Type,
+    pub indirect: bool,
+}
+
+/// `Cons(int, indirect List)` — enum variant の1 payload 位置。
+#[derive(Debug, Clone)]
+pub struct PayloadDecl {
+    pub ty: Type,
+    pub indirect: bool,
 }
 
 impl Item {
@@ -102,17 +126,54 @@ impl Item {
     }
 }
 
+/// `<T, U>` の1要素。名前は宣言の中でだけ意味を持つので、重複と
+/// スコープ外の診断が指せるよう span を持つ(MAP-Q1)
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub span: Span,
+}
+
+/// `impl` が実装する trait の参照。`Database` のように型引数を取らない形も、
+/// `Map<T>` のように取る形も同じ1つの表現に載せる
+#[derive(Debug, Clone)]
+pub struct TraitRef {
+    pub name: String,
+    /// `Map<T>` の `T`。型引数を取らない参照では空
+    pub args: Vec<Type>,
+}
+
 /// `fn find(id: int -> User?)` — 戻り値の `->` は括弧の内側にある
 #[derive(Debug)]
 pub struct Sig {
     pub name: String,
-    /// 第一引数が `self` か。トレイトのメソッドと関連関数の区別はこれ一つ。
+    /// `fn map<U>(...)` の `U`。自由関数・trait メソッド・impl メソッドで同じ
+    pub type_params: Vec<TypeParam>,
+    /// 第一引数のレシーバ。トレイトのメソッドと関連関数の区別はこれ一つ。
     /// 暗黙にしないのは、`Postgres::new` のようにレシーバを取らないものと
     /// 見た目で区別できなくなるため
-    pub has_self: bool,
+    pub receiver: Option<ReceiverMode>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub span: Span,
+}
+
+impl Sig {
+    /// レシーバを取るか。モードを見ない既存の検査はこれで足りる
+    pub fn has_self(&self) -> bool {
+        self.receiver.is_some()
+    }
+}
+
+/// `self` / `&self` / `&mut self` — レシーバの所有モード(design.md 決定2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiverMode {
+    /// `self` — レシーバを消費する
+    Owned,
+    /// `&self`
+    Shared,
+    /// `&mut self`
+    Mutable,
 }
 
 #[derive(Debug)]
@@ -126,9 +187,20 @@ pub struct Param {
 /// 言い分けられる(design.md 決定1)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Type {
+    /// `T` / `&T` / `&mut T`。ライフタイム引数は持たない(design.md 決定2)
+    pub mode: TypeMode,
     pub kind: TypeKind,
     /// `User?` / `[User]?` の後置 `?`
     pub optional: bool,
+}
+
+/// 型に付く所有モード。所有 `T`、共有借用 `&T`、排他借用 `&mut T` は別の静的型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypeMode {
+    #[default]
+    Owned,
+    Shared,
+    Mutable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,15 +208,44 @@ pub enum TypeKind {
     Named(String),
     /// `[T]`
     Array(Box<Type>),
+    /// `fn(P1, P2 -> R)` — 名前付きトップレベル関数の値型
+    Callable {
+        params: Vec<Type>,
+        result: Box<Type>,
+    },
 }
 
 impl Type {
-    /// 名前の葉。配列なら `None`
+    /// 名前の葉。配列・callable なら `None`
     pub fn name(&self) -> Option<&str> {
         match &self.kind {
             TypeKind::Named(name) => Some(name),
-            TypeKind::Array(_) => None,
+            TypeKind::Array(_) | TypeKind::Callable { .. } => None,
         }
+    }
+}
+
+/// 書かれたままの綴り。`impl` の対象型のように、名前の葉に収まらない型を
+/// 診断へ出すのに要る
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.mode {
+            TypeMode::Owned => {}
+            TypeMode::Shared => write!(f, "&")?,
+            TypeMode::Mutable => write!(f, "&mut ")?,
+        }
+        match &self.kind {
+            TypeKind::Named(name) => write!(f, "{name}")?,
+            TypeKind::Array(element) => write!(f, "[{element}]")?,
+            TypeKind::Callable { params, result } => {
+                let params: Vec<String> = params.iter().map(ToString::to_string).collect();
+                write!(f, "fn({}-> {result})", crate::hir::spelled_params(&params))?;
+            }
+        }
+        if self.optional {
+            write!(f, "?")?;
+        }
+        Ok(())
     }
 }
 
@@ -179,10 +280,21 @@ pub enum ExprKind {
     },
     Let {
         name: String,
+        /// `let mut x = ...` か。`let` は不変で、再代入・可変フィールド
+        /// アクセス・`&mut` の作成にはこれが要る
+        mutable: bool,
         /// `let name: T = value` の `T`。推論できない初期化子(裸の `nil`、
         /// 空配列)へ期待型を与える唯一の局所注釈(design.md 決定2)
         annotation: Option<Type>,
         value: Box<Expr>,
+    },
+    /// `&place` / `&mut place` / `move place` — 場所に付く所有権修飾。
+    ///
+    /// 低優先度の単項演算子ではない。末尾がメソッド呼び出しならレシーバに、
+    /// そうでなければ射影全体に付く(design.md 決定2)
+    Access {
+        mode: AccessMode,
+        place: Box<Expr>,
     },
     Assign {
         target: Box<Expr>,
@@ -297,6 +409,18 @@ pub enum Head {
     While(Box<Expr>),
     /// `with db(pg), clock<SystemClock>` — ambient 束縛の導入
     Ambient(Vec<Provision>),
+}
+
+/// `ExprKind::Access` の修飾。共有読みは書かずに済むので、ここに現れるのは
+/// 状態・所有・コストが動く3つだけ(design.md 決定2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMode {
+    /// `&place`
+    Shared,
+    /// `&mut place`
+    Mutable,
+    /// `move place`
+    Move,
 }
 
 #[derive(Debug, Clone, Copy)]

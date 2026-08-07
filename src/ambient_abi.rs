@@ -63,6 +63,9 @@ plan_ids!(InstanceId, RecordLayoutId);
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct InstanceKey {
     pub body: hir::BodyId,
+    /// この呼び出しで選ばれた callback。同じ本体でも callback が違えば
+    /// 要求も生成コードも別物になる(design.md 決定3)
+    pub bindings: hir::Bindings,
     /// `SlotId` 順。その本体の要求に制限したものだけが入る
     pub providers: Vec<(hir::SlotId, hir::TraitImplId)>,
 }
@@ -147,11 +150,27 @@ impl Plan {
             .map(|(index, instance)| (InstanceId::from_index(index), instance))
     }
 
+    /// 予約済み instance の個数。backend は `InstanceId` を関数番号へ写す前に、
+    /// 計画が範囲内を指していることを検証する。
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
     pub fn layouts(&self) -> impl Iterator<Item = (RecordLayoutId, &RecordLayout)> {
         self.layouts
             .iter()
             .enumerate()
             .map(|(index, layout)| (RecordLayoutId::from_index(index), layout))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instance_mut_for_test(&mut self, id: InstanceId) -> &mut Instance {
+        &mut self.instances[id.index()]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn instance_id_for_test(index: usize) -> InstanceId {
+        InstanceId::from_index(index)
     }
 
     /// 鍵を instance へ寄せる。**本体を歩く前に**確保するので、再帰の辺は
@@ -213,6 +232,9 @@ pub enum PlanError {
         implementation: hir::TraitImplId,
         method: hir::TraitMethodId,
     },
+    /// 間接呼び出しの呼び先が、この特殊化の callback 束縛から決まらない。
+    /// 型検査が callable 値の置き場所を絞っているので通常は起きない
+    UnresolvedCallback { body: hir::BodyId },
 }
 
 impl PlanError {
@@ -237,6 +259,10 @@ impl PlanError {
                 program.structs[program.trait_impls[*implementation].type_].name,
                 program.trait_methods[*method].name
             ),
+            PlanError::UnresolvedCallback { body } => format!(
+                "{}: 間接呼び出しの呼び先が決まりません",
+                program.show_body(*body)
+            ),
         }
     }
 }
@@ -253,10 +279,11 @@ pub type ProviderContext = BTreeMap<hir::SlotId, ProviderBinding>;
 /// 根は空の提供文脈から始まる。要求が残っていれば提供忘れだが、それは前段の
 /// 診断が先に止めるので、ここへ来たら不変条件の破れとして返す。
 pub fn plan(
-    program: &hir::Program,
+    checked: &crate::ownership::CheckedProgram,
     analysis: &crate::requirement::Analysis,
     entry: hir::CallableId,
 ) -> Result<Plan, PlanError> {
+    let program = &checked.hir;
     let roots: Vec<_> = std::iter::once(hir::BodyId::Callable(entry))
         .chain(program.tests.ids().map(hir::BodyId::Test))
         .map(|body| (body, ProviderContext::new()))
@@ -283,11 +310,12 @@ pub struct ProductionPlan {
 /// `exports` は公開名の昇順で渡す。`main` の提供状態が後続の公開呼び出しへ
 /// 引き継がれることはない
 pub fn plan_production(
-    program: &hir::Program,
+    checked: &crate::ownership::CheckedProgram,
     analysis: &crate::requirement::Analysis,
     entry: hir::CallableId,
     exports: &[(String, hir::CallableId)],
 ) -> Result<ProductionPlan, PlanError> {
+    let program = &checked.hir;
     let mut seen = BTreeSet::from([entry]);
     let mut roots = vec![(hir::BodyId::Callable(entry), ProviderContext::new())];
     for (_, callable) in exports {
@@ -308,12 +336,53 @@ pub fn plan_production(
     })
 }
 
+/// 単相化アルゴリズムの単体テスト用。通常経路では使わない。
+#[cfg(test)]
+pub(crate) fn plan_hir_for_test(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    entry: hir::CallableId,
+) -> Result<Plan, PlanError> {
+    let roots: Vec<_> = std::iter::once(hir::BodyId::Callable(entry))
+        .chain(program.tests.ids().map(hir::BodyId::Test))
+        .map(|body| (body, ProviderContext::new()))
+        .collect();
+    plan_roots(program, analysis, &roots)
+}
+
+/// 生産根の単相化アルゴリズムの単体テスト用。通常経路では使わない。
+#[cfg(test)]
+pub(crate) fn plan_production_hir_for_test(
+    program: &hir::Program,
+    analysis: &crate::requirement::Analysis,
+    entry: hir::CallableId,
+    exports: &[(String, hir::CallableId)],
+) -> Result<ProductionPlan, PlanError> {
+    let mut seen = BTreeSet::from([entry]);
+    let mut roots = vec![(hir::BodyId::Callable(entry), ProviderContext::new())];
+    for (_, callable) in exports {
+        if seen.insert(*callable) {
+            roots.push((hir::BodyId::Callable(*callable), ProviderContext::new()));
+        }
+    }
+    let plan = plan_roots(program, analysis, &roots)?;
+    let instance_of: BTreeMap<hir::BodyId, InstanceId> = plan.roots.iter().copied().collect();
+    Ok(ProductionPlan {
+        entry: instance_of[&hir::BodyId::Callable(entry)],
+        exports: exports
+            .iter()
+            .map(|(name, callable)| (name.clone(), instance_of[&hir::BodyId::Callable(*callable)]))
+            .collect(),
+        plan,
+    })
+}
+
 /// 根の並びを呼び出し側が決める計画。
 ///
 /// 根は与えられた順に確保されるので、instance の番号もその順で決まる。
 /// 同じ本体を指す根が複数あっても intern が1つに寄せる(別名の再エクスポートが
 /// 同じ実装を共有するのはこの性質)
-pub fn plan_roots(
+fn plan_roots(
     program: &hir::Program,
     analysis: &crate::requirement::Analysis,
     roots: &[(hir::BodyId, ProviderContext)],
@@ -326,16 +395,17 @@ pub fn plan_roots(
     };
 
     for (root, context) in roots {
-        let (instance, _) = planner.request(*root, context, *root)?;
+        let (instance, _) = planner.request(*root, hir::Bindings::new(), context, *root)?;
         planner.plan.roots.push((*root, instance));
     }
 
     // 確保だけして中身が空の instance を、確保順に片づける
     while let Some((instance, context)) = planner.pending.pop_front() {
-        let body_id = planner.plan.instance(instance).key.body;
-        let body = planner.program.body(body_id);
+        let key = planner.plan.instance(instance).key.clone();
+        let body = planner.program.body(key.body);
+        let bindings = hir::resolve_bindings(body, &key.bindings);
         for root in &body.root {
-            planner.walk(instance, body, *root, &context)?;
+            planner.walk(instance, body, *root, &context, &bindings)?;
         }
     }
 
@@ -362,6 +432,7 @@ impl<'a> Planner<'a> {
     fn request(
         &mut self,
         callee: hir::BodyId,
+        bindings: hir::Bindings,
         caller: &ProviderContext,
         caller_body: hir::BodyId,
     ) -> Result<(InstanceId, Vec<(hir::SlotId, ValueSource)>), PlanError> {
@@ -371,7 +442,7 @@ impl<'a> Planner<'a> {
         let mut inner = ProviderContext::new();
 
         // 要求は `SlotId` 順。layout・鍵・射影の並びはここで一度に決まる
-        for (slot, requirement) in self.analysis.requirements(callee) {
+        for (slot, requirement) in self.analysis.requirements(callee, &bindings) {
             let Some(binding) = caller.get(slot) else {
                 return Err(PlanError::MissingProvider {
                     body: caller_body,
@@ -411,6 +482,7 @@ impl<'a> Planner<'a> {
         let (instance, fresh) = self.plan.intern(
             InstanceKey {
                 body: callee,
+                bindings,
                 providers,
             },
             layout,
@@ -429,14 +501,29 @@ impl<'a> Planner<'a> {
         body: &'a hir::Body,
         id: hir::ExprId,
         context: &ProviderContext,
+        bindings: &hir::Bindings,
     ) -> Result<(), PlanError> {
         let expr = body.expr(id);
         macro_rules! walk {
             ($child:expr) => {
-                self.walk(instance, body, *$child, context)?
+                self.walk(instance, body, *$child, context, bindings)?
             };
         }
         match &expr.kind {
+            // 所有権修飾は場所を包むだけなので、計画は変わらない。場所の中に
+            // 呼び出しも提供も現れない(tasks 5.5)。提供の所有モード(共有・
+            // 排他・move・一時所有)は所有権解析が閉じるもので、provider の
+            // 選択にも slot/callable の同一性にも効かない。所有か借用かを
+            // record の欄に載せるのはデータ下ろしの段(design.md 決定11)
+            hir::ExprKind::Access { place, .. } => walk!(place),
+
+            // 組み込みの `push` は葉。呼び出し先も提供も持たないので、計画に
+            // 足すのは部分式だけ(MAP-075 決定1)
+            hir::ExprKind::Push { array, value } => {
+                walk!(array);
+                walk!(value);
+            }
+
             hir::ExprKind::With {
                 provisions,
                 body: inner,
@@ -458,11 +545,11 @@ impl<'a> Planner<'a> {
                         },
                     );
                 }
-                self.walk(instance, body, *inner, &replaced)?;
+                self.walk(instance, body, *inner, &replaced, bindings)?;
             }
 
             hir::ExprKind::Call(call) => {
-                self.plan_call(instance, id, call, context)?;
+                self.plan_call(instance, id, call, context, bindings)?;
                 if let hir::Call::Method { recv, .. } = call {
                     walk!(recv);
                 }
@@ -488,6 +575,7 @@ impl<'a> Planner<'a> {
             | hir::ExprKind::Local(_)
             | hir::ExprKind::UnitStruct(_)
             | hir::ExprKind::Variant(_)
+            | hir::ExprKind::Function(_)
             | hir::ExprKind::Return(None)
             | hir::ExprKind::Poison => {}
 
@@ -511,6 +599,7 @@ impl<'a> Planner<'a> {
             }
             hir::ExprKind::Neg(inner)
             | hir::ExprKind::Assert(inner)
+            | hir::ExprKind::Clone(inner)
             | hir::ExprKind::Return(Some(inner)) => walk!(inner),
             hir::ExprKind::Arith { lhs, rhs, .. }
             | hir::ExprKind::Eq { lhs, rhs }
@@ -549,12 +638,19 @@ impl<'a> Planner<'a> {
         id: hir::ExprId,
         call: &hir::Call,
         context: &ProviderContext,
+        bindings: &hir::Bindings,
     ) -> Result<(), PlanError> {
+        let body = self.program.body(self.plan.instance(instance).key.body);
         let caller = self.plan.instance(instance).key.body;
         let (callee, receiver) = match call {
             hir::Call::Direct { callable, .. }
             | hir::Call::Associated { callable, .. }
             | hir::Call::Method { callable, .. } => (*callable, None),
+            // 間接呼び出しは、この特殊化で選ばれている名前付き関数へ直に向かう
+            hir::Call::Indirect { callee, .. } => match hir::callable_of(body, *callee, bindings) {
+                Some(callable) => (callable, None),
+                None => return Err(PlanError::UnresolvedCallback { body: caller }),
+            },
             hir::Call::Slot {
                 slot,
                 method,
@@ -595,7 +691,9 @@ impl<'a> Planner<'a> {
             hir::Call::Ctor { .. } => return Ok(()),
         };
 
-        let (target, projection) = self.request(hir::BodyId::Callable(callee), context, caller)?;
+        let inner = hir::callee_bindings(self.program, body, callee, call_args(call), bindings);
+        let (target, projection) =
+            self.request(hir::BodyId::Callable(callee), inner, context, caller)?;
         self.plan.instances[instance.index()].calls.insert(
             id,
             PlannedCall {
@@ -614,6 +712,7 @@ fn call_args(call: &hir::Call) -> &[hir::ExprId] {
         | hir::Call::Associated { args, .. }
         | hir::Call::Method { args, .. }
         | hir::Call::Slot { args, .. }
+        | hir::Call::Indirect { args, .. }
         | hir::Call::Ctor { args, .. } => args,
     }
 }
@@ -742,6 +841,174 @@ mod tests {
         crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず")
     }
 
+    /// provider mode まで検査済みの HIR。計画 API 自体を `CheckedProgram` に
+    /// 切り替えるのは task 8.1 なので、ここではその前段で確定した mode が
+    /// 既存の ambient 計画の同一性を動かさないことだけを確認する。
+    fn ownership_checked_of(src: &str) -> hir::Program {
+        crate::ownership::check(lowered_of(src))
+            .expect("所有権検査を通るはず")
+            .hir
+    }
+
+    // ---- callback 特殊化の計画(tasks 3.3 / 3.4) ----
+
+    const CALLBACK_SRC: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply(f: fn(int -> int), value: int -> int) { f(value) }\n";
+
+    /// 名前で instance を全部拾い、それぞれの ambient layout の有無を返す
+    fn callback_instances(program: &hir::Program, plan: &Plan, name: &str) -> Vec<bool> {
+        plan.instances()
+            .filter(|(_, instance)| program.show_body(instance.key.body).ends_with(name))
+            .map(|(_, instance)| instance.layout.is_some())
+            .collect()
+    }
+
+    /// slot を要る callback と要らない callback で、`apply` の instance が割れる。
+    /// no-slot 側は ambient record を持たない
+    #[test]
+    fn callbackごとにapplyのinstanceが分かれる() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(Frozen {{ t = 1000 }}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let mut ambient = callback_instances(&program, &plan, "apply");
+        ambient.sort_unstable();
+        assert_eq!(ambient, vec![false, true]);
+    }
+
+    /// 同じ callback・同じ provider なら instance は1つに畳まれる
+    #[test]
+    fn 同じcallbackの計画は1つに畳まれる() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 with clock(Frozen {{ t = 1 }}) {{ apply(ticked, 1) + apply(ticked, 2) }}\n\
+             }}\n"
+        ));
+        assert_eq!(callback_instances(&program, &plan, "apply").len(), 1);
+    }
+
+    /// provider が違えば、同じ callback でも instance は分かれる(既存の規則)
+    #[test]
+    fn callbackが同じでもproviderが違えば分かれる() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 let a = with clock(Frozen {{ t = 1 }}) {{ apply(ticked, 1) }}\n\
+             \x20 let b = with clock(Zero {{}}) {{ apply(ticked, 2) }}\n\
+             \x20 a + b\n\
+             }}\n"
+        ));
+        assert_eq!(callback_instances(&program, &plan, "apply").len(), 2);
+    }
+
+    /// 間接呼び出しにも `PlannedCall` が付き、行き先は選ばれた callback
+    #[test]
+    fn 間接呼び出しは選ばれたcallbackへ向かう() {
+        let (program, plan) = plan_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ apply(plain, 1) }}\n"
+        ));
+        let targets: BTreeSet<String> = plan
+            .instances()
+            .filter(|(_, instance)| program.show_body(instance.key.body).ends_with("apply"))
+            .flat_map(|(_, instance)| instance.calls.values())
+            .map(|call| program.show_body(plan.instance(call.target).key.body))
+            .collect();
+        assert!(
+            targets.iter().any(|name| name.ends_with("plain")),
+            "{targets:?}"
+        );
+    }
+
+    /// 提供忘れは計画の前段(要求解析)で止まる。ここでは計画が通らないこと
+    #[test]
+    fn callback越しの提供忘れは計画で落ちる() {
+        let program = lowered_of(&format!(
+            "{CALLBACK_SRC}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
+        let entry = program.free_callable("main").expect("main がない");
+        let clock = slot(&program, "clock");
+        assert_eq!(
+            plan_hir_for_test(&program, &analysis, entry),
+            Err(PlanError::MissingProvider {
+                body: hir::BodyId::Callable(entry),
+                slot: clock
+            })
+        );
+    }
+
+    // ---- generic な具体化の計画(MAP-050 tasks 2.x) ----
+
+    /// 上と同じ形の helper を generic にしたもの。具体化は宣言名をそのまま
+    /// 名乗るので、instance は表示名ではなく鍵で言い分かれる
+    const GENERIC_CALLBACK_SRC: &str = "fn ticked(value: int -> int) { value + clock.now() }\n\
+         fn plain(value: int -> int) { value + 1 }\n\
+         fn apply<T, U>(f: fn(T -> U), x: T -> U) { f(x) }\n";
+
+    /// slot を要る callback と要らない callback で、generic な `apply` の
+    /// 具体化ごとに instance が割れる。no-slot 側は record も射影も持たない
+    #[test]
+    fn generic_の具体化ごとにinstanceが分かれる() {
+        let (program, plan) = plan_of(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 let quiet = apply(plain, 1)\n\
+             \x20 with clock(Frozen {{ t = 1000 }}) {{ apply(ticked, quiet) }}\n\
+             }}\n"
+        ));
+        let mut ambient = callback_instances(&program, &plan, "apply");
+        ambient.sort_unstable();
+        assert_eq!(ambient, vec![false, true]);
+
+        let quiet: Vec<&Instance> = plan
+            .instances()
+            .map(|(_, instance)| instance)
+            .filter(|instance| {
+                program.show_body(instance.key.body) == "apply" && instance.layout.is_none()
+            })
+            .collect();
+        assert_eq!(quiet.len(), 1, "callback-free の具体化が1つ");
+        assert!(quiet[0].key.providers.is_empty(), "{:?}", quiet[0].key);
+        assert!(
+            quiet[0]
+                .calls
+                .values()
+                .all(|call| call.projection.is_empty()),
+            "{:?}",
+            quiet[0].calls
+        );
+    }
+
+    /// 同じ具体化・同じ provider への2つの呼び出しは1つの instance へ寄る
+    #[test]
+    fn 同じgeneric具体化への呼び出しは1つのinstanceに畳まれる() {
+        let (program, plan) = plan_of(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{\n\
+             \x20 with clock(Frozen {{ t = 1 }}) {{ apply(ticked, 1) + apply(ticked, 2) }}\n\
+             }}\n"
+        ));
+        assert_eq!(callback_instances(&program, &plan, "apply").len(), 1);
+    }
+
+    /// generic な具体化へ届く要求の提供忘れも、非 generic と同じ形で落ちる
+    #[test]
+    fn generic越しの提供忘れは計画で落ちる() {
+        let program = lowered_of(&format!(
+            "{GENERIC_CALLBACK_SRC}fn main(-> int) {{ apply(ticked, 1) }}\n"
+        ));
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
+        let entry = program.free_callable("main").expect("main がない");
+        let clock = slot(&program, "clock");
+        assert_eq!(
+            plan_hir_for_test(&program, &analysis, entry),
+            Err(PlanError::MissingProvider {
+                body: hir::BodyId::Callable(entry),
+                slot: clock
+            })
+        );
+    }
+
     pub(super) fn slot(program: &hir::Program, name: &str) -> hir::SlotId {
         program
             .slots
@@ -778,9 +1045,9 @@ mod tests {
     }
 
     fn plan_program(program: &hir::Program) -> Plan {
-        let analysis = crate::requirement::analyze(program);
+        let analysis = crate::requirement::analyze_hir_for_test(program);
         let entry = program.free_callable("main").expect("main がない");
-        plan(program, &analysis, entry).expect("計画できるはず")
+        plan_hir_for_test(program, &analysis, entry).expect("計画できるはず")
     }
 
     /// 前置きを付けずに下ろして計画する(正典など完結したソース用)
@@ -804,6 +1071,7 @@ mod tests {
         providers.sort();
         InstanceKey {
             body: body(program, name),
+            bindings: hir::Bindings::new(),
             providers,
         }
     }
@@ -1024,7 +1292,7 @@ mod tests {
             "fn ticks(-> int) { clock.now() }\n\
              fn main(-> int) { 0 }\n",
         );
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let ticks = hir::BodyId::Callable(program.free_callable("ticks").unwrap());
         let clock = slot(&program, "clock");
 
@@ -1037,7 +1305,7 @@ mod tests {
 
         let empty = ProviderContext::new();
         assert_eq!(
-            planner.request(ticks, &empty, ticks),
+            planner.request(ticks, hir::Bindings::new(), &empty, ticks),
             Err(PlanError::MissingProvider {
                 body: ticks,
                 slot: clock
@@ -1054,7 +1322,7 @@ mod tests {
             },
         );
         assert_eq!(
-            planner.request(ticks, &type_only, ticks),
+            planner.request(ticks, hir::Bindings::new(), &type_only, ticks),
             Err(PlanError::TypeOnlyProvider {
                 body: ticks,
                 slot: clock
@@ -1089,6 +1357,49 @@ mod tests {
         let found = instances_named(program, plan, name);
         assert_eq!(found.len(), 1, "{name} の instance が1つではない");
         found[0]
+    }
+
+    /// provider の mode は loan/drop の事実であり、specialization の鍵と
+    /// record layout は従来どおり callable / slot / implementation ID だけで
+    /// 決まる。値を作った expr ID は各 mode で異なり得るため比較しない(tasks 5.5)。
+    #[test]
+    fn provider_modeはambientのcanonical_plan_factを変えない() {
+        let variants = [
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(store) { ticks() }",
+            "let mut store = SharedFrozen { t = 1 }\n with shared_clock(&mut store) { ticks() }",
+            "let store = SharedFrozen { t = 1 }\n with shared_clock(move store) { ticks() }",
+            "with shared_clock(SharedFrozen { t = 1 }) { ticks() }",
+        ];
+        let mut expected = None;
+        for provision in variants {
+            let program = ownership_checked_of(&format!(
+                "trait SharedClock {{ fn now(&self -> int) }}\n\
+                 struct SharedFrozen {{ t: int }}\n\
+                 impl SharedClock for SharedFrozen {{ fn now(&self -> int) {{ self.t }} }}\n\
+                 effect shared_clock: SharedClock\n\
+                 fn ticks(-> int) {{ shared_clock.now() }}\n\
+                 fn main(-> int) {{ {provision} }}\n"
+            ));
+            let analysis = crate::requirement::analyze_hir_for_test(&program);
+            let entry = program.free_callable("main").unwrap();
+            let plan = plan_hir_for_test(&program, &analysis, entry).expect("計画できるはず");
+            let ticks = only(&program, &plan, "ticks");
+            let layout = plan.layout(plan.instance(ticks).layout.expect("値要求の欄"));
+            let facts = (
+                plan.instance(ticks).key.clone(),
+                layout.fields.clone(),
+                providers_of(&program, &plan, ticks),
+                plan.instances().count(),
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(
+                    &facts, expected,
+                    "provider mode must not alter ambient facts"
+                );
+            } else {
+                expected = Some(facts);
+            }
+        }
     }
 
     /// 型提供は鍵と呼び先を変えるが、実行時の欄は作らない(決定6)
@@ -1394,14 +1705,16 @@ mod tests {
              root test \"昇格すると Gold になり時刻が刻まれる\" -> instance#1\n\
              layout#0 { db: Postgres, clock: SystemClock }\n\
              layout#1 { db: InMemoryDb, clock: Frozen }\n\
+             layout#2 { clock: SystemClock }\n\
+             layout#3 { clock: Frozen }\n\
              instance#0 main [] ambient -\n\
              \x20 expr#3 -> instance#2 {}\n\
              \x20 expr#6 -> instance#3 { db <- provision expr#3, clock <- provision expr#4 }\n\
              instance#1 test \"昇格すると Gold になり時刻が刻まれる\" [] ambient -\n\
              \x20 expr#7 -> instance#4 {}\n\
-             \x20 expr#11 -> instance#5 {}\n\
-             \x20 expr#14 -> instance#6 { db <- provision expr#9, clock <- provision expr#11 }\n\
-             \x20 expr#19 -> instance#7 {}\n\
+             \x20 expr#12 -> instance#5 {}\n\
+             \x20 expr#14 -> instance#6 { db <- provision expr#10, clock <- provision expr#12 }\n\
+             \x20 expr#21 -> instance#7 {}\n\
              instance#2 impl Postgres::new [] ambient -\n\
              instance#3 handle [db=Postgres, clock=SystemClock] ambient layout#0\n\
              \x20 expr#1 -> instance#8 { db <- field db, clock <- field clock }\n\
@@ -1410,25 +1723,24 @@ mod tests {
              instance#6 handle [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
              \x20 expr#1 -> instance#9 { db <- field db, clock <- field clock }\n\
              instance#7 impl InMemoryDb::get [] ambient -\n\
-             \x20 expr#2 -> instance#10 {}\n\
              instance#8 promote [db=Postgres, clock=SystemClock] ambient layout#0\n\
-             \x20 expr#1 -> instance#11 self=field db {}\n\
-             \x20 expr#10 -> instance#12 { db <- field db, clock <- field clock }\n\
-             instance#9 promote [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
              \x20 expr#1 -> instance#10 self=field db {}\n\
-             \x20 expr#10 -> instance#13 { db <- field db, clock <- field clock }\n\
-             instance#10 impl InMemoryDb::find [] ambient -\n\
-             instance#11 impl Postgres::find [] ambient -\n\
-             instance#12 stamp [db=Postgres, clock=SystemClock] ambient layout#0\n\
-             \x20 expr#1 -> instance#14 self=field clock {}\n\
-             \x20 expr#4 -> instance#15 self=field db {}\n\
-             instance#13 stamp [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#11 -> instance#11 { clock <- field clock }\n\
+             \x20 expr#14 -> instance#12 self=field db {}\n\
+             instance#9 promote [db=InMemoryDb, clock=Frozen] ambient layout#1\n\
+             \x20 expr#1 -> instance#13 self=field db {}\n\
+             \x20 expr#11 -> instance#14 { clock <- field clock }\n\
+             \x20 expr#14 -> instance#15 self=field db {}\n\
+             instance#10 impl Postgres::find [] ambient -\n\
+             instance#11 stamp [clock=SystemClock] ambient layout#2\n\
              \x20 expr#1 -> instance#16 self=field clock {}\n\
-             \x20 expr#4 -> instance#17 self=field db {}\n\
-             instance#14 impl SystemClock::now [] ambient -\n\
-             instance#15 impl Postgres::save [] ambient -\n\
-             instance#16 impl Frozen::now [] ambient -\n\
-             instance#17 impl InMemoryDb::save [] ambient -\n"
+             instance#12 impl Postgres::save [] ambient -\n\
+             instance#13 impl InMemoryDb::find [] ambient -\n\
+             instance#14 stamp [clock=Frozen] ambient layout#3\n\
+             \x20 expr#1 -> instance#17 self=field clock {}\n\
+             instance#15 impl InMemoryDb::save [] ambient -\n\
+             instance#16 impl SystemClock::now [] ambient -\n\
+             instance#17 impl Frozen::now [] ambient -\n"
         );
     }
 
@@ -1439,7 +1751,7 @@ mod tests {
     /// `公開名=関数名` で別名を書ける。別名を書かなければ両方同じ綴り
     fn production(src: &str, exports: &[&str]) -> (hir::Program, ProductionPlan) {
         let program = lowered_of(src);
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let entry = program.free_callable("main").expect("main がない");
         let exports: Vec<(String, hir::CallableId)> = exports
             .iter()
@@ -1451,8 +1763,8 @@ mod tests {
                 )
             })
             .collect();
-        let planned =
-            plan_production(&program, &analysis, entry, &exports).expect("計画できるはず");
+        let planned = plan_production_hir_for_test(&program, &analysis, entry, &exports)
+            .expect("計画できるはず");
         (program, planned)
     }
 
@@ -1512,7 +1824,7 @@ mod tests {
             "fn ticks(-> int) { clock.now() }\n\
              fn main(-> int) { with clock(Frozen { t = 1 }) { ticks() } }\n",
         );
-        let analysis = crate::requirement::analyze(&program);
+        let analysis = crate::requirement::analyze_hir_for_test(&program);
         let entry = program.free_callable("main").expect("main がない");
         let ticks = program.free_callable("ticks").expect("ticks がない");
 
@@ -1521,7 +1833,13 @@ mod tests {
         // 同じ本体でも、公開の根として単体で立てば要求が残る
         assert_eq!(analysis.errors_for_roots(&["ticks".to_string()]).len(), 1);
         assert_eq!(
-            plan_production(&program, &analysis, entry, &[("ticks".to_string(), ticks)]).err(),
+            plan_production_hir_for_test(
+                &program,
+                &analysis,
+                entry,
+                &[("ticks".to_string(), ticks)]
+            )
+            .err(),
             Some(PlanError::MissingProvider {
                 body: hir::BodyId::Callable(ticks),
                 slot: slot(&program, "clock"),

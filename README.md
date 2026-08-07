@@ -8,14 +8,14 @@
 effect db: Database                       // スロット宣言
 effect clock: Clock
 
-fn stamp(u: User) {                       // 使用
+fn stamp(u: &mut User) {                  // 使用
     u.promoted_at = clock.now()
-    db.save(u)
 }
 
 fn promote(id: int -> bool) {             // 経由するだけ = 無記述
-    let u = db.find(id) ?? return false
-    stamp(u)
+    let mut u = db.find(id) ?? return false
+    stamp(&mut u)
+    db.save(move u)
     true
 }
 
@@ -65,7 +65,7 @@ v1 の到達目標は [examples/canonical.rd](./examples/canonical.rd)。
 | 設計相談 / レビュー / 調査 | AI |
 
 語れる部分と手を動かす部分を一致させるための規則。実装言語は Rust、
-まずインタプリタから始める(バックエンドは未決のまま後ろに倒す)。
+まずインタプリタで意味を固めてからバックエンドへ進む。
 
 ## 現状
 
@@ -73,11 +73,11 @@ v1 の到達目標は達成済み。lexer、parser、要求推論、インタプ
 `cargo run`で正典プログラムのテストが完走する。現在の地図と次の作業は
 [docs/overview.md](./docs/overview.md)。
 
-処理系の境界は型付き HIR になった。パイプラインは
-`load AST → check/lower HIR → analyze HIR → eval HIR` で、型検査を通った後は
-構文木を見ない。HIR は全ての式の具体型と、呼び出し先・フィールド・variant・
-局所束縛・提供する実装をプログラム内の ID で持つので、要求解析も評価器も
-名前で引き直さない(`src/hir.rs`)。
+処理系の境界は ownership 検査済み HIR になった。パイプラインは
+`load AST → check/lower HIR → ownership check → CheckedProgram → analyze / eval / Wasm`。
+型検査・所有権検査を通った後は構文木を見ない。HIR は全ての式の具体型と、呼び出し先・
+フィールド・variant・局所束縛・提供する実装をプログラム内の ID で持つので、要求解析も
+評価器も名前で引き直さない(`src/hir.rs`)。
 
 型検査は全域化した。**値を産む式はすべて具体的な型を持ち、すべての呼び出しは
 一意の宣言へ解決される**。分類できない式が1つでもあれば、呼ばれない宣言の中でも
@@ -114,13 +114,90 @@ ambient の低水準契約も決まった。到達した本体を**実装の組�
 `rhodolite build app.rd --target wasm` は、`main` と `pub use` で明示選択した
 公開関数を根に、到達した instance だけを決定的な `.wasm` へ落とす。成果物は
 import も start section も持たず、`__rhodolite_main` と公開名を export し、
-インタフェース記述を `rhodolite.abi` custom section に埋め込む。v0 が扱うのは
-`unit` / `bool` / `int` の部分言語で、到達しない豊かな宣言はビルドを止めない
-(`src/wasm.rs`、[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md))。
-インタプリタは参照実装として残る。
+インタフェース記述を `rhodolite.abi` custom section に埋め込む。`str`、owned struct、
+payload enum、optional、配列と、それらの field 操作・`clone()`・`??`・`match`・`for` は、
+組み込み allocator と ownership の drop plan を使って線形メモリへ生成される。scalar
+だけの公開面は既存の ABI v0 のまま、owned data が1つでも公開署名にあればモジュール
+全体が ABI v1 を選び、正準 bytes を export memory 経由で受け渡す。内部 layout と
+公開 wire format は分離している
+([ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md)、
+[ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md))。インタプリタは参照実装として残る。
 
-次の一歩は、データ値の Wasm 表現
-([docs/compiler-roadmap.md](./docs/compiler-roadmap.md))。
+所有権検査も型付き HIR の次の境界として動いている。非 Copy 値は単独所有、`&T` の
+読み取り呼び出しだけは自動借用、変更は `&mut`、既存 local の移譲は `move`、複製は
+`clone()` と明示する。寿命名は書かず、全モジュールグラフの使用から借用領域と
+borrowed return の出どころを推論する。
 
-所有権・借用・`'a` 推論の柱はv1スコープ外として棚上げ中
-（[ADR-0001](./docs/adr/0001-v1-scope-effects-only.md)）。
+```rhodolite
+fn stamp(user: &mut User) { user.promoted_at = 1000 }
+fn persist(user: User) { let ignored = user }
+
+let mut user = User { id = 1, rank = Bronze, promoted_at = 0 }
+stamp(&mut user)
+let backup = user.clone()
+persist(move user)
+```
+
+インタプリタは所有 compound value を store で実行し、Wasm backend は同じ検査済み
+アクセスモードと drop plan を消費する。公開署名の borrow と aggregate に格納する borrow
+は引き続き拒否する。到達した inherent method、trait implementation、slot、`with`、値・型
+ambient record は specialization plan の直接 call と hidden handle へ下ろされ、提供の所有権と
+cleanup も保持する。`src/differential.rs` の維持された fixture 群が、同じ checked HIR を
+インタプリタと独立した Wasm engine に通し、結果、実行時失敗、公開 probe、宣言 test、生成 bytes
+を継続照合する。fixture を増やすときは、そこで名前付き source tree と期待する失敗分類を登録し、
+代表的な artifact 形の変更は意図して snapshot を更新する。
+
+名前付きトップレベル関数は `fn(P -> R)` の値になる。callable な引数と不変 local を
+通した間接呼び出しが書けるので、クロージャ抜きで高階の helper を組める。
+
+```rhodolite
+fn double(value: int -> int) { value * 2 }
+fn apply(f: fn(int -> int), value: int -> int) { f(value) }
+
+fn main(-> int) { apply(double, 21) }
+```
+
+呼び先はどの呼び出しでも静的に1つ決まるので、ambient 要求はその callback ごとに
+特殊化される。`db` を要る callback を渡した呼び出しだけが `db` を要求し、要らない
+callback を渡した呼び出しは隠し ambient record を持たない。生成 Wasm は表も
+`funcref` もクロージャ確保も使わず、計画が選んだ直接呼び出しになる。
+
+`fn`・`trait`・`impl` は型パラメータを取れる。宣言・本体検査・呼び出し地点での
+型引数推論・具体化まで通り、具体化した宣言は HIR インタプリタと Core Wasm の
+両方で同じ結果を出す。総称的な `map` も言語機能ではなく通常の Rhodolite ソースで
+書ける。配列へ要素を足す `push` だけがコンパイラ組み込みで、`Map<T>` と
+`impl<T> Map<T> for [T]` はプログラム側が宣言する。
+
+```rhodolite
+trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }
+
+impl<T> Map<T> for [T] {
+    fn map<U>(self, f: fn(T -> U) -> [U]) {
+        let mut result: [U] = []
+        for x in move self { result.push(f(move x)) }
+        move result
+    }
+}
+
+fn double(n: int -> int) { n * 2 }
+
+fn fold(xs: &[int] -> int) {
+    let mut t = 0
+    for x in xs { t = t * 10 + x }
+    t
+}
+
+fn main(-> int) {
+    let xs = [1, 2, 3]
+    let ys = move xs.map(double)
+    fold(&ys)
+}
+```
+
+`map` は `self` で入力を消費するので、既存 local を渡すときは `move xs.map(f)` と
+書き、元の配列を残したいときは `xs.clone().map(f)` と明示する。捕捉のある無名関数
+(クロージャ)、明示的な型引数指定、generic `struct` / `enum`、借用版 `map` は
+まだ無い。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
+[ADR-0010](./docs/adr/0010-owned-values-and-inferred-borrows.md) と
+[ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md)、順序は
+[docs/compiler-roadmap.md](./docs/compiler-roadmap.md)。

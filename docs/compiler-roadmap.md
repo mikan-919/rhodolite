@@ -4,8 +4,9 @@ Rhodolite は、言語の意味をインタプリタで固め、型付き HIR �
 **Core WebAssembly** バックエンドを追加する。インタプリタは捨てず、生成コードの
 振る舞いを照合する参照実装として残す。
 
-成果物を Core Wasm にした理由と、その上のホスト契約(Rhodolite ABI v0)は
-[ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。Component Model・
+成果物を Core Wasm にした理由と、その上のホスト契約は
+[ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md) と
+[ADR-0011](./adr/0011-owned-data-layout-and-abi-v1.md)。Component Model・
 WIT・WASI・JavaScript は言語の契約に入れず、必要なフレームワークが下流で包む。
 
 この文書は**順序と完了線の地図**であり、個々の機能仕様ではない。OpenSpec change は
@@ -24,7 +25,8 @@ change 名は予約名であり、まだ作成済みであることを意味し�
 - 複数モジュールからなるプログラムをコンパイルできる
 
 compiled v1 は汎用言語としての完成ではない。外部パッケージ、最適化、async、
-所有権、セルフホスト、本格 GC は含まない。
+セルフホスト、本格 GC は含まない。所有権・借用の静的契約はデータ値の Wasm 表現より
+先に固める。
 
 ## 全体の順序
 
@@ -44,16 +46,19 @@ define-ambient-runtime-abi（完了）
 emit-core-wasm-programs（完了）
         │
         ▼
-compile-wasm-data-values
+introduce-ownership-and-borrowing（完了）
         │
         ▼
-compile-wasm-traits-and-ambient
+compile-wasm-owned-data-values（完了）
         │
         ▼
-add-differential-execution
+compile-wasm-traits-and-ambient（完了）
         │
         ▼
-compiled v1
+add-differential-execution（完了）
+        │
+        ▼
+compiled v1（到達）
 ```
 
 | 段階 | 状態 | 想定 OpenSpec change | 成果 |
@@ -63,9 +68,10 @@ compiled v1
 | 2 | 完了 | `introduce-typed-hir` | 型付き・名前解決済み HIR |
 | 3 | 完了 | archived `define-ambient-runtime-abi` | ambient を明示化できる低水準契約 |
 | 4 | 完了 | archived `emit-core-wasm-programs` | スカラーと制御フローの Core Wasm 生成 |
-| 5 | 次 | `compile-wasm-data-values` | struct・enum・optional・配列の Wasm 表現 |
-| 6 | 未着手 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
-| 7 | 未着手 | `add-differential-execution` | 二つの実行系の一致を継続検証 |
+| 5 | 完了 | archived `introduce-ownership-and-borrowing` | 単独所有、借用推論、決定的 drop、checked HIR 境界 |
+| 6 | 完了 | `compile-wasm-owned-data-values` | owned data の Wasm 表現、allocator、ABI v1 |
+| 7 | 完了 | `compile-wasm-traits-and-ambient` | trait・slot・`with` の Wasm 生成 |
+| 8 | 完了 | `add-differential-execution` | 二つの実行系の一致を継続検証し、compiled v1 に到達 |
 
 同時に進行中にするのは原則として一段階だけとする。前段の完了線を満たし、change を
 archive してから次段の提案を作る。
@@ -107,9 +113,10 @@ span を持つ。
 - 既存の診断位置と要求表示が変わらない
 - AST 直接評価を正式な実行経路から外せる
 
-結果として、パイプラインは
+当時の型付き HIR 導入段階では、パイプラインは
 `load AST → check/lower HIR → analyze HIR → eval HIR` になった。
-`typecheck::check_and_lower` が唯一の境界で、診断が1件でもあれば HIR は渡らない。
+`typecheck::check_and_lower` が唯一の境界で、診断が1件でもあれば HIR は渡らなかった。
+現行パイプラインは次の ownership 段階で `CheckedProgram` 境界を追加している。
 下ろしを全域にするために、型注釈・`effect` の対象・inherent `impl` の対象は
 宣言済みの名前でなければならず、代入の左辺は局所束縛か宣言フィールドで
 なければならない。どれも以前は実行時に失敗するか黙って通っていた形で、
@@ -174,27 +181,54 @@ OpenSpec capability として定義した。
 - 各段の失敗が既存の診断描画で位置付きで出て、成果物を置き換えない
 - 同じ入力・同じ選択肢からは byte 単位で同じモジュールが出る
 
-## 5. データ値と小さなランタイムを作る
+## 5. 所有・借用を Wasm より先に閉じる
 
-想定 change: `compile-wasm-data-values`
+OpenSpec: archived `introduce-ownership-and-borrowing` /
+ADR: [0010](./adr/0010-owned-values-and-inferred-borrows.md)
 
-追加する順序は、`str`、struct、enum payload、optional、`match`、配列、共有された
-可変値、`for` とする。
+型付き HIR のあとに ownership pass を置く。非 Copy 値は単独所有、`&T` は共有 read、
+`&mut T` は排他的 mutation、`move` は明示 transfer、`clone()` は明示 deep clone と
+する。borrow の領域と borrowed return の provenance は全プログラムから推論し、
+drop は lexical scope exit で決定的に計画する。
 
-線形メモリに自前で置くか WasmGC に載せるかはここで決める。短命な CLI を対象にした
-プロセス寿命の arena を第一候補とし、本格 GC は最初のデータ生成を遮らないよう後段へ
-送る。この選択は change 作成時に改めて実測し、設計判断として記録する。
+この段階は Wasm memory layout を決めない。interpreter が store と検査済み place で
+参照意味を実行し、Wasm v0 は引き続き到達した scalar だけを生成する。borrowed public
+ABI と reachable non-scalar data は build 前に拒否する。
 
-完了条件:
+後続へ意図的に残すもの:
+
+- aggregate に格納する borrow とその region model
+- explicit shared ownership（RC / GC を含むかは concrete use case で決める）
+- owned data の allocator、memory layout、drop flag、rich public ABI
+- async / closure / separate compilation での ownership と provider lifetime
+
+## 6. owned data の Wasm 表現と小さなランタイムを作る
+
+OpenSpec: `compile-wasm-owned-data-values` /
+ADR: [0011](./adr/0011-owned-data-layout-and-abi-v1.md)
+
+`str`、owned struct、enum payload、optional、`match`、配列、`for` の順に追加した。
+aggregate borrow と shared ownership はこの段階の前提にしていない。
+
+生成モジュールは import-free の coalescing allocator、決定的なデータ layout、drop flag、
+clone/drop/equality glue、OOM trap を持つ。公開面は scalar だけなら ABI v0 を維持し、
+owned data を含めばモジュール全体で ABI v1 を選ぶ。ABI v1 は内部 heap pointer ではなく、
+検証付きの正準 bytes を export memory と予約済み exchange area 経由で運ぶ。
+
+完了条件(すべて達成):
 
 - 現在のデータ型と値操作を Wasm 側で表現できる
-- 共有された struct と配列の変更が参照実装と一致する
+- owned struct と配列の変更が参照実装と一致する
 - enum、optional、`match` の結果が参照実装と一致する
 - 公開 ABI が scalar 以外の値を運べるようになる
 
-## 6. trait と ambient をコンパイルする
+意図的に残した aggregate に格納する borrow と shared ownership は、引き続きこの段階の外に
+置く。到達した inherent method・trait・slot・`with`・空でない ambient record の生成は次段で
+ADR-0008 の計画へ接続し、完了した。
 
-想定 change: `compile-wasm-traits-and-ambient`
+## 7. trait と ambient をコンパイルする
+
+OpenSpec: `compile-wasm-traits-and-ambient`（完了）
 
 Rhodolite 固有の意味を Wasm バックエンドへ接続する段階。ADR-0008 の隠し ambient
 record を、空でない layout も運べる実行時表現として初めて実装する。
@@ -210,7 +244,7 @@ record を、空でない layout も運べる実行時表現として初めて�
 7. 要求推論から生成する隠し ambient 引数
 8. ネストした提供
 
-完了条件:
+完了条件(すべて達成):
 
 - `examples/canonical.rd` の Wasm を生成できる
 - 生成モジュールで正典テストが成功する
@@ -218,7 +252,7 @@ record を、空でない layout も運べる実行時表現として初めて�
 - 提供忘れがコード生成より前に到達経路付きで失敗する
 - 生成関数が不要な slot を引数に持たない
 
-## 7. 二つの実行系を継続的に照合する
+## 8. 二つの実行系を継続的に照合する
 
 想定 change: `add-differential-execution`
 
@@ -231,7 +265,7 @@ source → HIR ──┤
 ```
 
 比較対象は、戻り値、終了コード、標準出力、テスト結果、実行時エラーの分類、
-共有値の最終状態とする。
+owned 値と明示 borrow を経た最終状態とする。
 
 完了条件:
 
@@ -246,21 +280,47 @@ source → HIR ──┤
 [ADR-0003](./adr/0003-whole-program-monomorphization.md) の本丸である高階関数の
 エフェクト多相は、最初の Wasm バックエンドを通した後に進める。
 
+その最初の一枚として、**名前付き関数の値**(`fn(P -> R)`)は既に入っている。
+トップレベル関数の名前を値にでき、callable な引数・不変 local を通した間接
+呼び出しが書ける。呼び出し先は常に静的に1つ決まるので、要求解析と ambient ABI
+はその callback ごとに特殊化され、生成コードは表も `funcref` も使わない直接
+呼び出しになる。
+
+二枚目として、**型パラメータと総称的な `map`** も入った。`fn` / `trait` / `impl` が
+型パラメータを取り、呼び出し地点で型引数を推論して具体化した HIR を作る。型引数と
+trait impl は whole-program 特殊化の鍵に加わるので、generic な callback を経由した
+ambient 要求も呼び出し元まで推論される。具体化した宣言は HIR インタプリタと Core
+Wasm の両方で一致する。配列へ要素を足す `push` だけがコンパイラ組み込みで、
+`Map<T>` と `impl<T> Map<T> for [T]` は通常の Rhodolite ソースとして書く。段階の
+内訳と状態は [ROADMAP.md の Milestones](../ROADMAP.md#milestones)(MAP トラック)。
+
+そこに**入っていない**もの:
+
+- 捕捉を持つ無名関数・クロージャと、その実行時 ABI
+- 明示的な型引数指定(推論できない型パラメータは実行前に落ちる)
+- generic な `struct` / `enum`、制約付き型パラメータと overload resolution
+- 借用版 `map`(`&self` / `fn(&T -> U)`)と、配列の `len()`・添字アクセス
+- callable 値を戻り値・フィールド・variant payload・配列・可変 local に置くこと
+- 公開 ABI に出る callable 引数・結果
+
 ```text
-関数値・クロージャ
+関数値(← 名前付き関数の値まで完了)
         ↓
-型パラメータと高階関数
+型パラメータと高階関数(← 総称的な `map` まで完了)
         ↓
-呼び出し地点の具体化
+呼び出し地点の具体化(← 完了)
         ↓
-エフェクト要求を含む単相化
+エフェクト要求を含む単相化(← 完了)
+        ↓
+クロージャ(捕捉と実行時 ABI)
         ↓
 関数単位キャッシュと増分ビルド
 ```
 
 Component Model／WIT の生成、LLVM／Cranelift、ネイティブ生成、最適化、セルフホスト、
-パッケージマネージャ、LSP、async、所有権・借用、本格 GC、安定 ABI は、必要な実
-プログラムが現れてから別の地図を作る。
+パッケージマネージャ、LSP、本格 GC、安定 ABI は、必要な実プログラムが現れてから
+別の地図を作る。ownership の後続としては、aggregate borrow、explicit shared
+ownership、allocator/data layout、async、rich ABI を別 change で扱う。
 
 ## この文書の更新規則
 

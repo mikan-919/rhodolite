@@ -72,12 +72,19 @@ defined by `integer-runtime-semantics`. A false assertion SHALL trap.
 - **WHEN** a reachable branch executes a value-carrying `return`
 - **THEN** the generated function returns that value without evaluating later expressions in its body
 
+### Requirement: Reachable owned data programs lower to Core Wasm
+The Core Wasm backend SHALL lower reachable ownership-safe uses of `str`, owned structs, payload enums, optionals, arrays, declared indirect values, field access and assignment, ownership modifiers, `clone()`, `??`, `match`, and `for`. It SHALL preserve the runtime behavior specified by their existing language capabilities and by `wasm-owned-data-values`.
+
+#### Scenario: Owned data program executes
+- **WHEN** a production root reaches strings, an owned struct, a payload enum, an optional, and an array using supported operations
+- **THEN** the generated module validates and produces the same result as the reference interpreter
+
+#### Scenario: Canonical data subset builds
+- **WHEN** the canonical program reaches owned-data expressions through methods and ambient slot calls
+- **THEN** its owned-data expressions no longer cause an unsupported Wasm-target diagnostic
+
 ### Requirement: Emission follows the specialization plan
-Wasm functions for Rhodolite bodies SHALL be emitted from deterministic
-specialization instances and planned direct-call targets rather than by
-performing a second name or implementation lookup. Instances whose runtime
-ambient-record layout is empty MAY be emitted. Reaching an instance that needs
-a non-empty runtime ambient record SHALL fail as unsupported in this version.
+Wasm functions for Rhodolite bodies SHALL be emitted from deterministic specialization instances and planned direct-call targets rather than by performing a second name or implementation lookup. Every instance SHALL use the provider combination in its specialization key. An instance with value-level ambient requirements SHALL receive only the provider handles in its planned runtime-record layout; an instance with an empty layout SHALL receive no hidden ambient values.
 
 #### Scenario: Shared reachable instance is emitted once
 - **WHEN** more than one production root reaches the same specialization instance
@@ -85,23 +92,30 @@ a non-empty runtime ambient record SHALL fail as unsupported in this version.
 
 #### Scenario: Runtime provider record is required
 - **WHEN** reachable code requires a specialization instance with a non-empty ambient-record layout
-- **THEN** the build fails with a source-positioned unsupported-feature diagnostic
+- **THEN** the instance is emitted with the planned provider handles and its callers pass the corresponding projected handles
+
+#### Scenario: Provider combinations differ
+- **WHEN** the same body is reachable with two different provider implementation combinations
+- **THEN** each combination has one deterministic specialization instance and calls do not dispatch between them at runtime
 
 ### Requirement: Unsupported checks are reachability-sensitive
-All loaded code SHALL still pass the ordinary whole-program static checks.
-Wasm-subset support SHALL then be checked only for specialization instances
-reachable from production roots. A reachable expression, call form, value type,
-or runtime record outside the supported subset SHALL cause a source-positioned
-diagnostic naming the unsupported construct. Unsupported unreachable code SHALL
-not block production emission.
+All loaded code SHALL still pass the ordinary whole-program static and ownership checks. Wasm-target support SHALL then be checked only for specialization instances reachable from production roots. A reachable expression, value type, provider ownership form, runtime record, or public boundary outside the supported scalar, owned-data, and trait-and-ambient subsets SHALL cause a source-positioned diagnostic naming the unsupported construct. Unsupported unreachable code SHALL not block production emission.
 
 #### Scenario: Unsupported declaration is unreachable
-- **WHEN** a loaded but unreachable function uses strings, structs, enums, optionals, arrays, matching, methods, traits, ambient calls, or `with`
+- **WHEN** a loaded but unreachable function uses aggregate-stored borrows or another feature outside the supported Wasm subset
 - **THEN** the declaration remains statically checked but does not prevent a supported production build
 
 #### Scenario: Unsupported construct is reachable
-- **WHEN** a production root reaches one of those unsupported constructs
+- **WHEN** a production root reaches a construct outside the supported scalar, owned-data, and trait-and-ambient subsets
 - **THEN** the build fails before publishing the artifact and points to the reached construct
+
+#### Scenario: Owned data construct is reachable
+- **WHEN** a production root reaches ownership-safe strings, structs, enums, optionals, arrays, matching, or iteration
+- **THEN** the construct is checked and lowered rather than rejected merely for using a non-scalar value
+
+#### Scenario: Trait and ambient construct is reachable
+- **WHEN** a production root reaches an ownership-safe method, trait implementation, slot call, or `with` expression
+- **THEN** the construct is checked and lowered rather than rejected merely for using trait or ambient behavior
 
 ### Requirement: Wasm artifacts are valid and deterministic
 A successful build SHALL produce a valid Core WebAssembly module with no
@@ -120,3 +134,22 @@ program, options, and compiler version SHALL produce byte-identical modules.
 #### Scenario: Build is repeated
 - **WHEN** the same supported input is built twice with the same compiler and options
 - **THEN** the two module byte sequences are identical
+
+### Requirement: Wasm builds require ownership-safe programs
+The Wasm build pipeline SHALL complete whole-program ownership and borrow checking before production-root planning, layout, and reachability-sensitive Wasm support checking. Reachable owned values and internal checked borrows SHALL lower according to the checked ownership modes and drop plans. Borrowed public signatures and aggregate-stored borrows SHALL remain unsupported, while ownership errors in any loaded body SHALL fail the ordinary whole-program check even when unreachable.
+
+#### Scenario: Unreachable ownership error
+- **WHEN** an unreachable loaded declaration uses a value after move
+- **THEN** the Wasm build fails during whole-program ownership checking
+
+#### Scenario: Reachable owned data is accepted
+- **WHEN** an ownership-safe production root reaches an owned array or struct using checked internal borrows
+- **THEN** the backend plans its layout and emits it instead of reporting the former non-scalar target limitation
+
+#### Scenario: Public borrow remains rejected
+- **WHEN** a selected public function has a borrowed parameter or result
+- **THEN** the build fails before emission with a source-positioned public ABI diagnostic
+
+#### Scenario: Scalar program remains buildable
+- **WHEN** an ownership-safe program uses only Copy scalar values in reachable production code
+- **THEN** the existing scalar Core Wasm lowering remains available and deterministic
