@@ -286,6 +286,13 @@ struct Store {
 `for x in xs` は共有借用、`for x in &mut xs` は各要素への可変借用、`for x in move xs`
 は配列を消費して所有要素を順に渡す。loop variable と loop body は scope を作る。
 
+配列へ要素を足す手段は `push` だけ。`trait Push<T> { fn push(&mut self, x: T) }` を
+宣言すると、`impl<T> Push<T> for [T]` がコンパイラ組み込み実装として付く(本体は
+通常の Rhodolite ソースでは書けない)。`xs.push(y)` は `db.save(...)` と同じ暗黙の
+`&mut` 借用規約で `xs` を可変借用するので呼び出し側に修飾子は要らず、`y` は通常の
+引数と同じ move-once で渡る。容量は倍々に伸びる(capacity 0 の配列への初回 push が
+capacity 1 を確保し、以降は現在の容量の2倍)。`len()` と添字アクセス `xs[i]` はまだ無い。
+
 ## 名前付き関数の値
 
 型注釈の `fn(P1, P2 -> R)` は名前付きトップレベル関数の値型。引数型と結果型は
@@ -307,7 +314,8 @@ fn main(-> int) {
 
 この版では、callable 値は不変 local の初期化子か関数呼び出しの引数にしか置けない。
 可変 local・フィールド・variant payload・配列要素・戻り値に置くと型検査で落ちる。
-無名関数・クロージャ・型パラメータはまだ無い。
+捕捉のある無名関数(クロージャ)はまだ無い。
+型パラメータは「型パラメータ」節を参照。
 
 ## enum
 
@@ -542,9 +550,48 @@ trait 参照は `Map<T>` のように型引数を取れる。
 (1つのリストの中でも、メソッドが囲む `impl` の名前を名乗り直す形でも)。
 宣言の外で同じ綴りを型位置に書けば、それはただの未宣言の型名として落ちる。
 
-この版では宣言構文と型表現までを扱う。型パラメータを持つ宣言の本体検査・
-呼び出し地点の型引数推論・具体化はまだ行わないので、generic 宣言は実行経路に
-繋がらない。
+generic 宣言の本体は、型パラメータを剛体変数として宣言時に全域検査する。呼び出し
+地点では**具体的な引数から型引数をすべて推論**し、generic 宣言・型引数・callback
+束縛をキーに具体化した HIR を作る。ownership 以降へ渡る `CheckedProgram` に型変数は
+残らないので、要求推論・HIR インタプリタ・Core Wasm 生成はどれも具体化済みの宣言
+だけを見て、両実行系の結果は一致する。同じキーの再帰は具体化枠を先に確保して
+共有する。一つの再帰循環で同じ generic 宣言が異なる型引数を要求する polymorphic
+recursion は、無限具体化を避けるため実行前に落ちる。
+
+型引数を `xs.map::<int>(f)` のように**明示指定する構文は無い**。推論できない
+型パラメータが残る呼び出しは実行前に落ちる。型パラメータを書けるのは
+`fn` / `trait` / `impl` だけで、generic な `struct` / `enum` と、型パラメータへの
+制約(`T: Trait`)に基づく overload resolution はまだ無い。
+
+### 総称的な `map`
+
+`map` は言語の組み込みではない。`Map<T>` trait と配列用の `impl` を通常の
+Rhodolite ソースとして書き、本体は `push` と `for x in move self` で組む。
+
+```rhodolite
+trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }
+
+impl<T> Map<T> for [T] {
+    fn map<U>(self, f: fn(T -> U) -> [U]) {
+        let mut result: [U] = []
+        for x in move self { result.push(f(move x)) }
+        move result
+    }
+}
+
+fn double(n: int -> int) { n * 2 }
+
+fn main(-> [int]) {
+    let xs = [1, 2, 3]
+    move xs.map(double)
+}
+```
+
+`map` は `self` で入力を消費するので、既存の local を渡す呼び出しには `move` が
+要る(`move xs.map(double)`)。callback は `fn(T -> U)` で各要素の所有権を受け取る。
+`&self` を取る**借用版 `map` は無い**ので、元の配列を残したいときは
+`xs.clone().map(f)` と明示して複製を渡す。callback が ambient を要求するなら、その
+要求は `map` と trait 解決を越えて呼び出し元まで推論される。
 
 ## まだ決めていない
 
