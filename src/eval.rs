@@ -12,6 +12,7 @@
 use crate::diag::Diag;
 use crate::hir;
 use crate::ownership;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 // ---------------------------------------------------------------------------
@@ -45,6 +46,37 @@ pub enum Value {
         payload: Vec<Value>,
     },
     Array(Vec<Value>),
+    /// 公開境界を越えた callable(`callable-handle-lifecycle`)。指す関数の
+    /// 同一性は runtime の表にだけあり、値は不透明な ID しか持たない
+    Callable(CallableHandle),
+}
+
+/// 公開境界を越えた callable の使い捨て handle。
+///
+/// runtime が採番した不透明な ID だけを持つ。`hir::CallableId` などの内部の
+/// 位置は載せないし、そこから導きもしない(ADR-0011、design.md 決定2)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CallableHandle(u64);
+
+/// handle と行き先の対応表。`mint` で作り、`take` で1回だけ使い切る。
+/// 解放の操作はこれ以外に無い(CAB-Q2、design.md 決定1〜3)。
+#[derive(Debug, Default)]
+struct HandleTable {
+    minted: u64,
+    live: HashMap<u64, hir::CallableId>,
+}
+
+impl HandleTable {
+    fn mint(&mut self, target: hir::CallableId) -> CallableHandle {
+        self.minted += 1;
+        self.live.insert(self.minted, target);
+        CallableHandle(self.minted)
+    }
+
+    /// 生きている handle を取り出し、同時に無効にする。二度目は `None`。
+    fn take(&mut self, handle: CallableHandle) -> Option<hir::CallableId> {
+        self.live.remove(&handle.0)
+    }
 }
 
 /// struct の実体。
@@ -257,6 +289,8 @@ type CheckedAmbient = BTreeMap<hir::SlotId, CheckedAmbientBinding>;
 struct CheckedInterp<'p> {
     program: &'p hir::Program,
     plan: &'p ownership::Plan,
+    /// 呼び出しの外側にある handle 表。この実行が観測できる値を作るときだけ触る
+    handles: &'p RefCell<HandleTable>,
     store: Store,
     slots: Vec<Slot>,
     returned: Option<CheckedValue>,
@@ -264,10 +298,15 @@ struct CheckedInterp<'p> {
 }
 
 impl<'p> CheckedInterp<'p> {
-    fn new(program: &'p hir::Program, plan: &'p ownership::Plan) -> Self {
+    fn new(
+        program: &'p hir::Program,
+        plan: &'p ownership::Plan,
+        handles: &'p RefCell<HandleTable>,
+    ) -> Self {
         Self {
             program,
             plan,
+            handles,
             store: Store::default(),
             slots: Vec::new(),
             returned: None,
@@ -280,6 +319,36 @@ impl<'p> CheckedInterp<'p> {
             return fail(format!("関数 `{entry}` がありません"));
         };
         let value = match self.call(callable, None, Vec::new()) {
+            Ok(value) => value,
+            Err(error) => {
+                self.dispose();
+                return Err(error);
+            }
+        };
+        let shown = self.checked_public_value(&value)?;
+        self.drop_checked(value);
+        self.dispose();
+        Ok(shown)
+    }
+
+    /// handle から取り出した関数を引数付きで走らせる。`run` と同じ機構
+    /// (呼び出しごとの新しい `Store`、空の束縛と ambient)を通す。
+    fn invoke(mut self, callable: hir::CallableId, args: Vec<Value>) -> Eval {
+        let arity = self.program.callables[callable].params.len();
+        if arity != args.len() {
+            return fail(format!(
+                "callable handle の呼び出しには引数 {arity} 個が要ります({} 個渡されました)",
+                args.len()
+            ));
+        }
+        let args = args
+            .iter()
+            .map(internal_value)
+            .collect::<Result<Vec<_>, Flow>>()?
+            .into_iter()
+            .map(CheckedValue::Owned)
+            .collect();
+        let value = match self.call(callable, None, args) {
             Ok(value) => value,
             Err(error) => {
                 self.dispose();
@@ -1326,9 +1395,10 @@ impl<'p> CheckedInterp<'p> {
             OwnedValue::Bool(b) => Value::Bool(*b),
             OwnedValue::Unit => Value::Unit,
             OwnedValue::Nil => Value::Nil,
-            // callable 値は公開の ABI に出ない(型検査が戻り値位置を断る)
-            OwnedValue::Function(_) => {
-                return fail("callable 値は観測できる値になりません");
+            // 公開境界を越えてよいかは型検査(`callable-public-boundary`)が
+            // 既に見ている。ここは越えた callable に使い捨ての姿を与えるだけ
+            OwnedValue::Function(callable) => {
+                Value::Callable(self.handles.borrow_mut().mint(*callable))
             }
             OwnedValue::Location(id) => match self.store.get(*id) {
                 StoredValue::Struct { type_, .. } => new_obj(*type_),
@@ -1350,6 +1420,25 @@ impl<'p> CheckedInterp<'p> {
     }
 }
 
+/// 観測できる値を内部表現へ戻す。scalar と unit だけを運ぶ。
+///
+/// struct / enum / array の marshalling は host 境界(Wasm ABI)が形を決める
+/// CAB-030 以降の仕事なので、ここでは panic せず診断で断る(design.md 決定6)。
+fn internal_value(value: &Value) -> Result<OwnedValue, Flow> {
+    Ok(match value {
+        Value::Int(n) => OwnedValue::Int(*n),
+        Value::Str(text) => OwnedValue::Str(text.clone()),
+        Value::Bool(b) => OwnedValue::Bool(*b),
+        Value::Unit => OwnedValue::Unit,
+        Value::Nil => OwnedValue::Nil,
+        Value::Struct(_) | Value::Enum { .. } | Value::Array(_) | Value::Callable(_) => {
+            return fail(format!(
+                "callable handle の呼び出しが運べる引数は今のところ scalar と unit だけです({value:?})"
+            ));
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // インタプリタ
 // ---------------------------------------------------------------------------
@@ -1357,6 +1446,12 @@ impl<'p> CheckedInterp<'p> {
 pub struct Interp<'p> {
     program: &'p hir::Program,
     plan: &'p ownership::Plan,
+    /// 公開境界を越えた callable の使い捨て handle 表。
+    ///
+    /// 実行1回で捨てる `CheckedInterp` より長生きしなければならないので
+    /// `Interp` が持つ。`run`/`run_test`/`show` の `&self` を変えずに採番する
+    /// ため内部可変性で包む(design.md 決定1)
+    handles: RefCell<HandleTable>,
 }
 
 impl<'p> Interp<'p> {
@@ -1365,6 +1460,7 @@ impl<'p> Interp<'p> {
         Interp {
             program: &checked.hir,
             plan: &checked.plan,
+            handles: RefCell::default(),
         }
     }
 
@@ -1389,6 +1485,8 @@ impl<'p> Interp<'p> {
                 }
             }
             Value::Array(xs) => format!("[{} 要素]", xs.len()),
+            // 指す関数の名前は出さない。出せるのは採番した不透明な ID だけ
+            Value::Callable(handle) => format!("callable#{}", handle.0),
         }
     }
 
@@ -1396,12 +1494,29 @@ impl<'p> Interp<'p> {
     ///
     /// **ambient は空から始まる。**提供されていないものは何も届かない、が出発点。
     pub fn run(&self, entry: &str) -> Eval {
-        CheckedInterp::new(self.program, self.plan).run(entry)
+        CheckedInterp::new(self.program, self.plan, &self.handles).run(entry)
     }
 
     /// `test` の本体を走らせる。関数と同じ扱いで、`Env` も `Ambient` も空から。
     pub fn run_test(&self, id: hir::TestId) -> Eval {
-        CheckedInterp::new(self.program, self.plan).run_test(id)
+        CheckedInterp::new(self.program, self.plan, &self.handles).run_test(id)
+    }
+
+    /// handle を1つ使い切って、その行き先を引数付きで呼ぶ。
+    ///
+    /// 表からの取り出しは行き先を走らせる**前**なので、行き先自身が失敗しても
+    /// handle は消費される(design.md 決定3)。解放の操作は別に無い。
+    /// 既に使った handle と、そもそも採番していない handle は同じ形の実行時
+    /// 診断で断る(design.md 決定4)。
+    ///
+    /// いまの呼び出し元はこのモジュールの単体テストだけ。CLI と Wasm 側の
+    /// invoke export は CAB-030 の仕事なので、それまで未使用の警告を抑える
+    #[allow(dead_code)]
+    pub fn invoke(&self, handle: CallableHandle, args: Vec<Value>) -> Eval {
+        let Some(callable) = self.handles.borrow_mut().take(handle) else {
+            return fail("この callable handle は既に使い切られたか、存在しません");
+        };
+        CheckedInterp::new(self.program, self.plan, &self.handles).invoke(callable, args)
     }
 }
 
@@ -1482,6 +1597,134 @@ fn main(-> int) {{ twice(double, 3) + twice(negate, 4) }}
 "
         );
         assert!(matches!(run(&src, "main"), Ok(Value::Int(16))));
+    }
+
+    // ---- 公開境界を越えた callable の handle(callable-handle-lifecycle) ----
+
+    /// 公開エクスポートは entry module の `pub use` からしか生まれないので、
+    /// 2ファイル構成で読み込む。`run`/`checked_run` が渡している空の
+    /// `public_exports` では CAB-010 の callable 戻り値の緩和が効かない
+    fn checked_public(lib: &str) -> ownership::CheckedProgram {
+        let loaded = crate::module::load_files(&[
+            (
+                "main.rd",
+                "pub use lib::{pick, risky}\nfn main(-> int) { 1 }\n",
+            ),
+            ("lib.rd", lib),
+        ])
+        .expect("ロードできるはず");
+        let hir = crate::typecheck::check_and_lower(&loaded.program, &loaded.public_exports)
+            .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
+        crate::ownership::check(hir).unwrap_or_else(|d| panic!("所有権検査を通るはず: {d:?}"))
+    }
+
+    /// `pick` は要求ゼロの `double` をそのまま返す。`risky` が返す `guard` は
+    /// 引数しだいで実行時に落ちるので、失敗しても handle が消えることを見られる
+    const HANDLE_LIB: &str = "fn double(value: int -> int) { value * 2 }
+fn guard(value: int -> int) { assert value == 200
+ value }
+fn pick(-> fn(int -> int)) { double }
+fn risky(-> fn(int -> int)) { guard }
+";
+
+    fn handle_of(interp: &Interp<'_>, entry: &str) -> CallableHandle {
+        match interp.run(entry) {
+            Ok(Value::Callable(handle)) => handle,
+            other => panic!("handle が出るはず: {other:?}"),
+        }
+    }
+
+    fn diag_of(result: Eval) -> Diag {
+        match result {
+            Err(Flow::Error(diag)) => diag,
+            other => panic!("実行時診断で断るはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 公開エクスポートのcallable戻り値はhandleとして観測できる() {
+        let checked = checked_public(HANDLE_LIB);
+        let interp = Interp::new_checked(&checked);
+        let handle = handle_of(&interp, "lib::pick");
+        // 表示にも行き先の名前は出ない
+        assert_eq!(interp.show(&Value::Callable(handle)), "callable#1");
+    }
+
+    #[test]
+    fn handleは1回だけ呼べる() {
+        let checked = checked_public(HANDLE_LIB);
+        let interp = Interp::new_checked(&checked);
+        let handle = handle_of(&interp, "lib::pick");
+        assert!(matches!(
+            interp.invoke(handle, vec![Value::Int(21)]),
+            Ok(Value::Int(42))
+        ));
+    }
+
+    /// 同じ関数をもう一度返せば別の handle が出る。回復の道は残っている
+    #[test]
+    fn 同じhandleの二度目の呼び出しは断る() {
+        let checked = checked_public(HANDLE_LIB);
+        let interp = Interp::new_checked(&checked);
+        let handle = handle_of(&interp, "lib::pick");
+        assert!(matches!(
+            interp.invoke(handle, vec![Value::Int(1)]),
+            Ok(Value::Int(2))
+        ));
+        assert!(
+            diag_of(interp.invoke(handle, vec![Value::Int(1)]))
+                .msg
+                .contains("既に使い切られた")
+        );
+
+        let fresh = handle_of(&interp, "lib::pick");
+        assert_ne!(fresh, handle, "採番し直した handle は別物");
+        assert!(matches!(
+            interp.invoke(fresh, vec![Value::Int(3)]),
+            Ok(Value::Int(6))
+        ));
+    }
+
+    /// 解放は呼び出しの中で起きる。行き先の成否には依らない(CAB-Q2)
+    #[test]
+    fn 行き先が失敗してもhandleは消費される() {
+        let checked = checked_public(HANDLE_LIB);
+        let interp = Interp::new_checked(&checked);
+        let handle = handle_of(&interp, "lib::risky");
+        assert!(
+            diag_of(interp.invoke(handle, vec![Value::Int(1)]))
+                .msg
+                .contains("assert"),
+            "行き先自身が実行時に落ちる"
+        );
+        assert!(
+            diag_of(interp.invoke(handle, vec![Value::Int(200)]))
+                .msg
+                .contains("既に使い切られた")
+        );
+    }
+
+    #[test]
+    fn 採番していないhandleの呼び出しは断る() {
+        let checked = checked_public(HANDLE_LIB);
+        let interp = Interp::new_checked(&checked);
+        assert!(
+            diag_of(interp.invoke(CallableHandle(9999), vec![Value::Int(1)]))
+                .msg
+                .contains("既に使い切られた")
+        );
+    }
+
+    #[test]
+    fn handleの呼び出しは引数の個数を見る() {
+        let checked = checked_public(HANDLE_LIB);
+        let interp = Interp::new_checked(&checked);
+        let handle = handle_of(&interp, "lib::pick");
+        assert!(
+            diag_of(interp.invoke(handle, Vec::new()))
+                .msg
+                .contains("引数 1 個が要ります")
+        );
     }
 
     #[test]
