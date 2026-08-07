@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Rhodolite Architecture Atlas"
+  short_description: "Keep the interactive compiler architecture atlas accurate"
+  default_prompt: "Use $update-internal-architecture to refresh the Rhodolite internal architecture viewer from the current source and roadmap."
