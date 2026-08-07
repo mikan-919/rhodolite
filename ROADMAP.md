@@ -497,7 +497,7 @@ MAP-075 で意図的にスコープ外にした2機能を追加し、`push` に�
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
 | CLO-000 | `done` | 捕捉付き無名関数の観測可能な契約を決める | なし | M | 必要 |
-| CLO-010 | `in-progress` | 無名関数リテラルの文法と closure 値の型表現を追加する | CLO-000 | M | 不要 |
+| CLO-010 | `done` | 無名関数リテラルの文法と closure 値の型表現を追加する | CLO-000 | M | 不要 |
 | CLO-020 | `planned` | 自由変数の捕捉解決・closure 本体の型検査・aggregate 格納の型検査を追加する | CLO-010 | L | 不要 |
 | CLO-030 | `planned` | 捕捉と aggregate 格納の ownership（move/コピー・環境の drop）を検査する | CLO-020 | L | 不要 |
 | CLO-040 | `planned` | 捕捉環境を whole-program 特殊化キーに加える | CLO-020, CLO-030 | M | 不要 |
