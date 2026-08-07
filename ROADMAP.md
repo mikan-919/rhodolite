@@ -811,7 +811,7 @@ host が実装する関数を `extern` で宣言し、effect handler の中か�
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
 | EXT-000 | `done` | `extern` 宣言の観測可能な契約を決め、ADR-0009 決定1を差し替える ADR-0012 を書く | なし | L | 必要 |
-| EXT-010 | `ready` | `extern fn` 宣言の文法を追加する | EXT-000 | M | 不要 |
+| EXT-010 | `in-progress` | `extern fn` 宣言の文法を追加する | EXT-000 | M | 不要 |
 | EXT-020 | `planned` | extern 関数の型検査（シグネチャ制約・ambient 要求ゼロ）を追加する | EXT-010 | M | 不要 |
 | EXT-030 | `planned` | Core Wasm の import section 生成と `rhodolite.abi` の import 記述を追加する | EXT-020 | L | 不要 |
 | EXT-040 | `planned` | インタプリタで extern を実行するための host スタブ機構を追加する | EXT-020 | M | 不要 |
