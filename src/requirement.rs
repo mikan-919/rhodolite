@@ -792,6 +792,83 @@ impl Analysis {
 }
 
 // ---------------------------------------------------------------------------
+// 公開境界を越える callable(callable-public-boundary、CAB-010 決定3)
+// ---------------------------------------------------------------------------
+
+/// 公開エクスポートが返す callable を検査する。
+///
+/// 越えてよいのは「1つの名前付きトップレベル関数を直に指していて、その関数の
+/// ambient 要求が空」の callable だけ(CAB-Q3・CAB-Q4)。host には `with` に
+/// 当たる手段が無いので、要求が残ったまま境界を越えると誰も満たせない。
+///
+/// 引数側は見ない。callable 値を作れるのは名前付き関数の参照だけで、host が
+/// 引数に渡せるのは wasm 自身が戻り値で出した handle だけなので、出どころは
+/// その戻り値の位置で既に検査済み(CAB-010 決定4)。
+pub fn public_callable_errors(
+    program: &hir::Program,
+    analysis: &Analysis,
+    exports: &[(String, hir::CallableId)],
+) -> Vec<Diag> {
+    let mut errors = Vec::new();
+    for (name, id) in exports {
+        let callable = &program.callables[*id];
+        if !matches!(callable.ret.kind, hir::TypeKind::Callable { .. }) {
+            continue;
+        }
+        let body = &callable.body;
+        // 生産の根は callback を1つも束縛せずに計画される。同じ空の文脈から
+        // 別名 `let g = f` だけを辿る
+        let bindings = hir::resolve_bindings(body, &hir::Bindings::new());
+        let returns = body
+            .exprs()
+            .filter_map(|(_, decl)| match decl.kind {
+                hir::ExprKind::Return(Some(value)) => Some(value),
+                _ => None,
+            })
+            .chain(body.root.last().copied());
+        for expr in returns {
+            let span = body.expr(expr).span;
+            let Some(target) = hir::callable_of(body, expr, &bindings) else {
+                errors.push(
+                    Diag::at(
+                        span,
+                        format!(
+                            "公開関数 `{name}` が返す callable は1つの名前付き関数を指していません"
+                        ),
+                    )
+                    .label("ここが公開面の callable 戻り値")
+                    .help("トップレベル関数の名前をそのまま返してください"),
+                );
+                continue;
+            };
+            let reqs = analysis.requirements(hir::BodyId::Callable(target), &hir::Bindings::new());
+            if reqs.is_empty() {
+                continue;
+            }
+            let slots: Vec<&str> = reqs
+                .keys()
+                .map(|slot| program.slots[*slot].name.as_str())
+                .collect();
+            errors.push(
+                Diag::at(
+                    span,
+                    format!(
+                        "公開関数 `{name}` が返す `{}` は `{}` を要求しています",
+                        program.callables[target].name,
+                        slots.join("`, `")
+                    ),
+                )
+                .label("ここが公開面の callable 戻り値")
+                .help(
+                    "公開境界を越えられるのは要求ゼロの callable だけです。host は `with` で提供できません",
+                ),
+            );
+        }
+    }
+    errors
+}
+
+// ---------------------------------------------------------------------------
 // テスト。上から順に緑にしていく
 // ---------------------------------------------------------------------------
 
@@ -812,7 +889,7 @@ mod tests {
     }
 
     fn analysis_of_program(p: &ast::Program) -> Analysis {
-        let lowered = crate::typecheck::check_and_lower(p).expect("型検査を通るはず");
+        let lowered = crate::typecheck::check_and_lower(p, &[]).expect("型検査を通るはず");
         analyze_hir_for_test(&lowered)
     }
 
@@ -858,7 +935,7 @@ mod tests {
     /// 前置きを付けて型検査を通し、下ろした HIR を返す
     fn lowered_of(src: &str) -> hir::Program {
         let p = program(&format!("{PRELUDE}{src}"));
-        crate::typecheck::check_and_lower(&p).expect("型検査を通るはず")
+        crate::typecheck::check_and_lower(&p, &[]).expect("型検査を通るはず")
     }
 
     /// 所有権検査まで通した HIR。要求解析の API は task 8.1 まで従来どおり
@@ -1525,7 +1602,7 @@ mod tests {
     #[test]
     fn 意味の結果は全ての本体をidで引ける() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
-        let lowered = crate::typecheck::check_and_lower(&program(&src)).expect("型検査を通る");
+        let lowered = crate::typecheck::check_and_lower(&program(&src), &[]).expect("型検査を通る");
         let analysis = analyze_hir_for_test(&lowered);
 
         assert_eq!(
@@ -1598,7 +1675,8 @@ mod tests {
             ),
         ])
         .expect("ロードできる");
-        let lowered = crate::typecheck::check_and_lower(&loaded.program).expect("型検査を通る");
+        let lowered = crate::typecheck::check_and_lower(&loaded.program, &loaded.public_exports)
+            .expect("型検査を通る");
         let analysis = analyze_hir_for_test(&lowered);
 
         let both = hir::BodyId::Callable(lowered.free_callable("main::both").unwrap());
@@ -1667,7 +1745,7 @@ mod tests {
     #[test]
     fn 未定義の直接関数呼び出しは下ろす前に止まる() {
         let p = program(&format!("{PRELUDE}fn main() {{ stanp() }}\n"));
-        let errors = crate::typecheck::check_and_lower(&p).expect_err("解決できない");
+        let errors = crate::typecheck::check_and_lower(&p, &[]).expect_err("解決できない");
         assert_eq!(
             messages(&errors),
             vec!["main: `stanp` の呼び出し先が決まりません".to_string()]
@@ -1705,7 +1783,7 @@ mod tests {
     #[test]
     fn 手順2_スロットのフィールドは値にならないので下ろす前に止まる() {
         let p = program(&format!("{PRELUDE}fn f(-> int) {{ db.url }}\n"));
-        let errors = crate::typecheck::check_and_lower(&p).expect_err("値にならない");
+        let errors = crate::typecheck::check_and_lower(&p, &[]).expect_err("値にならない");
         assert!(
             errors[0].msg.contains("`db` は値として読めません"),
             "{errors:?}"

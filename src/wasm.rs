@@ -3098,7 +3098,7 @@ pub(crate) mod tests {
     pub(crate) fn plan_of(src: &str, exports: &[&str]) -> (CheckedProgram, ProductionPlan) {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap()))
             .expect("パースできるはず");
-        let program = crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず");
+        let program = crate::typecheck::check_and_lower(&parsed, &[]).expect("型検査を通るはず");
         let checked = crate::ownership::check(program).expect("所有権検査を通るはず");
         let analysis = crate::requirement::analyze(&checked);
         let entry = checked.hir.free_callable("main").expect("main がない");

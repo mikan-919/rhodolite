@@ -838,7 +838,7 @@ mod tests {
         let source = format!("{PRELUDE}{src}");
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(&source).unwrap()))
             .expect("パースできるはず");
-        crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず")
+        crate::typecheck::check_and_lower(&parsed, &[]).expect("型検査を通るはず")
     }
 
     /// provider mode まで検査済みの HIR。計画 API 自体を `CheckedProgram` に
@@ -1054,7 +1054,7 @@ mod tests {
     pub(super) fn plan_source(src: &str) -> (hir::Program, Plan) {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap()))
             .expect("パースできるはず");
-        let program = crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず");
+        let program = crate::typecheck::check_and_lower(&parsed, &[]).expect("型検査を通るはず");
         let plan = plan_program(&program);
         (program, plan)
     }

@@ -667,8 +667,8 @@ fn prepare(fixture: &'static Fixture) -> Result<Prepared, String> {
         .map(|file| (file.path, file.source))
         .collect();
     let loaded = module::load_files(&files).map_err(|failure| diagnostics(&failure.diagnostics))?;
-    let lowered =
-        typecheck::check_and_lower(&loaded.program).map_err(|errors| diagnostics(&errors))?;
+    let lowered = typecheck::check_and_lower(&loaded.program, &loaded.public_exports)
+        .map_err(|errors| diagnostics(&errors))?;
     let checked = ownership::check(lowered).map_err(|errors| diagnostics(&errors))?;
     let mut declared_tests = TestSummary::default();
     for (id, _) in checked.hir.tests.iter() {

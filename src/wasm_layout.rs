@@ -488,7 +488,7 @@ mod tests {
     fn program_of(src: &str) -> hir::Program {
         let parsed = crate::parse::parse(&crate::lex::join(crate::lex::lex(src).unwrap()))
             .expect("パースできるはず");
-        crate::typecheck::check_and_lower(&parsed).expect("型検査を通るはず")
+        crate::typecheck::check_and_lower(&parsed, &[]).expect("型検査を通るはず")
     }
 
     fn named(program: &hir::Program, name: &str) -> hir::Type {

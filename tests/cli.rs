@@ -1959,6 +1959,95 @@ fn 予約名の公開再エクスポートを拒否する() {
     assert!(!project.exists("target/wasm/app.wasm"), "{text}");
 }
 
+// ---- 公開境界の callable (callable-public-boundary、CAB-010) ----
+
+/// `pub use` で公開した関数と、その依存を1つのプロジェクトにする
+fn callable_export_project(lib: &str) -> Project {
+    let project = Project::new();
+    project.write("app.rd", "pub use lib::{surface}\nfn main(-> int) { 1 }\n");
+    project.write("lib.rd", lib);
+    project
+}
+
+/// host には `with` に当たる手段が無い。要求を残した callable は境界を越えられない
+#[test]
+fn 要求の残るcallableを公開境界へ出すのを拒否する() {
+    let project = callable_export_project(
+        "trait Clock { fn now(self -> int) }\n\
+         effect clock: Clock\n\
+         fn timed(n: int -> int) { n + clock.now() }\n\
+         fn surface(-> fn(int -> int)) { timed }\n",
+    );
+
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    // 返す関数と、それが要求しているスロットの両方を名指しする
+    assert!(text.contains("lib::timed"), "{text}");
+    assert!(text.contains("lib::clock"), "{text}");
+    assert!(text.contains("lib.rd:4:"), "{text}");
+    assert!(!project.exists("target/wasm/app.wasm"), "{text}");
+}
+
+/// 1つの名前付き関数に解けない戻り値は境界を越えられない
+#[test]
+fn 静的な行き先の無いcallableを公開境界へ出すのを拒否する() {
+    let project =
+        callable_export_project("fn surface(f: fn(int -> int) -> fn(int -> int)) { f }\n");
+
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("1つの名前付き関数を指していません"), "{text}");
+    assert!(text.contains("lib.rd:1:"), "{text}");
+}
+
+/// closure は名前付き関数ではない。CLO-020 が closure を通し始めても、
+/// 公開境界の手前で止まっていることをここで見張る
+#[test]
+fn クロージャリテラルを公開境界へ出すのを拒否する() {
+    let project =
+        callable_export_project("fn surface(-> fn(int -> int)) { fn(n: int -> int) { n * 2 } }\n");
+
+    let output = project.build(&["app.rd", "--target", "wasm"]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("lib.rd:1:"), "{text}");
+    assert!(!project.exists("target/wasm/app.wasm"), "{text}");
+}
+
+/// 型検査を通った callable 公開シグネチャも、生成側はまだ受け取れない。
+/// 黙って所有データとして扱わず、panic でもなく診断で止まる(CAB-030 まで)
+#[test]
+fn callableの公開シグネチャはwasmではまだ生成できない() {
+    for (lib, named) in [
+        // 戻り値。公開名を名指しする
+        (
+            "fn double(n: int -> int) { n * 2 }\n\
+             fn surface(-> fn(int -> int)) { double }\n",
+            "`surface` の callable 戻り値",
+        ),
+        // 引数(呼ばずに捨てるので、計画は通って生成側まで届く)。引数名を名指しする
+        (
+            "fn surface(f: fn(int -> int), n: int -> int) { n }\n",
+            "`surface` の引数 `f` の callable 型",
+        ),
+    ] {
+        let project = callable_export_project(lib);
+        let output = project.build(&["app.rd", "--target", "wasm"]);
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{lib}: {text}");
+        assert_eq!(output.status.code(), Some(1), "panic ではなく診断: {text}");
+        assert!(
+            text.contains("Wasm ターゲットではまだ生成できません"),
+            "{lib}: {text}"
+        );
+        assert!(text.contains(named), "{lib}: {text}");
+        assert!(text.contains("lib.rd:"), "{lib}: {text}");
+        assert!(!project.exists("target/wasm/app.wasm"), "{lib}: {text}");
+    }
+}
+
 // ---- 型パラメータ (MAP-010) ----
 
 /// 型パラメータを持つ宣言は実行経路に繋がらないので、`main` は今までどおり走る

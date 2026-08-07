@@ -98,7 +98,13 @@ fn signatures_impl(
                 .help(format!("`{ENTRY_EXPORT}` は引数なしで呼ばれます")),
         );
     }
-    let entry_result = result_port(program, entry.span, &entry.ret, &mut diagnostics);
+    let entry_result = result_port(
+        program,
+        ENTRY_EXPORT,
+        entry.span,
+        &entry.ret,
+        &mut diagnostics,
+    );
 
     let mut exports = Vec::new();
     for (name, instance) in &production.exports {
@@ -118,7 +124,13 @@ fn signatures_impl(
             let decl = callable.body.local(*local);
             params.push(param_port(program, name, decl, &mut diagnostics));
         }
-        let result = result_port(program, callable.span, &callable.ret, &mut diagnostics);
+        let result = result_port(
+            program,
+            name,
+            callable.span,
+            &callable.ret,
+            &mut diagnostics,
+        );
         exports.push((
             Signature {
                 name: name.clone(),
@@ -185,6 +197,13 @@ fn param_port(
             );
             Port::Scalar(Scalar::Int)
         }
+        None if is_callable(ty) => {
+            diagnostics.push(not_yet_callable(
+                decl.span,
+                format!("公開関数 `{name}` の引数 `{}` の callable 型", decl.name),
+            ));
+            Port::Scalar(Scalar::Int)
+        }
         None if supported(ty) => Port::Rich(ty.clone()),
         None => {
             diagnostics.push(
@@ -204,6 +223,7 @@ fn param_port(
 
 fn result_port(
     program: &hir::Program,
+    name: &str,
     span: crate::lex::Span,
     ty: &hir::Type,
     diagnostics: &mut Vec<Diag>,
@@ -214,6 +234,13 @@ fn result_port(
     }
     match scalar_of(ty) {
         Some(scalar) => Port::Scalar(scalar),
+        None if is_callable(ty) => {
+            diagnostics.push(not_yet_callable(
+                span,
+                format!("公開関数 `{name}` の callable 戻り値"),
+            ));
+            Port::Scalar(Scalar::Unit)
+        }
         None if supported(ty) => Port::Rich(ty.clone()),
         None => {
             diagnostics.push(
@@ -226,6 +253,26 @@ fn result_port(
             Port::Scalar(Scalar::Unit)
         }
     }
+}
+
+/// 公開面に出た callable 型か。
+///
+/// `wasm::supported` は「生成器が内部で表せるか」に答える別の問いなので、
+/// そちらは変えない。内部の callable local は呼び出し先へ畳まれて実行時表現を
+/// 持たないが、境界を越える callable は handle が要る(CAB-010 決定5)
+fn is_callable(ty: &hir::Type) -> bool {
+    matches!(ty.kind, hir::TypeKind::Callable { .. })
+}
+
+/// CAB-030 が invoke export を生やすまでの明示的な拒否。
+/// 黙って所有データとして扱うと、メタデータ生成まで届いてから落ちる
+fn not_yet_callable(span: crate::lex::Span, place: String) -> Diag {
+    Diag::at(
+        span,
+        format!("{place}は Wasm ターゲットではまだ生成できません"),
+    )
+    .label("ここが公開面の callable")
+    .help("callable 値の invoke export は CAB-030 で実装します")
 }
 
 /// 借用は呼び出し側の記憶を指す。境界を越えた先にその所有者は居ない

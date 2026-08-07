@@ -432,6 +432,12 @@ struct Out {
     /// generic `impl` の具体化が要る `TraitImplDecl`。`(struct, trait)` の組に
     /// 1つだけ、最初にその組のメソッドが解決したときに確保する(MAP-025 決定5)
     trait_impls: Vec<((hir::StructId, hir::TraitId), hir::TraitImplId)>,
+    /// ホストへ公開する宣言の正準名(`module::load` が `pub use` から落とした
+    /// もの)。callable 型を戻り値に書けるのはここに載った宣言だけ
+    /// (callable-public-boundary、CAB-010 決定2)。
+    ///
+    /// メソッドの `sig.name` は修飾されないので、正準名の集合と衝突しない
+    public_exports: BTreeSet<String>,
 }
 
 impl Out {
@@ -483,7 +489,10 @@ type CallbackKey = Vec<Option<hir::CallableId>>;
 ///
 /// 診断が1件でもあれば下ろしかけた HIR は捨てる。返った HIR には
 /// `Poison` な式も未解決の型も残らない。
-pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
+pub fn check_and_lower(
+    program: &Program,
+    public_exports: &[crate::module::PublicExport],
+) -> Result<hir::Program, Vec<Diag>> {
     let mut out = Out {
         diagnostics: Vec::new(),
         span: None,
@@ -495,6 +504,10 @@ pub fn check_and_lower(program: &Program) -> Result<hir::Program, Vec<Diag>> {
         instances: Vec::new(),
         building: Vec::new(),
         trait_impls: Vec::new(),
+        public_exports: public_exports
+            .iter()
+            .map(|export| export.canonical.clone())
+            .collect(),
     };
     let (decls, lowered, targets) = collect(program, &mut out);
     // 宣言が全部揃ってから所有の内包を見る。無限の大きさの型は本体の検査より
@@ -1321,10 +1334,19 @@ fn optional_reference(ty: &KnownType) -> String {
 }
 
 /// 宣言の実効戻り値型を HIR へ。注釈の省略は `unit` を返す宣言と同じ意味。
+///
+/// 公開エクスポートに選ばれた宣言だけは、引数と同じ形の規則で callable 型を
+/// 戻り値に書ける(callable-public-boundary、CAB-010 決定2)。何を返して
+/// よいかは `requirement::public_callable_errors` が別に見る。
 fn lower_ret(sig: &Sig, nominal: &Nominal, out: &mut Out) -> hir::Type {
     match &sig.ret {
         Some(ty) => {
-            reject_callable(ty, &format!("`{}` の戻り値型", sig.name), out);
+            let place = format!("`{}` の戻り値型", sig.name);
+            if out.public_exports.contains(&sig.name) {
+                reject_nested_callable(ty, &place, out);
+            } else {
+                reject_callable(ty, &place, out);
+            }
             lower_type(ty, nominal, out)
         }
         None => hir::Type::unit(),
@@ -5414,7 +5436,7 @@ mod tests {
     /// 診断だけを見る。下ろした HIR は捨てる
     fn diagnostics(src: &str) -> Vec<Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        check_and_lower(&program).err().unwrap_or_default()
+        check_and_lower(&program, &[]).err().unwrap_or_default()
     }
 
     fn only(src: &str) -> String {
@@ -5489,6 +5511,82 @@ fn apply(f: fn(int -> int), value: int -> int) { f(value) }
             "{:?}",
             errors(src)
         );
+    }
+
+    // ---- 公開シグネチャの callable(callable-public-boundary、CAB-010) ----
+
+    /// 公開エクスポートはエントリーモジュールの `pub use` でしか生まれないので、
+    /// 2ファイル構成で読み込んでから検査する
+    fn public_diagnostics(entry: &str, lib: &str) -> Vec<Diag> {
+        let loaded = crate::module::load_files(&[("main.rd", entry), ("lib.rd", lib)])
+            .expect("ロードできる");
+        check_and_lower(&loaded.program, &loaded.public_exports)
+            .err()
+            .unwrap_or_default()
+    }
+
+    fn public_errors(entry: &str, lib: &str) -> Vec<String> {
+        public_diagnostics(entry, lib)
+            .into_iter()
+            .map(|d| d.msg)
+            .collect()
+    }
+
+    const PUBLIC_ENTRY: &str = "pub use lib::{pick}\nfn main(-> int) { 1 }\n";
+
+    #[test]
+    fn 公開エクスポートはcallable引数を宣言できる() {
+        assert_eq!(
+            public_errors(
+                "pub use lib::{pick}\nfn main(-> int) { 1 }\n",
+                "fn pick(f: fn(int -> int), n: int -> int) { f(n) }\n",
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn 公開エクスポートはcallable戻り値型を宣言できる() {
+        assert_eq!(
+            public_errors(
+                PUBLIC_ENTRY,
+                "fn double(n: int -> int) { n * 2 }\nfn pick(-> fn(int -> int)) { double }\n",
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// 公開に選ばれていない宣言は今までどおり。緩和は公開面だけに閉じる
+    #[test]
+    fn 公開に選ばれていない関数のcallable戻り値型は拒否したまま() {
+        let errors = public_errors(
+            "use lib::{pick}\nfn main(-> int) { 1 }\n",
+            "fn double(n: int -> int) { n * 2 }\nfn pick(-> fn(int -> int)) { double }\n",
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("戻り値型")
+                && e.contains("callable 型 `fn(...)` を置けません")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn 公開シグネチャの入れ子callableは位置付きで拒否する() {
+        for lib in [
+            // optional
+            "fn double(n: int -> int) { n * 2 }\nfn pick(-> fn(int -> int)?) { double }\n",
+            // 参照
+            "fn double(n: int -> int) { n * 2 }\nfn pick(-> &fn(int -> int)) { double }\n",
+            // 配列に包む
+            "fn double(n: int -> int) { n * 2 }\nfn pick(-> [fn(int -> int)]) { [double] }\n",
+        ] {
+            let diagnostics = public_diagnostics(PUBLIC_ENTRY, lib);
+            let found = diagnostics
+                .iter()
+                .find(|d| d.msg.contains("戻り値型"))
+                .unwrap_or_else(|| panic!("戻り値型の診断がない: {diagnostics:?}"));
+            assert!(found.span.is_some(), "{found:?}");
+        }
     }
 
     #[test]
@@ -8155,7 +8253,7 @@ rank: Rank }
     /// 下ろした HIR。診断があれば失敗させる
     fn lowered(src: &str) -> hir::Program {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        check_and_lower(&program).expect("診断なしで下がるはず")
+        check_and_lower(&program, &[]).expect("診断なしで下がるはず")
     }
 
     /// 宣言だけの小さなプログラムを丸ごと固定する。宣言種ごとの ID の振り方と
@@ -8417,8 +8515,8 @@ rank: Rank }
             ),
         ])
         .expect("ロードできる");
-        let diagnostics =
-            check_and_lower(&loaded.program).expect_err("どちらのモジュールにも誤りがある");
+        let diagnostics = check_and_lower(&loaded.program, &loaded.public_exports)
+            .expect_err("どちらのモジュールにも誤りがある");
 
         let shown: Vec<&str> = diagnostics.iter().map(|d| d.msg.as_str()).collect();
         assert_eq!(
@@ -8454,7 +8552,8 @@ rank: Rank }
             ),
         ])
         .expect("ロードできる");
-        let program = check_and_lower(&loaded.program).expect("診断なしで下がるはず");
+        let program =
+            check_and_lower(&loaded.program, &loaded.public_exports).expect("診断なしで下がるはず");
 
         assert_eq!(program.structs.len(), 1, "宣言は1つだけ");
         let user = hir::Type {
@@ -9054,7 +9153,8 @@ rank: Rank }
             ("dep.rd", "struct Node { id: int\nindirect next: Node? }\n"),
         ])
         .expect("ロードできる");
-        let program = check_and_lower(&loaded.program).expect("診断なしで下がるはず");
+        let program =
+            check_and_lower(&loaded.program, &loaded.public_exports).expect("診断なしで下がるはず");
 
         assert_eq!(program.structs.len(), 1, "宣言は1つだけ");
         let node = program.structs.ids().next().unwrap();

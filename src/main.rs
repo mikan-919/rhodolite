@@ -121,7 +121,7 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
     };
     let sources = loaded.sources;
 
-    let lowered = match typecheck::check_and_lower(&loaded.program) {
+    let lowered = match typecheck::check_and_lower(&loaded.program, &loaded.public_exports) {
         Ok(lowered) => lowered,
         Err(errors) => {
             render::report(&errors, &sources);
@@ -181,7 +181,14 @@ fn build(entry: &Path, output: Option<&Path>) -> ExitCode {
             .iter()
             .map(|(_, id)| checked.hir.callables[*id].name.clone()),
     );
-    let errors = analysis.errors_for_roots(&roots);
+    let mut errors = analysis.errors_for_roots(&roots);
+    // 公開面の callable も同じ段でまとめて報告する。どちらも「根に残った要求」の
+    // 話なので、計画より前に両方出す(CAB-010 決定3)
+    errors.extend(requirement::public_callable_errors(
+        &checked.hir,
+        &analysis,
+        &exports,
+    ));
     if !errors.is_empty() {
         render::report(&errors, &sources);
         return ExitCode::FAILURE;
@@ -270,6 +277,7 @@ fn main() -> ExitCode {
     let program = loaded.program;
     let entry = loaded.entry;
     let sources = loaded.sources;
+    let public_exports = loaded.public_exports;
 
     println!("{path}: {} 個の宣言", program.items.len());
     for item in &program.items {
@@ -278,7 +286,7 @@ fn main() -> ExitCode {
 
     // 検査と下ろしはひとつ。ここを通れば、後段が受け取るのは型の付いた
     // 参照解決済みの HIR で、名前を引き直す必要がない(src/hir.rs)
-    let lowered = match typecheck::check_and_lower(&program) {
+    let lowered = match typecheck::check_and_lower(&program, &public_exports) {
         Ok(lowered) => lowered,
         Err(errors) => {
             eprintln!();

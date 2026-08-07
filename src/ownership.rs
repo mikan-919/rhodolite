@@ -2754,7 +2754,7 @@ mod tests {
     /// 型検査までは通る前提で、所有権検査だけを見る
     fn analyze_source(src: &str) -> Result<CheckedProgram, Vec<Diag>> {
         let program = parse::parse(&continue_lines(lex(src).unwrap())).expect("パースできるはず");
-        let hir = typecheck::check_and_lower(&program).expect("型検査を通るはず");
+        let hir = typecheck::check_and_lower(&program, &[]).expect("型検査を通るはず");
         check(hir)
     }
 
@@ -4790,7 +4790,8 @@ fn borrow_mut(s: &mut Store -> &mut Store) { s }
     /// 複数モジュールをまとめて検査する。所有権解析はプログラム全体で1回
     fn analyze_files(files: &[(&str, &str)]) -> Result<CheckedProgram, Vec<Diag>> {
         let loaded = crate::module::load_files(files).expect("ロードできる");
-        let hir = typecheck::check_and_lower(&loaded.program).expect("型検査を通るはず");
+        let hir = typecheck::check_and_lower(&loaded.program, &loaded.public_exports)
+            .expect("型検査を通るはず");
         check(hir)
     }
 

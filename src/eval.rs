@@ -1422,7 +1422,7 @@ mod tests {
     /// 合っていなければならない(design.md 決定7)。
     fn run(src: &str, entry: &str) -> Result<Value, Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        let hir = crate::typecheck::check_and_lower(&program)
+        let hir = crate::typecheck::check_and_lower(&program, &[])
             .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
         let checked =
             crate::ownership::check(hir).unwrap_or_else(|d| panic!("所有権検査を通るはず: {d:?}"));
@@ -1436,7 +1436,7 @@ mod tests {
 
     fn checked_run(src: &str, entry: &str) -> Result<Value, Diag> {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        let hir = crate::typecheck::check_and_lower(&program)
+        let hir = crate::typecheck::check_and_lower(&program, &[])
             .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
         let checked =
             crate::ownership::check(hir).unwrap_or_else(|d| panic!("所有権検査を通るはず: {d:?}"));
@@ -1488,7 +1488,7 @@ fn main(-> int) {{ twice(double, 3) + twice(negate, 4) }}
     fn ownership検査済み入口は計画に対応する式を評価する() {
         let src = "fn main(-> int) { let n = 40\n n + 2 }\n";
         let parsed = parse::parse(&join(lex(src).unwrap())).expect("パースできる");
-        let hir = crate::typecheck::check_and_lower(&parsed).expect("型検査を通る");
+        let hir = crate::typecheck::check_and_lower(&parsed, &[]).expect("型検査を通る");
         let checked = crate::ownership::check(hir).expect("所有権検査を通る");
         let interp = Interp::new_checked(&checked);
         assert!(matches!(interp.run("main"), Ok(Value::Int(42))));
@@ -1504,7 +1504,7 @@ fn main(-> int) {\n\
   copied.score\n\
 }\n";
         let parsed = parse::parse(&join(lex(src).unwrap())).expect("パースできる");
-        let hir = crate::typecheck::check_and_lower(&parsed).expect("型検査を通る");
+        let hir = crate::typecheck::check_and_lower(&parsed, &[]).expect("型検査を通る");
         let checked = crate::ownership::check(hir).expect("所有権検査を通る");
         assert!(matches!(
             Interp::new_checked(&checked).run("main"),
@@ -1664,7 +1664,7 @@ fn main(-> int) {\n\
     /// プログラムを知っている側から引く
     fn shown(src: &str, entry: &str) -> String {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        let hir = crate::typecheck::check_and_lower(&program)
+        let hir = crate::typecheck::check_and_lower(&program, &[])
             .unwrap_or_else(|d| panic!("型検査を通るはず: {d:?}"));
         let checked = crate::ownership::check(hir).expect("所有権検査を通るはず");
         let interp = Interp::new_checked(&checked);
@@ -1724,7 +1724,8 @@ fn main(-> int) {
     /// もう走らない(design.md 決定7)。文言は型検査側の綴り
     fn rejected(src: &str) -> String {
         let program = parse::parse(&join(lex(src).unwrap())).expect("パースできるはず");
-        let errors = crate::typecheck::check_and_lower(&program).expect_err("実行前に止まるはず");
+        let errors =
+            crate::typecheck::check_and_lower(&program, &[]).expect_err("実行前に止まるはず");
         errors
             .into_iter()
             .map(|d| d.msg)
@@ -2627,7 +2628,7 @@ fn main(-> int) {
     fn 正典のテストが通る() {
         let src = std::fs::read_to_string("examples/canonical.rd").unwrap();
         let program = parse::parse(&join(lex(&src).unwrap())).expect("パースできるはず");
-        let hir = crate::typecheck::check_and_lower(&program).expect("型検査を通る");
+        let hir = crate::typecheck::check_and_lower(&program, &[]).expect("型検査を通る");
         let checked = crate::ownership::check(hir).expect("所有権検査を通る");
         let interp = Interp::new_checked(&checked);
 
