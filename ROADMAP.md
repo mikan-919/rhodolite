@@ -667,12 +667,141 @@ MAP-075 で意図的にスコープ外にした2機能を追加し、`push` に�
 - 同じ入力から生成する Wasm が byte 単位で決定的である
 - 検証済みの安定状態が単独のスナップショットとしてコミットされている
 
+callable 値（named 関数値・closure）を公開 ABI の引数・戻り値に出せるようにする
+(CAB-000 〜 CAB-060)。現在は「公開 ABI に callable 値を出せない」という制約
+（Current State）を解除する。ADR-0009 の import-free 制約と ADR-0011 の
+内部アドレス非公開の原則は変えない前提で設計する。
+
+| タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
+|---|---|---|---|---|---|
+| CAB-000 | `needs-design` | callable 値の公開 ABI 露出の観測可能な契約を決める | なし | L | 必要 |
+| CAB-010 | `planned` | 公開シグネチャへの callable 型の許可と ambient 要求ゼロ制約の型検査を追加する | CAB-000 | M | 不要 |
+| CAB-020 | `planned` | callable 値の handle 表現とライフサイクル管理をランタイムに実装する | CAB-000 | L | 不要 |
+| CAB-030 | `planned` | 汎用 invoke export と（必要なら）解放 export を Core Wasm へ実装する | CAB-010, CAB-020 | L | 不要 |
+| CAB-040 | `planned` | ABI v1 メタデータに callable の型記述を追加する | CAB-010 | M | 不要 |
+| CAB-050 | `planned` | インタプリタ直接呼び出しと Wasm ABI 越し呼び出しの差分 fixture を追加する | CAB-030, CAB-040 | M | 不要 |
+| CAB-060 | `planned` | 仕様と利用者向け文書を更新する | CAB-050 | S | 不要 |
+
+### CAB-000 — callable 値の公開 ABI 露出の契約
+
+目的:
+
+- 実装が handle 表現・ライフサイクル・invoke 規約を勝手に選ばないよう、
+  最小の契約を先に固定する
+- ADR-0009（import-free artifact）・ADR-0011（内部アドレス非公開）と矛盾しない
+  設計にする
+
+完了条件:
+
+- CAB-Q1 〜 CAB-Q5 がすべて Decisions へ移っている
+- 方向性、handle 表現とライフサイクル、対象範囲、ambient 要求の扱い、
+  メタデータと invoke 規約が Decisions に明記されている
+- 既存 ADR と衝突する場合は、その旨と解決方法（ADR 更新の要否を含む）が
+  Decisions に明記されている
+
+検証方法:
+
+- CAB-Q1 〜 CAB-Q5 が Open Questions に残っていないことをレビューする
+- CAB-Q1 〜 CAB-Q5 の決定が Decisions にあり、ADR-0009 / ADR-0011 と矛盾しないことをレビューする
+
+### CAB-010 — 型検査：公開シグネチャへの callable 許可
+
+完了条件:
+
+- CAB-Q3 で決めた範囲（named 関数値のみ、または closure も含む）の callable
+  型を公開関数の引数・戻り値として宣言できる
+- CAB-Q4 の ambient 要求ゼロ制約に反する callable 型を source span 付きで拒否する
+- 対象外の callable（例えば CAB-Q3 で除外した種類）を公開シグネチャに書いた
+  場合を拒否する
+
+検証方法:
+
+- typecheck の公開シグネチャ callable 許可・拒否の焦点テスト
+- ambient 要求が残る callable を公開境界に出した場合の CLI 診断テスト
+
+### CAB-020 — handle 表現とライフサイクル
+
+完了条件:
+
+- CAB-Q2 で決めた handle 表現（使い捨て or 明示解放）をランタイムに実装する
+- handle は内部アドレスを含まない不透明 ID である
+- 使い捨てでない場合、二重解放・未解放を診断または安全に無視する規約が定まる
+
+検証方法:
+
+- handle 生成・呼び出し・（該当すれば）解放の unit test
+- 二重解放・不正 handle の安全性 test
+
+### CAB-030 — Core Wasm の invoke / 解放 export
+
+完了条件:
+
+- CAB-Q5 で決めた汎用 invoke export のシグネチャで callable を呼び出せる
+- CAB-Q1 の方向性どおり、host からの callable 注入経路は追加しない
+- 新しい table や `funcref` を増やす場合も、host が触れるのは export された
+  関数番号のみで、内部レイアウトを公開しない
+
+検証方法:
+
+- Wasm の invoke export の snapshot test
+- 独立 engine（host 役）からの呼び出し test
+
+### CAB-040 — ABI v1 メタデータ拡張
+
+完了条件:
+
+- `types` グラフに callable の型記述（引数型・戻り値型）を追加する
+- 公開署名から到達した callable 型だけを載せる（既存の到達性原則を保つ）
+- 既存の scalar / struct / enum / optional / array のメタデータ形式を変えない
+
+検証方法:
+
+- メタデータ snapshot test（callable を含む公開関数）
+
+### CAB-050 — 差分 fixture
+
+完了条件:
+
+- callable を公開境界へ出す・受け取るプログラムをインタプリタ直接呼び出しと
+  Wasm ABI 越し呼び出しの両方で実行する
+- 戻り値、実行時失敗、handle ライフサイクルの振る舞いが両者で一致する
+
+検証方法:
+
+- differential corpus に追加した fixture の実行
+
+### CAB-060 — 仕様と利用者向け文書
+
+完了条件:
+
+- OpenSpec の delta specs が main specs へ sync されている
+- README、overview、ADR-0011 が callable 値の公開 ABI 露出の契約を同じ言葉で
+  説明する（ADR-0011 の更新または新規 ADR の追加を CAB-000 の決定に従って行う）
+- Current State の「公開 ABI に borrow や callable 値を出せない」という記述を
+  実装後の境界に合わせて更新する
+
+検証方法:
+
+- 文書間の用語とリンクのレビュー
+- `bunx @fission-ai/openspec validate --all --strict`
+
+### CAB-010 〜 CAB-060 共通の完了条件
+
+各実装タスクは CAB-000 で作る OpenSpec tasks の対応範囲を実装する。
+次の条件をすべて満たしたときだけ `done` にできる。
+
+- 対応する OpenSpec scenario に自動テストがある
+- 新規テストと既存テストが通る
+- `cargo fmt --check` と warning をエラーにした Clippy が通る
+- インタプリタと Wasm の両方に関わる振る舞いは差分検証されている
+- 同じ入力から生成する Wasm が byte 単位で決定的である
+- 検証済みの安定状態が単独のスナップショットとしてコミットされている
+
 
 ## Future Directions
 
 まだ実施を約束していない長期案。
 
-- callable 値の公開 ABI 露出
 - 関数単位キャッシュと増分ビルド
 - LSP と IDE 連携
 
@@ -689,7 +818,26 @@ MAP-075 で意図的にスコープ外にした2機能を追加し、`push` に�
 
 まだ設計判断が終わっていない問題。
 
-なし
+- **CAB-Q1 — 方向性:** host が呼べるのは wasm 側が作った callable への
+  一方向ハンドルに限るか。[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md)
+  の「成果物は import-free」という制約と、host 提供の関数を wasm 側へ注入して
+  呼ばせる経路（逆方向）は正面衝突する。逆方向を Non-goals へ明記して閉じるか、
+  別の迂回策（例えば host 関数を直接 import せず、既存の module 内 named
+  関数の中から index で選ばせるだけにする）を許すか
+- **CAB-Q2 — handle のライフサイクル:** 公開境界を越えて host が持つ
+  callable の handle は、一度呼んだら自動解放される使い捨てにするか、host が
+  明示的に解放 export を呼ぶ複数回呼び出し可能な handle にするか。内部アドレスは
+  [ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md) の決定1により
+  host へ公開できないため、handle は不透明な ID にする
+- **CAB-Q3 — 対象範囲:** named 関数値だけを対象にするか、CLO で追加した
+  捕捉付き closure（捕捉環境という owned data を伴う）も対象にするか
+- **CAB-Q4 — ambient 要求の扱い:** 公開境界を越える callable が ambient を
+  要求する場合をどう扱うか。要求ゼロの callable だけ許可し、要求が残るものは
+  拒否するのが素直だが、それでよいか
+- **CAB-Q5 — メタデータと invoke 規約:** 汎用 invoke export のシグネチャ、
+  callable の引数・戻り値型を ADR-0011 の `types` グラフへどう記述するか。
+  異なるシグネチャの callable を同じ汎用 invoke に混在させる場合の型安全性を
+  どう担保するか
 
 ## Decisions
 
