@@ -16,6 +16,12 @@ JavaScript・ホストフレームワークは、いずれもコンパイラの�
 > 「v0 は scalar だけ」という線と、境界表現が scalar に閉じるという前提を
 > 差し替えた。成果物が import-free な Core Wasm + 埋め込み JSON であること、
 > 到達したところだけを対応検査すること、scalar の境界表現そのものは変わらない。
+>
+> [ADR-0012](./0012-extern-host-functions.md) が、下の決定1「import を
+> 1つも要求しない」を `extern fn` を使うモジュールに限って差し替えた。
+> `extern` を1つも持たないモジュールは引き続き import-free で、この差し替えの
+> 影響を受けない。host 面・export 名・失敗伝達・メタデータ形式・到達検査の
+> 原則はそのまま。
 
 ## Decision
 

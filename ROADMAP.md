@@ -803,12 +803,15 @@ host が実装する関数を `extern` で宣言し、effect handler の中か�
 呼べるようにする(EXT-000 〜 EXT-060)。CAB が「wasm→host」の一方向だけを
 扱うのに対し、EXT は逆方向(host→wasm への import)を扱う。[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md)
 の「成果物は import を1つも要求しない」という決定1と正面から相容れないため、
-EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を含める。
+[ADR-0012](./docs/adr/0012-extern-host-functions.md) がこの決定1だけを
+`extern fn` を使うモジュールに限って差し替えた（[ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md)
+が決定6を差し替えた前例と同じやり方。0009 の status は `accepted` のまま、
+冒頭にどの ADR が何を差し替えたかの注記を追加した）。
 
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
-| EXT-000 | `needs-design` | `extern` 宣言の観測可能な契約を決め、ADR-0009 を supersede する ADR を書く | なし | L | 必要 |
-| EXT-010 | `planned` | `extern fn` 宣言の文法を追加する | EXT-000 | M | 不要 |
+| EXT-000 | `done` | `extern` 宣言の観測可能な契約を決め、ADR-0009 決定1を差し替える ADR-0012 を書く | なし | L | 必要 |
+| EXT-010 | `ready` | `extern fn` 宣言の文法を追加する | EXT-000 | M | 不要 |
 | EXT-020 | `planned` | extern 関数の型検査（シグネチャ制約・ambient 要求ゼロ）を追加する | EXT-010 | M | 不要 |
 | EXT-030 | `planned` | Core Wasm の import section 生成と `rhodolite.abi` の import 記述を追加する | EXT-020 | L | 不要 |
 | EXT-040 | `planned` | インタプリタで extern を実行するための host スタブ機構を追加する | EXT-020 | M | 不要 |
@@ -820,28 +823,28 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
 目的:
 
 - host 依存部分の構文・型境界・失敗表現を先に固定する
-- ADR-0009 決定1（import-free）を変更する以上、新しい ADR で経緯と差分を
-  明文化し、0009 の status を superseded にする
+- ADR-0009 決定1（import-free）を変更する以上、新しい ADR（ADR-0012）で
+  経緯と差分を明文化する
 
 完了条件:
 
 - EXT-Q1 〜 EXT-Q6 がすべて Decisions へ移っている
 - 宣言構文、型と ownership の境界、instantiate 契約とメタデータ、
   ambient/effect との統合、失敗の伝達、スコープ境界が Decisions に明記されている
-- ADR-0009 を supersede する新しい ADR（`docs/adr/0012-*.md` 想定）の草稿ができ、
-  0009 の frontmatter が `status: superseded by ADR-0012` に更新されている
+- [ADR-0012](./docs/adr/0012-extern-host-functions.md) が `docs/adr/` に存在し、
+  ADR-0009 の冒頭に ADR-0012 が決定1を差し替えたことを示す注記がある
 
 検証方法:
 
 - EXT-Q1 〜 EXT-Q6 が Open Questions に残っていないことをレビューする
 - EXT-Q1 〜 EXT-Q6 の決定が Decisions にあることをレビューする
-- 新 ADR のレビューと ADR-0009 の status 更新の確認
+- ADR-0012 と ADR-0009 冒頭の注記のレビュー
 
 ### EXT-010 — 文法
 
 完了条件:
 
-- EXT-000 の契約どおりに `extern fn name(params -> ret)`（本体なし）を parse できる
+- `extern fn name(params -> ret)`（本体なし）を parse できる
 - extern 関数は通常の named 関数値と同じ型 `fn(P1, P2 -> R)` として扱われ、
   trait method の実装内から普通に呼び出せる
 - 本体を持つ `extern fn` や、対象外の構文（例えば `extern impl`）を source span
@@ -856,7 +859,8 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
 
 完了条件:
 
-- extern 関数のシグネチャは EXT-Q2 で決めた型集合に制限される
+- extern 関数のシグネチャは公開 ABI と同じ型集合（scalar + ADR-0011 の rich
+  型。`&T` / `&mut T` は拒否）に制限される
 - extern 関数は ambient を要求できない（要求があれば source span 付きで拒否する）
 - extern 関数を呼ぶ側は通常の関数呼び出しと同じ規則で型検査される
 
@@ -868,10 +872,12 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
 
 完了条件:
 
-- 到達した extern 関数だけを Wasm の import として生成する
-- `rhodolite.abi` に host が満たすべき import シグネチャの一覧を追加する
-- 未解決 import がある場合、instantiate が失敗することを文書化する
-  （ADR-0009 決定1の変更点として EXT-000 の新 ADR に明記済みであること）
+- 到達した extern 関数だけを、固定の import namespace `"host"` の Wasm import
+  として生成する
+- `rhodolite.abi` に、既存の `exports`（`name`/`params`/`result`）と対称な
+  `imports` 配列を追加する
+- 未解決 import がある場合、Wasm 標準の instantiate 失敗にそのまま任せる
+  （Rhodolite 側の専用チェックは追加しない）
 
 検証方法:
 
@@ -911,8 +917,6 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
 - README、overview、grammar が `extern fn` の契約を同じ言葉で説明する
 - Current State の「公開 ABI に borrow や callable 値を出せない」等の記述を
   実装後の境界（extern 経由の host 連携が可能になったこと）に合わせて更新する
-- ADR-0009 の status が superseded になっており、新 ADR が `docs/adr/` に
-  存在する
 
 検証方法:
 
@@ -952,27 +956,7 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
 
 まだ設計判断が終わっていない問題。
 
-- **EXT-Q1 — 宣言構文:** host 実装の関数をどう宣言するか。`extern fn
-  write_log(msg: str -> unit)` のような独立宣言にし、それを普通の関数値として
-  trait method の実装（`impl`）内から呼ぶ形にするか、それとも `extern impl`
-  のような専用構文で trait 実装ごと host 側に委ねる形にするか
-- **EXT-Q2 — 型と ownership の境界:** extern 関数の引数・戻り値にどの型を
-  許すか（scalar だけか、ADR-0011 の rich ABI 型まで含むか）。`&T` / `&mut T`
-  を渡せるか。渡せる場合、公開 ABI と同じ符号化契約（encode/decode）を
-  再利用できるか
-- **EXT-Q3 — instantiate 契約とメタデータ:** host が用意すべき import 関数群を
-  `rhodolite.abi` にどう記述するか（`imports` 欄の追加など）。ADR-0009 決定1の
-  「instantiate は何も走らせない」という前提は崩れる（未解決 import があれば
-  instantiate 自体が失敗する）が、それをどう文書化するか
-- **EXT-Q4 — ambient / effect との統合:** extern 関数は ambient を要求できない
-  （host に要求解決の概念が無い）という前提でよいか。effect の `impl` が
-  内部で extern 関数を呼んで実際の I/O を行う、という用途を想定した設計にするか
-- **EXT-Q5 — 失敗の伝達:** host 提供の extern 関数が失敗した場合、既存の
-  trap 契約（ADR-0009 決定4）にそのまま乗せるか、それとも新しい失敗表現を
-  extern 境界だけに導入するか
-- **EXT-Q6 — スコープ境界:** extern は常にキャプチャの無い named 関数として
-  だけ扱うか（closure 相当の概念を host 側に持ち込まない）。テスト時に
-  インタプリタ側で extern をどう実行するか（host スタブの共有機構が要るか）
+なし
 
 ## Decisions
 
@@ -1071,3 +1055,32 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
   whole-program monomorphization と同じ流儀）。実行時の型消去やバイト解釈の
   曖昧さを避け、ABI v1 の `types` グラフにはシグネチャごとの callable 型
   記述を追加する。
+- **EXT-Q1 — 宣言構文:** `extern fn name(params -> ret)`（本体なし）を
+  独立宣言とする。通常の named 関数値と同じ型を持ち、trait method の実装
+  （`impl`）内から普通の関数として呼ぶ。trait 実装ごと host に委ねる
+  `extern impl` 専用構文は導入しない（詳細は [ADR-0012](./docs/adr/0012-extern-host-functions.md) 決定1）。
+- **EXT-Q2 — 型と ownership の境界:** extern 関数の引数・戻り値は公開 ABI と
+  同じ型集合（scalar + ADR-0011 の rich 型）を許し、同じ encode/decode 契約を
+  再利用する。`&T` / `&mut T` は他の公開境界と同じ理由で拒否する
+  （ADR-0012 決定2）。
+- **EXT-Q3 — instantiate 契約とメタデータ:** import module namespace は
+  固定文字列 `"host"` に統一する。`rhodolite.abi` には既存の `exports` と
+  対称な形式（`name`/`params`/`result`）で `imports` 配列を追加する。
+  未解決 import があるときの instantiate 失敗は Wasm 標準の仕組みにそのまま
+  任せ、Rhodolite 側の専用チェックは追加しない（ADR-0012 決定3）。
+- **EXT-Q4 — ambient / effect との統合:** extern 関数は ambient を要求できない
+  （host に要求解決の概念が無いため）。一方、effect の `impl` メソッドが
+  内部で extern 関数を呼んで実際の I/O を行うことは、この系列が想定する
+  主要な用途である（ADR-0012 決定4）。
+- **EXT-Q5 — 失敗の伝達:** ADR-0009 決定4の trap 契約をそのまま踏襲する。
+  extern 境界専用の状態コードや例外表現は追加しない。回復可能な失敗を
+  表したい extern 関数は、戻り値の型に `T?` や enum を使う（ADR-0012 決定5）。
+- **EXT-Q6 — スコープ境界:** extern は常にキャプチャの無い named 関数として
+  扱う。closure 相当の概念は host 側に持ち込まない。テストでは HIR
+  インタプリタに名前ごとの host スタブを登録できる機構を EXT-040 で用意する
+  （ADR-0012 決定6）。
+
+[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md) の決定1
+（import-free）は、上記 EXT-Q1〜Q6 の決定を反映した [ADR-0012](./docs/adr/0012-extern-host-functions.md)
+によって `extern fn` を使うモジュールに限り差し替えられた。ADR-0009 自体の
+status は `accepted` のままとし、冒頭に ADR-0011 と同じ形式の注記を追加した。
