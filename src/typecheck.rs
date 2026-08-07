@@ -3240,6 +3240,17 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
 
         ExprKind::Call(callee, args) => call(callee, args, cx, locals, out),
 
+        // IDX-010 は文法だけ。要素型・借用・範囲検査は IDX-020 が入れる。
+        // 部分式は綴りだけ検査して、入れ子の誤りを取りこぼさないようにする
+        ExprKind::Index(base, index) => {
+            synth(base, cx, locals, out);
+            synth(index, cx, locals, out);
+            out.push(format!(
+                "{ctx}: 添字アクセス `xs[i]` はこの版では未対応です"
+            ));
+            poison()
+        }
+
         ExprKind::StructLit { name, fields } => {
             check_literal(name, fields, decls, ctx, out);
             let mut given = Vec::with_capacity(fields.len());
@@ -10399,6 +10410,39 @@ fn shout(value: str -> str) { value }
                     .contains("`[int]::map` のレシーバは `[int]` ですが、`&[int]` を渡しています")),
             "{:?}",
             errors(&src)
+        );
+    }
+
+    /// IDX-010 は文法だけ。`xs[i]` は型検査まで届いて「未対応」で落ちる。
+    /// 部分式は綴りだけ検査するので、入れ子の誤りも一緒に出る
+    #[test]
+    fn 添字アクセスは未対応として断る() {
+        let src = "fn main(-> int) { let xs = [1, 2]\n let i = 0\n xs[i] }\n";
+        assert!(
+            errors(src)
+                .iter()
+                .any(|e| e.contains("添字アクセス `xs[i]` はこの版では未対応です")),
+            "{:?}",
+            errors(src)
+        );
+        assert_eq!(
+            spanned(src, "添字アクセス"),
+            "xs[i]",
+            "診断はソース上の添字式を指す"
+        );
+
+        // 添字の中と基底の中の誤りは、他の式の中と同じに報告される
+        let nested = "fn main(-> int) { let xs = [1, 2]\n xs[missing] }\n";
+        assert!(
+            errors(nested).iter().any(|e| e.contains("missing")),
+            "{:?}",
+            errors(nested)
+        );
+        let base = "fn main(-> int) { nothing[0] }\n";
+        assert!(
+            errors(base).iter().any(|e| e.contains("nothing")),
+            "{:?}",
+            errors(base)
         );
     }
 }

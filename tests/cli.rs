@@ -2488,3 +2488,31 @@ fn 不要なslotはgeneric_の別の具体化へ伝播しない() {
     assert!(text.contains("  main::apply / (要求なし)\n"), "{text}");
     assert!(text.contains("  main::apply #2 / main::clock\n"), "{text}");
 }
+
+/// 壊れた添字構文は、ソース抜粋つきの診断で断る (IDX-010)
+#[test]
+fn 閉じない添字をソース位置つきで報告する() {
+    let project = Project::new();
+    project.write("main.rd", "fn main(-> int) {\n  let xs = [1]\n  xs[0\n}\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("`]` が必要です"), "{text}");
+    // miette がソースの該当行を抜粋する
+    assert!(text.contains("main.rd:3:"), "{text}");
+    assert!(text.contains("xs[0"), "{text}");
+}
+
+/// 中身の無い添字も同じくソース位置つきで断る (IDX-010)
+#[test]
+fn 空の添字をソース位置つきで報告する() {
+    let project = Project::new();
+    project.write("main.rd", "fn main(-> int) {\n  let xs = [1]\n  xs[]\n}\n");
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("main.rd:3:"), "{text}");
+    assert!(text.contains("式"), "{text}");
+}

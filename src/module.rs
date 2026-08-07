@@ -1009,6 +1009,26 @@ fn resolve_expr(
             declarations,
             diagnostics,
         ),
+        ExprKind::Index(base, index) => {
+            resolve_expr(
+                base,
+                locals,
+                local,
+                imported_declarations,
+                imported_modules,
+                declarations,
+                diagnostics,
+            );
+            resolve_expr(
+                index,
+                locals,
+                local,
+                imported_declarations,
+                imported_modules,
+                declarations,
+                diagnostics,
+            );
+        }
         ExprKind::Call(callee, args) => {
             resolve_expr(
                 callee,
@@ -1524,6 +1544,10 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             ExprKind::Call(callee, args) => {
                 collect_expr_paths(std::slice::from_ref(callee), locals, paths);
                 collect_expr_paths(args, locals, paths);
+            }
+            ExprKind::Index(base, index) => {
+                collect_expr_paths(std::slice::from_ref(base), locals, paths);
+                collect_expr_paths(std::slice::from_ref(index), locals, paths);
             }
             ExprKind::Array(items) | ExprKind::Block(items) => {
                 collect_expr_paths(items, locals, paths);
@@ -2444,5 +2468,45 @@ mod tests {
         let export = &loaded.public_exports[0];
         assert_eq!(export.name, "find_user");
         assert!(checked.free_callable(&export.canonical).is_some());
+    }
+
+    /// IDX-010: 添字の基底側・添字側の名前は `Field`/`Call` の中と同じに扱う
+    #[test]
+    fn 添字の両側の名前も他の式と同じに解決する() {
+        // 未 `use` のモジュール参照は、呼び出し引数や field レシーバの中と同じ報告
+        for src in [
+            "fn main() { xs.get(services::users::i) }\n",
+            "fn main() { services::users::xs.field }\n",
+            "fn main() { xs[services::users::i] }\n",
+            "fn main() { services::users::xs[i] }\n",
+        ] {
+            let message = load_err(&[("main.rd", src)]);
+            assert!(
+                message.contains("モジュール名 `services` は `use` されていません"),
+                "{src}: {message}"
+            );
+        }
+
+        // `use` した名前は添字の両側でも正準名へ書き換わる
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "use dep::{pick, all}\nfn main() {\n  all()[pick()]\n}\n",
+            ),
+            ("dep.rd", "fn pick(-> int) { 0 }\nfn all(-> int) { 1 }\n"),
+        ])
+        .expect("ロードできる");
+        let body = loaded
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn { sig, body, .. } if sig.name.ends_with("::main") => Some(body),
+                _ => None,
+            })
+            .expect("main がある");
+        let dumped = format!("{body:?}");
+        assert!(dumped.contains("dep::pick"), "{dumped}");
+        assert!(dumped.contains("dep::all"), "{dumped}");
     }
 }

@@ -1147,6 +1147,17 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Call(Box::new(e), args),
                     span: self.to(start),
                 };
+            } else if self.eat(&Tok::LBracket) {
+                // 角括弧の中では struct リテラルを禁じる理由がない
+                let saved = std::mem::replace(&mut self.no_struct, false);
+                let index = self.expr();
+                self.no_struct = saved;
+                let index = index?;
+                self.expect(&Tok::RBracket, "`]`")?;
+                e = Expr {
+                    kind: ExprKind::Index(Box::new(e), Box::new(index)),
+                    span: self.to(start),
+                };
             } else if self.eat(&Tok::ColonColon) {
                 let name = self.expect_ident("パスの続き")?;
                 // `A::b::c` は1つの Path に畳む
@@ -1492,6 +1503,9 @@ mod tests {
             ExprKind::Call(callee, args) => {
                 let args: Vec<String> = args.iter().map(show_expr).collect();
                 format!("{}({})", show_expr(callee), args.join(", "))
+            }
+            ExprKind::Index(base, index) => {
+                format!("{}[{}]", show_expr(base), show_expr(index))
             }
             ExprKind::Access { mode, place } => {
                 let mode = match mode {
@@ -2838,5 +2852,168 @@ mod tests {
     fn 閉じない型パラメータリストは断る() {
         assert!(error("fn f<T(x: T) { x }\n").contains("`>`"));
         assert!(error("fn f<>(x: int) { x }\n").contains("型パラメータ名"));
+    }
+
+    // --- IDX-010: 添字構文 ---
+
+    /// 最初の関数本体の式を1つずつ取り出す
+    fn stmts(src: &str) -> &'static [Expr] {
+        // 借用の都合で Program を漏らす。テスト内だけの割り切り
+        let p = Box::leak(Box::new(ok(src)));
+        p.items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn { body, .. } => Some(body.as_slice()),
+                _ => None,
+            })
+            .expect("fn が無い")
+    }
+
+    /// 単一の式を関数本体に包んで綴る
+    fn only(src: &str) -> String {
+        first(&format!("fn f() {{\n  {src}\n}}\n"))
+    }
+
+    /// 添字は後置の一段。`.field` / `(args)` と同じ優先順位で左から積む
+    #[test]
+    fn 添字は後置式として読める() {
+        for (src, spelling) in [
+            ("xs[i]", "xs[i]"),
+            ("xs[i][j]", "xs[i][j]"),
+            ("xs.get(i)[0]", "xs.get(i)[Int(0)]"),
+            ("xs[i].field", "xs[i].field"),
+            ("xs[i].get(j)", "xs[i].get(j)"),
+            ("xs[i + 1]", "xs[(i Add Int(1))]"),
+            ("xs[f(y)]", "xs[f(y)]"),
+            ("xs[ys[j]]", "xs[ys[j]]"),
+            // 後置なので、外側の二項演算子や所有権修飾より内側で束縛する
+            ("xs[i] + 1", "(xs[i] Add Int(1))"),
+            ("&xs[i]", "(&xs[i])"),
+        ] {
+            assert_eq!(only(src), spelling, "{src}");
+        }
+
+        // 配列リテラルへの添字。リテラル側の Debug 綴りは span を含むので形で見る
+        let ExprKind::Index(base, index) = &stmts("fn f() {\n  [1, 2, 3][0]\n}\n")[0].kind else {
+            panic!("Index ではない")
+        };
+        assert!(
+            matches!(&base.kind, ExprKind::Array(items) if items.len() == 3),
+            "基底が配列リテラルではない: {:?}",
+            base.kind
+        );
+        assert!(matches!(&index.kind, ExprKind::Int(0)), "{:?}", index.kind);
+    }
+
+    /// IDX-Q1: `len()` に専用構文は無い。`push` と同じメソッド呼び出しの産出
+    #[test]
+    fn lenは通常のメソッド呼び出しとして読める() {
+        assert_eq!(only("xs.len()"), "xs.len()");
+        assert_eq!(only("xs.push(y)"), "xs.push(y)");
+
+        let ExprKind::Call(callee, args) = &stmts("fn f() {\n  xs.len()\n}\n")[0].kind else {
+            panic!("Call ではない")
+        };
+        assert!(args.is_empty(), "`len()` は引数なしの呼び出し");
+        assert!(
+            matches!(&callee.kind, ExprKind::Field(recv, name)
+                if matches!(&recv.kind, ExprKind::Ident(n) if n == "xs") && name == "len"),
+            "callee が `Field(xs, len)` ではない: {:?}",
+            callee.kind
+        );
+    }
+
+    /// IDX-Q5: `xs[i] = v` は `user.id = id` と同じ代入の産出に載る
+    #[test]
+    fn 添字は代入の左辺になれる() {
+        let body = stmts("fn f() {\n  xs[i] = v\n  user.id = id\n}\n");
+        let spelled: Vec<(String, String)> = body
+            .iter()
+            .map(|e| {
+                let ExprKind::Assign { target, value } = &e.kind else {
+                    panic!("Assign ではない: {:?}", e.kind)
+                };
+                (show_expr(target), show_expr(value))
+            })
+            .collect();
+        assert_eq!(
+            spelled,
+            [
+                ("xs[i]".to_string(), "v".to_string()),
+                ("user.id".to_string(), "id".to_string()),
+            ]
+        );
+    }
+
+    /// 代入の右辺・引数・文位置・局所束縛のどれでも、添字は同じ普通の式のまま
+    #[test]
+    fn 代入以外の位置の添字は普通の式() {
+        let body = stmts("fn f() {\n  xs[i]\n  g(xs[i])\n  y = xs[i]\n  let v = xs[i]\n}\n");
+
+        let indexed = |e: &Expr| {
+            assert!(
+                matches!(&e.kind, ExprKind::Index(base, index)
+                    if matches!(&base.kind, ExprKind::Ident(n) if n == "xs")
+                        && matches!(&index.kind, ExprKind::Ident(n) if n == "i")),
+                "`xs[i]` の形ではない: {:?}",
+                e.kind
+            );
+        };
+
+        indexed(&body[0]);
+        let ExprKind::Call(_, args) = &body[1].kind else {
+            panic!("Call ではない: {:?}", body[1].kind)
+        };
+        indexed(&args[0]);
+        let ExprKind::Assign { value, .. } = &body[2].kind else {
+            panic!("Assign ではない: {:?}", body[2].kind)
+        };
+        indexed(value);
+        let ExprKind::Let { value, .. } = &body[3].kind else {
+            panic!("Let ではない: {:?}", body[3].kind)
+        };
+        indexed(value);
+    }
+
+    /// 壊れた添字はソース位置つきで断る
+    #[test]
+    fn 壊れた添字をソース位置つきで断る() {
+        for (src, needle) in [
+            ("fn f() {\n  xs[i\n}\n", "`]`"),
+            ("fn f() {\n  xs[]\n}\n", "式"),
+        ] {
+            let diagnostic = parse_src(src).expect_err(src);
+            assert!(diagnostic.msg.contains(needle), "{src}: {}", diagnostic.msg);
+            let span = diagnostic
+                .span
+                .unwrap_or_else(|| panic!("span が無い: {src}"));
+            // 添字を開いた `[` 以降を指す
+            assert!(
+                span.start >= 13 && span.end as usize <= src.len(),
+                "{src}: {span:?}"
+            );
+        }
+    }
+
+    /// 添字を含まない既存の構文の読みは変わらない
+    #[test]
+    fn 添字以外の構文の読みは変わらない() {
+        for (src, spelling) in [
+            ("xs.push(y)", "xs.push(y)"),
+            ("user.id", "user.id"),
+            ("user.?rank", "user.?rank"),
+            ("Rank::Gold", "Rank::Gold"),
+            ("f(a, b)", "f(a, b)"),
+        ] {
+            assert_eq!(only(src), spelling, "{src}");
+        }
+        // 配列リテラル・struct リテラル・配列型注釈も従来どおり読める
+        assert!(matches!(&stmts("fn f() {\n  [1, 2, 3]\n}\n")[0].kind,
+                ExprKind::Array(items) if items.len() == 3));
+        assert!(matches!(
+            &stmts("struct Circle { r: int }\nfn f() {\n  Circle { r = 1 }\n}\n")[0].kind,
+            ExprKind::StructLit { .. }
+        ));
+        ok("fn f(xs: [int] -> int) {\n  1\n}\n");
     }
 }

@@ -272,6 +272,9 @@ pub enum ExprKind {
     OptionalField(Box<Expr>, String),
     /// `f(a, b)`。`db.save(u)` は `Call(Field(db, "save"), [u])`
     Call(Box<Expr>, Vec<Expr>),
+    /// `xs[i]` — 後置の添字。基底と添字の順。`.field` / `(args)` と同じ
+    /// 後置段で左から積むので、`xs[i][j]` や `xs.get(i)[0]` も同じ形になる
+    Index(Box<Expr>, Box<Expr>),
     Array(Vec<Expr>),
     /// `Circle { r = 1.0 }`
     StructLit {
