@@ -674,9 +674,9 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 
 | タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
 |---|---|---|---|---|---|
-| CAB-000 | `needs-design` | callable 値の公開 ABI 露出の観測可能な契約を決める | なし | L | 必要 |
-| CAB-010 | `planned` | 公開シグネチャへの callable 型の許可と ambient 要求ゼロ制約の型検査を追加する | CAB-000 | M | 不要 |
-| CAB-020 | `planned` | callable 値の handle 表現とライフサイクル管理をランタイムに実装する | CAB-000 | L | 不要 |
+| CAB-000 | `done` | callable 値の公開 ABI 露出の観測可能な契約を決める | なし | L | 必要 |
+| CAB-010 | `ready` | 公開シグネチャへの callable 型の許可と ambient 要求ゼロ制約の型検査を追加する | CAB-000 | M | 不要 |
+| CAB-020 | `ready` | callable 値の handle 表現とライフサイクル管理をランタイムに実装する | CAB-000 | L | 不要 |
 | CAB-030 | `planned` | 汎用 invoke export と（必要なら）解放 export を Core Wasm へ実装する | CAB-010, CAB-020 | L | 不要 |
 | CAB-040 | `planned` | ABI v1 メタデータに callable の型記述を追加する | CAB-010 | M | 不要 |
 | CAB-050 | `planned` | インタプリタ直接呼び出しと Wasm ABI 越し呼び出しの差分 fixture を追加する | CAB-030, CAB-040 | M | 不要 |
@@ -708,42 +708,44 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 
 完了条件:
 
-- CAB-Q3 で決めた範囲（named 関数値のみ、または closure も含む）の callable
-  型を公開関数の引数・戻り値として宣言できる
-- CAB-Q4 の ambient 要求ゼロ制約に反する callable 型を source span 付きで拒否する
-- 対象外の callable（例えば CAB-Q3 で除外した種類）を公開シグネチャに書いた
-  場合を拒否する
+- named 関数値の型を公開関数の引数・戻り値として宣言できる（closure は対象外、
+  対象外の callable を公開シグネチャに書いた場合は source span 付きで拒否する）
+- ambient 要求が残る callable 型を source span 付きで拒否する。公開境界を
+  越えられるのは要求ゼロの callable だけ
 
 検証方法:
 
 - typecheck の公開シグネチャ callable 許可・拒否の焦点テスト
-- ambient 要求が残る callable を公開境界に出した場合の CLI 診断テスト
+- ambient 要求が残る callable / closure を公開境界に出した場合の CLI 診断テスト
 
 ### CAB-020 — handle 表現とライフサイクル
 
 完了条件:
 
-- CAB-Q2 で決めた handle 表現（使い捨て or 明示解放）をランタイムに実装する
+- callable の handle を使い捨て（single-shot）としてランタイムに実装する。
+  invoke の呼び出しの中で自動的に解放され、新しい解放 export は追加しない
 - handle は内部アドレスを含まない不透明 ID である
-- 使い捨てでない場合、二重解放・未解放を診断または安全に無視する規約が定まる
+- 同じ handle を2回 invoke しようとした場合を安全に拒否する（trap または
+  診断。実装時に既存の failure 分類へ合わせて選ぶ）
 
 検証方法:
 
-- handle 生成・呼び出し・（該当すれば）解放の unit test
-- 二重解放・不正 handle の安全性 test
+- handle 生成・呼び出し・自動解放の unit test
+- 同じ handle の二重呼び出しの安全性 test
 
-### CAB-030 — Core Wasm の invoke / 解放 export
+### CAB-030 — Core Wasm のシグネチャ別 invoke export
 
 完了条件:
 
-- CAB-Q5 で決めた汎用 invoke export のシグネチャで callable を呼び出せる
+- 到達した公開 callable 型のシグネチャごとに専用の invoke export を生成する
+  （汎用の1つの export にはしない）
 - CAB-Q1 の方向性どおり、host からの callable 注入経路は追加しない
 - 新しい table や `funcref` を増やす場合も、host が触れるのは export された
   関数番号のみで、内部レイアウトを公開しない
 
 検証方法:
 
-- Wasm の invoke export の snapshot test
+- Wasm のシグネチャ別 invoke export の snapshot test
 - 独立 engine（host 役）からの呼び出し test
 
 ### CAB-040 — ABI v1 メタデータ拡張
@@ -950,20 +952,6 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
 
 まだ設計判断が終わっていない問題。
 
-- **CAB-Q2 — handle のライフサイクル:** 公開境界を越えて host が持つ
-  callable の handle は、一度呼んだら自動解放される使い捨てにするか、host が
-  明示的に解放 export を呼ぶ複数回呼び出し可能な handle にするか。内部アドレスは
-  [ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md) の決定1により
-  host へ公開できないため、handle は不透明な ID にする
-- **CAB-Q3 — 対象範囲:** named 関数値だけを対象にするか、CLO で追加した
-  捕捉付き closure（捕捉環境という owned data を伴う）も対象にするか
-- **CAB-Q4 — ambient 要求の扱い:** 公開境界を越える callable が ambient を
-  要求する場合をどう扱うか。要求ゼロの callable だけ許可し、要求が残るものは
-  拒否するのが素直だが、それでよいか
-- **CAB-Q5 — メタデータと invoke 規約:** 汎用 invoke export のシグネチャ、
-  callable の引数・戻り値型を ADR-0011 の `types` グラフへどう記述するか。
-  異なるシグネチャの callable を同じ汎用 invoke に混在させる場合の型安全性を
-  どう担保するか
 - **EXT-Q1 — 宣言構文:** host 実装の関数をどう宣言するか。`extern fn
   write_log(msg: str -> unit)` のような独立宣言にし、それを普通の関数値として
   trait method の実装（`impl`）内から呼ぶ形にするか、それとも `extern impl`
@@ -1066,3 +1054,20 @@ EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を�
   別系列 EXT（`extern` 宣言、ADR-0009 を supersede する新 ADR が必要）が
   引き受ける。したがって逆方向を Non-goals へ明記する必要はない
   ——CAB の範囲外なだけで、EXT で正式に扱う。
+- **CAB-Q2 — handle のライフサイクル:** callable の handle は使い捨て
+  （single-shot）にする。host が invoke export で一度呼ぶと、その呼び出しの
+  中で handle は自動的に解放される。新しい解放 export は追加しない。同じ
+  callback を複数回使いたい host は、元の公開関数を再度呼んで新しい handle を
+  取り直す。
+- **CAB-Q3 — 対象範囲:** 今回は named 関数値だけを対象にする。CLO で追加した
+  捕捉付き closure（捕捉環境という owned data を伴う）は対象外とし、closure の
+  公開 ABI 露出は引き続き Future Direction とする。
+- **CAB-Q4 — ambient 要求の扱い:** 公開境界を越えられるのは ambient 要求が
+  ゼロの callable だけとする。要求が残る callable を公開シグネチャに書いた
+  場合は source span 付きで拒否する。host には要求解決の概念が無いため。
+- **CAB-Q5 — メタデータと invoke 規約:** invoke は汎用の1つの export ではなく、
+  到達した公開 callable 型のシグネチャごとに専用の export を生成する
+  （[ADR-0003](./docs/adr/0003-whole-program-monomorphization.md) の
+  whole-program monomorphization と同じ流儀）。実行時の型消去やバイト解釈の
+  曖昧さを避け、ABI v1 の `types` グラフにはシグネチャごとの callable 型
+  記述を追加する。
