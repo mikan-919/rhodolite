@@ -1058,6 +1058,40 @@ fn resolve_expr(
             declarations,
             diagnostics,
         ),
+        // 注釈の名前の葉は名前付き関数の署名と同じ規則で正準化し、本体は
+        // 引数名を足した複製スコープで見る(`Head::For` と同じ形)。捕捉の
+        // 可否は決めない — 外側 locals はそのまま渡すだけ(CLO-020)
+        ExprKind::Closure { params, ret, body } => {
+            let mut inner_locals = locals.clone();
+            for param in params.iter_mut() {
+                resolve_type(
+                    &mut param.ty,
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                );
+                inner_locals.insert(param.name.clone());
+            }
+            if let Some(ret) = ret {
+                resolve_type(
+                    ret,
+                    local,
+                    imported_declarations,
+                    imported_modules,
+                    declarations,
+                );
+            }
+            resolve_exprs(
+                body,
+                &mut inner_locals,
+                local,
+                imported_declarations,
+                imported_modules,
+                declarations,
+                diagnostics,
+            );
+        }
         ExprKind::StructLit { name, fields } => {
             if !name
                 .split("::")
@@ -1551,6 +1585,17 @@ fn collect_expr_paths(body: &[Expr], locals: &mut BTreeSet<String>, paths: &mut 
             }
             ExprKind::Array(items) | ExprKind::Block(items) => {
                 collect_expr_paths(items, locals, paths);
+            }
+            ExprKind::Closure { params, ret, body } => {
+                let mut inner_locals = locals.clone();
+                for param in params {
+                    collect_type_paths(&param.ty, paths);
+                    inner_locals.insert(param.name.clone());
+                }
+                if let Some(ret) = ret {
+                    collect_type_paths(ret, paths);
+                }
+                collect_expr_paths(body, &mut inner_locals, paths);
             }
             ExprKind::StructLit { name, fields } => {
                 if !name
@@ -2508,5 +2553,49 @@ mod tests {
         let dumped = format!("{body:?}");
         assert!(dumped.contains("dep::pick"), "{dumped}");
         assert!(dumped.contains("dep::all"), "{dumped}");
+    }
+
+    /// CLO-010: closure の引数は本体のスコープに入り、外側のローカルも
+    /// 今までどおり見える。捕捉の可否はここでは何も決めない (CLO-020)
+    #[test]
+    fn 無名関数の引数と外側のローカルは名前解決で誤診されない() {
+        // 引数参照も外側 local 参照も、モジュール参照とは見なされない
+        load_files(&[(
+            "main.rd",
+            "fn main() {\n  let outer = 1\n  fn(x: int -> int) { x + outer }\n}\n",
+        )])
+        .expect("ロードできる");
+
+        // 未 `use` のモジュール参照は本体の中でも今までどおり報告される
+        let message = load_err(&[(
+            "main.rd",
+            "fn main() {\n  fn(x: int -> int) { services::users::x }\n}\n",
+        )]);
+        assert!(
+            message.contains("モジュール名 `services` は `use` されていません"),
+            "{message}"
+        );
+
+        // 引数・戻り値の型注釈と本体の名前は、名前付き関数と同じく正準化される
+        let loaded = load_files(&[
+            (
+                "main.rd",
+                "use dep::{User, pick}\nfn main() {\n  fn(u: User -> int) { pick() }\n}\n",
+            ),
+            ("dep.rd", "struct User { id: int }\nfn pick(-> int) { 0 }\n"),
+        ])
+        .expect("ロードできる");
+        let body = loaded
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn { sig, body, .. } if sig.name.ends_with("::main") => Some(body),
+                _ => None,
+            })
+            .expect("main がある");
+        let dumped = format!("{body:?}");
+        assert!(dumped.contains("dep::User"), "{dumped}");
+        assert!(dumped.contains("dep::pick"), "{dumped}");
     }
 }

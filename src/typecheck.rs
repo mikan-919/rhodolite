@@ -3251,6 +3251,16 @@ fn walk_kind(e: &Expr, expected: Expect, cx: &Cx, locals: &mut Locals, out: &mut
             poison()
         }
 
+        // CLO-010 は文法と型表現だけ。本体は捕捉を解決したスコープでしか
+        // 意味を持たないので、ここでは降りずに断る(design.md 決定4)。
+        // 自由変数の解決・本体の型検査は CLO-020 がこの arm を置き換える
+        ExprKind::Closure { .. } => {
+            out.push(format!(
+                "{ctx}: 無名関数リテラル `fn(...) {{ ... }}` はこの版では未対応です"
+            ));
+            poison()
+        }
+
         ExprKind::StructLit { name, fields } => {
             check_literal(name, fields, decls, ctx, out);
             let mut given = Vec::with_capacity(fields.len());
@@ -10443,6 +10453,42 @@ fn shout(value: str -> str) { value }
             errors(base).iter().any(|e| e.contains("nothing")),
             "{:?}",
             errors(base)
+        );
+    }
+
+    /// CLO-010 は文法と型表現だけ。無名関数リテラルはパースとモジュール解決を
+    /// 通り抜けて、型検査で「未対応」として落ちる
+    #[test]
+    fn 無名関数リテラルは未対応として断る() {
+        let src = "fn main(-> int) { let g = fn(x: int -> int) { x }\n 1 }\n";
+        assert!(
+            errors(src)
+                .iter()
+                .any(|e| e.contains("無名関数リテラル `fn(...) { ... }` はこの版では未対応です")),
+            "{:?}",
+            errors(src)
+        );
+        assert_eq!(
+            spanned(src, "無名関数リテラル"),
+            "fn(x: int -> int) { x }",
+            "診断はソース上のリテラル全体を指す"
+        );
+
+        // 本体へは降りないので、報告はこの1件だけ (捕捉解決は CLO-020)
+        let with_free = "fn main(-> int) { fn(x: int -> int) { missing }\n 1 }\n";
+        assert_eq!(
+            errors(with_free)
+                .iter()
+                .filter(|e| e.contains("未対応"))
+                .count(),
+            1,
+            "{:?}",
+            errors(with_free)
+        );
+        assert!(
+            !errors(with_free).iter().any(|e| e.contains("missing")),
+            "本体の自由変数は CLO-020 まで見ない: {:?}",
+            errors(with_free)
         );
     }
 }

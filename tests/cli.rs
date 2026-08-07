@@ -2516,3 +2516,37 @@ fn 空の添字をソース位置つきで報告する() {
     assert!(text.contains("main.rd:3:"), "{text}");
     assert!(text.contains("式"), "{text}");
 }
+
+/// 引数の型注釈を欠いた無名関数リテラルは、ソース抜粋つきの診断で断る (CLO-010)
+#[test]
+fn 型注釈を欠いた無名関数リテラルをソース位置つきで報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn main(-> int) {\n  let g = fn(x -> int) { x }\n  1\n}\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("`:` が必要です"), "{text}");
+    // miette がソースの該当行を抜粋する
+    assert!(text.contains("main.rd:2:"), "{text}");
+    assert!(text.contains("fn(x -> int)"), "{text}");
+}
+
+/// 閉じない無名関数の本体も同じくソース位置つきで断る (CLO-010)
+#[test]
+fn 閉じない無名関数の本体をソース位置つきで報告する() {
+    let project = Project::new();
+    project.write(
+        "main.rd",
+        "fn main(-> int) {\n  let g = fn(x: int -> int) { x\n  1\n}\n",
+    );
+
+    let output = project.run("main.rd");
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("`}`"), "{text}");
+    assert!(text.contains("main.rd:"), "{text}");
+}

@@ -492,9 +492,6 @@ impl<'a> Parser<'a> {
         let type_params = self.type_params()?;
         self.expect(&Tok::LParen, "`(`")?;
 
-        let mut params = Vec::new();
-        let mut ret = None;
-
         // `fn save(self, u: User -> unit)` — self は型を書かない。
         // これがある/ないだけがメソッドと関連関数の区別。所有モードは
         // `self` / `&self` / `&mut self` の3つ(design.md 決定2)
@@ -503,22 +500,7 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::Comma);
         }
 
-        if !self.at(&Tok::RParen) {
-            if !self.at(&Tok::Arrow) {
-                loop {
-                    let pname = self.expect_ident("引数名")?;
-                    self.expect(&Tok::Colon, "`:`")?;
-                    let ty = self.ty()?;
-                    params.push(Param { name: pname, ty });
-                    if !self.eat(&Tok::Comma) {
-                        break;
-                    }
-                }
-            }
-            if self.eat(&Tok::Arrow) {
-                ret = Some(self.ty()?);
-            }
-        }
+        let (params, ret) = self.fn_params_and_ret()?;
 
         self.expect(&Tok::RParen, "`)`")?;
         // 破棄はコンパイラが決めるので、利用者が書ける後始末フックは無い。
@@ -540,6 +522,32 @@ impl<'a> Parser<'a> {
             ret,
             span: self.to(start),
         })
+    }
+
+    /// `(a: int, b: str -> R)` の中身、開き `(` とレシーバの後ろから閉じ `)` の
+    /// 手前まで。名前付き関数の `sig()` と無名関数リテラルで共有する —
+    /// 引数名・型注釈は必須で、期待型や本体からの推論はしない(CLO-Q1)。
+    /// `->` を省くと戻り値は `unit` (`typecheck::effective_ret`)
+    fn fn_params_and_ret(&mut self) -> PResult<(Vec<Param>, Option<Type>)> {
+        let mut params = Vec::new();
+        let mut ret = None;
+        if !self.at(&Tok::RParen) {
+            if !self.at(&Tok::Arrow) {
+                loop {
+                    let pname = self.expect_ident("引数名")?;
+                    self.expect(&Tok::Colon, "`:`")?;
+                    let ty = self.ty()?;
+                    params.push(Param { name: pname, ty });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            if self.eat(&Tok::Arrow) {
+                ret = Some(self.ty()?);
+            }
+        }
+        Ok((params, ret))
     }
 
     /// 引数リストの先頭のレシーバ。`&` は引数名にはなれないので曖昧にならない。
@@ -1368,6 +1376,18 @@ impl<'a> Parser<'a> {
             Tok::LBrace => {
                 let body = self.block()?;
                 ExprKind::Block(body)
+            }
+
+            // `fn(x: int -> int) { x }` — 名前を省いた関数リテラル。式位置の
+            // `fn` は必ずこれ。宣言位置の `fn` には名前が続き、型注釈位置の
+            // `fn(...)` は `ty()` が読むので、先読みは要らない(design.md 決定2)
+            Tok::Fn => {
+                self.bump();
+                self.expect(&Tok::LParen, "`(`")?;
+                let (params, ret) = self.fn_params_and_ret()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                let body = self.block()?;
+                ExprKind::Closure { params, ret, body }
             }
 
             // `match rank { Rank::Gold: "gold" }` — 選ばれた arm の値を産む式。
@@ -3015,5 +3035,193 @@ mod tests {
             ExprKind::StructLit { .. }
         ));
         ok("fn f(xs: [int] -> int) {\n  1\n}\n");
+    }
+
+    // --- CLO-010: 無名関数リテラル ---
+
+    /// 引数・戻り値・本体の式数だけを綴る。名前付き関数の署名と同じ形なので
+    /// `show_type` をそのまま使える
+    fn spell_closure(e: &Expr) -> String {
+        let ExprKind::Closure { params, ret, body } = &e.kind else {
+            panic!("Closure ではない: {:?}", e.kind)
+        };
+        let params: Vec<String> = params
+            .iter()
+            .map(|p| format!("{}: {}", p.name, show_type(&p.ty)))
+            .collect();
+        let ret = match ret {
+            Some(ty) => show_type(ty),
+            None => "(省略)".to_string(),
+        };
+        format!("fn({} -> {}) {{{}式}}", params.join(", "), ret, body.len())
+    }
+
+    /// 引数ゼロ・複数引数・戻り値省略。文法は名前付き関数の署名と同じ産出
+    #[test]
+    fn 無名関数リテラルを式として読める() {
+        let body = stmts(concat!(
+            "fn f() {\n",
+            "  fn(-> int) { 1 }\n",
+            "  fn(a: int, b: int -> int) { a + b }\n",
+            "  fn(x: int) { let ignored = x }\n",
+            "  fn(u: &User, xs: [int]? -> User?) { u }\n",
+            "}\n"
+        ));
+        assert_eq!(spell_closure(&body[0]), "fn( -> int) {1式}");
+        assert_eq!(
+            spell_closure(&body[1]),
+            "fn(a: int, b: int -> int) {1式}",
+            "引数は名前付き関数と同じ `name: Type` の並び"
+        );
+        // `->` の省略は推論ではない。注釈が無いという事実だけが残る
+        assert_eq!(spell_closure(&body[2]), "fn(x: int -> (省略)) {1式}");
+        assert_eq!(
+            spell_closure(&body[3]),
+            "fn(u: &User, xs: [int]? -> User?) {1式}",
+            "型注釈は `ty()` の全産出をそのまま使える"
+        );
+    }
+
+    /// 式なので `let` の初期化子にも呼び出し引数にも置ける
+    #[test]
+    fn 無名関数リテラルは式の置ける場所に置ける() {
+        let body = stmts("fn f() {\n  let g = fn(x: int -> int) { x }\n}\n");
+        let ExprKind::Let { name, value, .. } = &body[0].kind else {
+            panic!("Let ではない: {:?}", body[0].kind)
+        };
+        assert_eq!(name, "g");
+        assert_eq!(spell_closure(value), "fn(x: int -> int) {1式}");
+
+        let body = stmts("fn f() {\n  apply(fn(x: int -> int) { x }, 1)\n}\n");
+        let ExprKind::Call(callee, args) = &body[0].kind else {
+            panic!("Call ではない: {:?}", body[0].kind)
+        };
+        assert_eq!(show_expr(callee), "apply");
+        assert_eq!(args.len(), 2);
+        assert_eq!(spell_closure(&args[0]), "fn(x: int -> int) {1式}");
+    }
+
+    /// CLO-Q3: closure の宣言型は名前付き関数値の `fn(P1, P2 -> R)` と同じ形。
+    /// 別の「closure 型」は導入しない
+    #[test]
+    fn 無名関数の宣言型は名前付き関数値の型と一致する() {
+        let p = ok(concat!(
+            "fn add(a: int, b: int -> int) { a + b }\n",
+            "fn f() {\n",
+            "  let g: fn(int, int -> int) = add\n",
+            "  fn(a: int, b: int -> int) { a + b }\n",
+            "}\n"
+        ));
+        let named = p
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn { sig, .. } if sig.name == "add" => Some(sig),
+                _ => None,
+            })
+            .expect("add がある");
+        let body = p
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn { sig, body, .. } if sig.name == "f" => Some(body),
+                _ => None,
+            })
+            .expect("f がある");
+
+        let ExprKind::Let {
+            annotation: Some(annotation),
+            ..
+        } = &body[0].kind
+        else {
+            panic!("注釈つき Let ではない: {:?}", body[0].kind)
+        };
+        let ExprKind::Closure { params, ret, .. } = &body[1].kind else {
+            panic!("Closure ではない: {:?}", body[1].kind)
+        };
+
+        // closure の注釈から組んだ callable 型が、名前付き関数値の型注釈と等しい
+        let from_closure = Type {
+            mode: TypeMode::Owned,
+            kind: TypeKind::Callable {
+                params: params.iter().map(|p| p.ty.clone()).collect(),
+                result: Box::new(ret.clone().expect("戻り値注釈がある")),
+            },
+            optional: false,
+        };
+        assert_eq!(&from_closure, annotation);
+
+        // 引数・戻り値そのものも名前付き関数の署名と要素ごとに同じ
+        let spell = |params: &[Param], ret: &Option<Type>| {
+            let params: Vec<String> = params
+                .iter()
+                .map(|p| format!("{}: {}", p.name, show_type(&p.ty)))
+                .collect();
+            format!("{} -> {:?}", params.join(", "), ret.as_ref().map(show_type))
+        };
+        assert_eq!(spell(params, ret), spell(&named.params, &named.ret));
+    }
+
+    /// 壊れた無名関数リテラルは、名前付き関数の署名とまったく同じ診断で断る
+    #[test]
+    fn 壊れた無名関数リテラルをソース位置つきで断る() {
+        for (src, needle) in [
+            // 引数の型注釈欠落
+            ("fn f() {\n  fn(x -> int) { x }\n}\n", "`:`"),
+            // 閉じない引数リスト
+            ("fn f() {\n  fn(x: int -> int { x }\n}\n", "`)`"),
+            // 閉じない本体
+            ("fn f() {\n  fn(x: int -> int) { x\n}\n", "`}`"),
+            // 本体そのものが無い
+            ("fn f() {\n  fn(x: int -> int)\n}\n", "`{`"),
+        ] {
+            let diagnostic = parse_src(src).expect_err(src);
+            assert!(diagnostic.msg.contains(needle), "{src}: {}", diagnostic.msg);
+            let span = diagnostic
+                .span
+                .unwrap_or_else(|| panic!("span が無い: {src}"));
+            assert!(
+                span.start as usize >= 11 && span.end as usize <= src.len(),
+                "{src}: {span:?}"
+            );
+        }
+
+        // 同じ欠落には名前付き関数と同じ文言が出る(産出を共有しているため)
+        assert_eq!(
+            error("fn f() {\n  fn(x -> int) { x }\n}\n"),
+            error("fn g(x -> int) { x }\n"),
+        );
+    }
+
+    /// 既存の `fn` の3つの位置は読みが変わらない
+    #[test]
+    fn 無名関数リテラルは既存のfnの読みを変えない() {
+        // 宣言位置 — 名前が続くので従来どおり item
+        let p = ok("fn add(a: int, b: int -> int) { a + b }\n");
+        let Item::Fn { sig, .. } = &p.items[0] else {
+            panic!("fn ではない")
+        };
+        assert_eq!(sig.name, "add");
+        assert_eq!(sig.params.len(), 2);
+
+        // 型注釈位置 — 引数に名前を書かない `Callable` のまま
+        let body = stmts("fn f() {\n  let g: fn(int, int -> int) = add\n}\n");
+        let ExprKind::Let {
+            annotation: Some(annotation),
+            ..
+        } = &body[0].kind
+        else {
+            panic!("注釈つき Let ではない")
+        };
+        assert_eq!(show_type(annotation), "fn(int, int -> int)");
+        assert!(matches!(annotation.kind, TypeKind::Callable { .. }));
+        // 型注釈位置では `->` は今までどおり必須
+        assert!(error("fn f(g: fn(int) -> int) { 1 }\n").contains("`->`"));
+
+        // 裸のブロックは第二級のまま。`fn` が付かない限り Closure にはならない
+        assert!(matches!(
+            &stmts("fn f() {\n  { 1 }\n}\n")[0].kind,
+            ExprKind::Block(items) if items.len() == 1
+        ));
     }
 }

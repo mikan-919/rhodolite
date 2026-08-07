@@ -313,6 +313,14 @@ pub enum ExprKind {
     Assert(Box<Expr>),
     /// `{ ... }` — 第二級。値は最後の式
     Block(Vec<Expr>),
+    /// `fn(a: int -> int) { a + 1 }` — 名前を持たない関数リテラル。
+    /// 引数・戻り値の綴りは名前付き関数の `Sig` と同じ形なので、
+    /// 型としては既存の `TypeKind::Callable` がそのまま使える(CLO-Q3)
+    Closure {
+        params: Vec<Param>,
+        ret: Option<Type>,
+        body: Vec<Expr>,
+    },
     /// `match rank { Rank::Gold: "gold"  _: "other" }` — enum の variant ごとの
     /// 分岐。選ばれた arm の値がこの式の値になる(design.md 決定1)
     Match {
