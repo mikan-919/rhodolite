@@ -489,13 +489,190 @@ MAP-075 で意図的にスコープ外にした2機能を追加し、`push` に�
 - 同じ入力から生成する Wasm が byte 単位で決定的である
 - 検証済みの安定状態が単独のスナップショットとしてコミットされている
 
+捕捉付き無名関数(クロージャ)を追加する(CLO-000 〜 CLO-090)。名前付き
+トップレベル関数値だけだった呼び出し可能値に、周囲のローカルを捕捉する
+無名関数を加え、struct field や配列要素への格納(aggregate 格納)まで含める。
+公開 ABI への露出はこの系列に含めない(Future Directions に残す)。
+
+| タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
+|---|---|---|---|---|---|
+| CLO-000 | `done` | 捕捉付き無名関数の観測可能な契約を決める | なし | M | 必要 |
+| CLO-010 | `ready` | 無名関数リテラルの文法と closure 値の型表現を追加する | CLO-000 | M | 不要 |
+| CLO-020 | `planned` | 自由変数の捕捉解決・closure 本体の型検査・aggregate 格納の型検査を追加する | CLO-010 | L | 不要 |
+| CLO-030 | `planned` | 捕捉と aggregate 格納の ownership（move/コピー・環境の drop）を検査する | CLO-020 | L | 不要 |
+| CLO-040 | `planned` | 捕捉環境を whole-program 特殊化キーに加える | CLO-020, CLO-030 | M | 不要 |
+| CLO-050 | `planned` | 捕捉された closure の ambient 要求を推論する | CLO-040 | L | 不要 |
+| CLO-060 | `planned` | closure の具体化を HIR インタプリタで実行する | CLO-030, CLO-040, CLO-050 | M | 不要 |
+| CLO-070 | `planned` | closure の具体化を Core Wasm へ生成する | CLO-030, CLO-040, CLO-050 | L | 不要 |
+| CLO-080 | `planned` | 差分実行 fixture と決定性検証を追加する | CLO-060, CLO-070 | M | 不要 |
+| CLO-090 | `planned` | 仕様と利用者向け文書を更新する | CLO-080 | S | 不要 |
+
+### CLO-000 — 捕捉付き無名関数の契約
+
+目的:
+
+- 実装が捕捉・所有権・単相化の構造を勝手に選ばないよう、最小の言語契約を先に固定する
+
+完了条件:
+
+- CLO-Q1 〜 CLO-Q5 がすべて Decisions へ移っている
+- 構文、捕捉範囲、所有権モード、型表現、ambient 要求伝播、aggregate 格納と
+  公開 ABI のスコープ境界が Decisions に明記されている
+
+検証方法:
+
+- CLO-Q1 〜 CLO-Q5 が Open Questions に残っていないことをレビューする
+- CLO-Q1 〜 CLO-Q5 の決定が Decisions にあることをレビューする
+
+### CLO-010 — 文法と型表現
+
+完了条件:
+
+- 名前を省いた `fn(params -> ret) { body }` を無名関数リテラルとして parse できる
+- パラメータ型・戻り値型の注釈は named 関数と同じく必須とし、期待型からの推論は
+  行わない
+- closure 値は既存の named 関数値と同じ型 `fn(P1, P2 -> R)` として型検査へ渡る
+- 既存の named 関数値・第二級ブロックの AST dump と振る舞いが変わらない
+
+検証方法:
+
+- lexer / parser の焦点テストと dump snapshot
+- 不正構文（型注釈欠落など）の CLI 診断テスト
+
+### CLO-020 — 捕捉解決・型検査・aggregate 格納
+
+完了条件:
+
+- closure 本体で参照する自由変数をローカルのみから一意に解決する。ambient は
+  捕捉対象にしない（CLO-050 で呼び出し時に解決する）
+- closure 値は `fn(P1, P2 -> R)` として named 関数値と同じ適合規則で
+  引数・戻り値・`let` に渡せる
+- closure 値を struct field の型、配列要素の型として宣言・型検査できる
+  （公開 ABI 上の型としては扱わない）
+
+検証方法:
+
+- typecheck の自由変数解決・スコープ外参照（ambient 誤参照)・型適合の焦点テスト
+- struct field / 配列要素に closure 値を持つ宣言の焦点テスト
+
+### CLO-030 — ownership 境界
+
+完了条件:
+
+- 捕捉した Copy local は自動的にコピーされ、非 Copy local は本体中の
+  `move x` で明示的に一度だけ消費される。借用捕捉（`&T` / `&mut T` を環境に
+  格納すること）はこの系列で扱わない
+- closure が呼ばれずに drop される経路でも捕捉環境が一度だけ drop される
+- struct field / 配列要素に格納した closure は他の owned 値と同じ move・drop
+  規則に従う
+- 未解決の捕捉が ownership 以降へ漏れないことを検査する
+
+検証方法:
+
+- ownership の捕捉 move / 二重消費 / 環境 drop の焦点テスト
+- aggregate に格納した closure の move / drop 焦点テスト
+
+### CLO-040 — whole-program 特殊化
+
+完了条件:
+
+- 捕捉環境の型（またはキー）を specialization key に加える
+- 同じ closure 定義でも捕捉内容が異なれば別 instance になる
+- 到達しない closure instance は生成しない
+
+検証方法:
+
+- 特殊化キーの決定性・共有・到達性の snapshot test
+
+### CLO-050 — ambient 要求推論
+
+完了条件:
+
+- closure もただの callable 値として扱い、MAP-050 が作った関数値・型引数ごとの
+  要求推論をそのまま適用する
+- closure 固有の特別な要求推論経路は追加しない
+- 提供忘れは closure を経由する到達経路付きで診断する
+
+検証方法:
+
+- requirement / ambient ABI の closure 経由の組み合わせテスト（MAP-050 の
+  既存テストを closure 値でも実行する）
+- 提供忘れの CLI 診断テスト
+
+### CLO-060 — HIR インタプリタ
+
+完了条件:
+
+- 捕捉環境を保持した closure 値を実行できる
+- 同じ closure 定義を異なる捕捉内容で呼び分けられる
+- struct field / 配列要素に格納した closure を呼び出せる
+- 捕捉値の move・drop・ambient の振る舞いが検査済み計画と一致する
+
+検証方法:
+
+- eval の捕捉あり closure の生成・呼び出し・drop・aggregate 格納の焦点テスト
+
+### CLO-070 — Core Wasm 生成
+
+完了条件:
+
+- 到達した closure instance だけを生成する
+- 捕捉環境が異なる instance を決定的な直接呼び出しへ下ろす
+- 新しい table、`funcref`、動的ディスパッチを追加しない
+- インタプリタと戻り値・失敗分類・所有値の最終状態が一致する
+
+検証方法:
+
+- Wasm の closure instance・直接 call・aggregate 格納の snapshot test
+- 独立 engine による差分実行 test
+
+### CLO-080 — 差分 fixture と決定性
+
+完了条件:
+
+- 捕捉あり/なし、Copy/non-Copy 捕捉、ambient を使う closure、aggregate に
+  格納した closure を維持された fixture に含める
+- 戻り値、実行時失敗、最終状態がインタプリタと Wasm で一致する
+- 同じ source tree と option から byte 単位で同じ Wasm が生成される
+
+検証方法:
+
+- differential corpus に追加した fixture の実行
+- 連続する2回の build の byte 比較
+
+### CLO-090 — 仕様と利用者向け文書
+
+完了条件:
+
+- OpenSpec の delta specs が main specs へ sync されている
+- README、overview、grammar、CONTEXT.md の「第二級ブロック」記述が捕捉付き
+  無名関数と aggregate 格納の現在の境界を同じ言葉で説明する
+- 公開 ABI への露出が未実装と明示される
+- Current State と Milestones が実装後の状態に更新されている
+
+検証方法:
+
+- 文書間の用語とリンクのレビュー
+- `bunx @fission-ai/openspec validate --all --strict`
+
+### CLO-010 〜 CLO-090 共通の完了条件
+
+各実装タスクは CLO-000 で作る OpenSpec tasks の対応範囲を実装する。
+次の条件をすべて満たしたときだけ `done` にできる。
+
+- 対応する OpenSpec scenario に自動テストがある
+- 新規テストと既存テストが通る
+- `cargo fmt --check` と warning をエラーにした Clippy が通る
+- インタプリタと Wasm の両方に関わる振る舞いは差分検証されている
+- 同じ入力から生成する Wasm が byte 単位で決定的である
+- 検証済みの安定状態が単独のスナップショットとしてコミットされている
+
 
 ## Future Directions
 
 まだ実施を約束していない長期案。
 
-- 捕捉を持つ無名関数・クロージャ
-- callable 値の aggregate 格納と公開 ABI
+- callable 値の公開 ABI 露出
 - 関数単位キャッシュと増分ビルド
 - LSP と IDE 連携
 
@@ -503,7 +680,6 @@ MAP-075 で意図的にスコープ外にした2機能を追加し、`push` に�
 
 少なくとも現在は実装しないもの。
 
-- クロージャとその実行時 ABI
 - 型に表れるエフェクト変数や effect row
 - モジュール単独型検査と汎用バイナリの配布
 - generic struct / enum
@@ -569,3 +745,23 @@ MAP-075 で意図的にスコープ外にした2機能を追加し、`push` に�
   含める。既存の field 代入・`&mut` place 規約と同じく、代入は `xs` への暗黙
   `&mut` 借用のもとで行い、範囲外は IDX-Q3/Q4 と同じ trap、`v` は通常の
   move-once 引数と同じ所有権規則で書き込む（旧要素の drop を含む）。
+- **CLO-Q1 — 構文とパラメータ注釈:** 無名関数リテラルは名前を省いた
+  `fn(params -> ret) { body }`。CONTEXT.md の「第二級ブロック」が
+  `fn(...) { ... }` を「環境構築を遅延する第一級の値」と位置づけている構文を
+  そのまま流用する。パラメータ型・戻り値型の注釈は named 関数と同じく必須とし、
+  期待型からの推論は今回追加しない。
+- **CLO-Q2 — 捕捉範囲と既定モード:** 捕捉できるのはローカル変数だけとする。
+  Copy local は自動的にコピーされ、非 Copy local は本体中の `move x` で
+  明示的に一度だけ消費される。借用捕捉（`&T` / `&mut T` を closure の環境に
+  格納すること）は今回扱わない（ADR-0010 が未対応の aggregate borrow に当たるため）。
+  ambient は捕捉扱いにせず、CLO-Q4 のとおり呼び出し時に解決する。
+- **CLO-Q3 — closure 値の型表現:** 捕捉のある closure も既存の named 関数値と
+  同じ型 `fn(P1, P2 -> R)` として扱う。捕捉内容の違いは静的型ではなく
+  CLO-040 の whole-program 特殊化キー側で区別し、`apply<T, U>` のような既存
+  generic helper へ無改造で渡せるようにする。
+- **CLO-Q4 — 捕捉された closure の ambient 要求伝播:** closure もただの
+  callable 値として扱い、MAP-050 で作った「関数値・型引数ごとの要求推論」を
+  そのまま適用する。生成時点の ambient を固定する特別な意味論は導入しない。
+- **CLO-Q5 — スコープ境界:** closure 値を struct field・配列要素へ格納する
+  aggregate 格納はこの系列に含める。公開 ABI の引数・戻り値へ closure 値を
+  出すことは含めず、引き続き Future Direction とする。
