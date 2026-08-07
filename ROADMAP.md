@@ -693,16 +693,16 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 
 完了条件:
 
-- CAB-Q1 〜 CAB-Q5 がすべて Decisions へ移っている
-- 方向性、handle 表現とライフサイクル、対象範囲、ambient 要求の扱い、
+- CAB-Q1（方向性）は決定済み。CAB-Q2 〜 CAB-Q5 がすべて Decisions へ移っている
+- handle 表現とライフサイクル、対象範囲、ambient 要求の扱い、
   メタデータと invoke 規約が Decisions に明記されている
 - 既存 ADR と衝突する場合は、その旨と解決方法（ADR 更新の要否を含む）が
   Decisions に明記されている
 
 検証方法:
 
-- CAB-Q1 〜 CAB-Q5 が Open Questions に残っていないことをレビューする
-- CAB-Q1 〜 CAB-Q5 の決定が Decisions にあり、ADR-0009 / ADR-0011 と矛盾しないことをレビューする
+- CAB-Q2 〜 CAB-Q5 が Open Questions に残っていないことをレビューする
+- CAB-Q2 〜 CAB-Q5 の決定が Decisions にあり、ADR-0009 / ADR-0011 と矛盾しないことをレビューする
 
 ### CAB-010 — 型検査：公開シグネチャへの callable 許可
 
@@ -797,6 +797,138 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 - 同じ入力から生成する Wasm が byte 単位で決定的である
 - 検証済みの安定状態が単独のスナップショットとしてコミットされている
 
+host が実装する関数を `extern` で宣言し、effect handler の中から実際の I/O を
+呼べるようにする(EXT-000 〜 EXT-060)。CAB が「wasm→host」の一方向だけを
+扱うのに対し、EXT は逆方向(host→wasm への import)を扱う。[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md)
+の「成果物は import を1つも要求しない」という決定1と正面から相容れないため、
+EXT-000 の完了条件には新しい ADR による ADR-0009 の supersede を含める。
+
+| タスクID | 状態 | タスク名 | 依存 | 工数 | 設計判断 |
+|---|---|---|---|---|---|
+| EXT-000 | `needs-design` | `extern` 宣言の観測可能な契約を決め、ADR-0009 を supersede する ADR を書く | なし | L | 必要 |
+| EXT-010 | `planned` | `extern fn` 宣言の文法を追加する | EXT-000 | M | 不要 |
+| EXT-020 | `planned` | extern 関数の型検査（シグネチャ制約・ambient 要求ゼロ）を追加する | EXT-010 | M | 不要 |
+| EXT-030 | `planned` | Core Wasm の import section 生成と `rhodolite.abi` の import 記述を追加する | EXT-020 | L | 不要 |
+| EXT-040 | `planned` | インタプリタで extern を実行するための host スタブ機構を追加する | EXT-020 | M | 不要 |
+| EXT-050 | `planned` | host スタブを共有した差分実行 fixture を追加する | EXT-030, EXT-040 | M | 不要 |
+| EXT-060 | `planned` | 仕様と利用者向け文書を更新する | EXT-050 | S | 不要 |
+
+### EXT-000 — `extern` 宣言の契約
+
+目的:
+
+- host 依存部分の構文・型境界・失敗表現を先に固定する
+- ADR-0009 決定1（import-free）を変更する以上、新しい ADR で経緯と差分を
+  明文化し、0009 の status を superseded にする
+
+完了条件:
+
+- EXT-Q1 〜 EXT-Q6 がすべて Decisions へ移っている
+- 宣言構文、型と ownership の境界、instantiate 契約とメタデータ、
+  ambient/effect との統合、失敗の伝達、スコープ境界が Decisions に明記されている
+- ADR-0009 を supersede する新しい ADR（`docs/adr/0012-*.md` 想定）の草稿ができ、
+  0009 の frontmatter が `status: superseded by ADR-0012` に更新されている
+
+検証方法:
+
+- EXT-Q1 〜 EXT-Q6 が Open Questions に残っていないことをレビューする
+- EXT-Q1 〜 EXT-Q6 の決定が Decisions にあることをレビューする
+- 新 ADR のレビューと ADR-0009 の status 更新の確認
+
+### EXT-010 — 文法
+
+完了条件:
+
+- EXT-000 の契約どおりに `extern fn name(params -> ret)`（本体なし）を parse できる
+- extern 関数は通常の named 関数値と同じ型 `fn(P1, P2 -> R)` として扱われ、
+  trait method の実装内から普通に呼び出せる
+- 本体を持つ `extern fn` や、対象外の構文（例えば `extern impl`）を source span
+  付きで拒否する
+
+検証方法:
+
+- lexer / parser の焦点テストと dump snapshot
+- 不正構文の CLI 診断テスト
+
+### EXT-020 — 型検査
+
+完了条件:
+
+- extern 関数のシグネチャは EXT-Q2 で決めた型集合に制限される
+- extern 関数は ambient を要求できない（要求があれば source span 付きで拒否する）
+- extern 関数を呼ぶ側は通常の関数呼び出しと同じ規則で型検査される
+
+検証方法:
+
+- typecheck の型集合制限・ambient 要求拒否の焦点テスト
+
+### EXT-030 — Core Wasm の import と ABI メタデータ
+
+完了条件:
+
+- 到達した extern 関数だけを Wasm の import として生成する
+- `rhodolite.abi` に host が満たすべき import シグネチャの一覧を追加する
+- 未解決 import がある場合、instantiate が失敗することを文書化する
+  （ADR-0009 決定1の変更点として EXT-000 の新 ADR に明記済みであること）
+
+検証方法:
+
+- Wasm の import section と `rhodolite.abi` の snapshot test
+- host スタブを満たした instantiate の成功 test と、満たさない場合の失敗 test
+
+### EXT-040 — インタプリタの host スタブ
+
+完了条件:
+
+- HIR インタプリタが extern 呼び出しを host スタブ実装へ委譲できる
+- テストごとに host スタブを差し替えられる
+- host スタブが無い extern 呼び出しは明確なエラーで止まる（サイレントに
+  no-op しない）
+
+検証方法:
+
+- eval の host スタブ呼び出し・未設定時のエラー焦点テスト
+
+### EXT-050 — 差分 fixture
+
+完了条件:
+
+- 同じ host スタブ実装をインタプリタと Wasm 側（テスト用ホストドライバ）の
+  両方で使う fixture を追加する
+- extern の戻り値・失敗がインタプリタと Wasm で一致する
+
+検証方法:
+
+- differential corpus に追加した fixture の実行
+
+### EXT-060 — 仕様と利用者向け文書
+
+完了条件:
+
+- OpenSpec の delta specs が main specs へ sync されている
+- README、overview、grammar が `extern fn` の契約を同じ言葉で説明する
+- Current State の「公開 ABI に borrow や callable 値を出せない」等の記述を
+  実装後の境界（extern 経由の host 連携が可能になったこと）に合わせて更新する
+- ADR-0009 の status が superseded になっており、新 ADR が `docs/adr/` に
+  存在する
+
+検証方法:
+
+- 文書間の用語とリンクのレビュー
+- `bunx @fission-ai/openspec validate --all --strict`
+
+### EXT-010 〜 EXT-060 共通の完了条件
+
+各実装タスクは EXT-000 で作る OpenSpec tasks の対応範囲を実装する。
+次の条件をすべて満たしたときだけ `done` にできる。
+
+- 対応する OpenSpec scenario に自動テストがある
+- 新規テストと既存テストが通る
+- `cargo fmt --check` と warning をエラーにした Clippy が通る
+- インタプリタと Wasm の両方に関わる振る舞いは差分検証されている
+- 同じ入力から生成する Wasm が byte 単位で決定的である
+- 検証済みの安定状態が単独のスナップショットとしてコミットされている
+
 
 ## Future Directions
 
@@ -818,12 +950,6 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 
 まだ設計判断が終わっていない問題。
 
-- **CAB-Q1 — 方向性:** host が呼べるのは wasm 側が作った callable への
-  一方向ハンドルに限るか。[ADR-0009](./docs/adr/0009-core-wasm-is-the-compiler-artifact.md)
-  の「成果物は import-free」という制約と、host 提供の関数を wasm 側へ注入して
-  呼ばせる経路（逆方向）は正面衝突する。逆方向を Non-goals へ明記して閉じるか、
-  別の迂回策（例えば host 関数を直接 import せず、既存の module 内 named
-  関数の中から index で選ばせるだけにする）を許すか
 - **CAB-Q2 — handle のライフサイクル:** 公開境界を越えて host が持つ
   callable の handle は、一度呼んだら自動解放される使い捨てにするか、host が
   明示的に解放 export を呼ぶ複数回呼び出し可能な handle にするか。内部アドレスは
@@ -838,6 +964,27 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
   callable の引数・戻り値型を ADR-0011 の `types` グラフへどう記述するか。
   異なるシグネチャの callable を同じ汎用 invoke に混在させる場合の型安全性を
   どう担保するか
+- **EXT-Q1 — 宣言構文:** host 実装の関数をどう宣言するか。`extern fn
+  write_log(msg: str -> unit)` のような独立宣言にし、それを普通の関数値として
+  trait method の実装（`impl`）内から呼ぶ形にするか、それとも `extern impl`
+  のような専用構文で trait 実装ごと host 側に委ねる形にするか
+- **EXT-Q2 — 型と ownership の境界:** extern 関数の引数・戻り値にどの型を
+  許すか（scalar だけか、ADR-0011 の rich ABI 型まで含むか）。`&T` / `&mut T`
+  を渡せるか。渡せる場合、公開 ABI と同じ符号化契約（encode/decode）を
+  再利用できるか
+- **EXT-Q3 — instantiate 契約とメタデータ:** host が用意すべき import 関数群を
+  `rhodolite.abi` にどう記述するか（`imports` 欄の追加など）。ADR-0009 決定1の
+  「instantiate は何も走らせない」という前提は崩れる（未解決 import があれば
+  instantiate 自体が失敗する）が、それをどう文書化するか
+- **EXT-Q4 — ambient / effect との統合:** extern 関数は ambient を要求できない
+  （host に要求解決の概念が無い）という前提でよいか。effect の `impl` が
+  内部で extern 関数を呼んで実際の I/O を行う、という用途を想定した設計にするか
+- **EXT-Q5 — 失敗の伝達:** host 提供の extern 関数が失敗した場合、既存の
+  trap 契約（ADR-0009 決定4）にそのまま乗せるか、それとも新しい失敗表現を
+  extern 境界だけに導入するか
+- **EXT-Q6 — スコープ境界:** extern は常にキャプチャの無い named 関数として
+  だけ扱うか（closure 相当の概念を host 側に持ち込まない）。テスト時に
+  インタプリタ側で extern をどう実行するか（host スタブの共有機構が要るか）
 
 ## Decisions
 
@@ -913,3 +1060,9 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 - **CLO-Q5 — スコープ境界:** closure 値を struct field・配列要素へ格納する
   aggregate 格納はこの系列に含める。公開 ABI の引数・戻り値へ closure 値を
   出すことは含めず、引き続き Future Direction とする。
+- **CAB-Q1 — 方向性:** CAB は wasm→host の一方向（wasm 側が作った callable
+  への opaque handle を host が invoke export 経由で呼ぶ）だけを扱う。
+  host が定義した実際のロジックを wasm 側から呼ぶ経路は CAB の対象にせず、
+  別系列 EXT（`extern` 宣言、ADR-0009 を supersede する新 ADR が必要）が
+  引き受ける。したがって逆方向を Non-goals へ明記する必要はない
+  ——CAB の範囲外なだけで、EXT で正式に扱う。
