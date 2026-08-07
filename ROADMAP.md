@@ -676,7 +676,7 @@ callable 値（named 関数値・closure）を公開 ABI の引数・戻り値�
 |---|---|---|---|---|---|
 | CAB-000 | `done` | callable 値の公開 ABI 露出の観測可能な契約を決める | なし | L | 必要 |
 | CAB-010 | `done` | 公開シグネチャへの callable 型の許可と ambient 要求ゼロ制約の型検査を追加する | CAB-000 | M | 不要 |
-| CAB-020 | `ready` | callable 値の handle 表現とライフサイクル管理をランタイムに実装する | CAB-000 | L | 不要 |
+| CAB-020 | `in-progress` | callable 値の handle 表現とライフサイクル管理をランタイムに実装する | CAB-000 | L | 不要 |
 | CAB-030 | `planned` | 汎用 invoke export と（必要なら）解放 export を Core Wasm へ実装する | CAB-010, CAB-020 | L | 不要 |
 | CAB-040 | `planned` | ABI v1 メタデータに callable の型記述を追加する | CAB-010 | M | 不要 |
 | CAB-050 | `planned` | インタプリタ直接呼び出しと Wasm ABI 越し呼び出しの差分 fixture を追加する | CAB-030, CAB-040 | M | 不要 |
