@@ -286,23 +286,33 @@ owned 値と明示 borrow を経た最終状態とする。
 はその callback ごとに特殊化され、生成コードは表も `funcref` も使わない直接
 呼び出しになる。
 
+二枚目として、**型パラメータと総称的な `map`** も入った。`fn` / `trait` / `impl` が
+型パラメータを取り、呼び出し地点で型引数を推論して具体化した HIR を作る。型引数と
+trait impl は whole-program 特殊化の鍵に加わるので、generic な callback を経由した
+ambient 要求も呼び出し元まで推論される。具体化した宣言は HIR インタプリタと Core
+Wasm の両方で一致する。配列へ要素を足す `push` だけがコンパイラ組み込みで、
+`Map<T>` と `impl<T> Map<T> for [T]` は通常の Rhodolite ソースとして書く。段階の
+内訳と状態は [ROADMAP.md の Milestones](../ROADMAP.md#milestones)(MAP トラック)。
+
 そこに**入っていない**もの:
 
 - 捕捉を持つ無名関数・クロージャと、その実行時 ABI
-- 型パラメータと総称的な `map`、配列の高階 API
+- 明示的な型引数指定(推論できない型パラメータは実行前に落ちる)
+- generic な `struct` / `enum`、制約付き型パラメータと overload resolution
+- 借用版 `map`(`&self` / `fn(&T -> U)`)と、配列の `len()`・添字アクセス
 - callable 値を戻り値・フィールド・variant payload・配列・可変 local に置くこと
 - 公開 ABI に出る callable 引数・結果
 
 ```text
 関数値(← 名前付き関数の値まで完了)
         ↓
+型パラメータと高階関数(← 総称的な `map` まで完了)
+        ↓
+呼び出し地点の具体化(← 完了)
+        ↓
+エフェクト要求を含む単相化(← 完了)
+        ↓
 クロージャ(捕捉と実行時 ABI)
-        ↓
-型パラメータと高階関数
-        ↓
-呼び出し地点の具体化
-        ↓
-エフェクト要求を含む単相化
         ↓
 関数単位キャッシュと増分ビルド
 ```

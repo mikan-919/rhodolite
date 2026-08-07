@@ -195,10 +195,11 @@ unwinding をしない。`indirect` は有限な再帰所有 edge を明示す�
 aggregate に格納した borrow、GC、runtime borrow check、raw pointer、`unsafe` はまだない。
 理由と境界は [ADR-0010](./adr/0010-owned-values-and-inferred-borrows.md)。
 
-現在の interpreter はこの契約を実行する参照実装である。一方、Core Wasm v0 は到達した
-scalar (`unit` / `bool` / `int`) だけを生成し、non-scalar data、borrow、public borrowed
-signature は source span 付きで build 前に拒否する。owned data の layout は次段まで
-意図的に未実装である。
+現在の interpreter はこの契約を実行する参照実装である。Core Wasm backend は同じ
+検査済みアクセスモードと drop plan を消費し、`str`・owned struct・payload enum・
+optional・配列とその field 操作・`clone()`・`??`・`match`・`for` を、組み込み
+allocator と決定的な data layout の上へ生成する(ADR-0011)。borrow と borrowed
+public signature は引き続き source span 付きで build 前に拒否する。
 
 ## 7. 検査がいま保証すること
 
@@ -264,6 +265,18 @@ ADR-0006 のモジュール分割、struct の形の検査、enum の宣言、
 メソッド・関連関数・スロットの名前は値にならない。callable 型のローカルや引数は
 通常の呼び出し構文で呼べて、その呼び先は呼び出し特殊化ごとに1つの名前付き関数へ
 静的に決まる。
+
+`fn`・`trait`・`impl` は型パラメータ `<T, U>` を宣言できる(`struct` と `enum` には
+書けない)。generic 本体は型パラメータを剛体変数としてまず全域検査し、具体的な
+呼び出し地点で型引数を推論して、generic 宣言 ID・型引数・callback 束縛をキーに
+具体化した HIR を作る。ownership 以降へ渡る `CheckedProgram` に型変数は残らないので、
+要求推論・インタプリタ・Wasm 生成は具体化済みの宣言だけを見る。配列へ要素を足す
+`push` は `trait Push<T>` を宣言するとコンパイラ組み込み実装が付く唯一の generic
+impl で、総称的な `map` は組み込みではなく `trait Map<T>` と
+`impl<T> Map<T> for [T]` を通常の Rhodolite ソースとして書く。`map` は `self` で
+入力を消費するので呼び出しは `move xs.map(f)` になり、元の配列を残したいときは
+`xs.clone().map(f)` と明示する。捕捉のある無名関数(クロージャ)、明示的な型引数
+指定、generic `struct` / `enum`、借用版 `map` はまだ無い。
 
 trait を実装する `impl` は宣言の時点で契約と突き合わされ、メソッドの過不足・
 レシーバの形・引数型・戻り値型が一致する(引数名は実装側の局所名なので入らない)。
@@ -395,11 +408,21 @@ ambient の低水準契約まで決まった。`src/ambient_abi.rs` は、`main`
 正典プログラム全体がこの計画へ落ちることは決定的なスナップショットで固定してある。
 判断の理由は [ADR-0008](./adr/0008-ambient-abi-is-a-specialization-plan.md)。
 
-この計画を入力にした Core Wasm 生成 (`emit-core-wasm-programs`) は動いている。
+この計画を入力にした Core Wasm 生成は動いている。
 `rhodolite build <entry.rd> --target wasm` が、`main` と `pub use` で明示選択した
 公開関数を根に、到達した instance ごとに1つの Wasm 関数を出す。呼び先は計画が持つ
 `InstanceId` を関数番号へ引き直すだけで、名前解決をやり直さない。ホスト面の
-取り決めは [ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。
+取り決めは [ADR-0009](./adr/0009-core-wasm-is-the-compiler-artifact.md)。owned data の
+Wasm 表現・ABI v1(`compile-wasm-owned-data-values`)、trait と ambient の生成
+(`compile-wasm-traits-and-ambient`)、二つの実行系の差分実行
+(`add-differential-execution`)まで通り、compiled v1 に到達した。
 
-次は、owned data の Wasm 表現(`compile-wasm-owned-data-values`)。順序と完了線は
-[`compiler-roadmap.md`](./compiler-roadmap.md)。
+compiled v1 の後は [`ROADMAP.md`](../ROADMAP.md) の MAP トラックを進めている。
+型パラメータの構文と型表現、汎用関数と汎用 trait / impl の検査、呼び出し地点の
+具体化、whole-program 特殊化キーへの型引数の追加、generic callback の ambient
+要求推論、HIR インタプリタと Core Wasm での実行、組み込み `push`、通常ソースで
+書く `Map<T>`、正典 fixture と byte 決定性の検証(MAP-000 〜 MAP-090)は完了して
+いる。次の一歩はこの文書を含む利用者向け文書の更新(MAP-100)で、その先は捕捉を
+持つ無名関数(クロージャ)とその実行時 ABI になる。明示的な型引数指定、generic
+`struct` / `enum`、借用版 `map` は現時点の非目標のまま据え置く。段階の順序と
+完了線は [`compiler-roadmap.md`](./compiler-roadmap.md)。

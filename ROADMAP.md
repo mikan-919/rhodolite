@@ -32,6 +32,9 @@ source
 - モジュール読み込みと `pub use` による公開関数の選択
 - `int` / `bool` / `str` / `unit`、struct、enum、optional、配列
 - 分岐、ループ、`match`、method、trait method、名前付き関数値
+- `fn` / `trait` / `impl` の型パラメータ、呼び出し地点の型引数推論と具体化、
+  型引数を鍵に含む whole-program 特殊化
+- 組み込み `push` と、通常の Rhodolite ソースで書く `Map<T>` / `impl<T> Map<T> for [T]`
 - 単独所有、明示的な `move` / `clone()`、`&T` / `&mut T` の借用検査、決定的 drop
 - owned data を含む Core Wasm 生成、組み込み allocator、公開 ABI v0 / v1
 - source span と要求の到達経路を伴う実行前診断
@@ -39,7 +42,11 @@ source
 現在の大きな制約:
 
 - 型・ambient 要求・借用の解決は whole-program 前提で、モジュール単独型検査は行わない
-- 関数値は名前付きトップレベル関数のみ。クロージャ、型パラメータ、汎用的な高階関数は未実装
+- 関数値は名前付きトップレベル関数のみ。捕捉のある無名関数(クロージャ)は未実装
+- 型引数は推論のみで明示指定できない。generic な `struct` / `enum` と
+  制約付き型パラメータは持たない
+- `map` は `self` を消費する形だけで、借用版 `map` は無い。配列の `len()` と
+  添字アクセス `xs[i]` もまだ無い
 - borrow を aggregate に格納できず、shared ownership、GC、raw pointer、`unsafe` は持たない
 - 公開 ABI に borrow や callable 値を出せない。ABI はまだ安定化の対象ではない
 - async/await、ジェネレータ、バックトラッキング、language-level unwinding はサポートしない
@@ -83,18 +90,32 @@ Agent は対象タスクを `in-progress` にし、1タスクずつ実装する�
 
 ## Milestones
 
-次の到達点は、名前付き関数値と型パラメータを使った汎用 `map` である。
+名前付き関数値と型パラメータを使った汎用 `map` に到達した(MAP-000 〜 MAP-090)。
 ambient を要求する関数を `map` へ渡すと、その要求が呼び出し元まで推論される。
 エフェクト変数はソース上の型に出さない。クロージャはこの到達点に含めない。
 
+`Map<T>` は組み込みではなく、通常の Rhodolite ソースとして宣言する。`map` は
+`self` を消費するので、呼び出しには `move` が要る。
+
 ```rhodolite
+trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }
+
+impl<T> Map<T> for [T] {
+    fn map<U>(self, f: fn(T -> U) -> [U]) {
+        let mut result: [U] = []
+        for x in move self { result.push(f(move x)) }
+        move result
+    }
+}
+
 fn fetch(id: int -> User?) {
     db.find(id)
 }
 
 fn main(-> [User?]) {
     with db<Postgres> {
-        [1, 2, 3].map(fetch)
+        let ids = [1, 2, 3]
+        move ids.map(fetch)
     }
 }
 ```
@@ -118,7 +139,7 @@ fn main(-> [User?]) {
 | MAP-075 | `done` | 通常コードから使える最小の配列構築手段を追加する | MAP-030, MAP-060, MAP-070 | M | 不要 |
 | MAP-080 | `done` | 汎用 `map` trait と配列用 impl を Rhodolite で実装する | MAP-050, MAP-075 | M | 不要 |
 | MAP-090 | `done` | 正典 fixture、差分実行、決定性検証を追加する | MAP-080 | M | 不要 |
-| MAP-100 | `ready` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
+| MAP-100 | `done` | 仕様と利用者向け文書を更新する | MAP-090 | S | 不要 |
 
 ### MAP-000 — 汎用 `map` の契約
 

@@ -160,8 +160,44 @@ fn main(-> int) { apply(double, 21) }
 呼び先はどの呼び出しでも静的に1つ決まるので、ambient 要求はその callback ごとに
 特殊化される。`db` を要る callback を渡した呼び出しだけが `db` を要求し、要らない
 callback を渡した呼び出しは隠し ambient record を持たない。生成 Wasm は表も
-`funcref` もクロージャ確保も使わず、計画が選んだ直接呼び出しになる。捕捉のある
-無名関数、型パラメータ、総称的な `map` はまだ無い。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
+`funcref` もクロージャ確保も使わず、計画が選んだ直接呼び出しになる。
+
+`fn`・`trait`・`impl` は型パラメータを取れる。宣言・本体検査・呼び出し地点での
+型引数推論・具体化まで通り、具体化した宣言は HIR インタプリタと Core Wasm の
+両方で同じ結果を出す。総称的な `map` も言語機能ではなく通常の Rhodolite ソースで
+書ける。配列へ要素を足す `push` だけがコンパイラ組み込みで、`Map<T>` と
+`impl<T> Map<T> for [T]` はプログラム側が宣言する。
+
+```rhodolite
+trait Map<T> { fn map<U>(self, f: fn(T -> U) -> [U]) }
+
+impl<T> Map<T> for [T] {
+    fn map<U>(self, f: fn(T -> U) -> [U]) {
+        let mut result: [U] = []
+        for x in move self { result.push(f(move x)) }
+        move result
+    }
+}
+
+fn double(n: int -> int) { n * 2 }
+
+fn fold(xs: &[int] -> int) {
+    let mut t = 0
+    for x in xs { t = t * 10 + x }
+    t
+}
+
+fn main(-> int) {
+    let xs = [1, 2, 3]
+    let ys = move xs.map(double)
+    fold(&ys)
+}
+```
+
+`map` は `self` で入力を消費するので、既存 local を渡すときは `move xs.map(f)` と
+書き、元の配列を残したいときは `xs.clone().map(f)` と明示する。捕捉のある無名関数
+(クロージャ)、明示的な型引数指定、generic `struct` / `enum`、借用版 `map` は
+まだ無い。構文と診断の詳細は [docs/grammar.md](./docs/grammar.md)、設計判断は
 [ADR-0010](./docs/adr/0010-owned-values-and-inferred-borrows.md) と
 [ADR-0011](./docs/adr/0011-owned-data-layout-and-abi-v1.md)、順序は
 [docs/compiler-roadmap.md](./docs/compiler-roadmap.md)。
