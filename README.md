@@ -1,6 +1,6 @@
-# Rhodolite
+<h1 align="center">Rhodolite</h1>
 
-> **関数呼び出しで切れない束縛を持つ言語。**
+<p align="center"><strong>関数呼び出しで切れない束縛を持つ言語。</strong></p>
 
 変数の束縛は関数を跨ぐと切れる。切れない束縛を言語に入れると、DIコンテナが不要になる。
 
@@ -31,6 +31,8 @@ fn main() {
 
 用語の定義は [CONTEXT.md](./CONTEXT.md)、設計判断の理由は [docs/adr/](./docs/adr/)。
 v1 の到達目標は [examples/canonical.rd](./examples/canonical.rd)。
+
+<p align="center"><a href="#このプロジェクトの成功条件">成功条件</a> · <a href="#v1-の完了線">v1 の完了線</a> · <a href="#開発の規則">開発の規則</a> · <a href="#現状">現状</a></p>
 
 ## このプロジェクトの成功条件
 
